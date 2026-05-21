@@ -2456,7 +2456,8 @@ class ChatToolWindowContent(
         consolePanel = bp
         bp.onLoadMoreRequested = { persistenceManager.onLoadMoreHistory() }
         persistenceManager.setEntryStore(bp.entryStore)
-        persistenceManager.setCallbacks(object : ConversationPersistenceManager.Callbacks {            override fun appendEntries(entries: List<EntryData>, totalPromptCount: Int) =
+        persistenceManager.setCallbacks(object : ConversationPersistenceManager.Callbacks {
+            override fun appendEntries(entries: List<EntryData>, totalPromptCount: Int) =
                 broadcastPanel.appendEntries(entries, totalPromptCount)
 
             override fun prependEntries(entries: List<EntryData>) =
