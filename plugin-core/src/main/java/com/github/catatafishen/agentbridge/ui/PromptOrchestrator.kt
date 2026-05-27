@@ -182,6 +182,7 @@ class PromptOrchestrator(
     }
 
     private fun executePrompt(prompt: String, contextItems: List<ContextItemData>, selectedModelId: String) {
+        agentManager.beginPrompt()
         try {
             // Clean up agent resources from previous turns before starting a new one
             AgentTabTracker.getInstance(project).closeTrackedTabs()
@@ -222,6 +223,8 @@ class PromptOrchestrator(
             handlePromptCompletion(prompt)
         } catch (e: Exception) {
             handlePromptError(e)
+        } finally {
+            agentManager.endPrompt()
         }
     }
 

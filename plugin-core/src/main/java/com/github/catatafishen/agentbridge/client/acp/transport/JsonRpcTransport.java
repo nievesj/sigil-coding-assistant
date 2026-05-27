@@ -253,13 +253,74 @@ public class JsonRpcTransport {
                     Thread.currentThread().interrupt();
                 }
             }
+            String exitContext = buildExitContext(proc);
             String stderrContext = buildStderrContext();
-            IOException cause = stderrContext.isEmpty()
-                ? new IOException("Agent process exited unexpectedly")
-                : new IOException("Agent process exited unexpectedly: " + stderrContext);
+            StringBuilder message = new StringBuilder("Agent process exited unexpectedly");
+            if (!exitContext.isEmpty()) {
+                message.append(" (").append(exitContext).append(")");
+            }
+            if (!stderrContext.isEmpty()) {
+                message.append(": ").append(stderrContext);
+            }
+            IOException cause = new IOException(message.toString());
             pendingRequests.forEach((id, future) -> future.completeExceptionally(cause));
             pendingRequests.clear();
         }
+    }
+
+    /**
+     * Build a short diagnostic string describing how the agent process exited.
+     * <p>
+     * Waits up to 500&nbsp;ms for the OS to reap the process (the read loop typically
+     * notices EOF before {@code waitFor} returns), then reports the numeric exit value
+     * and a human-readable interpretation of common Unix signal codes (128+signal).
+     * <p>
+     * Silent kills (SIGKILL by OOM killer, bwrap sandbox, or external tooling) leave
+     * no stderr, so the exit code is often the only diagnostic available — without
+     * this context the user sees a bare "Agent process exited unexpectedly" message.
+     */
+    private static String buildExitContext(Process proc) {
+        try {
+            if (!proc.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                return "still running after EOF";
+            }
+            int code = proc.exitValue();
+            String interpretation = interpretExitCode(code);
+            return interpretation.isEmpty()
+                ? "exit code " + code
+                : "exit code " + code + " — " + interpretation;
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return "interrupted while reading exit code";
+        } catch (IllegalThreadStateException ignored) {
+            return "exit code unavailable";
+        }
+    }
+
+    /**
+     * Map common exit codes (Unix 128+signal convention) to a short, neutral label.
+     * Returns an empty string for ordinary exit codes — the numeric value alone is enough.
+     * <p>
+     * We deliberately avoid speculating about <em>why</em> a signal was delivered
+     * (sandbox, OOM killer, manual kill, etc.) — the cause varies wildly by environment
+     * and the raw stderr output (also included in the error message) is the most reliable
+     * source of truth.
+     */
+    private static String interpretExitCode(int code) {
+        return switch (code) {
+            case 0 -> "clean exit";
+            case 130 -> "SIGINT";
+            case 134 -> "SIGABRT";
+            case 137 -> "SIGKILL";
+            case 139 -> "SIGSEGV";
+            case 143 -> "SIGTERM";
+            default -> {
+                if (code > 128 && code < 192) {
+                    yield "signal " + (code - 128);
+                }
+                yield "";
+            }
+        };
     }
 
     private void processLine(String line) {

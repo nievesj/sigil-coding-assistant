@@ -139,11 +139,16 @@ class JsonRpcTransportTest {
         private final InputStream in;     // process stdout — transport reads here
         private final InputStream err;    // process stderr — transport reads here
         private volatile boolean alive = true;
+        private volatile int exitCode = 0;
 
         MockProcess(OutputStream out, InputStream in, InputStream err) {
             this.out = out;
             this.in = in;
             this.err = err;
+        }
+
+        void setExitCode(int code) {
+            this.exitCode = code;
         }
 
         @Override
@@ -169,7 +174,7 @@ class JsonRpcTransportTest {
         @Override
         public int exitValue() {
             if (alive) throw new IllegalThreadStateException("Process still running");
-            return 0;
+            return exitCode;
         }
 
         @Override
@@ -1044,6 +1049,32 @@ class JsonRpcTransportTest {
                 "Should mention 'exited unexpectedly', got: " + cause.getMessage());
             assertTrue(cause.getMessage().contains("FATAL: out of memory"),
                 "Should include stderr content, got: " + cause.getMessage());
+        }
+
+        @Test
+        @DisplayName("process exit with nonzero code includes exit code and signal label")
+        void processExitIncludesExitCodeAndSignalLabel() throws Exception {
+            transport.start(mockProcess);
+
+            CompletableFuture<JsonElement> future = transport.sendRequest("test/method", null);
+            readSentLine();
+
+            // Simulate SIGKILL: mark process dead with exit code 137 BEFORE closing stdout,
+            // so the read loop's buildExitContext can observe the terminated state.
+            ((MockProcess) mockProcess).setExitCode(137);
+            mockProcess.destroy();
+            feedToTransport.close();
+
+            ExecutionException ex = assertThrows(ExecutionException.class,
+                () -> future.get(5, TimeUnit.SECONDS));
+            IOException cause = (IOException) ex.getCause();
+            String msg = cause.getMessage();
+            assertTrue(msg.contains("exited unexpectedly"),
+                "Should mention 'exited unexpectedly', got: " + msg);
+            assertTrue(msg.contains("137"),
+                "Should include numeric exit code 137, got: " + msg);
+            assertTrue(msg.contains("SIGKILL"),
+                "Should include signal label SIGKILL, got: " + msg);
         }
 
         @Test

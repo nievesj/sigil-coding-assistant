@@ -1,11 +1,11 @@
 package com.github.catatafishen.agentbridge.services;
 
+import com.github.catatafishen.agentbridge.bridge.AgentConfig;
+import com.github.catatafishen.agentbridge.bridge.ProfileBasedAgentConfig;
 import com.github.catatafishen.agentbridge.client.AbstractClient;
 import com.github.catatafishen.agentbridge.client.ClientRegistry;
 import com.github.catatafishen.agentbridge.client.claude.ClaudeClient;
 import com.github.catatafishen.agentbridge.client.codex.CodexClient;
-import com.github.catatafishen.agentbridge.bridge.AgentConfig;
-import com.github.catatafishen.agentbridge.bridge.ProfileBasedAgentConfig;
 import com.github.catatafishen.agentbridge.psi.PlatformApiCompat;
 import com.github.catatafishen.agentbridge.session.SessionSwitchService;
 import com.github.catatafishen.agentbridge.settings.ChatInputSettings;
@@ -58,6 +58,25 @@ public final class ActiveAgentManager implements Disposable {
     private GenericSettings cachedSettings;
     private GenericAgentUiSettings cachedUiSettings;
     private volatile boolean started;
+
+    /**
+     * Reference count of in-flight prompts. Incremented by {@link #beginPrompt()} before a
+     * prompt is dispatched and decremented by {@link #endPrompt()} when it completes.
+     * <p>
+     * Used by {@link #getClient()} to suppress automatic agent restart while a prompt is
+     * streaming. Without this guard, any UI/EDT access of {@code agentManager.client} during
+     * streaming would race the dying transport: if the underlying CLI process has just been
+     * reaped by the OS (e.g. killed silently by bwrap/OOM), {@link AbstractClient#isHealthy()}
+     * flips to {@code false} before the read loop notices EOF — and the next {@code getClient()}
+     * call eagerly starts a fresh process, killing the old one and failing the in-flight
+     * prompt with a generic "Agent process exited unexpectedly" message before the proper
+     * error/Reconnect path in {@code PromptOrchestrator.handlePromptError} can run.
+     * <p>
+     * AtomicInteger (not AtomicBoolean) so nested or overlapping prompts both increment
+     * safely — the restart guard stays active until every active prompt has finished.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger inFlightPromptCount =
+        new java.util.concurrent.atomic.AtomicInteger(0);
 
     public ActiveAgentManager(@NotNull Project project) {
         this.project = project;
@@ -230,10 +249,42 @@ public final class ActiveAgentManager implements Disposable {
      */
     @NotNull
     public AbstractClient getClient() {
-        if (!started || acpClient == null || !acpClient.isHealthy()) {
+        // Skip auto-restart while a prompt is in flight. See inFlightPromptCount Javadoc:
+        // a silent CLI death during streaming would otherwise race with the prompt's error
+        // path — the restart kills the dying transport and fails the in-flight future with
+        // a bare "Agent process exited unexpectedly" before handlePromptError can show the
+        // proper Reconnect banner.
+        boolean needStart = !started || acpClient == null
+            || (!acpClient.isHealthy() && inFlightPromptCount.get() == 0);
+        if (needStart) {
             start();
         }
         return acpClient;
+    }
+
+    /**
+     * Mark a prompt as in flight. Suppresses automatic agent restart in {@link #getClient()}
+     * until the matching {@link #endPrompt()} call. Must be paired in a try/finally.
+     */
+    public void beginPrompt() {
+        inFlightPromptCount.incrementAndGet();
+    }
+
+    /**
+     * Mark an in-flight prompt as finished. Re-enables automatic agent restart on
+     * {@link #getClient()} once all in-flight prompts have ended.
+     */
+    public void endPrompt() {
+        int remaining = inFlightPromptCount.updateAndGet(v -> Math.max(0, v - 1));
+        if (remaining == 0) {
+            // Snapshot the volatile field — a concurrent stop()/agent switch can
+            // null acpClient between the null check and isHealthy() otherwise.
+            AbstractClient client = acpClient;
+            if (client != null && !client.isHealthy()) {
+                LOG.info("In-flight prompt finished; agent client is unhealthy and will be "
+                    + "restarted on next access");
+            }
+        }
     }
 
     /**
