@@ -1,0 +1,34 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ Platform Gradle Plugin cache
+.intellijPlatform/
+
+# IDE - user-specific
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/shelf/
+.idea/dictionaries/
+.idea/*.iws
+*.iml
+*.ipr
+out/
+
+# IDE - shared (tracked in git)
+!.idea/runConfigurations/
+!.idea/misc.xml
+!.idea/gradle.xml
+!.idea/vcs.xml
+!.idea/encodings.xml
+!.idea/compiler.xml
+!.idea/kotlinc.xml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plugin specific
+local.properties
+/.idea

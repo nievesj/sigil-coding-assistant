@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<idea-plugin>
+    <id>com.opencode.plugin</id>
+    <name>OpenCode Plugin</name>
+    <vendor>OpenCode</vendor>
+    <description>AI-assisted development plugin for IntelliJ IDEA.</description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.java</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+    </extensions>
+
+    <actions>
+    </actions>
+</idea-plugin>
