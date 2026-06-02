@@ -1,7 +1,7 @@
 plugins {
     id("org.jetbrains.intellij.platform") version("2.16.0")
-    kotlin("jvm") version "2.1.20"
-    kotlin("plugin.serialization") version "2.1.20"
+    kotlin("jvm") version "2.3.0"
+    kotlin("plugin.serialization") version "2.3.0"
 }
 
 group = providers.gradleProperty("pluginGroup").get()
@@ -29,6 +29,18 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.collections.immutable)
 
+    // Flexmark (Markdown rendering)
+    implementation(libs.flexmark.core) {
+        exclude(group = "org.jetbrains", module = "annotations")
+        exclude(group = "junit", module = "junit")
+    }
+    implementation(libs.flexmark.ext.strikethrough) {
+        exclude(group = "org.jetbrains", module = "annotations")
+    }
+    implementation(libs.flexmark.ext.tables) {
+        exclude(group = "org.jetbrains", module = "annotations")
+    }
+
     // Logging
     implementation(libs.slf4j.api)
     implementation(libs.logback.classic)
@@ -55,7 +67,7 @@ intellijPlatform {
         name = providers.gradleProperty("pluginName").get()
         version = providers.gradleProperty("pluginVersion").get()
         ideaVersion {
-            sinceBuild = "261.0"
+            sinceBuild = "261"
             untilBuild = "263.*"
         }
     }

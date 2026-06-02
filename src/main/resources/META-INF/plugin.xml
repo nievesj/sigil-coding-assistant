@@ -9,6 +9,11 @@
     <depends>com.intellij.java</depends>
 
     <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+            id="OpenCode Chat"
+            secondary="true"
+            icon="AllIcons.Actions.ChatWithIcon"
+            factoryClass="com.opencode.acp.chat.ChatToolWindowFactory"/>
     </extensions>
 
     <actions>

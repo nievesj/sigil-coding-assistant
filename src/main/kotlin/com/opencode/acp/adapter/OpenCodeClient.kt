@@ -320,6 +320,17 @@ class OpenCodeClient(
         getJson("/agent")
 
     // -------------------------------------------------------------------------
+    // Providers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Lists all providers and their models.
+     * GET /provider
+     */
+    suspend fun listProviders(): ProviderResponse =
+        getJson("/provider")
+
+    // -------------------------------------------------------------------------
     // Commands
     // -------------------------------------------------------------------------
 
@@ -547,3 +558,37 @@ class OpenCodeClient(
         sseClient.close()
     }
 }
+
+/** Provider info from GET /provider. */
+@Serializable
+data class ProviderResponse(
+    val all: List<ProviderData>,
+    val default: Map<String, String> = emptyMap(),
+    val connected: List<String> = emptyList()
+)
+
+@Serializable
+data class ProviderData(
+    val id: String,
+    val name: String,
+    val env: List<String> = emptyList(),
+    val models: Map<String, ModelData> = emptyMap()
+)
+
+@Serializable
+data class ModelData(
+    val id: String,
+    val name: String,
+    val reasoning: Boolean = false,
+    val tool_call: Boolean = false,
+    val attachment: Boolean = false,
+    val temperature: Boolean = false,
+    val release_date: String = "",
+    val limit: ModelLimit? = null
+)
+
+@Serializable
+data class ModelLimit(
+    val context: Int = 0,
+    val output: Int = 0
+)
