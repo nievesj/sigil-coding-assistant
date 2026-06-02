@@ -1,0 +1,50 @@
+[versions]
+kotlin = "2.1.20"
+kotlinx-serialization = "1.7.3"
+kotlinx-coroutines = "1.9.0"
+kotlinx-collections-immutable = "0.3.7"
+acp-sdk = "0.24.0"
+ktor = "3.1.3"
+slf4j = "2.0.17"
+logback = "1.5.18"
+micrometer = "1.14.6"
+junit = "5.12.2"
+kotest = "6.0.0.M3"
+wiremock = "3.12.1"
+
+[libraries]
+# ACP SDK
+acp-sdk = { group = "com.agentclientprotocol", name = "acp", version.ref = "acp-sdk" }
+acp-ktor-client = { group = "com.agentclientprotocol", name = "acp-ktor-client", version.ref = "acp-sdk" }
+
+# KotlinX
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
+kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
+kotlinx-collections-immutable = { group = "org.jetbrains.kotlinx", name = "kotlinx-collections-immutable-jvm", version.ref = "kotlinx-collections-immutable" }
+
+# Ktor
+ktor-client-core = { group = "io.ktor", name = "ktor-client-core", version.ref = "ktor" }
+ktor-client-cio = { group = "io.ktor", name = "ktor-client-cio", version.ref = "ktor" }
+ktor-client-content-negotiation = { group = "io.ktor", name = "ktor-client-content-negotiation", version.ref = "ktor" }
+ktor-serialization-json = { group = "io.ktor", name = "ktor-serialization-kotlinx-json", version.ref = "ktor" }
+
+# Logging
+slf4j-api = { group = "org.slf4j", name = "slf4j-api", version.ref = "slf4j" }
+logback-classic = { group = "ch.qos.logback", name = "logback-classic", version.ref = "logback" }
+
+# Metrics
+micrometer-core = { group = "io.micrometer", name = "micrometer-core", version.ref = "micrometer" }
+
+# Testing
+junit-api = { group = "org.junit.jupiter", name = "junit-jupiter-api", version.ref = "junit" }
+junit-engine = { group = "org.junit.jupiter", name = "junit-jupiter-engine", version.ref = "junit" }
+kotest-runner = { group = "io.kotest", name = "kotest-runner-junit5", version.ref = "kotest" }
+kotest-assertions = { group = "io.kotest", name = "kotest-assertions-core", version.ref = "kotest" }
+wiremock = { group = "org.wiremock", name = "wiremock-standalone", version.ref = "wiremock" }
+
+[bundles]
+acp = ["acp-sdk"]
+ktor-client = ["ktor-client-core", "ktor-client-cio", "ktor-client-content-negotiation", "ktor-serialization-json"]
+kotlinx = ["kotlinx-serialization-json", "kotlinx-coroutines-core", "kotlinx-collections-immutable"]
+test = ["junit-api", "junit-engine", "kotest-runner", "kotest-assertions", "kotlinx-coroutines-test"]
