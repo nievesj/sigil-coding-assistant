@@ -6,10 +6,11 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.*
+import io.ktor.client.plugins.sse.SSE
+import io.ktor.client.plugins.sse.sse
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
-import io.ktor.utils.io.jvm.javaio.toInputStream
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -44,27 +45,14 @@ class OpenCodeClient(
         encodeDefaults = true
     }
 
-    /** SSE-dedicated client for raw HTTP streaming. */
-    private val sseClient: HttpClient by lazy {
-        HttpClient(CIO) {
-            // If an auth token is configured, apply it as a default header
-            authToken?.let { token ->
-                defaultRequest {
-                    header(HttpHeaders.Authorization, "Bearer $token")
-                }
-            }
-        }
-    }
-
     // -------------------------------------------------------------------------
     // Request / Response DTOs (private)
     // -------------------------------------------------------------------------
 
     @Serializable
     private data class CreateSessionRequest(
-        val cwd: String,
-        val model: String? = null,
-        val agent: String? = null
+        val parentID: String? = null,
+        val title: String? = null
     )
 
     @Serializable
@@ -72,8 +60,7 @@ class OpenCodeClient(
 
     @Serializable
     private data class SendMessageResponse(
-        val correlationId: String? = null,
-        val id: String? = null
+        val info: MessageInfo? = null
     )
 
     @Serializable
@@ -116,7 +103,12 @@ class OpenCodeClient(
         val response = httpClient.get("$baseUrl$path") {
             applyAuth()
         }
-        return json.decodeFromString<T>(response.bodyAsText())
+        val body = response.bodyAsText()
+        if (!response.status.isSuccess()) {
+            logger.error { "GET $path returned ${response.status}: ${body.take(500)}" }
+            error("GET $path failed with ${response.status}: ${body.take(200)}")
+        }
+        return json.decodeFromString<T>(body)
     }
 
     /**
@@ -128,7 +120,12 @@ class OpenCodeClient(
             contentType(ContentType.Application.Json)
             setBody(json.encodeToString(kotlinx.serialization.serializer(request::class.java), request))
         }
-        return json.decodeFromString<T>(response.bodyAsText())
+        val body = response.bodyAsText()
+        if (!response.status.isSuccess()) {
+            logger.error { "POST $path returned ${response.status}: ${body.take(500)}" }
+            error("POST $path failed with ${response.status}: ${body.take(200)}")
+        }
+        return json.decodeFromString<T>(body)
     }
 
     /**
@@ -188,11 +185,24 @@ class OpenCodeClient(
      * POST /session
      */
     suspend fun createSession(
-        cwd: String,
-        model: String? = null,
-        agent: String? = null
-    ): OpenCodeSession =
-        postJson("/session", CreateSessionRequest(cwd = cwd, model = model, agent = agent))
+        title: String? = null
+    ): OpenCodeSession {
+        val response = httpClient.post("$baseUrl/session") {
+            applyAuth()
+            contentType(ContentType.Application.Json)
+            if (title != null) {
+                setBody(json.encodeToString(CreateSessionRequest.serializer(), CreateSessionRequest(title = title)))
+            } else {
+                setBody("{}")
+            }
+        }
+        val body = response.bodyAsText()
+        if (!response.status.isSuccess()) {
+            logger.error { "POST /session returned ${response.status}: ${body.take(500)}" }
+            error("POST /session failed with ${response.status}: ${body.take(200)}")
+        }
+        return json.decodeFromString<OpenCodeSession>(body)
+    }
 
     /**
      * Lists all active sessions.
@@ -283,14 +293,21 @@ class OpenCodeClient(
         sessionId: String,
         parts: List<OpenCodePart>
     ): String {
+        val requestBody = json.encodeToString(SendMessageRequest(parts = parts))
+        logger.info { "Sending message: ${requestBody.take(200)}" }
         val response = httpClient.post("$baseUrl/session/$sessionId/message") {
             applyAuth()
             contentType(ContentType.Application.Json)
-            setBody(json.encodeToString(SendMessageRequest(parts = parts)))
+            setBody(requestBody)
         }
-        val responseBody: SendMessageResponse = json.decodeFromString(response.bodyAsText())
-        return responseBody.correlationId ?: responseBody.id
-            ?: error("No correlation ID or message ID in response")
+        val body = response.bodyAsText()
+        if (!response.status.isSuccess()) {
+            logger.error { "POST /session/$sessionId/message returned ${response.status}: ${body.take(500)}" }
+            error("POST /session/$sessionId/message failed with ${response.status}: ${body.take(200)}")
+        }
+        val responseBody: SendMessageResponse = json.decodeFromString(body)
+        return responseBody.info?.id
+            ?: error("No message ID in response")
     }
 
     /**
@@ -393,30 +410,31 @@ class OpenCodeClient(
     fun subscribeGlobalEvents(): Flow<SseEvent> = callbackFlow {
         val job = launch {
             try {
-                sseClient.prepareGet("$baseUrl/global/event") {
-                    authToken?.let { header(HttpHeaders.Authorization, "Bearer $it") }
-                }.execute { response ->
-                    val inputStream = response.bodyAsChannel().toInputStream()
-                    val reader = BufferedReader(InputStreamReader(inputStream))
-                    val eventTypeBuffer = StringBuilder()
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null) {
-                        val ln = line ?: break
-                        if (ln.startsWith("event:")) {
-                            eventTypeBuffer.clear()
-                            eventTypeBuffer.append(ln.removePrefix("event:").trim())
-                        } else if (ln.startsWith("data:")) {
-                            val data = ln.removePrefix("data:").trim()
-                            val eventType = eventTypeBuffer.toString()
-                            if (eventType.isNotEmpty() && data.isNotEmpty()) {
-                                val parsed = parseSseEventFromData(eventType, data)
-                                if (parsed != null) {
-                                    send(parsed)
-                                }
-                            }
-                            eventTypeBuffer.clear()
+                httpClient.sse("$baseUrl/event") {
+                    logger.info { "SSE connected to $baseUrl/event" }
+                    incoming.collect { event ->
+                        val data = event.data ?: return@collect
+                        val jsonObj: JsonObject = try {
+                            json.parseToJsonElement(data).jsonObject
+                        } catch (_: Exception) {
+                            return@collect
+                        }
+                        val eventType = event.event ?: jsonObj["type"]?.jsonPrimitive?.contentOrNull ?: return@collect
+                        val props = jsonObj["properties"]?.jsonObject ?: jsonObj
+
+                        // Extract sessionId from various possible locations
+                        val sessionId = when {
+                            props["sessionID"] != null -> props["sessionID"]?.jsonPrimitive?.contentOrNull
+                            props["sessionId"] != null -> props["sessionId"]?.jsonPrimitive?.contentOrNull
+                            else -> null
+                        } ?: return@collect
+
+                        val parsed = parseSseEvent(eventType, props, sessionId)
+                        if (parsed != null) {
+                            send(parsed)
                         }
                     }
+                    logger.info { "SSE stream ended" }
                 }
             } catch (e: Exception) {
                 logger.warn(e) { "SSE connection closed with error" }
@@ -429,81 +447,110 @@ class OpenCodeClient(
     }
 
     /**
-     * Parses SSE event data string into our internal [SseEvent] hierarchy.
+     * Parses SSE event data into our internal [SseEvent] hierarchy.
+     * Handles both old format (flat JSON) and new format (properties wrapper).
      */
-    private fun parseSseEventFromData(eventType: String, data: String): SseEvent? {
-        val obj: JsonObject = try {
-            json.parseToJsonElement(data).jsonObject
-        } catch (e: Exception) {
-            logger.warn { "Failed to parse SSE event data as JSON: $data" }
-            return null
-        }
-
-        val sessionId = obj["sessionId"]?.jsonPrimitive?.contentOrNull ?: return null
-
+    private fun parseSseEvent(eventType: String, props: JsonObject, sessionId: String): SseEvent? {
         return try {
             when (eventType) {
+                "message.part.delta" -> {
+                    val field = props["field"]?.jsonPrimitive?.contentOrNull
+                    if (field == "text") {
+                        val text = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
+                        SseEvent.TextChunk(sessionId = sessionId, text = text)
+                    } else null
+                }
+
+                "message.part.updated" -> {
+                    val part = props["part"]?.jsonObject
+                    if (part != null) {
+                        val partType = part["type"]?.jsonPrimitive?.contentOrNull
+                        when (partType) {
+                            "text" -> {
+                                val text = part["text"]?.jsonPrimitive?.contentOrNull
+                                if (text != null) {
+                                    SseEvent.TextChunk(sessionId = sessionId, text = text)
+                                } else null
+                            }
+                            "tool_use" -> {
+                                val toolCallId = part["id"]?.jsonPrimitive?.contentOrNull ?: return null
+                                val toolName = part["name"]?.jsonPrimitive?.contentOrNull ?: "tool"
+                                SseEvent.ToolUse(
+                                    sessionId = sessionId,
+                                    toolCallId = toolCallId,
+                                    toolName = toolName,
+                                    title = part["name"]?.jsonPrimitive?.contentOrNull,
+                                    input = part["input"]?.jsonObject
+                                )
+                            }
+                            "tool_result" -> {
+                                val toolCallId = part["id"]?.jsonPrimitive?.contentOrNull ?: return null
+                                SseEvent.ToolResult(
+                                    sessionId = sessionId,
+                                    toolCallId = toolCallId,
+                                    isError = part["isError"]?.jsonPrimitive?.contentOrNull == "true"
+                                )
+                            }
+                            else -> null
+                        }
+                    } else null
+                }
+
+                "message.updated" -> {
+                    val info = props["info"]?.jsonObject
+                    if (info != null) {
+                        val finish = info["finish"]?.jsonPrimitive?.contentOrNull
+                        if (finish == "stop" || finish == "end") {
+                            SseEvent.Stop(sessionId = sessionId, stopReason = finish)
+                        } else if (finish != null) {
+                            SseEvent.Stop(sessionId = sessionId, stopReason = finish)
+                        } else null
+                    } else null
+                }
+
+                "session.created" -> {
+                    SseEvent.SessionCreated(sessionId = sessionId)
+                }
+
+                "stop" -> {
+                    val stopReason = props["stopReason"]?.jsonPrimitive?.contentOrNull ?: "stop"
+                    SseEvent.Stop(sessionId = sessionId, stopReason = stopReason)
+                }
+
                 "text_chunk" -> {
-                    val text = obj["text"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val text = props["text"]?.jsonPrimitive?.contentOrNull ?: return null
                     SseEvent.TextChunk(sessionId = sessionId, text = text)
                 }
 
                 "tool_use" -> {
-                    val toolCallId = obj["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val toolName = obj["toolName"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val title = obj["title"]?.jsonPrimitive?.contentOrNull
-                    val input = obj["input"]?.jsonObject
+                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val toolName = props["toolName"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val title = props["title"]?.jsonPrimitive?.contentOrNull
                     SseEvent.ToolUse(
                         sessionId = sessionId,
                         toolCallId = toolCallId,
                         toolName = toolName,
                         title = title,
-                        input = input
+                        input = props["input"]?.jsonObject
                     )
                 }
 
                 "tool_result" -> {
-                    val toolCallId = obj["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val isError = obj["isError"]?.jsonPrimitive?.let {
+                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val isError = props["isError"]?.jsonPrimitive?.let {
                         if (it.isString) it.content.lowercase() == "true" else it.toString().lowercase() == "true"
                     } ?: false
-                    val content = obj["content"]?.jsonArray?.mapNotNull { element ->
-                        element as? JsonObject
-                    }
                     SseEvent.ToolResult(
                         sessionId = sessionId,
                         toolCallId = toolCallId,
-                        isError = isError,
-                        content = content
+                        isError = isError
                     )
                 }
 
-                "plan" -> {
-                    val entriesArray = obj["entries"]?.jsonArray ?: return null
-                    val entries = entriesArray.mapNotNull { entryElement ->
-                        val entryObj = entryElement as? JsonObject ?: return@mapNotNull null
-                        val description = entryObj["description"]?.jsonPrimitive?.contentOrNull
-                            ?: return@mapNotNull null
-                        val priority = entryObj["priority"]?.jsonPrimitive?.contentOrNull ?: "MEDIUM"
-                        val status = entryObj["status"]?.jsonPrimitive?.contentOrNull ?: "PENDING"
-                        PlanEntry(
-                            description = description,
-                            priority = priority,
-                            status = status
-                        )
-                    }
-                    SseEvent.Plan(sessionId = sessionId, entries = entries)
-                }
-
-                "stop" -> {
-                    val stopReason = obj["stopReason"]?.jsonPrimitive?.contentOrNull ?: "unknown"
-                    SseEvent.Stop(sessionId = sessionId, stopReason = stopReason)
-                }
-
                 "permission" -> {
-                    val toolCallId = obj["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val action = obj["action"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val description = obj["description"]?.jsonPrimitive?.contentOrNull
+                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val action = props["action"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val description = props["description"]?.jsonPrimitive?.contentOrNull
                     SseEvent.Permission(
                         sessionId = sessionId,
                         toolCallId = toolCallId,
@@ -513,34 +560,14 @@ class OpenCodeClient(
                 }
 
                 "error" -> {
-                    val message = obj["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown error"
-                    val code = obj["code"]?.jsonPrimitive?.intOrNull
-                    SseEvent.Error(
-                        sessionId = sessionId,
-                        message = message,
-                        code = code
-                    )
+                    val message = props["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown error"
+                    SseEvent.Error(sessionId = sessionId, message = message)
                 }
 
-                "session_created" -> {
-                    SseEvent.SessionCreated(sessionId = sessionId)
-                }
-
-                "message_complete" -> {
-                    val messageId = obj["messageId"]?.jsonPrimitive?.contentOrNull ?: return null
-                    SseEvent.MessageComplete(
-                        sessionId = sessionId,
-                        messageId = messageId
-                    )
-                }
-
-                else -> {
-                    logger.debug { "Unknown SSE event type: $eventType" }
-                    null
-                }
+                else -> null
             }
         } catch (e: Exception) {
-            logger.warn(e) { "Error parsing SSE event of type: $eventType" }
+            logger.warn(e) { "Error parsing SSE event: $eventType" }
             null
         }
     }
@@ -554,8 +581,7 @@ class OpenCodeClient(
      * The main httpClient lifecycle is managed by the owner (caller).
      */
     override fun close() {
-        // Only close the SSE client we created; the main httpClient is owned by the caller
-        sseClient.close()
+        // No-op: SSE now uses the shared httpClient owned by the caller
     }
 }
 

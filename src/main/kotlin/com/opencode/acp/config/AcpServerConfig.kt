@@ -16,8 +16,6 @@ data class AcpServerConfig(
     val openCodeHost: String = AcpDefaults.DEFAULT_OPENCODE_HOST,
     val openCodePort: Int = AcpDefaults.DEFAULT_OPENCODE_PORT,
     val openCodePassword: String? = null,
-    val openCodeLaunch: Boolean = false,
-    val openCodeBinaryPath: String? = null,
     val sessionPersistenceDir: String = AcpDefaults.SESSION_PERSISTENCE_DIR,
     val maxConcurrentSessions: Int = AcpDefaults.MAX_CONCURRENT_SESSIONS,
     val transport: TransportMode = TransportMode.STDIO

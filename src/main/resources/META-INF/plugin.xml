@@ -9,10 +9,19 @@
     <depends>com.intellij.java</depends>
 
     <extensions defaultExtensionNs="com.intellij">
+        <applicationService
+            serviceImplementation="com.opencode.acp.config.settings.OpenCodeSettingsState"/>
+
+        <applicationConfigurable
+            parentId="tools"
+            instance="com.opencode.acp.config.settings.OpenCodeSettingsConfigurable"
+            id="com.opencode.acp.settings"
+            displayName="OpenCode"/>
+
         <toolWindow
             id="OpenCode Chat"
             secondary="true"
-            icon="AllIcons.Actions.ChatWithIcon"
+            icon="/icons/opencode-toolwindow.svg"
             factoryClass="com.opencode.acp.chat.ChatToolWindowFactory"/>
     </extensions>
 

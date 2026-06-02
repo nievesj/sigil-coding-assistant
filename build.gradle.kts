@@ -18,16 +18,20 @@ dependencies {
     // ACP SDK
     implementation(libs.acp.sdk)
 
-    // Ktor HTTP client
+    // Ktor HTTP client — exclude coroutines (IntelliJ Platform bundles its own patched fork)
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.cio)
     implementation(libs.ktor.client.content.negotiation)
     implementation(libs.ktor.serialization.json)
 
-    // KotlinX
+    // KotlinX serialization (safe — no coroutine transitive deps)
     implementation(libs.kotlinx.serialization.json)
-    implementation(libs.kotlinx.coroutines.core)
+
+    // KotlinX collections (safe — no coroutine transitive deps)
     implementation(libs.kotlinx.collections.immutable)
+
+    // compileOnly for coroutines — compile against platform's version, don't bundle
+    compileOnly(libs.kotlinx.coroutines.core)
 
     // Flexmark (Markdown rendering)
     implementation(libs.flexmark.core) {
@@ -41,9 +45,11 @@ dependencies {
         exclude(group = "org.jetbrains", module = "annotations")
     }
 
-    // Logging
+    // Logging — IntelliJ Platform bundles SLF4J; keep logback for development but exclude transitive SLF4J
     implementation(libs.slf4j.api)
-    implementation(libs.logback.classic)
+    implementation(libs.logback.classic) {
+        exclude(group = "org.slf4j", module = "slf4j-api")
+    }
 
     // Metrics
     implementation(libs.micrometer.core)
@@ -60,6 +66,19 @@ dependencies {
         intellijIdea(providers.gradleProperty("platformVersion"))
         bundledPlugin("com.intellij.java")
     }
+}
+
+// Global exclusions: catch anything missed by per-dependency excludes
+// Must NOT use configureEach — coroutines must remain on compileClasspath for the compiler
+configurations.runtimeClasspath {
+    // Coroutines — IDE bundles its own patched fork; must not be in plugin JAR
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core-jvm")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-jdk8")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-reactive")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-reactor")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-slf4j")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-debug")
 }
 
 intellijPlatform {

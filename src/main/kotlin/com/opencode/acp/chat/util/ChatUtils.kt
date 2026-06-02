@@ -29,7 +29,8 @@ fun edtScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.ED
 /** Generate a stable UUID for message/tool IDs. */
 fun generateId(): String = UUID.randomUUID().toString()
 
-/** Renders markdown to sanitized HTML. Disables raw HTML to prevent XSS. */
+/** Renders markdown to sanitized HTML.
+ *  Strips inline styles and classes that Swing's limited CSS parser cannot handle. */
 fun renderMarkdownToHtml(markdown: String): String {
     val parser = Parser.builder()
         .extensions(listOf(StrikethroughExtension.create(), TablesExtension.create()))
@@ -38,6 +39,10 @@ fun renderMarkdownToHtml(markdown: String): String {
         .build()
     val document = parser.parse(markdown)
     return renderer.render(document)
+        // Strip inline styles Swing's limited CSS parser cannot handle
+        .replace(Regex(""" style\s*=\s*"[^"]*""""), "")
+        // Strip class attributes Swing doesn't use
+        .replace(Regex(""" class\s*=\s*"[^"]*""""), "")
 }
 
 /** Escape HTML for user message display. */

@@ -9,14 +9,18 @@ import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.chat.util.renderMarkdownToHtml
 import com.opencode.acp.config.AcpDefaults
+import com.opencode.acp.config.settings.OpenCodeSettingsState
+import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.sse.SSE
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,6 +32,8 @@ import java.io.Closeable
 class ChatViewModel(
     private val scope: CoroutineScope
 ) : Closeable {
+
+    private val logger = KotlinLogging.logger {}
 
     // --- State ---
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
@@ -50,6 +56,8 @@ class ChatViewModel(
     private var httpClient: HttpClient? = null
     private var sessionId: String? = null
     private var sseJob: Job? = null
+    private var openCodeProcess: Process? = null
+    private var permissionTimeoutJob: Job? = null
 
     /** Tracks the assistant message currently being streamed. */
     private var activeAssistantMessageId: String? = null
@@ -68,22 +76,64 @@ class ChatViewModel(
 
     // --- Public API ---
 
-    /** Configure the OpenCode server connection parameters before initialize(). */
-    fun configure(
-        host: String = AcpDefaults.DEFAULT_OPENCODE_HOST,
-        port: Int = AcpDefaults.DEFAULT_OPENCODE_PORT,
-        authToken: String? = null
-    ) {
-        this.host = host
-        this.port = port
-        this.authToken = authToken
+    /** Read settings from persistent state and update local fields. */
+    private fun loadSettings() {
+        // host, port, authToken use AcpDefaults — no user configuration needed
     }
 
-    /** Initialise the connection: create client, health check, create session, load agents/providers. */
+    /** Launch the OpenCode binary as a subprocess if auto-launch is enabled. */
+    private fun launchOpenCodeBinary(binaryPath: String) {
+        if (openCodeProcess?.isAlive == true) {
+            logger.info { "OpenCode process already running, skipping launch" }
+            return
+        }
+
+        try {
+            logger.info { "Launching: $binaryPath serve --host $host --port $port" }
+            val pb = ProcessBuilder(binaryPath, "serve", "--host", host, "--port", port.toString())
+                .redirectErrorStream(true)
+            openCodeProcess = pb.start()
+            logger.info { "OpenCode process started (PID: ${openCodeProcess?.pid()})" }
+
+            // Drain stdout/stderr to a background thread (non-blocking)
+            Thread({
+                openCodeProcess?.inputStream?.bufferedReader()?.use { reader ->
+                    reader.lines().forEach { line ->
+                        logger.debug { "[opencode] $line" }
+                    }
+                }
+            }, "opencode-stdout-drain").apply {
+                isDaemon = true
+                start()
+            }
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to launch OpenCode binary at $binaryPath" }
+        }
+    }
+
+    /** Initialise the connection: launch binary, create client, health check, create session. */
     suspend fun initialize(projectBasePath: String) {
+        logger.info { "Initializing connection to OpenCode at $host:$port" }
         _connectionState.value = ConnectionState.CONNECTING
         try {
+            // Load persisted settings
+            loadSettings()
+
+            // Always launch the OpenCode binary if a path is configured
+            val settings = OpenCodeSettingsState.getInstance().state
+            if (settings.binaryPath.isNotBlank()) {
+                logger.info { "Launching OpenCode binary: ${settings.binaryPath}" }
+                launchOpenCodeBinary(settings.binaryPath)
+                // Give the server time to start
+                delay(2000)
+            } else {
+                logger.warn { "No OpenCode binary path configured — cannot start server" }
+                _connectionState.value = ConnectionState.ERROR
+                return
+            }
+
             // Create HTTP client and OpenCodeClient
+            logger.info { "Creating HTTP client for $host:$port" }
             val client = HttpClient(CIO) {
                 install(ContentNegotiation) {
                     json(Json {
@@ -92,6 +142,7 @@ class ChatViewModel(
                         encodeDefaults = true
                     })
                 }
+                install(SSE)
             }
             httpClient = client
 
@@ -103,50 +154,61 @@ class ChatViewModel(
             openCodeClient = opencodeClient
 
             // Health check
+            logger.info { "Running health check..." }
             if (!opencodeClient.healthCheck()) {
+                logger.warn { "Health check failed — server not reachable at $host:$port" }
                 _connectionState.value = ConnectionState.ERROR
                 return
             }
+            logger.info { "Health check passed" }
 
             // Create session
-            val session = opencodeClient.createSession(cwd = projectBasePath)
+            logger.info { "Creating session" }
+            val session = opencodeClient.createSession()
             sessionId = session.id
+            logger.info { "Session created: ${session.id}" }
 
             // Load agents
             try {
                 val agents = opencodeClient.listAgents()
+                logger.info { "Loaded ${agents.size} agents" }
                 _controlState.value = _controlState.value.copy(
                     agents = agents.map { info ->
                         OpenCodeAgentInfo(id = info.id, name = info.name, description = info.description)
                     }
                 )
-            } catch (_: Exception) {
-                // Non-fatal: agents list is optional
+            } catch (e: Exception) {
+                logger.warn(e) { "Failed to load agents (non-fatal)" }
             }
 
-            // Load providers and models
+            // Load providers and models (only from connected/authenticated providers)
             try {
                 val providerResponse = opencodeClient.listProviders()
-                val models = providerResponse.all.flatMap { provider ->
-                    provider.models.map { (_, modelData) ->
-                        ProviderModel(
-                            providerID = provider.id,
-                            modelID = modelData.id,
-                            displayName = "${provider.name} / ${modelData.name}",
-                            reasoning = modelData.reasoning
-                        )
+                val connectedIds = providerResponse.connected.toSet()
+                val models = providerResponse.all
+                    .filter { it.id in connectedIds }
+                    .flatMap { provider ->
+                        provider.models.map { (_, modelData) ->
+                            ProviderModel(
+                                providerID = provider.id,
+                                modelID = modelData.id,
+                                displayName = "${provider.name} / ${modelData.name}",
+                                reasoning = modelData.reasoning
+                            )
                     }
                 }
+                logger.info { "Loaded ${models.size} models from ${providerResponse.all.size} providers" }
                 _controlState.value = _controlState.value.copy(
                     models = models,
                     selectedModel = models.firstOrNull()
                 )
-            } catch (_: Exception) {
-                // Non-fatal: providers list is optional
+            } catch (e: Exception) {
+                logger.warn(e) { "Failed to load providers (non-fatal)" }
             }
 
             // Subscribe to global SSE events (long-lived background subscription)
             val currentSessionId = sessionId ?: return
+            logger.info { "Subscribing to SSE events for session $currentSessionId" }
             sseJob = scope.launch {
                 opencodeClient.subscribeGlobalEvents()
                     .filter { event -> event.sessionId == currentSessionId }
@@ -154,7 +216,9 @@ class ChatViewModel(
             }
 
             _connectionState.value = ConnectionState.CONNECTED
-        } catch (_: Exception) {
+            logger.info { "Connected to OpenCode successfully" }
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to initialize connection" }
             _connectionState.value = ConnectionState.ERROR
         }
     }
@@ -169,10 +233,6 @@ class ChatViewModel(
 
     fun selectThinkingEffort(effort: ThinkingEffort) {
         _controlState.value = _controlState.value.copy(thinkingEffort = effort)
-    }
-
-    fun setConnectionState(state: ConnectionState) {
-        _connectionState.value = state
     }
 
     /** Send a user message to the OpenCode engine. Suspends until the response is complete. */
@@ -241,18 +301,33 @@ class ChatViewModel(
         val client = openCodeClient
         val currentSessionId = sessionId
         if (client != null && currentSessionId != null) {
-            client.respondPermission(
-                sessionId = currentSessionId,
-                permissionId = prompt.permissionId,
-                response = response.optionId
-            )
+            try {
+                client.respondPermission(
+                    sessionId = currentSessionId,
+                    permissionId = prompt.permissionId,
+                    response = response.optionId
+                )
+                when (response) {
+                    PermissionResponse.REJECT_ONCE ->
+                        updateToolCallStatus(prompt.toolCallId, ToolCallStatus.FAILED)
+                    PermissionResponse.ALLOW_ONCE,
+                    PermissionResponse.ALLOW_ALWAYS ->
+                        updateToolCallStatus(prompt.toolCallId, ToolCallStatus.IN_PROGRESS)
+                }
+                _permissionPrompt.value = null
+            } catch (_: Exception) {
+                // Network error — keep prompt open for retry
+            }
         }
-        _permissionPrompt.value = null
+        permissionTimeoutJob?.cancel()
+        permissionTimeoutJob = null
     }
 
     override fun close() {
         sseJob?.cancel()
         sseJob = null
+        permissionTimeoutJob?.cancel()
+        permissionTimeoutJob = null
         responseDeferred?.complete(Unit)
         responseDeferred = null
         activeAssistantMessageId = null
@@ -261,6 +336,9 @@ class ChatViewModel(
         httpClient?.close()
         httpClient = null
         sessionId = null
+        // Kill the launched OpenCode process if we own it
+        openCodeProcess?.destroyForcibly()
+        openCodeProcess = null
     }
 
     // --- SSE Event Handling ---
@@ -297,15 +375,15 @@ class ChatViewModel(
             }
 
             is SseEvent.Permission -> {
-                // Create a permission prompt for the user to review
+                updateToolCallStatus(event.toolCallId, ToolCallStatus.PENDING)
                 val prompt = PermissionPrompt(
-                    permissionId = event.toolCallId,  // Use toolCallId as the permission identifier
+                    permissionId = event.toolCallId,
                     toolCallId = event.toolCallId,
                     toolName = event.action,
-                    description = event.description,
-                    options = emptyList()
+                    description = event.description
                 )
                 _permissionPrompt.value = prompt
+                startPermissionTimeout()
             }
 
             is SseEvent.Error -> {
@@ -382,5 +460,20 @@ class ChatViewModel(
         }
         messages[index] = msg.copy(toolCalls = updatedPills)
         _messages.value = messages
+    }
+
+    private fun updateToolCallStatus(toolCallId: String, status: ToolCallStatus) {
+        val messageId = toolCallIndex[toolCallId] ?: return
+        updateToolCallStatus(messageId, toolCallId, status)
+    }
+
+    private fun startPermissionTimeout() {
+        permissionTimeoutJob?.cancel()
+        val timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds
+        if (timeoutSeconds <= 0) return
+        permissionTimeoutJob = scope.launch {
+            delay(timeoutSeconds * 1000L)
+            _permissionPrompt.value = null
+        }
     }
 }

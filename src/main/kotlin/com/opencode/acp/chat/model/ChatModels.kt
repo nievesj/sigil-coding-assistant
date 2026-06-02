@@ -1,7 +1,5 @@
 package com.opencode.acp.chat.model
 
-import com.agentclientprotocol.model.ContentBlock
-import com.agentclientprotocol.model.PermissionOption
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
 
@@ -33,9 +31,7 @@ data class PermissionPrompt(
     val permissionId: String,
     val toolCallId: String,
     val toolName: String,
-    val description: String?,
-    val options: List<PermissionOption>,
-    val expiresAt: Long? = null
+    val description: String?
 )
 
 /** Bottom bar state. */
@@ -52,23 +48,6 @@ data class OpenCodeAgentInfo(
     val id: String,
     val name: String,
     val description: String? = null
-)
-
-/** Provider info from GET /provider. */
-data class ProviderInfo(
-    val id: String,
-    val name: String,
-    val models: Map<String, ModelInfo>
-)
-
-/** Model info nested inside a provider. */
-data class ModelInfo(
-    val id: String,
-    val name: String,
-    val reasoning: Boolean = false,
-    val toolCall: Boolean = false,
-    val contextLimit: Int = 0,
-    val outputLimit: Int = 0
 )
 
 /** Flattened model selection for the control bar. */

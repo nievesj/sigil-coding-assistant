@@ -30,6 +30,9 @@ class ChatPanel(
     private val connectionBanner = ConnectionBannerComponent(
         onRetry = { scope.launch { viewModel.initialize(project.basePath ?: ".") } }
     )
+    private val permissionPrompt = PermissionPromptComponent(
+        onRespond = { response -> scope.launch { viewModel.respondPermission(response) } }
+    )
 
     init {
         Disposer.register(parentDisposable, this)
@@ -44,6 +47,9 @@ class ChatPanel(
             viewModel.connectionState.collect { state ->
                 connectionBanner.updateState(state)
                 inputArea.setInputEnabled(state == ConnectionState.CONNECTED)
+                if (state != ConnectionState.CONNECTED) {
+                    permissionPrompt.hidePrompt()
+                }
             }
         }
         scope.launch {
@@ -56,14 +62,27 @@ class ChatPanel(
                 inputArea.showCancelMode(streaming)
             }
         }
+        scope.launch {
+            viewModel.permissionPrompt.collect { prompt ->
+                if (prompt != null) {
+                    permissionPrompt.showPrompt(prompt)
+                    inputArea.setInputEnabled(false)
+                } else {
+                    permissionPrompt.hidePrompt()
+                    val connected = viewModel.connectionState.value == ConnectionState.CONNECTED
+                    inputArea.setInputEnabled(connected)
+                }
+            }
+        }
 
         // Assemble layout
         add(connectionBanner, BorderLayout.NORTH)
         add(messageList.component, BorderLayout.CENTER)
 
         val southPanel = JPanel(BorderLayout())
-        southPanel.add(controlBar, BorderLayout.NORTH)
-        southPanel.add(inputArea, BorderLayout.CENTER)
+        southPanel.add(permissionPrompt, BorderLayout.NORTH)
+        southPanel.add(controlBar, BorderLayout.CENTER)
+        southPanel.add(inputArea, BorderLayout.SOUTH)
         add(southPanel, BorderLayout.SOUTH)
 
         // Auto-connect on tool window open
@@ -71,8 +90,6 @@ class ChatPanel(
             viewModel.initialize(project.basePath ?: ".")
         }
     }
-
-    fun getViewModel(): ChatViewModel = viewModel
 
     override fun dispose() {
         scope.cancel()
