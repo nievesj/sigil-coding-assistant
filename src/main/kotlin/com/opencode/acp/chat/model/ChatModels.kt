@@ -58,6 +58,26 @@ data class ProviderModel(
     val reasoning: Boolean = false
 )
 
+/** Sealed type for heterogeneous combo box model items (headers + models with stars). */
+sealed interface DropdownItem {
+    /** Provider section header — not interactive. */
+    data class ProviderHeader(val name: String) : DropdownItem
+
+    /** A single model entry with favorite toggle. */
+    data class ModelItem(
+        val model: ProviderModel,
+        val providerName: String,
+        val modelName: String,
+        val isFavorite: Boolean
+    ) : DropdownItem {
+        /** Equality by ProviderModel so JComboBox.setSelectedItem() can match across lists. */
+        override fun equals(other: Any?): Boolean =
+            other is ModelItem && model == other.model
+
+        override fun hashCode(): Int = model.hashCode()
+    }
+}
+
 enum class ThinkingEffort(val label: String, val variant: String?) {
     NONE("None", "none"),
     LOW("Low", "low"),

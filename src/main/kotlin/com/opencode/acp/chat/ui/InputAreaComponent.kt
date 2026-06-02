@@ -1,16 +1,13 @@
 package com.opencode.acp.chat.ui
 
+import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextArea
-import java.awt.BorderLayout
-import java.awt.Dimension
+import java.awt.*
 import java.awt.event.ActionEvent
 import java.awt.event.InputEvent
 import java.awt.event.KeyEvent
-import javax.swing.AbstractAction
-import javax.swing.JButton
-import javax.swing.JPanel
-import javax.swing.KeyStroke
+import javax.swing.*
 
 class InputAreaComponent(
     private val onSend: (String) -> Unit,
@@ -50,7 +47,16 @@ class InputAreaComponent(
             override fun actionPerformed(e: ActionEvent) = onCancel()
         })
 
-        sendButton = JButton("Send")
+        sendButton = JButton("▶").apply {
+            toolTipText = "Send (Enter)"
+            font = font.deriveFont(Font.BOLD, 12f)
+            preferredSize = Dimension(32, 24)
+            margin = Insets(0, 0, 0, 0)
+            border = BorderFactory.createEmptyBorder(2, 6, 2, 6)
+            background = JBColor.namedColor("Button.background", JBColor(0x3a3c42, 0x3a3c42))
+            foreground = JBColor(0x589df6, 0x589df6)
+            isFocusPainted = false
+        }
         sendButton.addActionListener {
             val text = textArea.text.trim()
             if (text.isNotEmpty()) {
@@ -59,18 +65,43 @@ class InputAreaComponent(
             }
         }
 
-        cancelButton = JButton("Stop")
+        cancelButton = JButton("⏹").apply {
+            toolTipText = "Stop (Escape)"
+            font = font.deriveFont(Font.BOLD, 12f)
+            preferredSize = Dimension(32, 24)
+            margin = Insets(0, 0, 0, 0)
+            border = BorderFactory.createEmptyBorder(2, 6, 2, 6)
+            background = JBColor.namedColor("Button.background", JBColor(0x3a3c42, 0x3a3c42))
+            foreground = JBColor(0xdb4437, 0xdb4437)
+            isFocusPainted = false
+        }
         cancelButton.addActionListener { onCancel() }
         cancelButton.isVisible = false
 
-        val scrollPane = JBScrollPane(textArea)
-        scrollPane.preferredSize = Dimension(0, 80)
-        add(scrollPane, BorderLayout.CENTER)
+        // Text area with send button overlaid at bottom-right
+        val textPanel = JPanel(BorderLayout())
+        textPanel.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(JBColor.border(), 1),
+            BorderFactory.createEmptyBorder(4, 4, 4, 4)
+        )
+        textPanel.background = JBColor.namedColor("Editor.background", JBColor(0x2b2d31, 0x2b2d31))
 
-        val buttonPanel = JPanel()
-        buttonPanel.add(sendButton)
-        buttonPanel.add(cancelButton)
-        add(buttonPanel, BorderLayout.EAST)
+        val scrollPane = JBScrollPane(textArea).apply {
+            preferredSize = Dimension(0, 60)
+            border = BorderFactory.createEmptyBorder()
+            viewport.background = JBColor.namedColor("Editor.background", JBColor(0x2b2d31, 0x2b2d31))
+        }
+        textPanel.add(scrollPane, BorderLayout.CENTER)
+
+        // Button panel overlaid at bottom-right
+        val buttonOverlay = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0))
+        buttonOverlay.isOpaque = false
+        buttonOverlay.border = BorderFactory.createEmptyBorder(0, 0, 0, 0)
+        buttonOverlay.add(sendButton)
+        buttonOverlay.add(cancelButton)
+        textPanel.add(buttonOverlay, BorderLayout.SOUTH)
+
+        add(textPanel, BorderLayout.CENTER)
     }
 
     fun clear() { textArea.text = "" }

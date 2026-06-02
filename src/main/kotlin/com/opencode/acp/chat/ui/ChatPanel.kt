@@ -81,8 +81,8 @@ class ChatPanel(
 
         val southPanel = JPanel(BorderLayout())
         southPanel.add(permissionPrompt, BorderLayout.NORTH)
-        southPanel.add(controlBar, BorderLayout.CENTER)
-        southPanel.add(inputArea, BorderLayout.SOUTH)
+        southPanel.add(inputArea, BorderLayout.CENTER)
+        southPanel.add(controlBar, BorderLayout.SOUTH)
         add(southPanel, BorderLayout.SOUTH)
 
         // Auto-connect on tool window open
