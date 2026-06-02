@@ -1,6 +1,5 @@
 package com.opencode.acp.chat.ui
 
-import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
 import com.opencode.acp.chat.model.ControlBarState
@@ -8,6 +7,7 @@ import com.opencode.acp.chat.model.DropdownItem
 import com.opencode.acp.chat.model.OpenCodeAgentInfo
 import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.model.ThinkingEffort
+import com.opencode.acp.chat.util.ChatColors
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import java.awt.BorderLayout
 import java.awt.Component
@@ -174,14 +174,14 @@ class ControlBarComponent(
     private inner class ModelRenderer : ListCellRenderer<DropdownItem> {
         private val headerLabel = JBLabel().apply {
             font = font.deriveFont(Font.BOLD, JBUI.scaleFontSize(11f).toFloat())
-            foreground = JBColor(0x589df6, 0x589df6)
-            border = BorderFactory.createEmptyBorder(
+            foreground = ChatColors.textLink()
+            border = JBUI.Borders.empty(
                 JBUI.scale(6), JBUI.scale(4), JBUI.scale(2), JBUI.scale(4)
             )
         }
 
         private val modelPanel = JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
-            border = BorderFactory.createEmptyBorder(
+            border = JBUI.Borders.empty(
                 JBUI.scale(2), JBUI.scale(4), JBUI.scale(2), JBUI.scale(4)
             )
             isOpaque = true
@@ -230,10 +230,10 @@ class ControlBarComponent(
 
                     starLabel.text = if (value.isFavorite) "★" else "☆"
                     starLabel.foreground = if (value.isFavorite) {
-                        if (index == hoveredStarIndex) JBColor(0xffd700, 0xffd700)
-                        else JBColor(0xf0c674, 0xf0c674)
+                        if (index == hoveredStarIndex) ChatColors.starHover
+                        else ChatColors.starFavorite
                     } else {
-                        JBColor(0x6b6b6b, 0x6b6b6b)
+                        ChatColors.starMuted()
                     }
 
                     modelPanel.apply {

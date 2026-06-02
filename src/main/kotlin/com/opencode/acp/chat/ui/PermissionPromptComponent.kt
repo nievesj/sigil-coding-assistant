@@ -1,11 +1,11 @@
 package com.opencode.acp.chat.ui
 
 import com.intellij.icons.AllIcons
-import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
 import com.opencode.acp.chat.model.PermissionPrompt
 import com.opencode.acp.chat.model.PermissionResponse
+import com.opencode.acp.chat.util.ChatColors
 import java.awt.*
 import javax.swing.*
 
@@ -20,20 +20,23 @@ class PermissionPromptComponent(private val onRespond: (PermissionResponse) -> U
     init {
         isVisible = false
 
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(1, 0, 1, 0, JBColor.border()),
+        // JBUI.Borders per DESIGN.md — no BorderFactory, no MatteBorder
+        border = JBUI.Borders.compound(
+            JBUI.Borders.customLineTop(ChatColors.border()),
+            JBUI.Borders.customLineBottom(ChatColors.border()),
             JBUI.Borders.empty(8, 8, 8, 8)
         )
-        background = JBColor.namedColor("Panel.background", JBColor(0xF0F0F0, 0x3C3C3C))
+        background = ChatColors.panelBg()
 
         add(iconLabel, BorderLayout.WEST)
 
         val centerPanel = Box.createVerticalBox()
         centerPanel.isOpaque = false
         titleLabel.font = titleLabel.font.deriveFont(Font.BOLD)
+        titleLabel.foreground = ChatColors.textPrimary()
         centerPanel.add(titleLabel)
         centerPanel.add(Box.createVerticalStrut(2))
-        descriptionLabel.foreground = JBColor.GRAY
+        descriptionLabel.foreground = ChatColors.textMuted()
         centerPanel.add(descriptionLabel)
         add(centerPanel, BorderLayout.CENTER)
 
@@ -47,7 +50,7 @@ class PermissionPromptComponent(private val onRespond: (PermissionResponse) -> U
         }
 
         val rejectButton = JButton("Reject")
-        rejectButton.foreground = JBColor.namedColor("Component.errorFocusColor", JBColor(0xDB4437, 0xE55341))
+        rejectButton.foreground = ChatColors.error()
         rejectButton.addActionListener {
             onRespond(PermissionResponse.REJECT_ONCE)
             hidePrompt()
@@ -77,8 +80,8 @@ class PermissionPromptComponent(private val onRespond: (PermissionResponse) -> U
 
     fun hidePrompt() {
         currentPrompt = null
-        titleLabel.text = null
-        descriptionLabel.text = null
+        titleLabel.text = ""
+        descriptionLabel.text = ""
         isVisible = false
         revalidate()
         repaint()

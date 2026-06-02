@@ -1,8 +1,9 @@
 package com.opencode.acp.chat.ui
 
-import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextArea
+import com.intellij.util.ui.JBUI
+import com.opencode.acp.chat.util.ChatColors
 import java.awt.*
 import java.awt.event.ActionEvent
 import java.awt.event.InputEvent
@@ -20,6 +21,9 @@ class InputAreaComponent(
     init {
         textArea.lineWrap = true
         textArea.wrapStyleWord = true
+        textArea.font = JBUI.Fonts.label()
+        textArea.background = ChatColors.editorBg()
+        textArea.foreground = ChatColors.textPrimary()
 
         // Enter -> send
         textArea.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "send")
@@ -49,12 +53,12 @@ class InputAreaComponent(
 
         sendButton = JButton("▶").apply {
             toolTipText = "Send (Enter)"
-            font = font.deriveFont(Font.BOLD, 12f)
-            preferredSize = Dimension(32, 24)
+            font = font.deriveFont(Font.BOLD, JBUI.scaleFontSize(12f).toFloat())
+            preferredSize = Dimension(JBUI.scale(32), JBUI.scale(24))
             margin = Insets(0, 0, 0, 0)
-            border = BorderFactory.createEmptyBorder(2, 6, 2, 6)
-            background = JBColor.namedColor("Button.background", JBColor(0x3a3c42, 0x3a3c42))
-            foreground = JBColor(0x589df6, 0x589df6)
+            border = JBUI.Borders.empty(JBUI.scale(2), JBUI.scale(6))
+            background = ChatColors.buttonBg()
+            foreground = ChatColors.textPrimary()
             isFocusPainted = false
         }
         sendButton.addActionListener {
@@ -67,36 +71,36 @@ class InputAreaComponent(
 
         cancelButton = JButton("⏹").apply {
             toolTipText = "Stop (Escape)"
-            font = font.deriveFont(Font.BOLD, 12f)
-            preferredSize = Dimension(32, 24)
+            font = font.deriveFont(Font.BOLD, JBUI.scaleFontSize(12f).toFloat())
+            preferredSize = Dimension(JBUI.scale(32), JBUI.scale(24))
             margin = Insets(0, 0, 0, 0)
-            border = BorderFactory.createEmptyBorder(2, 6, 2, 6)
-            background = JBColor.namedColor("Button.background", JBColor(0x3a3c42, 0x3a3c42))
-            foreground = JBColor(0xdb4437, 0xdb4437)
+            border = JBUI.Borders.empty(JBUI.scale(2), JBUI.scale(6))
+            background = ChatColors.buttonBg()
+            foreground = ChatColors.error()
             isFocusPainted = false
         }
         cancelButton.addActionListener { onCancel() }
         cancelButton.isVisible = false
 
-        // Text area with send button overlaid at bottom-right
+        // Text area with send button at bottom-right
         val textPanel = JPanel(BorderLayout())
-        textPanel.border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(JBColor.border(), 1),
-            BorderFactory.createEmptyBorder(4, 4, 4, 4)
+        textPanel.border = JBUI.Borders.compound(
+            JBUI.Borders.customLineTop(ChatColors.border()),
+            JBUI.Borders.empty(JBUI.scale(4))
         )
-        textPanel.background = JBColor.namedColor("Editor.background", JBColor(0x2b2d31, 0x2b2d31))
+        textPanel.background = ChatColors.editorBg()
 
         val scrollPane = JBScrollPane(textArea).apply {
-            preferredSize = Dimension(0, 60)
-            border = BorderFactory.createEmptyBorder()
-            viewport.background = JBColor.namedColor("Editor.background", JBColor(0x2b2d31, 0x2b2d31))
+            preferredSize = Dimension(0, JBUI.scale(60))
+            border = JBUI.Borders.empty()  // JBUI.Borders (DPI-aware) per DESIGN.md
+            viewport.background = ChatColors.editorBg()
         }
         textPanel.add(scrollPane, BorderLayout.CENTER)
 
-        // Button panel overlaid at bottom-right
+        // Button overlay at bottom-right
         val buttonOverlay = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0))
         buttonOverlay.isOpaque = false
-        buttonOverlay.border = BorderFactory.createEmptyBorder(0, 0, 0, 0)
+        buttonOverlay.border = JBUI.Borders.empty()
         buttonOverlay.add(sendButton)
         buttonOverlay.add(cancelButton)
         textPanel.add(buttonOverlay, BorderLayout.SOUTH)

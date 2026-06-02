@@ -3,7 +3,9 @@ package com.opencode.acp.chat.ui
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.util.ui.JBUI
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.util.ChatColors
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.util.edtScope
 import kotlinx.coroutines.cancel
@@ -17,7 +19,7 @@ class ChatPanel(
 ) : JPanel(BorderLayout()), Disposable {
     private val scope = edtScope()
     private val viewModel = ChatViewModel(scope)
-    private val messageList = MessageListComponent()
+    private val messageList = MessageListComponent(project)
     private val inputArea = InputAreaComponent(
         onSend = { text -> scope.launch { viewModel.sendMessage(text) } },
         onCancel = { scope.launch { viewModel.cancel() } }
@@ -36,6 +38,10 @@ class ChatPanel(
 
     init {
         Disposer.register(parentDisposable, this)
+
+        // Theme-aware styling for the main panel
+        background = ChatColors.toolWindowBg()
+        border = JBUI.Borders.customLineTop(ChatColors.border())
 
         // Wire ViewModel flows -> Swing updates
         scope.launch {
