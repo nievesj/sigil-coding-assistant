@@ -56,6 +56,37 @@ via `mapLanguageId()` (e.g., "css" → "CSS", "js" → "JavaScript").
 - **Warning:** Do NOT attempt to override `DefaultMarkdownBlockRenderer` methods
   for code blocks again — it compiles but does not dispatch at runtime in IU-261.
 
+### Jewel Markdown: Inline Code Background (InlinesStyling Propagation)
+
+Jewel renders inline code backgrounds via `SpanStyle.background` in
+`AnnotatedString` — it is NOT a composable-level `Modifier.background()`.
+This means `SpanStyle(background = Color.Transparent)` CAN remove the gray
+background on inline code.
+
+**Root cause of the "can't remove" bug:** `MarkdownStyling.create()` propagates
+`inlinesStyling` only to `Paragraph`. Each `Heading.Hn.create()` creates its
+OWN `InlinesStyling` with the default `inlineCodeBackgroundColor` (gray). So
+inline code in **paragraphs** had the transparent background, but inline code
+in **headings** still showed gray.
+
+**Fix:** Pass `customInlinesStyling` explicitly to each heading level:
+```kotlin
+MarkdownStyling.create(
+    inlinesStyling = customInlinesStyling,
+    heading = Heading.create(
+        h1 = Heading.H1.create(inlinesStyling = customInlinesStyling),
+        h2 = Heading.H2.create(inlinesStyling = customInlinesStyling),
+        // ... through h6
+    ),
+)
+```
+
+- **Files:** `MessageList.kt`
+- **Key insight:** Any custom `InlinesStyling` MUST be passed to ALL block types
+  that accept it (Paragraph, Heading.H1–H6, BlockQuote, List). Jewel's `create()`
+  factory methods default to creating fresh `InlinesStyling` instances when the
+  parameter is not explicitly provided.
+
 ### OpenCode Server API
 
 - **Docs:** https://opencode.ai/docs/server/
@@ -137,3 +168,4 @@ via `mapLanguageId()` (e.g., "css" → "CSS", "js" → "JavaScript").
 - [x] Fixed CSS rendering crash (Swing HTML renderer can't handle border-radius, margin, etc.)
 - [x] Dark theme chat UI with proper typography and colors
 - [x] Code block rendering with custom ChatFencedCodeBlock via MarkdownSegmenter (bypasses dead DefaultMarkdownBlockRenderer override)
+- [x] Inline code gray background removed — fix was SpanStyle(background=Transparent) propagation to Heading.H1–H6 (not a composable-level background)

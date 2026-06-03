@@ -1,13 +1,7 @@
 package com.opencode.acp.chat.ui.compose
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -19,7 +13,7 @@ import org.jetbrains.jewel.ui.component.Text
 
 @Composable
 fun ThinkingIndicator(modifier: Modifier = Modifier) {
-    Row(
+    androidx.compose.foundation.layout.Row(
         modifier = modifier.padding(horizontal = 16.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -34,25 +28,11 @@ fun ThinkingIndicator(modifier: Modifier = Modifier) {
 
 @Composable
 fun ThinkingPill(content: String, modifier: Modifier = Modifier) {
-    val displayText = if (content.length > 80) content.take(80) + "…" else content
-    Box(
-        modifier = modifier
-            .padding(horizontal = 12.dp, vertical = 4.dp)
-            .border(
-                width = 1.dp,
-                color = Color(0x40808080),
-                shape = RoundedCornerShape(4.dp)
-            )
-            .background(
-                color = Color(0x10808080),
-                shape = RoundedCornerShape(4.dp)
-            )
-            .padding(horizontal = 8.dp, vertical = 4.dp)
-    ) {
-        Text(
-            text = displayText,
-            fontStyle = FontStyle.Italic,
-            color = Color.Gray
-        )
-    }
+    // Full thinking content displayed as muted text — no truncation, no pill border
+    Text(
+        text = content,
+        fontStyle = FontStyle.Italic,
+        color = Color(0xFF9E9E9E), // muted gray, lighter than response text
+        modifier = modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+    )
 }

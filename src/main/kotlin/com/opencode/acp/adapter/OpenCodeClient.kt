@@ -455,10 +455,12 @@ class OpenCodeClient(
             when (eventType) {
                 "message.part.delta" -> {
                     val field = props["field"]?.jsonPrimitive?.contentOrNull
-                    if (field == "text") {
-                        val text = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
-                        SseEvent.TextChunk(sessionId = sessionId, text = text)
-                    } else null
+                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
+                    when (field) {
+                        "text" -> SseEvent.TextChunk(sessionId = sessionId, text = delta)
+                        "thinking", "reasoning" -> SseEvent.ThinkingChunk(sessionId = sessionId, text = delta)
+                        else -> null
+                    }
                 }
 
                 "message.part.updated" -> {
@@ -470,6 +472,12 @@ class OpenCodeClient(
                                 val text = part["text"]?.jsonPrimitive?.contentOrNull
                                 if (text != null) {
                                     SseEvent.TextChunk(sessionId = sessionId, text = text)
+                                } else null
+                            }
+                            "reasoning", "thinking" -> {
+                                val text = part["text"]?.jsonPrimitive?.contentOrNull
+                                if (text != null) {
+                                    SseEvent.ThinkingChunk(sessionId = sessionId, text = text)
                                 } else null
                             }
                             "tool_use" -> {

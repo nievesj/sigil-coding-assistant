@@ -173,6 +173,12 @@ class OpenCodeAgentSession(
                     is SseEvent.MessageComplete -> {
                         logger.debug { "Message completed: ${sseEvent.messageId}" }
                     }
+
+                    is SseEvent.ThinkingChunk -> {
+                        // Thinking content is handled by ChatViewModel for the chat UI.
+                        // In the ACP SDK path, this is informational only.
+                        logger.debug { "Thinking chunk: ${sseEvent.text.take(100)}" }
+                    }
                 }
             }
         } catch (e: CancellationException) {

@@ -19,6 +19,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState.Sta
         var permissionTimeoutSeconds: Int = 60,
         /** List of favorite model keys in format "providerID\x1FmodelID" */
         var favoriteModels: List<String> = emptyList(),
+        /** Inline code text color as "#RRGGBB" (default: green #6BBE50) */
+        var inlineCodeColor: String = "#6BBE50",
+        /** Ordered list number color as "#RRGGBB" (default: green #6BBE50) */
+        var listNumberColor: String = "#6BBE50",
     )
 
     private var myState: State = State()

@@ -3,8 +3,8 @@
 package com.opencode.acp.chat.ui.compose
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -28,6 +29,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intellij.icons.AllIcons
@@ -112,42 +114,54 @@ fun ChatFencedCodeBlock(
         .highlight(content, lang)
         .collectAsState(AnnotatedString(content))
 
+    val editorScheme = remember {
+        EditorColorsManager.getInstance().globalScheme
+    }
     val editorFontSize = remember {
-        try {
-            EditorColorsManager.getInstance().globalScheme.getFont(EditorFontType.PLAIN).size
-        } catch (_: Exception) { 13 }
+        try { editorScheme.getFont(EditorFontType.PLAIN).size } catch (_: Exception) { 13 }
     }
 
-    val codeFontFamily = FontFamily.Monospace
     val codeTextStyle = TextStyle(
-        fontFamily = codeFontFamily,
+        fontFamily = FontFamily.Monospace,
         fontSize = editorFontSize.sp,
         lineHeight = (editorFontSize * 1.5).sp,
         color = Color(0xFFD4D4D4),
     )
 
-    val lines = remember(content) { content.lines() }
-    val lineNumberWidth = remember(lines.size) {
-        val digits = lines.size.toString().length
-        (digits * 12 + 16).dp
+    val clipboardManager = LocalClipboardManager.current
+    val lineNumberColor = Color(0xFF858585)
+
+    // Derive everything from annotatedCode to avoid streaming race
+    val lines = remember(annotatedCode) { annotatedCode.text.lines() }
+    val lineCount = lines.size
+
+    // Line number text: "1\n2\n3\n..." — same line count as code, uses same TextStyle
+    val lineNumberText = remember(lineCount) {
+        buildString {
+            for (i in 1..lineCount) {
+                if (i > 1) append('\n')
+                append(i)
+            }
+        }
     }
 
-    val clipboardManager = LocalClipboardManager.current
+    val lineNumberWidth = remember(lineCount) {
+        val digits = lineCount.toString().length
+        (digits * 12 + 16).dp
+    }
 
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(8.dp))
             .background(Color(0xFF1E1E1E))
-            .border(1.dp, Color(0xFF3C3C3C), RoundedCornerShape(8.dp))
             .fillMaxWidth(),
     ) {
-        // Language header with copy button — NOT selectable
+        // Language header with copy button
         DisableSelection {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF2D2D2D))
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
@@ -156,12 +170,12 @@ fun ChatFencedCodeBlock(
                         key = IntelliJIconKey.fromPlatformIcon(languageIcon(language.orEmpty())),
                         contentDescription = displayName,
                         modifier = Modifier.size(14.dp),
-                        tint = Color(0xFFBBBBBB),
+                        tint = Color(0xFF6BBE50),
                     )
                     Spacer(Modifier.width(6.dp))
                     Text(
                         text = displayName,
-                        style = codeTextStyle.copy(fontSize = 12.sp, color = Color(0xFFBBBBBB)),
+                        style = codeTextStyle.copy(fontSize = 12.sp, color = Color(0xFF6BBE50)),
                     )
                 }
 
@@ -178,38 +192,34 @@ fun ChatFencedCodeBlock(
             }
         }
 
-        // Line numbers — NOT selectable
-        DisableSelection {
-            Row(modifier = Modifier.padding(vertical = 8.dp)) {
-                // Line numbers column
-                Column(
+        // Code area — line numbers and code use identical TextStyle so the layout
+        // engine places baselines at exactly the same Y positions.
+        // softWrap = false on both ensures no hidden line wrapping.
+        Row(modifier = Modifier.padding(vertical = 8.dp)) {
+            // Line numbers — NOT selectable
+            DisableSelection {
+                Text(
+                    text = lineNumberText,
+                    style = codeTextStyle.copy(color = lineNumberColor),
+                    softWrap = false,
+                    textAlign = TextAlign.End,
                     modifier = Modifier
                         .width(lineNumberWidth)
                         .padding(end = 8.dp),
-                    horizontalAlignment = Alignment.End,
-                ) {
-                    lines.forEachIndexed { index, _ ->
-                        Text(
-                            text = "${index + 1}",
-                            style = codeTextStyle.copy(
-                                color = Color(0xFF858585),
-                                fontSize = (editorFontSize - 1).sp,
-                            ),
-                            modifier = Modifier.padding(end = 4.dp),
-                        )
-                    }
-                }
+                )
+            }
 
-                // Code text — selectable
-                SelectionContainer {
-                    Text(
-                        text = annotatedCode,
-                        style = codeTextStyle,
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(start = 4.dp, end = 12.dp),
-                    )
-                }
+            // Code — selectable, scrollable for long lines
+            SelectionContainer {
+                Text(
+                    text = annotatedCode,
+                    style = codeTextStyle,
+                    softWrap = false,
+                    modifier = Modifier
+                        .weight(1f)
+                        .horizontalScroll(rememberScrollState())
+                        .padding(start = 4.dp, end = 12.dp),
+                )
             }
         }
     }

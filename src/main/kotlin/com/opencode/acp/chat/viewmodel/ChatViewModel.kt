@@ -374,6 +374,10 @@ class ChatViewModel(
                 appendTextToMessage(msgId, event.text)
             }
 
+            is SseEvent.ThinkingChunk -> {
+                appendThinkingContent(msgId, event.text)
+            }
+
             is SseEvent.ToolUse -> {
                 val pill = ToolCallPill(
                     toolCallId = event.toolCallId,
@@ -465,6 +469,14 @@ class ChatViewModel(
         val index = messageIndex[messageId] ?: return
         val msg = messages[index]
         messages[index] = msg.copy(content = msg.content + toAppend)
+        _messages.value = messages
+    }
+
+    private fun appendThinkingContent(messageId: String, text: String) {
+        val messages = _messages.value.toMutableList()
+        val index = messageIndex[messageId] ?: return
+        val msg = messages[index]
+        messages[index] = msg.copy(thinkingContent = msg.thinkingContent + text)
         _messages.value = messages
     }
 

@@ -69,6 +69,12 @@ sealed interface SseEvent {
         override val sessionId: String,
         val messageId: String
     ) : SseEvent
+
+    /** Thinking/reasoning content from the model (streaming). */
+    data class ThinkingChunk(
+        override val sessionId: String,
+        val text: String
+    ) : SseEvent
 }
 
 /**

@@ -18,7 +18,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.intellij.openapi.project.Project
 import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.MessageRole
@@ -27,6 +31,7 @@ import org.jetbrains.jewel.foundation.code.highlighting.NoOpCodeHighlighter
 import org.jetbrains.jewel.intui.markdown.bridge.ProvideMarkdownStyling
 import org.jetbrains.jewel.intui.markdown.bridge.styling.create
 import org.jetbrains.jewel.markdown.Markdown
+import org.jetbrains.jewel.markdown.rendering.InlinesStyling
 import org.jetbrains.jewel.markdown.rendering.MarkdownStyling
 import org.jetbrains.jewel.markdown.processing.MarkdownProcessor
 
@@ -38,7 +43,6 @@ fun MessageList(
 ) {
     val listState = rememberLazyListState()
 
-    // Auto-scroll to bottom when new messages arrive
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
             listState.animateScrollToItem(messages.size - 1)
@@ -89,22 +93,65 @@ fun UserMessage(message: ChatMessage) {
 @Composable
 fun AssistantMessage(message: ChatMessage, project: Project? = null) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        // Tool pills
         message.toolCalls.forEach { pill ->
             ToolPill(pill)
         }
 
-        // Thinking content
         if (message.thinkingContent.isNotEmpty()) {
             ThinkingPill(message.thinkingContent)
         }
 
-        // Message content
         if (message.isStreaming && message.content.isBlank()) {
             ThinkingIndicator()
         } else if (message.content.isNotBlank()) {
             val currentProject = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-            val markdownStyling = remember { MarkdownStyling.create() }
+
+            val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
+            val defaultGreen = Color(0xFF6BBE50)
+            val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
+            val listNumberColor = parseColorOrDefault(settings.listNumberColor, defaultGreen)
+
+            val customInlinesStyling = remember(inlineCodeColor) {
+                InlinesStyling.create(
+                    inlineCode = SpanStyle(
+                        color = inlineCodeColor,
+                        background = Color.Transparent,
+                        fontFamily = FontFamily.Monospace,
+                    ),
+                )
+            }
+
+            val markdownStyling = remember(customInlinesStyling, listNumberColor) {
+                val baseTextStyle = org.jetbrains.jewel.bridge.theme.retrieveDefaultTextStyle()
+                MarkdownStyling.create(
+                    inlinesStyling = customInlinesStyling,
+                    heading = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.create(
+                        h1 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H1.create(
+                            inlinesStyling = customInlinesStyling,
+                        ),
+                        h2 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H2.create(
+                            inlinesStyling = customInlinesStyling,
+                        ),
+                        h3 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H3.create(
+                            inlinesStyling = customInlinesStyling,
+                        ),
+                        h4 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H4.create(
+                            inlinesStyling = customInlinesStyling,
+                        ),
+                        h5 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H5.create(
+                            inlinesStyling = customInlinesStyling,
+                        ),
+                        h6 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H6.create(
+                            inlinesStyling = customInlinesStyling,
+                        ),
+                    ),
+                    list = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.create(
+                        ordered = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.create(
+                            numberStyle = TextStyle(color = listNumberColor, fontSize = 14.sp),
+                        ),
+                    ),
+                )
+            }
             val markdownProcessor = remember { MarkdownProcessor() }
             val codeHighlighter = remember(currentProject) {
                 currentProject?.let {
@@ -114,7 +161,6 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null) {
                 } ?: NoOpCodeHighlighter
             }
 
-            // Segment markdown into text and code blocks
             val segments = remember(message.content) {
                 MarkdownSegmenter.segment(message.content)
             }
@@ -131,7 +177,6 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null) {
                     segments.forEach { segment ->
                         when (segment.type) {
                             MarkdownSegment.Type.TEXT -> {
-                                // Render text with Jewel's default Markdown renderer
                                 Markdown(
                                     markdown = segment.content,
                                     modifier = Modifier.fillMaxWidth(),
@@ -139,10 +184,15 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null) {
                                 )
                             }
                             MarkdownSegment.Type.CODE -> {
-                                // Render code block with our custom composable
                                 ChatFencedCodeBlock(
                                     content = segment.content,
                                     language = segment.language,
+                                )
+                            }
+                            MarkdownSegment.Type.TABLE -> {
+                                ChatTable(
+                                    rawMarkdown = segment.content,
+                                    modifier = Modifier.fillMaxWidth(),
                                 )
                             }
                         }
@@ -150,5 +200,20 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null) {
                 }
             }
         }
+    }
+}
+
+/**
+ * Parse a hex color string ("#RRGGBB" or "RRGGBB") to Compose Color.
+ * Falls back to defaultColor if invalid or blank.
+ */
+private fun parseColorOrDefault(hex: String, defaultColor: Color): Color {
+    if (hex.isBlank()) return defaultColor
+    val clean = hex.removePrefix("#")
+    return try {
+        val argb = clean.toLong(16) or 0xFF000000
+        Color(argb.toInt())
+    } catch (_: Exception) {
+        defaultColor
     }
 }
