@@ -8,7 +8,6 @@ data class ChatMessage(
     val id: String,
     val role: MessageRole,
     val content: String,
-    val renderedHtml: String? = null,
     val timestamp: Long,
     val toolCalls: List<ToolCallPill> = emptyList(),
     val thinkingContent: String = "",

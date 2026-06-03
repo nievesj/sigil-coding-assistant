@@ -34,18 +34,6 @@ dependencies {
     // compileOnly for coroutines — compile against platform's version, don't bundle
     compileOnly(libs.kotlinx.coroutines.core)
 
-    // Flexmark (Markdown rendering)
-    implementation(libs.flexmark.core) {
-        exclude(group = "org.jetbrains", module = "annotations")
-        exclude(group = "junit", module = "junit")
-    }
-    implementation(libs.flexmark.ext.strikethrough) {
-        exclude(group = "org.jetbrains", module = "annotations")
-    }
-    implementation(libs.flexmark.ext.tables) {
-        exclude(group = "org.jetbrains", module = "annotations")
-    }
-
     // Logging — IntelliJ Platform bundles SLF4J; keep logback for development but exclude transitive SLF4J
     implementation(libs.slf4j.api)
     implementation(libs.logback.classic) {
@@ -69,6 +57,14 @@ dependencies {
 
         // Jewel/Compose bundled modules
         composeUI()
+
+        // Jewel Markdown (not included in composeUI)
+        bundledModule("intellij.platform.jewel.markdown.core")
+        bundledModule("intellij.platform.jewel.markdown.ideLafBridgeStyling")
+        bundledModule("intellij.platform.jewel.markdown.extensions.gfmTables")
+        bundledModule("intellij.platform.jewel.markdown.extensions.gfmAlerts")
+        bundledModule("intellij.platform.jewel.markdown.extensions.gfmStrikethrough")
+        bundledModule("intellij.platform.jewel.markdown.extensions.autolink")
     }
 }
 

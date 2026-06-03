@@ -7,7 +7,6 @@ import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.adapter.OpenCodePart
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.util.generateId
-import com.opencode.acp.chat.util.renderMarkdownToHtml
 import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -278,7 +277,24 @@ class ChatViewModel(
 
             // Suspend until the SSE subscription delivers a Stop event
             deferred.await()
-        } catch (_: CancellationException) {
+        } catch (e: CancellationException) {
+            markStreamingComplete(assistantMsg.id)
+        } catch (e: Exception) {
+            // Route error to chat as a descriptive assistant message
+            val errorMsg = when {
+                e.message?.contains("timeout", ignoreCase = true) == true ->
+                    "Request timed out. The OpenCode server at $host:$port did not respond in time. " +
+                    "Check that the server is running and responsive."
+                e.message?.contains("connect", ignoreCase = true) == true ->
+                    "Connection lost to OpenCode server at $host:$port. " +
+                    "The server may have stopped or become unreachable."
+                e.message?.contains("refused", ignoreCase = true) == true ->
+                    "Connection refused by OpenCode server at $host:$port. " +
+                    "Ensure the server is running on the correct port."
+                else ->
+                    "An error occurred while sending the message: ${e.message ?: e.javaClass.simpleName}"
+            }
+            appendTextToMessage(assistantMsg.id, "\n\n**Error:** $errorMsg")
             markStreamingComplete(assistantMsg.id)
         } finally {
             _isStreaming.value = false
@@ -456,10 +472,7 @@ class ChatViewModel(
         val messages = _messages.value.toMutableList()
         val index = messageIndex[messageId] ?: return
         val msg = messages[index]
-        messages[index] = msg.copy(
-            isStreaming = false,
-            renderedHtml = renderMarkdownToHtml(msg.content)
-        )
+        messages[index] = msg.copy(isStreaming = false)
         _messages.value = messages
     }
 
