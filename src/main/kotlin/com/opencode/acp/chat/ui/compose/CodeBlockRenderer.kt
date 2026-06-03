@@ -36,6 +36,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intellij.icons.AllIcons
+import com.intellij.openapi.editor.colors.EditorColors
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.colors.EditorFontType
 import kotlinx.coroutines.launch
@@ -125,17 +126,27 @@ fun ChatFencedCodeBlock(
     val editorFontSize = remember {
         try { editorScheme.getFont(EditorFontType.PLAIN).size } catch (_: Exception) { 13 }
     }
+    val editorFgColor = remember {
+        Color(editorScheme.defaultForeground.rgb)
+    }
+    val editorBgColor = remember {
+        Color(editorScheme.defaultBackground.rgb)
+    }
+    val lineNumberColor = remember {
+        val awtColor = editorScheme.getColor(EditorColors.LINE_NUMBERS_COLOR)
+            ?: editorScheme.defaultForeground
+        Color(awtColor.rgb)
+    }
 
     val codeTextStyle = TextStyle(
         fontFamily = FontFamily.Monospace,
         fontSize = editorFontSize.sp,
         lineHeight = (editorFontSize * 1.5).sp,
-        color = Color(0xFFD4D4D4),
+        color = editorFgColor,
     )
 
     val clipboard = LocalClipboard.current
     val coroutineScope = rememberCoroutineScope()
-    val lineNumberColor = Color(0xFF858585)
 
     // Derive everything from annotatedCode to avoid streaming race
     val lines = remember(annotatedCode) { annotatedCode.text.lines() }
@@ -159,7 +170,7 @@ fun ChatFencedCodeBlock(
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFF1E1E1E))
+            .background(editorBgColor)
             .fillMaxWidth(),
     ) {
         // Language header with copy button
