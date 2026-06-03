@@ -27,6 +27,28 @@ To see logs in the Run tool window:
 To see stdout from the plugin, use `println()` — it appears in the Run tool
 window console (not in idea.log).
 
+### Jewel Markdown: Cannot Override DefaultMarkdownBlockRenderer for Code Blocks
+
+Jewel's `DefaultMarkdownBlockRenderer` in IU-261 has method overrides like
+`render(FencedCodeBlock, Fenced, enabled, modifier)` that **compile** but
+**never fire at runtime**. Confirmed via `println` debug logging: the override
+compiles, the renderer instance is created and passed to `ProvideMarkdownStyling`
+and `Markdown(blockRenderer=...)`, yet the `when` dispatch inside
+`DefaultMarkdownBlockRenderer.render(block: MarkdownBlock, ...)` never reaches
+our override. Root cause unclear (classloader isolation? bundling patching?),
+but the effect is consistent and reproducible.
+
+**Solution:** Bypass Jewel's renderer entirely for code blocks. `MarkdownSegmenter`
+regex-splits the raw markdown into TEXT and CODE segments. TEXT segments go
+through Jewel's `Markdown` composable (default renderer). CODE segments render
+directly via our `ChatFencedCodeBlock` composable (dark theme, language header,
+copy button, line numbers, syntax highlighting via `CodeHighlighterFactory`).
+
+- **Files:** `MarkdownSegmenter.kt`, `MessageList.kt`, `CodeBlockRenderer.kt`
+- **Deleted:** `ChatMarkdownBlockRenderer.kt` (dead override code)
+- **Warning:** Do NOT attempt to override `DefaultMarkdownBlockRenderer` methods
+  for code blocks again — it compiles but does not dispatch at runtime in IU-261.
+
 ### OpenCode Server API
 
 - **Docs:** https://opencode.ai/docs/server/
@@ -107,3 +129,4 @@ window console (not in idea.log).
 - [x] Fixed SVG icon (was symlink with @media style rules)
 - [x] Fixed CSS rendering crash (Swing HTML renderer can't handle border-radius, margin, etc.)
 - [x] Dark theme chat UI with proper typography and colors
+- [x] Code block rendering with custom ChatFencedCodeBlock via MarkdownSegmenter (bypasses dead DefaultMarkdownBlockRenderer override)
