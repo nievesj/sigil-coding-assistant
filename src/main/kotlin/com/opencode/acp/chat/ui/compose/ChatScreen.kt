@@ -20,6 +20,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.viewmodel.ChatViewModel
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
@@ -151,6 +152,21 @@ fun ChatScreen(
             kotlinx.coroutines.awaitCancellation()
         } finally {
             connection.disconnect()
+        }
+    }
+
+    // Listen for Ctrl+V paste signal from IntelliJ's action system.
+    // IntelliJ consumes Ctrl+V before Compose's onPreviewKeyEvent, so we
+    // register an AnAction with Ctrl+V shortcut on the tool window content
+    // (see ChatToolWindowFactory). When triggered, it checks the clipboard
+    // for image data and attaches it.
+    LaunchedEffect(viewModel) {
+        viewModel.pasteImageSignal.collectLatest {
+            val file = readClipboardImage()
+            if (file != null) {
+                attachedFiles.add(file)
+                println("[ChatScreen] Pasted image from clipboard: ${file.name}")
+            }
         }
     }
 

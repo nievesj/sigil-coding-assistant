@@ -22,22 +22,28 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draganddrop.DragAndDropEvent
+import androidx.compose.ui.draganddrop.DragAndDropTarget
+import androidx.compose.ui.draganddrop.DragAndDropTargetModifierNode
+import androidx.compose.ui.draganddrop.DragData
+import androidx.compose.ui.draganddrop.awtTransferable
+import androidx.compose.ui.draganddrop.dragData
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.isCtrlPressed
-import androidx.compose.ui.input.key.isMetaPressed
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.node.ModifierNodeElement
+import androidx.compose.ui.platform.InspectorInfo
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -72,41 +78,114 @@ data class AttachedFile(
 )
 
 /**
- * Reads an image from the system clipboard.
+ * Reads an image or image file from the system clipboard.
  * Returns an AttachedFile with a data URI if an image is present, null otherwise.
+ *
+ * Clipboard may contain images in different formats:
+ * - DataFlavor.imageFlavor (e.g. screenshot via Print Screen)
+ * - DataFlavor.javaFileListFlavor (e.g. copied image file from file manager)
+ *
+ * AWT clipboard access MUST happen on the Event Dispatch Thread.
  */
-suspend fun readClipboardImage(): AttachedFile? = withContext(Dispatchers.IO) {
+suspend fun readClipboardImage(): AttachedFile? {
+    // Read clipboard — in IntelliJ, the Compose UI thread IS the AWT EDT,
+    // so we can check directly. For safety, we detect the thread context.
+    val clipResult: Any? = if (java.awt.EventQueue.isDispatchThread()) {
+        // Already on EDT — read clipboard directly
+        readClipboardOnEdt()
+    } else {
+        // Not on EDT — dispatch to EDT and wait
+        withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                var result: Any? = null
+                java.awt.EventQueue.invokeAndWait {
+                    result = readClipboardOnEdt()
+                }
+                result
+            } catch (e: Exception) {
+                println("[ClipboardPaste] invokeAndWait failed: ${e.message}")
+                null
+            }
+        }
+    }
+
+    // Process clipboard data on IO dispatcher
+    return withContext(Dispatchers.IO) {
+        try {
+            when (clipResult) {
+                is java.awt.Image -> {
+                    val bufferedImage = clipResult.toBufferedImage()
+                    val baos = ByteArrayOutputStream()
+                    ImageIO.write(bufferedImage, "png", baos)
+                    val bytes = baos.toByteArray()
+                    val base64 = Base64.getEncoder().encodeToString(bytes)
+                    val dataUri = "data:image/png;base64,$base64"
+                    println("[ClipboardPaste] Created data URI from image, size=${bytes.size} bytes")
+                    AttachedFile(name = "clipboard-image.png", path = "", mime = "image/png", dataUri = dataUri)
+                }
+                is List<*> -> {
+                    // List of image files from clipboard
+                    val files = clipResult.filterIsInstance<java.io.File>()
+                    if (files.isEmpty()) return@withContext null
+                    // Attach the first image file
+                    files.first().toAttachedFile()
+                }
+                else -> null
+            }
+        } catch (e: Exception) {
+            println("[ClipboardPaste] Image processing failed: ${e.message}")
+            null
+        }
+    }
+}
+
+/**
+ * Reads clipboard content on the EDT. Returns java.awt.Image, List<java.io.File>, or null.
+ */
+private fun readClipboardOnEdt(): Any? {
     try {
         val clipboard = Toolkit.getDefaultToolkit().systemClipboard
-        val transferable = clipboard.getContents(null) ?: return@withContext null
-
-        if (!transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
-            return@withContext null
+        val transferable = clipboard.getContents(null)
+        if (transferable == null) {
+            println("[ClipboardPaste] Clipboard contents are null")
+            return null
         }
 
-        val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
-            ?: return@withContext null
+        // Log available flavors for debugging
+        val flavors = transferable.transferDataFlavors
+        println("[ClipboardPaste] Available flavors: ${flavors.map { it.humanPresentableName }}")
 
-        val bufferedImage = image.toBufferedImage()
+        // 1. Try imageFlavor (screenshot, copied image from image editor)
+        if (transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
+            val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
+            if (image != null) {
+                println("[ClipboardPaste] Got image from imageFlavor")
+                return image
+            }
+        }
 
-        // Convert to PNG bytes
-        val baos = ByteArrayOutputStream()
-        ImageIO.write(bufferedImage, "png", baos)
-        val bytes = baos.toByteArray()
+        // 2. Try javaFileListFlavor (copied image file from OS file manager)
+        if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+            @Suppress("UNCHECKED_CAST")
+            val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
+            if (files != null && files.isNotEmpty()) {
+                // Check if any file is an image
+                val imageExts = setOf("png", "jpg", "jpeg", "gif", "bmp", "svg", "webp")
+                val imageFiles = files.filter { f ->
+                    f.extension.lowercase() in imageExts
+                }
+                if (imageFiles.isNotEmpty()) {
+                    println("[ClipboardPaste] Got ${imageFiles.size} image file(s) from javaFileListFlavor: ${imageFiles.map { it.name }}")
+                    return imageFiles
+                }
+            }
+        }
 
-        // Create data URI
-        val base64 = Base64.getEncoder().encodeToString(bytes)
-        val dataUri = "data:image/png;base64,$base64"
-
-        AttachedFile(
-            name = "clipboard-image.png",
-            path = "",
-            mime = "image/png",
-            dataUri = dataUri
-        )
-    } catch (_: Exception) {
-        null
+        println("[ClipboardPaste] No image or image file found in clipboard")
+    } catch (e: Exception) {
+        println("[ClipboardPaste] EDT clipboard read failed: ${e.message}")
     }
+    return null
 }
 
 /**
@@ -127,7 +206,46 @@ private fun java.awt.Image.toBufferedImage(): BufferedImage {
     return bufferedImage
 }
 
-@OptIn(ExperimentalJewelApi::class)
+/**
+ * ModifierNodeElement that attaches a [DragAndDropTarget] to the modifier chain.
+ * This is needed because the bundled Compose (CMP 1.10) does not expose a
+ * [Modifier.dragAndDropTarget] extension — only the node-based API.
+ *
+ * Note: The factory function [DragAndDropTargetModifierNode] returns the sealed interface type,
+ * not [Modifier.Node]. However, the underlying implementation ([DragAndDropNode]) IS a
+ * [Modifier.Node], so the cast is safe.
+ */
+@OptIn(ExperimentalComposeUiApi::class)
+private class DropTargetElement(
+    private val target: DragAndDropTarget,
+    private val shouldStartDragAndDrop: (DragAndDropEvent) -> Boolean,
+) : ModifierNodeElement<Modifier.Node>() {
+    @Suppress("UNCHECKED_CAST")
+    override fun create(): Modifier.Node = DragAndDropTargetModifierNode(
+        shouldStartDragAndDrop = shouldStartDragAndDrop,
+        target = target,
+    ) as Modifier.Node
+
+    override fun update(node: Modifier.Node) = Unit
+
+    override fun InspectorInfo.inspectableProperties() {
+        name = "dragAndDropTarget"
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is DropTargetElement) return false
+        return target === other.target && shouldStartDragAndDrop == other.shouldStartDragAndDrop
+    }
+
+    override fun hashCode(): Int {
+        var result = target.hashCode()
+        result = 31 * result + shouldStartDragAndDrop.hashCode()
+        return result
+    }
+}
+
+@OptIn(ExperimentalJewelApi::class, ExperimentalComposeUiApi::class)
 @Composable
 fun InputArea(
     enabled: Boolean,
@@ -151,8 +269,102 @@ fun InputArea(
 ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
-    val coroutineScope = rememberCoroutineScope()
     var showAttachMenu by remember { mutableStateOf(false) }
+    var isDragging by remember { mutableStateOf(false) }
+
+    // Drag-and-drop target for file drops
+    val fileDropTarget = remember(onAttachFile, onImagePasted) {
+        object : DragAndDropTarget {
+            override fun onEntered(event: DragAndDropEvent) {
+                isDragging = true
+            }
+
+            override fun onExited(event: DragAndDropEvent) {
+                isDragging = false
+            }
+
+            override fun onDrop(event: DragAndDropEvent): Boolean {
+                isDragging = false
+                val dragData = event.dragData()
+
+                when (dragData) {
+                    is DragData.FilesList -> {
+                        val uris = dragData.readFiles()
+                        uris.map { uri ->
+                            try {
+                                java.io.File(java.net.URI(uri)).toAttachedFile()
+                            } catch (e: Exception) {
+                                println("[InputArea] Failed to read dropped file: $uri — ${e.message}")
+                                null
+                            }
+                        }.filterNotNull().forEach { file ->
+                            onAttachFile(file)
+                        }
+                        return uris.isNotEmpty()
+                    }
+                    is DragData.Image -> {
+                        try {
+                            // DragData.Image.readImage() returns Painter (CMP 1.10),
+                            // so we fall through to the AWT transferable approach below.
+                            // Drag through to else branch for AWT image extraction.
+                            null
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                }
+
+                // AWT fallback: handles DragData.Image (reads as AWT Image),
+                // unknown drag data, and any case above that fell through.
+                try {
+                    val transferable = event.awtTransferable
+
+                    // Try image first (covers DragData.Image and clipboard image drops)
+                    if (transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
+                        try {
+                            val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
+                            if (image != null) {
+                                val bufferedImage = image.toBufferedImage()
+                                val baos = ByteArrayOutputStream()
+                                ImageIO.write(bufferedImage, "png", baos)
+                                val bytes = baos.toByteArray()
+                                val base64 = Base64.getEncoder().encodeToString(bytes)
+                                val dataUri = "data:image/png;base64,$base64"
+                                val attached = AttachedFile(
+                                    name = "dropped-image.png",
+                                    path = "",
+                                    mime = "image/png",
+                                    dataUri = dataUri,
+                                )
+                                onImagePasted(attached)
+                                return true
+                            }
+                        } catch (e: Exception) {
+                            println("[InputArea] Failed to extract image from AWT transferable: ${e.message}")
+                        }
+                    }
+
+                    // Try file list
+                    if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                        @Suppress("UNCHECKED_CAST")
+                        val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
+                        files?.forEach { file ->
+                            try {
+                                onAttachFile(file.toAttachedFile())
+                            } catch (e: Exception) {
+                                println("[InputArea] Failed to process dropped AWT file: ${file.name} — ${e.message}")
+                            }
+                        }
+                        return !files.isNullOrEmpty()
+                    }
+                } catch (e: Exception) {
+                    println("[InputArea] AWT drag-and-drop fallback failed: ${e.message}")
+                }
+
+                return false
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
@@ -174,11 +386,17 @@ fun InputArea(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(12.dp))
-                .background(inputBg)
+                .background(if (isDragging) Color(0xFF2E3A2E) else inputBg)
                 .border(
-                    width = 1.dp,
-                    color = inputBorder,
+                    width = if (isDragging) 2.dp else 1.dp,
+                    color = if (isDragging) accentGreen else inputBorder,
                     shape = RoundedCornerShape(12.dp),
+                )
+                .then(
+                    DropTargetElement(
+                        target = fileDropTarget,
+                        shouldStartDragAndDrop = { true },
+                    )
                 ),
         ) {
             Row(
@@ -263,15 +481,6 @@ fun InputArea(
                                             onCancel()
                                             true
                                         }
-                                    }
-                                    // Ctrl+V / Cmd+V — paste image from clipboard
-                                    (event.isCtrlPressed || event.isMetaPressed) && event.key == Key.V -> {
-                                        coroutineScope.launch {
-                                            readClipboardImage()?.let { file ->
-                                                onImagePasted(file)
-                                            }
-                                        }
-                                        false // Let normal text paste still work
                                     }
                                     else -> false
                                 }
@@ -378,4 +587,15 @@ fun InputArea(
             ThinkingSelector(controlState, onThinkingChanged)
         }
     }
+}
+
+/**
+ * Converts a java.io.File into an AttachedFile by reading its bytes and encoding as a data URI.
+ */
+private fun java.io.File.toAttachedFile(): AttachedFile {
+    val bytes = readBytes()
+    val base64 = Base64.getEncoder().encodeToString(bytes)
+    val mime = java.net.URLConnection.guessContentTypeFromName(name) ?: "application/octet-stream"
+    val dataUri = "data:$mime;base64,$base64"
+    return AttachedFile(name = name, path = absolutePath, mime = mime, dataUri = dataUri)
 }

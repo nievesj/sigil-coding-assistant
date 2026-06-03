@@ -21,8 +21,10 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
@@ -50,6 +52,15 @@ class ChatViewModel(
 
     private val _permissionPrompt = MutableStateFlow<PermissionPrompt?>(null)
     val permissionPrompt: StateFlow<PermissionPrompt?> = _permissionPrompt.asStateFlow()
+
+    /** Signal emitted by the Ctrl+V IntelliJ action to trigger clipboard image paste in Compose. */
+    private val _pasteImageSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val pasteImageSignal = _pasteImageSignal.asSharedFlow()
+
+    /** Emits a signal to check the clipboard for an image. Called by the IntelliJ Ctrl+V action. */
+    fun requestImagePaste() {
+        _pasteImageSignal.tryEmit(Unit)
+    }
 
     // --- Internal: OpenCode engine connection ---
     private var openCodeClient: OpenCodeClient? = null

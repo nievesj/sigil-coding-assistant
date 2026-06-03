@@ -1,12 +1,17 @@
 package com.opencode.acp.chat
 
+import com.intellij.openapi.actionSystem.CustomShortcutSet
+import com.intellij.openapi.actionSystem.KeyboardShortcut
 import com.intellij.openapi.project.DumbAware
+import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.opencode.acp.chat.ui.compose.ChatScreen
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.util.edtScope
+import java.awt.event.KeyEvent
+import javax.swing.KeyStroke
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.jetbrains.jewel.bridge.addComposeTab
@@ -20,6 +25,22 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         // and JewelComposePanel creation — no explicit SwingBridgeTheme {} wrapper needed.
         toolWindow.addComposeTab("Chat") {
             ChatScreen(viewModel, project)
+        }
+
+        // Register Ctrl+V / Cmd+V action on the tool window content component.
+        // IntelliJ's action system consumes Ctrl+V before it reaches Compose's onPreviewKeyEvent,
+        // so we must intercept at the IDE level and signal the Compose UI.
+        val content = toolWindow.contentManager.contents.firstOrNull()
+        if (content != null) {
+            val component = content.component
+            val pasteAction = DumbAwareAction.create {
+                viewModel.requestImagePaste()
+            }
+            val pasteShortcut = CustomShortcutSet(
+                KeyboardShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_V, KeyEvent.CTRL_DOWN_MASK), null),
+                KeyboardShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_V, KeyEvent.META_DOWN_MASK), null),
+            )
+            pasteAction.registerCustomShortcutSet(pasteShortcut, component, project)
         }
 
         // Register disposable for ViewModel cleanup

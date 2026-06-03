@@ -87,6 +87,27 @@ MarkdownStyling.create(
   factory methods default to creating fresh `InlinesStyling` instances when the
   parameter is not explicitly provided.
 
+### Ctrl+V / Clipboard Image Paste — Must Use IntelliJ AnAction, NOT Compose onPreviewKeyEvent
+
+IntelliJ's action system (`IdeKeyEventDispatcher`) intercepts Ctrl+V (the `$Paste`
+action) **before** Compose's `onPreviewKeyEvent` receives it. Registering Ctrl+V in
+`Modifier.onPreviewKeyEvent` on a Compose `TextArea` simply never fires because
+IntelliJ's keymap dispatching consumes the event first.
+
+**Solution:** Register a `DumbAwareAction` with `CustomShortcutSet(Ctrl+V, Cmd+V)` on
+the tool window's content component. The action emits a signal to the ViewModel
+(`pasteImageSignal: SharedFlow`), which the Compose UI collects via `LaunchedEffect`
+to check the clipboard for images and attach them.
+
+- **Files:** `ChatToolWindowFactory.kt` (AnAction registration), `ChatViewModel.kt`
+  (`pasteImageSignal` + `requestImagePaste()`), `ChatScreen.kt`
+  (`LaunchedEffect` collecting signal), `InputArea.kt` (`readClipboardImage()`)
+- **Warning:** Do NOT attempt to handle Ctrl+V via Compose `onPreviewKeyEvent` in
+  an IntelliJ plugin — it does not work. The IDE action system consumes the event
+  before it reaches the Compose layer.
+- **Reference:** phodal/auto-dev uses the same pattern (`IdeaDevInInput.kt`) —
+  `DumbAwareAction` + `registerCustomShortcutSet` for Ctrl+V on Swing components
+
 ### OpenCode Server API
 
 - **Docs:** https://opencode.ai/docs/server/
