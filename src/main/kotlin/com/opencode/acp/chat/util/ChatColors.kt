@@ -114,6 +114,9 @@ object ChatColors {
                     color: $fg;
                     font-family: 'Segoe UI', 'Helvetica Neue', sans-serif;
                     font-size: ${codeSize}pt;
+                    margin-left: 0;
+                    margin-right: 0;
+                    padding: 0;
                 }
                 pre {
                     background: $editorBgCss;
@@ -129,10 +132,11 @@ object ChatColors {
                     font-size: ${codeSize}pt;
                 }
                 a { color: $linkFg; }
-                h1, h2, h3 { font-weight: bold; }
+                h1, h2, h3 { font-weight: bold; text-align: left; }
                 h1 { font-size: ${codeSize + 5}pt; }
                 h2 { font-size: ${codeSize + 3}pt; }
                 h3 { font-size: ${codeSize + 1}pt; }
+                p { margin: 0; }
             </style></head><body>$content</body></html>
         """.trimIndent()
     }

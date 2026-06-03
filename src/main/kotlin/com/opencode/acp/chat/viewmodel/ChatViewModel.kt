@@ -62,6 +62,9 @@ class ChatViewModel(
     /** Tracks the assistant message currently being streamed. */
     private var activeAssistantMessageId: String? = null
 
+    /** Text of the last user message — used to strip echo from assistant response. */
+    private var lastUserText: String? = null
+
     /** Deferred completed when the current response finishes (Stop event). */
     private var responseDeferred: CompletableDeferred<Unit>? = null
 
@@ -248,6 +251,7 @@ class ChatViewModel(
             timestamp = System.currentTimeMillis()
         )
         addMessage(userMsg)
+        lastUserText = text
 
         // Create streaming assistant message (initially empty)
         val assistantMsg = ChatMessage(
@@ -259,6 +263,7 @@ class ChatViewModel(
         )
         addMessage(assistantMsg)
         activeAssistantMessageId = assistantMsg.id
+        firstTextChunkReceived = false
 
         _isStreaming.value = true
         val deferred = CompletableDeferred<Unit>()
@@ -279,6 +284,7 @@ class ChatViewModel(
             _isStreaming.value = false
             responseDeferred = null
             activeAssistantMessageId = null
+            firstTextChunkReceived = false
         }
     }
 
@@ -293,6 +299,7 @@ class ChatViewModel(
         responseDeferred?.complete(Unit)
         responseDeferred = null
         _isStreaming.value = false
+        firstTextChunkReceived = false
     }
 
     /** Respond to a permission prompt from the OpenCode engine. */
@@ -423,11 +430,25 @@ class ChatViewModel(
         }
     }
 
+    /** Whether the first non-empty text chunk for the current assistant response has been received. */
+    private var firstTextChunkReceived = false
+
     private fun appendTextToMessage(messageId: String, text: String) {
+        val toAppend = if (!firstTextChunkReceived && text.isNotBlank()) {
+            firstTextChunkReceived = true
+            val userText = lastUserText
+            if (userText != null && text.startsWith(userText, ignoreCase = true)) {
+                text.substring(userText.length)
+            } else {
+                text
+            }
+        } else {
+            text
+        }
         val messages = _messages.value.toMutableList()
         val index = messageIndex[messageId] ?: return
         val msg = messages[index]
-        messages[index] = msg.copy(content = msg.content + text)
+        messages[index] = msg.copy(content = msg.content + toAppend)
         _messages.value = messages
     }
 

@@ -1,11 +1,14 @@
 package com.opencode.acp.chat.util
 
 import com.intellij.openapi.editor.EditorFactory
+import com.intellij.openapi.editor.EditorGutter
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.colors.EditorFontType
 import com.intellij.openapi.editor.ex.EditorEx
+import com.intellij.openapi.editor.ex.util.EditorUtil
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
+import com.intellij.ui.EditorTextField
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import com.vladsch.flexmark.ast.FencedCodeBlock
@@ -23,21 +26,14 @@ sealed class ContentSegment {
     data class Html(val html: String) : ContentSegment()
 
     /**
-     * A code block rendered with a real IntelliJ Editor.
-     * @param editor the created EditorEx — must be released via [dispose] when no longer needed
-     * @param component the JComponent to embed in the UI
+     * A code block rendered with an EditorTextField.
+     * EditorTextField self-manages editor lifecycle via removeNotify().
      */
     data class Code(
         val content: String,
         val language: String,
-        val editor: EditorEx,
         val component: JComponent
-    ) : ContentSegment() {
-        /** Release the editor back to EditorFactory. MUST be called when the component is removed. */
-        fun dispose() {
-            EditorFactory.getInstance().releaseEditor(editor)
-        }
-    }
+    ) : ContentSegment()
 }
 
 /** Language display names for the code block header. */
@@ -76,8 +72,7 @@ private fun languageDisplayName(language: String): String = when (language.lower
 
 /**
  * Parses markdown and renders it into segments: HTML text + code block editors.
- * Code blocks use a **real IntelliJ Editor** (via EditorFactory) for full IDE rendering:
- * line numbers, gutter, syntax highlighting, indent guides, selection, etc.
+ * Code blocks use EditorTextField for embedded IDE editor rendering with line numbers.
  */
 object MarkdownSegmenter {
 
@@ -85,7 +80,7 @@ object MarkdownSegmenter {
 
     /**
      * Parse markdown and produce a list of content segments.
-     * Text segments use themed HTML; code blocks use real IntelliJ Editor instances.
+     * Text segments use themed HTML; code blocks use IntelliJ EditorTextField instances.
      */
     fun segment(markdown: String, project: Project?): List<ContentSegment> {
         val document = parser.parse(markdown)
@@ -106,8 +101,8 @@ object MarkdownSegmenter {
                     segments.add(ContentSegment.Html(ChatColors.buildThemedHtml(renderMarkdownToHtml(textParts.joinToString("")))))
                     textParts.clear()
                 }
-                val (editor, component) = createIdeEditor(codeContent, language, project)
-                segments.add(ContentSegment.Code(codeContent, language, editor, component))
+                val component = createCodeEditor(codeContent, language, project)
+                segments.add(ContentSegment.Code(codeContent, language, component))
             }
 
             lastEndOffset = node.endOffset
@@ -130,74 +125,71 @@ object MarkdownSegmenter {
     }
 
     /**
-     * Create a **real IntelliJ Editor** that looks identical to the IDE editor.
-     * Uses EditorFactory.createEditor() — NOT EditorTextField.
-     *
-     * Configures every available public editor setting to match the IDE appearance:
-     * - Line numbers in the gutter
-     * - Proper color scheme (Darcula, Light, etc.)
-     * - Read-only (viewer mode)
-     * - Full IDE chrome visible
+     * Create an EditorTextField for code display with full IDE editor colors,
+     * syntax highlighting, line numbers, and gutter.
      */
-    private fun createIdeEditor(
+    private fun createCodeEditor(
         code: String,
         language: String,
         project: Project?
-    ): Pair<EditorEx, JComponent> {
+    ): JComponent {
         val ext = languageToExtension(language)
         val fileType = FileTypeManager.getInstance().getFileTypeByExtension(ext)
         val doc = EditorFactory.getInstance().createDocument(code)
         val scheme = EditorColorsManager.getInstance().globalScheme
 
-        // Create a REAL editor — this gives us the full IDE rendering pipeline
-        val editor = EditorFactory.getInstance().createEditor(doc, project, fileType, true) as EditorEx
+        val editorField = object : EditorTextField(
+            doc,
+            project,
+            fileType,
+            true,   // isViewer — read-only
+            false   // isFontShouldBeScaled
+        ) {
+            override fun createEditor(): EditorEx {
+                val editor = super.createEditor()
 
-        // Bind the global color scheme so all tokens render with the active theme
-        editor.colorsScheme = scheme
-        editor.reinitSettings()
+                // Bind the global color scheme
+                editor.colorsScheme = scheme
+                editor.reinitSettings()
 
-        // ── Editor Settings — match IDE defaults exactly ──
-        editor.settings.apply {
-            // Line numbers — ON
-            isLineNumbersShown = true
+                // ── Line numbers and gutter ──
+                editor.settings.isLineNumbersShown = true
+                editor.settings.isFoldingOutlineShown = false
+                editor.settings.additionalLinesCount = 0
+                editor.settings.additionalColumnsCount = 0
+                editor.settings.isRightMarginShown = false
+                editor.settings.isCaretRowShown = false
+                editor.settings.isBlockCursor = false
 
-            // Right margin — hidden
-            isRightMarginShown = false
+                // Force gutter component visible — needed for in-memory documents
+                val gutter = editor.gutter
+                (gutter as? JComponent)?.isVisible = true
 
-            // Caret row — OFF (read-only, no caret)
-            isCaretRowShown = false
+                // Make the inner editor component opaque with the scheme background
+                editor.component.isOpaque = true
+                editor.component.background = scheme.defaultBackground
+                editor.component.border = JBUI.Borders.empty()
 
-            // Folding — OFF for cleaner display in chat
-            isFoldingOutlineShown = false
+                return editor
+            }
 
-            // Additional lines — minimal padding
-            additionalLinesCount = 0
-            additionalColumnsCount = 0
-
-            // Block cursor — OFF (read-only)
-            isBlockCursor = false
+            // Display-only — no focus
+            override fun isFocusable(): Boolean = false
         }
 
-        // Make it read-only at the document level too
-        editor.isViewer = true
+        editorField.setOneLineMode(false)
+        editorField.isOpaque = true
+        editorField.background = scheme.defaultBackground
+        editorField.border = JBUI.Borders.empty()
 
-        // ── Component appearance ──
-        val editorComponent = editor.contentComponent
-        editorComponent.isOpaque = true
-        editorComponent.background = scheme.defaultBackground
-        editorComponent.border = JBUI.Borders.empty(JBUI.scale(2), JBUI.scale(4))
-
-        // Make the entire editor component (including gutter) match
-        editor.component.isOpaque = true
-        editor.component.background = scheme.defaultBackground
-
-        // ── Height calculation — match IDE line height ──
+        // Only constrain height — width is free for BoxLayout to stretch
         val lineCount = code.count { it == '\n' } + 1
-        val lineHeight = scheme.getFont(EditorFontType.PLAIN).size + JBUI.scale(6)
-        val headerHeight = JBUI.scale(24) // language label header
-        val preferredHeight = lineCount * lineHeight + JBUI.scale(8) + headerHeight
+        val lineHeight = scheme.getFont(EditorFontType.PLAIN).size + JBUI.scale(4)
+        val preferredHeight = lineCount * lineHeight + JBUI.scale(16)
+        editorField.preferredSize = Dimension(400, preferredHeight)
+        // Don't set maximumSize — BoxLayout distributes extra space based on it
 
-        // ── Wrap in a panel with language header ──
+        // Language label header
         val displayName = languageDisplayName(language)
         val headerPanel = JPanel(BorderLayout()).apply {
             isOpaque = true
@@ -213,16 +205,16 @@ object MarkdownSegmenter {
             }
         }
 
+        // Wrap: header + editor in a bordered panel
         val wrapper = JPanel(BorderLayout()).apply {
             isOpaque = true
             background = scheme.defaultBackground
-            preferredSize = Dimension(0, preferredHeight)
-            maximumSize = Dimension(Int.MAX_VALUE, preferredHeight)
+            border = JBUI.Borders.empty(JBUI.scale(2), JBUI.scale(0))
             add(headerPanel, BorderLayout.NORTH)
-            add(editor.component, BorderLayout.CENTER)
+            add(editorField, BorderLayout.CENTER)
         }
 
-        return Pair(editor, wrapper)
+        return wrapper
     }
 
     /** Map language name to file extension for syntax highlighting. */

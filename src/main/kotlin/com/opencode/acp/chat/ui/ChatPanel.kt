@@ -22,9 +22,7 @@ class ChatPanel(
     private val messageList = MessageListComponent(project)
     private val inputArea = InputAreaComponent(
         onSend = { text -> scope.launch { viewModel.sendMessage(text) } },
-        onCancel = { scope.launch { viewModel.cancel() } }
-    )
-    private val controlBar = ControlBarComponent(
+        onCancel = { scope.launch { viewModel.cancel() } },
         onAgentChanged = { viewModel.selectAgent(it) },
         onModelChanged = { viewModel.selectModel(it) },
         onThinkingChanged = { viewModel.selectThinkingEffort(it) }
@@ -60,7 +58,7 @@ class ChatPanel(
         }
         scope.launch {
             viewModel.controlState.collect { state ->
-                controlBar.updateState(state)
+                inputArea.updateState(state)
             }
         }
         scope.launch {
@@ -88,7 +86,6 @@ class ChatPanel(
         val southPanel = JPanel(BorderLayout())
         southPanel.add(permissionPrompt, BorderLayout.NORTH)
         southPanel.add(inputArea, BorderLayout.CENTER)
-        southPanel.add(controlBar, BorderLayout.SOUTH)
         add(southPanel, BorderLayout.SOUTH)
 
         // Auto-connect on tool window open
