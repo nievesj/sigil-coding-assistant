@@ -2,6 +2,7 @@ plugins {
     id("org.jetbrains.intellij.platform") version("2.16.0")
     kotlin("jvm") version "2.3.0"
     kotlin("plugin.serialization") version "2.3.0"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.3.0"
 }
 
 group = providers.gradleProperty("pluginGroup").get()
@@ -65,6 +66,9 @@ dependencies {
     intellijPlatform {
         intellijIdea(providers.gradleProperty("platformVersion"))
         bundledPlugin("com.intellij.java")
+
+        // Jewel/Compose bundled modules
+        composeUI()
     }
 }
 
