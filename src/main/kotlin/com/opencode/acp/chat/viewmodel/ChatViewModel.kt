@@ -222,7 +222,8 @@ class ChatViewModel(
                                 displayName = "${provider.name} / ${modelData.name}",
                                 reasoning = modelData.reasoning,
                                 contextWindow = modelData.limit?.context ?: 0,
-                                providerIconId = provider.id
+                                providerIconId = provider.id,
+                                variants = modelData.variants?.keys?.toList() ?: emptyList()
                             )
                     }
                 }

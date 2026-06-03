@@ -616,8 +616,12 @@ fun InputArea(
                 }
             }
 
+            // Thinking selector — only visible when model has thinking variants
+            if (controlState.selectedModel?.variants?.isNotEmpty() == true) {
+                ThinkingSelector(controlState, onThinkingChanged)
+            }
+
             Spacer(modifier = Modifier.weight(1f))
-            ThinkingSelector(controlState, onThinkingChanged)
         }
     }
 }

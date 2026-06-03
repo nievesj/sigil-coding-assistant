@@ -56,7 +56,8 @@ data class ProviderModel(
     val displayName: String,
     val reasoning: Boolean = false,
     val contextWindow: Int = 0,
-    val providerIconId: String = ""
+    val providerIconId: String = "",
+    val variants: List<String> = emptyList()
 )
 
 /** Sealed type for heterogeneous combo box model items (headers + models with stars). */

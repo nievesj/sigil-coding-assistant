@@ -638,7 +638,8 @@ data class ModelData(
     val attachment: Boolean = false,
     val temperature: Boolean = false,
     val release_date: String = "",
-    val limit: ModelLimit? = null
+    val limit: ModelLimit? = null,
+    val variants: Map<String, Map<String, kotlinx.serialization.json.JsonElement>>? = null
 )
 
 @Serializable

@@ -107,18 +107,25 @@ fun ThinkingSelector(
     controlState: ControlBarState,
     onThinkingChanged: (ThinkingEffort) -> Unit,
 ) {
-    val isEnabled = controlState.selectedModel?.reasoning == true
+    val variants = controlState.selectedModel?.variants ?: emptyList()
     val displayText = controlState.thinkingEffort.label
     var showPopup by remember { mutableStateOf(false) }
+
+    // Build available efforts: Default + model's actual variants
+    val availableEfforts = remember(variants) {
+        val matched = variants.mapNotNull { variantName ->
+            ThinkingEffort.entries.find { it.variant == variantName }
+        }
+        listOf(ThinkingEffort.DEFAULT) + matched
+    }
 
     Box {
         SelectorChip(
             text = displayText,
-            enabled = isEnabled,
-            onClick = if (isEnabled) {{ showPopup = !showPopup }} else null,
+            onClick = { showPopup = !showPopup },
         )
 
-        if (showPopup && isEnabled) {
+        if (showPopup) {
             Popup(
                 alignment = Alignment.TopStart,
                 offset = IntOffset(0, -4),
@@ -131,7 +138,7 @@ fun ThinkingSelector(
             ) {
                 SimplePickerPanel(
                     title = "THINKING",
-                    items = ThinkingEffort.entries.map { effort ->
+                    items = availableEfforts.map { effort ->
                         PickerItem(
                             label = effort.label,
                             isSelected = effort == controlState.thinkingEffort,
@@ -165,7 +172,6 @@ internal fun SelectorChip(
     val borderColor = if (enabled) ChipBorder else ChipBorderDisabled
 
     val modifier = Modifier
-        .widthIn(min = 120.dp)
         .clip(RoundedCornerShape(6.dp))
         .background(bgColor)
         .border(1.dp, borderColor, RoundedCornerShape(6.dp))
@@ -205,7 +211,7 @@ private fun SimplePickerPanel(
 ) {
     Column(
         modifier = Modifier
-            .widthIn(min = 180.dp)
+            .widthIn(min = 100.dp, max = 180.dp)
             .heightIn(max = 280.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(PanelBg)
@@ -223,7 +229,6 @@ private fun SimplePickerPanel(
         // Items
         LazyColumn(
             modifier = Modifier
-                .fillMaxWidth()
                 .weight(1f, fill = false)
                 .heightIn(min = 0.dp),
         ) {
