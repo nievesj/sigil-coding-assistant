@@ -40,14 +40,49 @@ import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 
+/**
+ * Language name mapping: markdown code fence language → language
+ * identifier accepted by the Jewel CodeHighlighter.
+ */
+private fun mapLanguageId(lang: String): String {
+    return when (lang.lowercase()) {
+        "js" -> "JavaScript"
+        "ts" -> "TypeScript"
+        "jsx" -> "JavaScript"
+        "tsx" -> "TypeScript"
+        "py" -> "Python"
+        "rb" -> "Ruby"
+        "rs" -> "Rust"
+        "kt" -> "Kotlin"
+        "kts" -> "Kotlin"
+        "cs" -> "C#"
+        "cpp" -> "C++"
+        "objc" -> "Objective-C"
+        "sh", "bash", "zsh" -> "Shell"
+        "yml" -> "YAML"
+        "md" -> "Markdown"
+        "dockerfile" -> "Dockerfile"
+        "json" -> "JSON"
+        "xml" -> "XML"
+        "html" -> "HTML"
+        "css" -> "CSS"
+        "sql" -> "SQL"
+        "go" -> "Go"
+        "java" -> "Java"
+        "c" -> "C"
+        "text", "plaintext", "txt" -> ""
+        else -> lang // pass through as-is
+    }
+}
+
 @Composable
 fun ChatFencedCodeBlock(
     content: String,
     language: String?,
     modifier: Modifier = Modifier,
 ) {
-    val lang = language.orEmpty()
-    val displayName = lang.ifBlank { "Code" }
+    val lang = language.orEmpty().let { mapLanguageId(it) }
+    val displayName = language.orEmpty().ifBlank { "Code" }
 
     val annotatedCode by LocalCodeHighlighter.current
         .highlight(content, lang)

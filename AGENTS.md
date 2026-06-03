@@ -39,10 +39,17 @@ our override. Root cause unclear (classloader isolation? bundling patching?),
 but the effect is consistent and reproducible.
 
 **Solution:** Bypass Jewel's renderer entirely for code blocks. `MarkdownSegmenter`
-regex-splits the raw markdown into TEXT and CODE segments. TEXT segments go
-through Jewel's `Markdown` composable (default renderer). CODE segments render
-directly via our `ChatFencedCodeBlock` composable (dark theme, language header,
-copy button, line numbers, syntax highlighting via `CodeHighlighterFactory`).
+uses a line-by-line state machine to split raw markdown into TEXT and CODE segments.
+TEXT segments go through Jewel's `Markdown` composable (default renderer). CODE
+segments render directly via our `ChatFencedCodeBlock` composable (dark theme,
+language header, copy button, line numbers, syntax highlighting via
+`LocalCodeHighlighter`).
+
+**Why state machine, not regex:** Initial regex `^```(\S*)\n(.*?)^``` ` failed
+because LLMs sometimes emit ``` mid-line (e.g., `text```css`) or omit trailing
+newlines. The state machine handles all fence positions and captures the language
+identifier correctly. Language names are mapped to Jewel's expected identifiers
+via `mapLanguageId()` (e.g., "css" → "CSS", "js" → "JavaScript").
 
 - **Files:** `MarkdownSegmenter.kt`, `MessageList.kt`, `CodeBlockRenderer.kt`
 - **Deleted:** `ChatMarkdownBlockRenderer.kt` (dead override code)
