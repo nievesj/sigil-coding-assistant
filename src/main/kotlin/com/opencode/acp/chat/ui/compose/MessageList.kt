@@ -126,7 +126,7 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null) {
             ) {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     segments.forEach { segment ->
                         when (segment.type) {

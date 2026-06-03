@@ -75,6 +75,30 @@ private fun mapLanguageId(lang: String): String {
     }
 }
 
+/**
+ * Map language name to IntelliJ platform icon for the code block header.
+ */
+private fun languageIcon(lang: String): javax.swing.Icon = when (lang.lowercase()) {
+    "javascript", "js", "jsx"     -> AllIcons.FileTypes.JavaScript
+    "typescript", "ts", "tsx"     -> AllIcons.FileTypes.JavaScript
+    "css", "scss", "less"         -> AllIcons.FileTypes.Css
+    "java"                        -> AllIcons.FileTypes.Java
+    "kotlin", "kt", "kts"         -> AllIcons.Language.Kotlin
+    "python", "py"                -> AllIcons.Language.Python
+    "ruby", "rb"                  -> AllIcons.Language.Ruby
+    "rust", "rs"                  -> AllIcons.Language.Rust
+    "go"                          -> AllIcons.Language.GO
+    "scala"                       -> AllIcons.Language.Scala
+    "php"                         -> AllIcons.Language.Php
+    "html", "htm"                 -> AllIcons.FileTypes.Html
+    "xml"                         -> AllIcons.FileTypes.Xml
+    "json"                        -> AllIcons.FileTypes.Json
+    "yaml", "yml"                 -> AllIcons.FileTypes.Yaml
+    "shell", "bash", "zsh", "sh"  -> AllIcons.Nodes.Console
+    "sql"                         -> AllIcons.FileTypes.Text
+    else                          -> AllIcons.FileTypes.Text
+}
+
 @Composable
 fun ChatFencedCodeBlock(
     content: String,
@@ -129,8 +153,8 @@ fun ChatFencedCodeBlock(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.Nodes.Artifact),
-                        contentDescription = "Code",
+                        key = IntelliJIconKey.fromPlatformIcon(languageIcon(language.orEmpty())),
+                        contentDescription = displayName,
                         modifier = Modifier.size(14.dp),
                         tint = Color(0xFFBBBBBB),
                     )
