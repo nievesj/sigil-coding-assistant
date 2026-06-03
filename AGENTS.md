@@ -105,6 +105,70 @@ MarkdownStyling.create(
 - Used by Zed, JetBrains AI Assistant, Neovim plugins
 - Our plugin uses `opencode serve` (HTTP REST + SSE) instead — gives more control over custom UI
 
+### IntelliJ Platform Icons (AllIcons) — Confirmed Available
+
+Icons referenced via `AllIcons.*` that are **known to compile** in this project.
+Use `IntelliJIconKey.fromPlatformIcon(AllIcons.X.Y)` to wrap for Jewel `Icon`.
+
+#### File Types
+| Icon | Constant |
+|------|----------|
+| JavaScript | `AllIcons.FileTypes.JavaScript` |
+| Java | `AllIcons.FileTypes.Java` |
+| CSS | `AllIcons.FileTypes.Css` |
+| HTML | `AllIcons.FileTypes.Html` |
+| XML | `AllIcons.FileTypes.Xml` |
+| JSON | `AllIcons.FileTypes.Json` |
+| YAML | `AllIcons.FileTypes.Yaml` |
+| Text (generic) | `AllIcons.FileTypes.Text` |
+| Image | `AllIcons.FileTypes.Image` |
+
+#### Language Icons
+| Icon | Constant |
+|------|----------|
+| Kotlin | `AllIcons.Language.Kotlin` |
+| Python | `AllIcons.Language.Python` |
+| Ruby | `AllIcons.Language.Ruby` |
+| Rust | `AllIcons.Language.Rust` |
+| Go | `AllIcons.Language.GO` |
+| Scala | `AllIcons.Language.Scala` |
+| PHP | `AllIcons.Language.Php` |
+
+#### Actions
+| Icon | Constant |
+|------|----------|
+| Search | `AllIcons.Actions.Search` |
+| Forward (chevron) | `AllIcons.Actions.Forward` |
+| Copy | `AllIcons.Actions.Copy` |
+| Close (×) | `AllIcons.Actions.Close` |
+| Add (+) | `AllIcons.General.Add` |
+| Suspend (stop) | `AllIcons.Actions.Suspend` |
+| MoveUp (send arrow) | `AllIcons.Actions.MoveUp` |
+| Execute (play) | `AllIcons.Actions.Execute` |
+| Checked | `AllIcons.Actions.Checked` |
+| Cancel | `AllIcons.Actions.Cancel` |
+| Lightning | `AllIcons.Actions.Lightning` |
+
+#### Nodes
+| Icon | Constant |
+|------|----------|
+| Folder | `AllIcons.Nodes.Folder` |
+| Console (terminal) | `AllIcons.Nodes.Console` |
+
+#### General
+| Icon | Constant |
+|------|----------|
+| BalloonError | `AllIcons.General.BalloonError` |
+| BalloonInformation | `AllIcons.General.BalloonInformation` |
+
+**Icons that DO NOT exist** (don't waste time looking for these):
+- `AllIcons.FileTypes.Kotlin` — use `AllIcons.Language.Kotlin` instead
+- `AllIcons.FileTypes.TypeScript` — use `AllIcons.FileTypes.JavaScript` instead
+- `AllIcons.FileTypes.Markdown` — use `AllIcons.FileTypes.Text` instead
+- `AllIcons.Nodes.Gradle` — use `AllIcons.Nodes.Gradle` (may exist but untested)
+- `AllIcons.FileTypes.Any_type` — use `AllIcons.FileTypes.Text` instead
+- `AllIcons.Nodes.File` — use `AllIcons.FileTypes.Text` instead
+
 ---
 
 ## Deferred Features
