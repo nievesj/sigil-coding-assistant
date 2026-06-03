@@ -17,12 +17,17 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.project.Project
 import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.MessageRole
@@ -112,11 +117,20 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null) {
             val listNumberColor = parseColorOrDefault(settings.listNumberColor, defaultGreen)
 
             val customInlinesStyling = remember(inlineCodeColor) {
+                val linkColor = Color(0xFF3574F0)
                 InlinesStyling.create(
                     inlineCode = SpanStyle(
                         color = inlineCodeColor,
                         background = Color.Transparent,
                         fontFamily = FontFamily.Monospace,
+                    ),
+                    link = SpanStyle(
+                        color = linkColor,
+                        textDecoration = TextDecoration.Underline,
+                    ),
+                    linkHovered = SpanStyle(
+                        color = linkColor,
+                        textDecoration = TextDecoration.Underline,
                     ),
                 )
             }
@@ -150,6 +164,12 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null) {
                             numberStyle = TextStyle(color = listNumberColor, fontSize = 14.sp),
                         ),
                     ),
+                    blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
+                        padding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        lineWidth = 3.dp,
+                        lineColor = Color(0xFF3E3E3E),
+                        textColor = Color(0xFF9E9E9E),
+                    ),
                 )
             }
             val markdownProcessor = remember { MarkdownProcessor() }
@@ -181,6 +201,7 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null) {
                                     markdown = segment.content,
                                     modifier = Modifier.fillMaxWidth(),
                                     selectable = true,
+                                    onUrlClick = { url -> BrowserUtil.open(url) },
                                 )
                             }
                             MarkdownSegment.Type.CODE -> {

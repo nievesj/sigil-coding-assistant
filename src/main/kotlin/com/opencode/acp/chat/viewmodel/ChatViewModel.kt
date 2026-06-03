@@ -6,6 +6,7 @@ import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.adapter.OpenCodePart
 import com.opencode.acp.chat.model.*
+import com.opencode.acp.chat.ui.compose.AttachedFile
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
@@ -238,7 +239,7 @@ class ChatViewModel(
     }
 
     /** Send a user message to the OpenCode engine. Suspends until the response is complete. */
-    suspend fun sendMessage(text: String) {
+    suspend fun sendMessage(text: String, files: List<AttachedFile> = emptyList()) {
         val client = openCodeClient ?: return
         val currentSessionId = sessionId ?: return
 
@@ -270,10 +271,21 @@ class ChatViewModel(
 
         try {
             // Build message parts
-            val parts = listOf(OpenCodePart.Text(text = text))
+            val parts = mutableListOf<OpenCodePart>(OpenCodePart.Text(text = text))
+            files.forEach { file ->
+                parts.add(OpenCodePart.File(mime = file.mime, url = file.dataUri, filename = file.name))
+            }
+
+            // Derive optional request fields from control bar state
+            val state = _controlState.value
+            val variant = state.thinkingEffort.variant // null for DEFAULT
+            val agent = state.selectedAgent?.id
+            val model = state.selectedModel?.let {
+                OpenCodeClient.MessageModel(providerID = it.providerID, modelID = it.modelID)
+            }
 
             // Send via OpenCodeClient (returns immediately with correlationId)
-            client.sendMessageAsync(currentSessionId, parts)
+            client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
 
             // Suspend until the SSE subscription delivers a Stop event
             deferred.await()

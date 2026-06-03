@@ -56,7 +56,18 @@ class OpenCodeClient(
     )
 
     @Serializable
-    private data class SendMessageRequest(val parts: List<OpenCodePart>)
+    private data class SendMessageRequest(
+        val parts: List<OpenCodePart>,
+        val variant: String? = null,
+        val agent: String? = null,
+        val model: MessageModel? = null
+    )
+
+    @Serializable
+    data class MessageModel(
+        val providerID: String,
+        val modelID: String
+    )
 
     @Serializable
     private data class SendMessageResponse(
@@ -288,12 +299,21 @@ class OpenCodeClient(
     /**
      * Sends a message (list of parts) to a session and returns a correlation ID.
      * POST /session/{id}/message
+     *
+     * @param variant Model variant hint (e.g. "low", "medium", "high" for thinking effort)
+     * @param agent Agent name override (e.g. "coder", "task")
+     * @param model Model override with providerID and modelID
      */
     suspend fun sendMessageAsync(
         sessionId: String,
-        parts: List<OpenCodePart>
+        parts: List<OpenCodePart>,
+        variant: String? = null,
+        agent: String? = null,
+        model: MessageModel? = null
     ): String {
-        val requestBody = json.encodeToString(SendMessageRequest(parts = parts))
+        val requestBody = json.encodeToString(
+            SendMessageRequest(parts = parts, variant = variant, agent = agent, model = model)
+        )
         logger.info { "Sending message: ${requestBody.take(200)}" }
         val response = httpClient.post("$baseUrl/session/$sessionId/message") {
             applyAuth()

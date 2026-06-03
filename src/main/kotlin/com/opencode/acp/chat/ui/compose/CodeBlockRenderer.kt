@@ -1,4 +1,4 @@
-@file:OptIn(ExperimentalJewelApi::class)
+@file:OptIn(ExperimentalJewelApi::class, ExperimentalComposeUiApi::class)
 
 package com.opencode.acp.chat.ui.compose
 
@@ -21,11 +21,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -35,7 +38,9 @@ import androidx.compose.ui.unit.sp
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.colors.EditorFontType
+import kotlinx.coroutines.launch
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
+import java.awt.datatransfer.StringSelection
 import org.jetbrains.jewel.foundation.code.highlighting.LocalCodeHighlighter
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.Icon
@@ -128,7 +133,8 @@ fun ChatFencedCodeBlock(
         color = Color(0xFFD4D4D4),
     )
 
-    val clipboardManager = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
+    val coroutineScope = rememberCoroutineScope()
     val lineNumberColor = Color(0xFF858585)
 
     // Derive everything from annotatedCode to avoid streaming race
@@ -185,7 +191,9 @@ fun ChatFencedCodeBlock(
                     modifier = Modifier
                         .size(16.dp)
                         .clickable {
-                            clipboardManager.setText(AnnotatedString(content))
+                            coroutineScope.launch {
+                                clipboard.setClipEntry(ClipEntry(StringSelection(content)))
+                            }
                         },
                     tint = Color(0xFFBBBBBB),
                 )

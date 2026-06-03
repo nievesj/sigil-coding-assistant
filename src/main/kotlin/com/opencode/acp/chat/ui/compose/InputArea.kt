@@ -1,15 +1,27 @@
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -29,11 +41,16 @@ import com.opencode.acp.chat.model.ThinkingEffort
 import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
-import org.jetbrains.jewel.ui.component.IconButton
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.TextArea
 import org.jetbrains.jewel.ui.icon.IntelliJIconKey
-import androidx.compose.foundation.text.input.TextFieldState
+
+data class AttachedFile(
+    val name: String,
+    val path: String,
+    val mime: String,
+    val dataUri: String
+)
 
 @OptIn(ExperimentalJewelApi::class)
 @Composable
@@ -45,115 +62,181 @@ fun InputArea(
     onCancel: () -> Unit,
     onAgentChanged: (OpenCodeAgentInfo) -> Unit,
     onModelChanged: (ProviderModel) -> Unit,
-    onThinkingChanged: (ThinkingEffort) -> Unit
+    onThinkingChanged: (ThinkingEffort) -> Unit,
+    attachedFiles: List<AttachedFile> = emptyList(),
+    onAttach: () -> Unit = {},
+    onRemoveFile: (Int) -> Unit = {}
 ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
 
-    // Auto-focus on composition
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
     }
 
+    val inputBg = Color(0xFF2B2B2B)
+    val inputBorder = Color(0xFF3E3E3E)
+    val inputBorderFocused = Color(0xFF4A90D9)
+    val mutedText = Color(0xFF808080)
+    val accentGreen = Color(0xFF6BBE50)
+    val surfaceColor = Color(0xFF1E1E1E)
+
     Column(
-        modifier = Modifier.padding(8.dp, 6.dp, 8.dp, 8.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
-        // Text area + send/cancel buttons
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically
+        // Text area container with rounded corners and border
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(inputBg)
+                .border(
+                    width = 1.dp,
+                    color = inputBorder,
+                    shape = RoundedCornerShape(12.dp),
+                ),
         ) {
-            // Attach button (circular) - placeholder
-            IconButton(
-                onClick = { /* TODO: file attachment */ },
-                modifier = Modifier.size(28.dp)
+            Row(
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.Bottom,
             ) {
-                Icon(
-                    key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add),
-                    contentDescription = "Attach",
-                    modifier = Modifier.size(16.dp)
-                )
-            }
-
-            // Text area with keyboard shortcuts
-            TextArea(
-                state = textState,
-                modifier = Modifier
-                    .weight(1f)
-                    .focusRequester(focusRequester)
-                    .onPreviewKeyEvent { event ->
-                        if (event.type == KeyEventType.KeyDown) {
-                            when {
-                                // Enter → send (no Shift)
-                                event.key == Key.Enter && !event.isShiftPressed -> {
-                                    val text = textState.text.toString().trim()
-                                    if (text.isNotEmpty()) {
-                                        onSend(text)
-                                        textState.edit { replace(0, length, "") }
-                                    }
-                                    true
-                                }
-                                // Shift+Enter → newline (default behavior)
-                                event.key == Key.Enter && event.isShiftPressed -> false
-                                // Escape → cancel
-                                event.key == Key.Escape -> {
-                                    onCancel()
-                                    true
-                                }
-                                else -> false
-                            }
-                        } else false
-                    },
-                enabled = enabled,
-                placeholder = { Text("Type a message...") }
-            )
-
-            // Send / Cancel button
-            if (isStreaming) {
-                IconButton(
-                    onClick = onCancel,
-                    modifier = Modifier.size(32.dp)
+                // Attach button (circular, subtle)
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .clickable(enabled = enabled) { onAttach() }
+                        .padding(8.dp),
+                    contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Suspend),
-                        contentDescription = "Cancel",
-                        modifier = Modifier.size(16.dp)
+                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add),
+                        contentDescription = "Attach",
+                        modifier = Modifier.size(16.dp),
+                        tint = mutedText,
                     )
                 }
-            } else {
-                IconButton(
-                    onClick = {
-                        val text = textState.text.toString().trim()
-                        if (text.isNotEmpty()) {
-                            onSend(text)
-                            textState.edit { replace(0, length, "") }
-                        }
-                    },
-                    modifier = Modifier.size(32.dp),
-                    enabled = enabled
+
+                // Text area
+                TextArea(
+                    state = textState,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(40.dp)
+                        .focusRequester(focusRequester)
+                        .onPreviewKeyEvent { event ->
+                            if (event.type == KeyEventType.KeyDown) {
+                                when {
+                                    event.key == Key.Enter && !event.isShiftPressed -> {
+                                        val text = textState.text.toString().trim()
+                                        if (text.isNotEmpty()) {
+                                            onSend(text)
+                                            textState.edit { replace(0, length, "") }
+                                        }
+                                        true
+                                    }
+                                    event.key == Key.Enter && event.isShiftPressed -> false
+                                    event.key == Key.Escape -> {
+                                        onCancel()
+                                        true
+                                    }
+                                    else -> false
+                                }
+                            } else false
+                        },
+                    enabled = enabled,
+                    placeholder = { Text("Type a message...", color = mutedText) },
+                )
+
+                // Send / Cancel button (circular)
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (isStreaming) Color(0xFF3E3E3E)
+                            else if (enabled && textState.text.isNotBlank()) accentGreen
+                            else Color(0xFF3E3E3E)
+                        )
+                        .clickable(enabled = enabled) {
+                            if (isStreaming) {
+                                onCancel()
+                            } else {
+                                val text = textState.text.toString().trim()
+                                if (text.isNotEmpty()) {
+                                    onSend(text)
+                                    textState.edit { replace(0, length, "") }
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.MoveUp),
-                        contentDescription = "Send",
-                        modifier = Modifier.size(16.dp)
+                        key = IntelliJIconKey.fromPlatformIcon(
+                            if (isStreaming) AllIcons.Actions.Suspend
+                            else AllIcons.Actions.MoveUp
+                        ),
+                        contentDescription = if (isStreaming) "Cancel" else "Send",
+                        modifier = Modifier.size(16.dp),
+                        tint = Color.White,
                     )
                 }
             }
         }
 
-        // Selector row: Agent ✦ Model ✦ Thinking
+        // Attached file pills
+        if (attachedFiles.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                attachedFiles.forEachIndexed { index, file ->
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xFF3E3E3E))
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = file.name,
+                            fontSize = 11.sp,
+                            color = Color(0xFFBBBBBB),
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(12.dp)
+                                .clip(CircleShape)
+                                .clickable { onRemoveFile(index) },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
+                                contentDescription = "Remove",
+                                modifier = Modifier.size(12.dp),
+                                tint = Color(0xFF808080),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Selector row: Agent | Model | Thinking — compact, no separators
         Row(
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             AgentSelector(controlState, onAgentChanged)
-            Text(
-                text = "✦",
-                color = Color.Gray,
-                fontSize = 12.sp
-            )
             ModelSelector(controlState, onModelChanged)
+            Spacer(modifier = Modifier.weight(1f))
             ThinkingSelector(controlState, onThinkingChanged)
         }
     }

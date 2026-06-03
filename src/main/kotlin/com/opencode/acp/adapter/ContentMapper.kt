@@ -44,6 +44,9 @@ class ContentMapper {
         is OpenCodePart.Text -> ContentBlock.Text(
             text = part.text
         )
+        is OpenCodePart.File -> ContentBlock.Text(
+            text = "[File: ${part.filename ?: part.url} (${part.mime})]"
+        )
         is OpenCodePart.ToolUse -> {
             val toolCallJson = buildString {
                 append("Tool call: ")
@@ -62,6 +65,7 @@ class ContentMapper {
             val resultText = part.content.joinToString("\n") { childPart ->
                 when (childPart) {
                     is OpenCodePart.Text -> childPart.text
+                    is OpenCodePart.File -> "[File: ${childPart.filename ?: childPart.url}]"
                     is OpenCodePart.ToolUse -> "[ToolUse: ${childPart.name} (${childPart.id})]"
                     is OpenCodePart.ToolResult -> "[ToolResult: ${childPart.toolUseId}]"
                 }

@@ -1,7 +1,14 @@
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.ControlBarState
 import com.opencode.acp.chat.model.DropdownItem
@@ -37,7 +44,7 @@ fun AgentSelector(
             }
         }
     ) {
-        Text(displayText, fontSize = 12.sp)
+        SelectorChip(displayText)
     }
 }
 
@@ -73,7 +80,7 @@ fun ModelSelector(
             }
         }
     ) {
-        Text(displayText, fontSize = 12.sp)
+        SelectorChip(displayText)
     }
 }
 
@@ -99,8 +106,37 @@ fun ThinkingSelector(
             }
         }
     ) {
-        Text(displayText, fontSize = 12.sp)
+        SelectorChip(
+            text = displayText,
+            enabled = isEnabled,
+        )
     }
+}
+
+/**
+ * Compact chip-style selector that matches the OpenCode aesthetic.
+ * Dark background, rounded corners, subtle border, small text.
+ */
+@Composable
+private fun SelectorChip(
+    text: String,
+    enabled: Boolean = true,
+) {
+    val bgColor = if (enabled) Color(0xFF2B2B2B) else Color(0xFF252525)
+    val textColor = if (enabled) Color(0xFFCCCCCC) else Color(0xFF606060)
+    val borderColor = if (enabled) Color(0xFF3E3E3E) else Color(0xFF333333)
+
+    Text(
+        text = text,
+        fontSize = 11.sp,
+        color = textColor,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(bgColor)
+            .then(
+                Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+            ),
+    )
 }
 
 private fun buildGroupedModelList(

@@ -80,6 +80,14 @@ sealed interface OpenCodePart {
     data class Text(val text: String) : OpenCodePart
 
     @Serializable
+    @SerialName("file")
+    data class File(
+        val mime: String,
+        val url: String,
+        val filename: String? = null
+    ) : OpenCodePart
+
+    @Serializable
     @SerialName("tool_use")
     data class ToolUse(
         val id: String,
