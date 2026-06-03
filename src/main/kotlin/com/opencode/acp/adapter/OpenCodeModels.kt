@@ -68,8 +68,8 @@ data class MessageInfo(
 
 @Serializable
 data class MessageError(
-    val name: String,
-    val message: String,
+    val name: String = "",
+    val message: String? = null,
     val retries: Int? = null
 )
 
@@ -108,7 +108,8 @@ sealed interface OpenCodePart {
 data class AgentInfo(
     val name: String,
     val description: String? = null,
-    val mode: String? = null
+    val mode: String? = null,
+    val hidden: Boolean? = null
 ) {
     val id: String get() = name
 }

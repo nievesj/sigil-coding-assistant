@@ -270,6 +270,7 @@ fun InputArea(
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
     var showAttachMenu by remember { mutableStateOf(false) }
+    var showModelPicker by remember { mutableStateOf(false) }
     var isDragging by remember { mutableStateOf(false) }
 
     // Drag-and-drop target for file drops
@@ -575,14 +576,46 @@ fun InputArea(
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Selector row: Agent | Model | Thinking — compact, no separators
+        // Selector row: Agent | Model | Thinking — cohesive dark chips
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             AgentSelector(controlState, onAgentChanged)
-            ModelSelector(controlState, onModelChanged)
+
+            // Model picker chip + popup
+            Box {
+                val modelDisplayText = controlState.selectedModel?.displayName?.substringAfter(" / ")?.trim() ?: "Model"
+                SelectorChip(
+                    text = modelDisplayText,
+                    onClick = { showModelPicker = !showModelPicker },
+                )
+
+                if (showModelPicker) {
+                    Popup(
+                        alignment = Alignment.TopStart,
+                        offset = IntOffset(0, -4),
+                        properties = PopupProperties(
+                            focusable = true,
+                            dismissOnBackPress = true,
+                            dismissOnClickOutside = true,
+                        ),
+                        onDismissRequest = { showModelPicker = false },
+                    ) {
+                        ModelPickerPanel(
+                            models = controlState.models,
+                            selectedModel = controlState.selectedModel,
+                            onModelSelected = { model ->
+                                onModelChanged(model)
+                                showModelPicker = false
+                            },
+                            onDismiss = { showModelPicker = false },
+                        )
+                    }
+                }
+            }
+
             Spacer(modifier = Modifier.weight(1f))
             ThinkingSelector(controlState, onThinkingChanged)
         }

@@ -1,181 +1,279 @@
 package com.opencode.acp.chat.ui.compose
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import com.opencode.acp.chat.model.ControlBarState
-import com.opencode.acp.chat.model.DropdownItem
 import com.opencode.acp.chat.model.OpenCodeAgentInfo
-import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.model.ThinkingEffort
-import com.opencode.acp.config.settings.OpenCodeSettingsState
-import org.jetbrains.jewel.foundation.ExperimentalJewelApi
-import org.jetbrains.jewel.ui.component.Dropdown
-import org.jetbrains.jewel.ui.component.GroupHeader
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.component.MenuScope
 
-@OptIn(ExperimentalJewelApi::class)
+// ── Shared colors ───────────────────────────────────────────────────────────
+private val ChipBg = Color(0xFF2B2B2B)
+private val ChipBorder = Color(0xFF3E3E3E)
+private val ChipText = Color(0xFFCCCCCC)
+private val ChipTextDisabled = Color(0xFF606060)
+private val ChipBorderDisabled = Color(0xFF333333)
+private val PanelBg = Color(0xFF2B2B2B)
+private val PanelBorder = Color(0xFF3E3E3E)
+private val HoverBg = Color(0xFF363636)
+private val SelectedBg = Color(0xFF2D4F6D)
+private val MutedText = Color(0xFF808080)
+private val PrimaryText = Color(0xFFCCCCCC)
+private val SectionHeaderColor = Color(0xFF589DF6)
+
+// ── Agent Selector ──────────────────────────────────────────────────────────
+
 @Composable
 fun AgentSelector(
     controlState: ControlBarState,
-    onAgentChanged: (OpenCodeAgentInfo) -> Unit
+    onAgentChanged: (OpenCodeAgentInfo) -> Unit,
 ) {
-    val agents = controlState.agents
     val selected = controlState.selectedAgent
+    val agents = controlState.agents
     val displayText = selected?.name ?: "Agent"
+    var showPopup by remember { mutableStateOf(false) }
 
-    Dropdown(
-        menuContent = {
-            agents.forEach { agent ->
-                selectableItem(
-                    selected = agent == selected,
-                    onClick = { onAgentChanged(agent) }
-                ) {
-                    Text(agent.name)
-                }
+    Box {
+        SelectorChip(
+            text = displayText,
+            onClick = { showPopup = !showPopup },
+        )
+
+        if (showPopup && agents.isNotEmpty()) {
+            Popup(
+                alignment = Alignment.TopStart,
+                offset = IntOffset(0, -4),
+                properties = PopupProperties(
+                    focusable = true,
+                    dismissOnBackPress = true,
+                    dismissOnClickOutside = true,
+                ),
+                onDismissRequest = { showPopup = false },
+            ) {
+                SimplePickerPanel(
+                    title = "AGENT",
+                    items = agents.map { agent ->
+                        PickerItem(
+                            label = agent.name,
+                            isSelected = agent == selected,
+                            onClick = {
+                                onAgentChanged(agent)
+                                showPopup = false
+                            },
+                        )
+                    },
+                    onDismiss = { showPopup = false },
+                )
             }
         }
-    ) {
-        SelectorChip(displayText)
     }
 }
 
-@OptIn(ExperimentalJewelApi::class)
-@Composable
-fun ModelSelector(
-    controlState: ControlBarState,
-    onModelChanged: (ProviderModel) -> Unit
-) {
-    val settings = remember { OpenCodeSettingsState.getInstance() }
-    val items = remember(controlState.models, controlState.selectedModel) {
-        buildGroupedModelList(controlState.models, settings)
-    }
-    val displayText = controlState.selectedModel?.displayName?.substringAfter(" / ")?.trim() ?: "Model"
+// ── Thinking Selector ───────────────────────────────────────────────────────
 
-    Dropdown(
-        menuContent = {
-            items.forEach { item ->
-                when (item) {
-                    is DropdownItem.ProviderHeader -> {
-                        passiveItem { GroupHeader(item.name) }
-                    }
-                    is DropdownItem.ModelItem -> {
-                        selectableItem(
-                            selected = item.model == controlState.selectedModel,
-                            onClick = { onModelChanged(item.model) }
-                        ) {
-                            val label = if (item.isFavorite) "★ ${item.modelName}" else item.modelName
-                            Text(label)
-                        }
-                    }
-                }
-            }
-        }
-    ) {
-        SelectorChip(displayText)
-    }
-}
-
-@OptIn(ExperimentalJewelApi::class)
 @Composable
 fun ThinkingSelector(
     controlState: ControlBarState,
-    onThinkingChanged: (ThinkingEffort) -> Unit
+    onThinkingChanged: (ThinkingEffort) -> Unit,
 ) {
     val isEnabled = controlState.selectedModel?.reasoning == true
     val displayText = controlState.thinkingEffort.label
+    var showPopup by remember { mutableStateOf(false) }
 
-    Dropdown(
-        enabled = isEnabled,
-        menuContent = {
-            ThinkingEffort.entries.forEach { effort ->
-                selectableItem(
-                    selected = effort == controlState.thinkingEffort,
-                    onClick = { onThinkingChanged(effort) }
-                ) {
-                    Text(effort.label)
-                }
-            }
-        }
-    ) {
+    Box {
         SelectorChip(
             text = displayText,
             enabled = isEnabled,
+            onClick = if (isEnabled) {{ showPopup = !showPopup }} else null,
         )
+
+        if (showPopup && isEnabled) {
+            Popup(
+                alignment = Alignment.TopStart,
+                offset = IntOffset(0, -4),
+                properties = PopupProperties(
+                    focusable = true,
+                    dismissOnBackPress = true,
+                    dismissOnClickOutside = true,
+                ),
+                onDismissRequest = { showPopup = false },
+            ) {
+                SimplePickerPanel(
+                    title = "THINKING",
+                    items = ThinkingEffort.entries.map { effort ->
+                        PickerItem(
+                            label = effort.label,
+                            isSelected = effort == controlState.thinkingEffort,
+                            onClick = {
+                                onThinkingChanged(effort)
+                                showPopup = false
+                            },
+                        )
+                    },
+                    onDismiss = { showPopup = false },
+                )
+            }
+        }
     }
 }
 
+// ── Shared SelectorChip ─────────────────────────────────────────────────────
+
 /**
- * Compact chip-style selector that matches the OpenCode aesthetic.
- * Dark background, rounded corners, subtle border, small text.
+ * Chip-style selector matching the model picker aesthetic.
+ * Dark background, rounded corners, subtle border, wider than before.
  */
 @Composable
-private fun SelectorChip(
+internal fun SelectorChip(
     text: String,
     enabled: Boolean = true,
+    onClick: (() -> Unit)? = null,
 ) {
-    val bgColor = if (enabled) Color(0xFF2B2B2B) else Color(0xFF252525)
-    val textColor = if (enabled) Color(0xFFCCCCCC) else Color(0xFF606060)
-    val borderColor = if (enabled) Color(0xFF3E3E3E) else Color(0xFF333333)
+    val bgColor = if (enabled) ChipBg else Color(0xFF252525)
+    val textColor = if (enabled) ChipText else ChipTextDisabled
+    val borderColor = if (enabled) ChipBorder else ChipBorderDisabled
+
+    val modifier = Modifier
+        .widthIn(min = 120.dp)
+        .clip(RoundedCornerShape(6.dp))
+        .background(bgColor)
+        .border(1.dp, borderColor, RoundedCornerShape(6.dp))
+        .padding(horizontal = 10.dp, vertical = 5.dp)
+
+    val finalModifier = if (onClick != null && enabled) {
+        modifier.clickable(onClick = onClick)
+    } else {
+        modifier
+    }
 
     Text(
         text = text,
-        fontSize = 11.sp,
+        fontSize = 12.sp,
         color = textColor,
-        modifier = Modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(bgColor)
-            .then(
-                Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-            ),
+        modifier = finalModifier,
     )
 }
 
-private fun buildGroupedModelList(
-    models: List<ProviderModel>,
-    settings: OpenCodeSettingsState
-): List<DropdownItem> {
-    if (models.isEmpty()) return emptyList()
+// ── Simple Picker Panel (used by Agent + Thinking) ──────────────────────────
 
-    settings.cleanupStaleFavorites(models)
+private data class PickerItem(
+    val label: String,
+    val isSelected: Boolean,
+    val onClick: () -> Unit,
+)
 
-    val result = mutableListOf<DropdownItem>()
+/**
+ * Lightweight picker panel matching ModelPickerPanel's visual style.
+ * Used for Agent and Thinking selectors.
+ */
+@Composable
+private fun SimplePickerPanel(
+    title: String,
+    items: List<PickerItem>,
+    onDismiss: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .widthIn(min = 180.dp)
+            .heightIn(max = 280.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(PanelBg)
+            .border(1.dp, PanelBorder, RoundedCornerShape(8.dp)),
+    ) {
+        // Section header
+        Text(
+            text = title,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            color = SectionHeaderColor,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+        )
 
-    // Favorites section
-    val favorites = models.filter { settings.isFavoriteModel(it.providerID, it.modelID) }
-    if (favorites.isNotEmpty()) {
-        result.add(DropdownItem.ProviderHeader("★ Favorites"))
-        for (model in favorites) {
-            val (provider, name) = parseDisplayName(model.displayName)
-            result.add(DropdownItem.ModelItem(model, provider, name, isFavorite = true))
+        // Items
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f, fill = false)
+                .heightIn(min = 0.dp),
+        ) {
+            items(
+                count = items.size,
+                key = { items[it].label },
+            ) { index ->
+                val item = items[index]
+                PickerItemRow(
+                    label = item.label,
+                    isSelected = item.isSelected,
+                    onClick = item.onClick,
+                )
+            }
         }
     }
-
-    // Non-favorites grouped by provider
-    val nonFavorites = models.filter { !settings.isFavoriteModel(it.providerID, it.modelID) }
-    var lastProvider: String? = null
-    for (model in nonFavorites) {
-        val providerName = model.displayName.substringBefore(" / ").trim()
-        if (providerName != lastProvider) {
-            result.add(DropdownItem.ProviderHeader(providerName))
-            lastProvider = providerName
-        }
-        val modelName = model.displayName.substringAfter(" / ").trim()
-        result.add(DropdownItem.ModelItem(model, "", modelName, isFavorite = false))
-    }
-    return result
 }
 
-private fun parseDisplayName(displayName: String): Pair<String, String> {
-    val parts = displayName.split(" / ", limit = 2)
-    return if (parts.size == 2) Pair(parts[0].trim(), parts[1].trim())
-    else Pair(displayName, displayName)
+@Composable
+private fun PickerItemRow(
+    label: String,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isHovered by interactionSource.collectIsHoveredAsState()
+
+    val bgColor = when {
+        isSelected -> SelectedBg
+        isHovered -> HoverBg
+        else -> Color.Transparent
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(30.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(bgColor)
+            .hoverable(interactionSource)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            color = if (isSelected) Color.White else PrimaryText,
+            maxLines = 1,
+            modifier = Modifier.weight(1f),
+        )
+    }
 }

@@ -176,23 +176,36 @@ class ChatViewModel(
             }
             logger.info { "Health check passed" }
 
-            // Create session
-            logger.info { "Creating session" }
-            val session = opencodeClient.createSession()
-            sessionId = session.id
-            logger.info { "Session created: ${session.id}" }
-
-            // Load agents
+            // Load agents first so we can select the default
+            var defaultAgent: String? = null
             try {
-                val agents = opencodeClient.listAgents()
-                logger.info { "Loaded ${agents.size} agents" }
+                val allAgents = opencodeClient.listAgents()
+                val agents = allAgents.filter { it.mode != "subagent" && it.hidden != true }
+                logger.info { "Loaded ${agents.size} user-facing agents (filtered from ${allAgents.size} total)" }
                 _controlState.value = _controlState.value.copy(
                     agents = agents.map { info ->
                         OpenCodeAgentInfo(id = info.id, name = info.name, description = info.description)
                     }
                 )
+                // Default to "orchestrator" if available, otherwise first agent
+                defaultAgent = agents.firstOrNull { it.name == "orchestrator" }?.name
+                    ?: agents.firstOrNull()?.name
             } catch (e: Exception) {
                 logger.warn(e) { "Failed to load agents (non-fatal)" }
+            }
+
+            // Create session (agent is per-message, not per-session)
+            logger.info { "Creating session" }
+            val session = opencodeClient.createSession()
+            sessionId = session.id
+            logger.info { "Session created: ${session.id}" }
+
+            // Select the default agent in the control state
+            if (defaultAgent != null) {
+                val agentInfo = _controlState.value.agents.find { it.id == defaultAgent }
+                if (agentInfo != null) {
+                    _controlState.value = _controlState.value.copy(selectedAgent = agentInfo)
+                }
             }
 
             // Load providers and models (only from connected/authenticated providers)
@@ -207,7 +220,9 @@ class ChatViewModel(
                                 providerID = provider.id,
                                 modelID = modelData.id,
                                 displayName = "${provider.name} / ${modelData.name}",
-                                reasoning = modelData.reasoning
+                                reasoning = modelData.reasoning,
+                                contextWindow = modelData.limit?.context ?: 0,
+                                providerIconId = provider.id
                             )
                     }
                 }

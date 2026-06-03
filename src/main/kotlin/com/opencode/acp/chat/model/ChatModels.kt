@@ -54,7 +54,9 @@ data class ProviderModel(
     val providerID: String,
     val modelID: String,
     val displayName: String,
-    val reasoning: Boolean = false
+    val reasoning: Boolean = false,
+    val contextWindow: Int = 0,
+    val providerIconId: String = ""
 )
 
 /** Sealed type for heterogeneous combo box model items (headers + models with stars). */
@@ -67,7 +69,8 @@ sealed interface DropdownItem {
         val model: ProviderModel,
         val providerName: String,
         val modelName: String,
-        val isFavorite: Boolean
+        val isFavorite: Boolean,
+        val contextWindowLabel: String = ""
     ) : DropdownItem {
         /** Equality by ProviderModel so JComboBox.setSelectedItem() can match across lists. */
         override fun equals(other: Any?): Boolean =

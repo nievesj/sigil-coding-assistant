@@ -34,8 +34,8 @@ dependencies {
     // compileOnly for coroutines — compile against platform's version, don't bundle
     compileOnly(libs.kotlinx.coroutines.core)
 
-    // Logging — IntelliJ Platform bundles SLF4J; keep logback for development but exclude transitive SLF4J
-    implementation(libs.slf4j.api)
+    // Logging — IntelliJ Platform bundles SLF4J; compile-only, exclude from plugin zip
+    compileOnly(libs.slf4j.api)
     implementation(libs.logback.classic) {
         exclude(group = "org.slf4j", module = "slf4j-api")
     }
@@ -69,7 +69,7 @@ dependencies {
 }
 
 // Global exclusions: catch anything missed by per-dependency excludes
-// Must NOT use configureEach — coroutines must remain on compileClasspath for the compiler
+// Must NOT use configureEach — these must remain on compileClasspath for the compiler
 configurations.runtimeClasspath {
     // Coroutines — IDE bundles its own patched fork; must not be in plugin JAR
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core")
@@ -79,6 +79,17 @@ configurations.runtimeClasspath {
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-reactor")
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-slf4j")
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-debug")
+
+    // Kotlin stdlib — IDE bundles its own; duplicates cause classloader conflicts
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk7")
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
+
+    // SLF4J — IDE bundles its own
+    exclude(group = "org.slf4j", module = "slf4j-api")
+
+    // JetBrains Annotations — IDE bundles its own
+    exclude(group = "org.jetbrains", module = "annotations")
 }
 
 intellijPlatform {

@@ -52,7 +52,8 @@ class OpenCodeClient(
     @Serializable
     private data class CreateSessionRequest(
         val parentID: String? = null,
-        val title: String? = null
+        val title: String? = null,
+        val agent: String? = null
     )
 
     @Serializable
@@ -198,14 +199,13 @@ class OpenCodeClient(
     suspend fun createSession(
         title: String? = null
     ): OpenCodeSession {
+        val requestBody = buildJsonObject {
+            if (title != null) put("title", title)
+        }.toString()
         val response = httpClient.post("$baseUrl/session") {
             applyAuth()
             contentType(ContentType.Application.Json)
-            if (title != null) {
-                setBody(json.encodeToString(CreateSessionRequest.serializer(), CreateSessionRequest(title = title)))
-            } else {
-                setBody("{}")
-            }
+            setBody(requestBody)
         }
         val body = response.bodyAsText()
         if (!response.status.isSuccess()) {
