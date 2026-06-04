@@ -21,7 +21,7 @@ dependencies {
 
     // Ktor HTTP client — exclude coroutines (IntelliJ Platform bundles its own patched fork)
     implementation(libs.ktor.client.core)
-    implementation(libs.ktor.client.cio)
+    implementation(libs.ktor.client.java)
     implementation(libs.ktor.client.content.negotiation)
     implementation(libs.ktor.serialization.json)
 
@@ -90,6 +90,18 @@ configurations.runtimeClasspath {
 
     // JetBrains Annotations — IDE bundles its own
     exclude(group = "org.jetbrains", module = "annotations")
+
+    // Netty — no longer needed (Java engine uses java.net.http.HttpClient)
+    exclude(group = "io.netty", module = "netty-common")
+    exclude(group = "io.netty", module = "netty-buffer")
+    exclude(group = "io.netty", module = "netty-transport")
+    exclude(group = "io.netty", module = "netty-handler")
+    exclude(group = "io.netty", module = "netty-codec")
+    exclude(group = "io.netty", module = "netty-codec-http")
+    exclude(group = "io.netty", module = "netty-codec-http2")
+    exclude(group = "io.netty", module = "netty-resolver")
+    exclude(group = "io.netty", module = "netty-resolver-dns")
+    exclude(group = "io.netty", module = "netty-codec-dns")
 }
 
 intellijPlatform {

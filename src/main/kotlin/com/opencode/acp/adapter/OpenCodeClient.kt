@@ -4,7 +4,7 @@ import com.opencode.acp.PlanEntry
 import com.opencode.acp.SseEvent
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.client.HttpClient
-import io.ktor.client.engine.cio.CIO
+import io.ktor.client.engine.java.Java
 import io.ktor.client.plugins.*
 import io.ktor.client.plugins.sse.SSE
 import io.ktor.client.plugins.sse.sse
@@ -29,7 +29,7 @@ private val logger = KotlinLogging.logger {}
  * agent, command, and SSE event endpoints.
  *
  * @param baseUrl the base URL of the OpenCode server (e.g. "http://localhost:3000")
- * @param httpClient the Ktor HttpClient instance (expected to be CIO-based)
+ * @param httpClient the Ktor HttpClient instance
  * @param authToken optional bearer token for authenticated requests
  */
 class OpenCodeClient(

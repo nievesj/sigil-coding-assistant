@@ -1,16 +1,30 @@
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.foundation.Image as ComposeImage
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.unit.dp
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.fileChooser.FileChooserFactory
@@ -111,6 +125,7 @@ fun ChatScreen(
     val permissionPrompt by viewModel.permissionPrompt.collectAsState()
     val scope = rememberCoroutineScope()
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
+    var previewImageUri by remember { mutableStateOf<String?>(null) }
 
     // Recent files — reactive state that updates when files open/close
     val recentFiles = remember { mutableStateListOf<RecentFile>() }
@@ -159,13 +174,19 @@ fun ChatScreen(
     // IntelliJ consumes Ctrl+V before Compose's onPreviewKeyEvent, so we
     // register an AnAction with Ctrl+V shortcut on the tool window content
     // (see ChatToolWindowFactory). When triggered, it checks the clipboard
-    // for image data and attaches it.
+    // for images, files, or text and handles each case.
     LaunchedEffect(viewModel) {
         viewModel.pasteImageSignal.collectLatest {
-            val file = readClipboardImage()
-            if (file != null) {
-                attachedFiles.add(file)
-                println("[ChatScreen] Pasted image from clipboard: ${file.name}")
+            when (val result = readClipboardContent()) {
+                is ClipboardResult.FileResult -> {
+                    attachedFiles.add(result.file)
+                    println("[ChatScreen] Pasted file from clipboard: ${result.file.name}")
+                }
+                is ClipboardResult.TextResult -> {
+                    viewModel.requestTextPaste(result.text)
+                    println("[ChatScreen] Pasted text from clipboard, length=${result.text.length}")
+                }
+                null -> { /* nothing on clipboard */ }
             }
         }
     }
@@ -232,57 +253,85 @@ fun ChatScreen(
         }
     }
 
-    Column(Modifier.fillMaxSize()) {
-        // Connection banner (shows/hides based on state)
-        ConnectionBanner(
-            state = connectionState,
-            onRetry = { scope.launch { viewModel.initialize(project.basePath ?: ".") } }
-        )
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            // Connection banner (shows/hides based on state)
+            ConnectionBanner(
+                state = connectionState,
+                onRetry = { scope.launch { viewModel.initialize(project.basePath ?: ".") } }
+            )
 
-        // Message list (fills remaining space)
-        MessageList(
-            messages = messages,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            project = project
-        )
+            // Message list (fills remaining space)
+            MessageList(
+                messages = messages,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                project = project
+            )
 
-        // Permission prompt (shows/hides based on state)
-        permissionPrompt?.let { prompt ->
-            PermissionPrompt(
-                prompt = prompt,
-                onRespond = { response ->
-                    scope.launch { viewModel.respondPermission(response) }
-                }
+            // Permission prompt (shows/hides based on state)
+            permissionPrompt?.let { prompt ->
+                PermissionPrompt(
+                    prompt = prompt,
+                    onRespond = { response ->
+                        scope.launch { viewModel.respondPermission(response) }
+                    }
+                )
+            }
+
+            // Input area (always visible at bottom, disabled when disconnected or permission active)
+            val inputEnabled = connectionState == ConnectionState.CONNECTED && permissionPrompt == null
+            InputArea(
+                enabled = inputEnabled,
+                isStreaming = isStreaming,
+                controlState = controlState,
+                onSend = { text ->
+                    scope.launch {
+                        viewModel.sendMessage(text, attachedFiles.toList())
+                        attachedFiles.clear()
+                    }
+                },
+                onCancel = { scope.launch { viewModel.cancel() } },
+                onAgentChanged = { viewModel.selectAgent(it) },
+                onModelChanged = { viewModel.selectModel(it) },
+                onThinkingChanged = { viewModel.selectThinkingEffort(it) },
+                attachedFiles = attachedFiles,
+                onAttachFile = { file -> attachedFiles.add(file) },
+                onRemoveFile = onRemoveFile,
+                onImagePasted = { file -> attachedFiles.add(file) },
+                onImagePreview = { uri -> previewImageUri = uri },
+                pasteTextSignal = viewModel.pasteTextSignal,
+                recentFiles = recentFiles,
+                searchResults = searchResults,
+                onSearch = onSearch,
+                onFilesAndFolders = onFilesAndFolders,
+                onImage = onImage,
+                onRecentFileClick = onRecentFileClick,
             )
         }
 
-        // Input area (always visible at bottom, disabled when disconnected or permission active)
-        val inputEnabled = connectionState == ConnectionState.CONNECTED && permissionPrompt == null
-        InputArea(
-            enabled = inputEnabled,
-            isStreaming = isStreaming,
-            controlState = controlState,
-            onSend = { text ->
-                scope.launch {
-                    viewModel.sendMessage(text, attachedFiles.toList())
-                    attachedFiles.clear()
+        // Image preview overlay — centered in the entire plugin window
+        previewImageUri?.let { uri ->
+            val bitmap = remember(uri) { decodeDataUriToBitmap(uri) }
+            if (bitmap != null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color(0x88000000))
+                        .clickable { previewImageUri = null },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ComposeImage(
+                        bitmap = bitmap,
+                        contentDescription = "Preview",
+                        modifier = Modifier
+                            .fillMaxWidth(0.85f)
+                            .fillMaxHeight(0.85f)
+                            .clip(RoundedCornerShape(8.dp)),
+                        contentScale = ContentScale.Fit,
+                    )
                 }
-            },
-            onCancel = { scope.launch { viewModel.cancel() } },
-            onAgentChanged = { viewModel.selectAgent(it) },
-            onModelChanged = { viewModel.selectModel(it) },
-            onThinkingChanged = { viewModel.selectThinkingEffort(it) },
-            attachedFiles = attachedFiles,
-            onAttachFile = { file -> attachedFiles.add(file) },
-            onRemoveFile = onRemoveFile,
-            onImagePasted = { file -> attachedFiles.add(file) },
-            recentFiles = recentFiles,
-            searchResults = searchResults,
-            onSearch = onSearch,
-            onFilesAndFolders = onFilesAndFolders,
-            onImage = onImage,
-            onRecentFileClick = onRecentFileClick,
-        )
+            }
+        }
     }
 }
 

@@ -12,7 +12,7 @@ import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.client.HttpClient
-import io.ktor.client.engine.cio.CIO
+import io.ktor.client.engine.java.Java
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.sse.SSE
 import io.ktor.serialization.kotlinx.json.json
@@ -57,9 +57,18 @@ class ChatViewModel(
     private val _pasteImageSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val pasteImageSignal = _pasteImageSignal.asSharedFlow()
 
+    /** Signal emitted when Ctrl+V finds text on the clipboard. Carries the text to insert. */
+    private val _pasteTextSignal = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val pasteTextSignal = _pasteTextSignal.asSharedFlow()
+
     /** Emits a signal to check the clipboard for an image. Called by the IntelliJ Ctrl+V action. */
     fun requestImagePaste() {
         _pasteImageSignal.tryEmit(Unit)
+    }
+
+    /** Emits a signal to insert text into the input field. Called by the paste handler. */
+    fun requestTextPaste(text: String) {
+        _pasteTextSignal.tryEmit(text)
     }
 
     // --- Internal: OpenCode engine connection ---
@@ -148,7 +157,7 @@ class ChatViewModel(
 
             // Create HTTP client and OpenCodeClient
             logger.info { "Creating HTTP client for $host:$port" }
-            val client = HttpClient(CIO) {
+            val client = HttpClient(Java) {
                 install(ContentNegotiation) {
                     json(Json {
                         ignoreUnknownKeys = true
@@ -228,9 +237,17 @@ class ChatViewModel(
                     }
                 }
                 logger.info { "Loaded ${models.size} models from ${providerResponse.all.size} providers" }
+                // Restore last selected model, or fall back to first
+                val savedKey = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance()
+                    .lastSelectedModelKey
+                val restoredModel = if (savedKey.isNotEmpty()) {
+                    models.find {
+                        com.opencode.acp.config.settings.OpenCodeSettingsState.modelKey(it.providerID, it.modelID) == savedKey
+                    }
+                } else null
                 _controlState.value = _controlState.value.copy(
                     models = models,
-                    selectedModel = models.firstOrNull()
+                    selectedModel = restoredModel ?: models.firstOrNull()
                 )
             } catch (e: Exception) {
                 logger.warn(e) { "Failed to load providers (non-fatal)" }
@@ -259,6 +276,10 @@ class ChatViewModel(
 
     fun selectModel(model: ProviderModel) {
         _controlState.value = _controlState.value.copy(selectedModel = model)
+        // Persist selection across sessions
+        val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance()
+        settings.lastSelectedModelKey =
+            com.opencode.acp.config.settings.OpenCodeSettingsState.modelKey(model.providerID, model.modelID)
     }
 
     fun selectThinkingEffort(effort: ThinkingEffort) {

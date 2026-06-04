@@ -95,28 +95,25 @@ class OpenCodeSettingsPanel {
         .addComponent(statusLabel)
         .panel
 
-    fun setState(state: OpenCodeSettingsState.State) {
-        binaryPathField.text = state.binaryPath
-        timeoutField.text = state.permissionTimeoutSeconds.toString()
-        inlineCodeColorField.text = state.inlineCodeColor
-        listNumberColorField.text = state.listNumberColor
+    fun setState(settings: OpenCodeSettingsState) {
+        binaryPathField.text = settings.binaryPath
+        timeoutField.text = settings.permissionTimeoutSeconds.toString()
+        inlineCodeColorField.text = settings.inlineCodeColor
+        listNumberColorField.text = settings.listNumberColor
     }
 
-    fun getState(): OpenCodeSettingsState.State {
-        return OpenCodeSettingsState.State(
-            binaryPath = binaryPathField.text.trim(),
-            permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60,
-            inlineCodeColor = inlineCodeColorField.text.trim(),
-            listNumberColor = listNumberColorField.text.trim(),
-        )
+    fun applyTo(settings: OpenCodeSettingsState) {
+        settings.binaryPath = binaryPathField.text.trim()
+        settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60
+        settings.inlineCodeColor = inlineCodeColorField.text.trim()
+        settings.listNumberColor = listNumberColorField.text.trim()
     }
 
-    fun isModified(state: OpenCodeSettingsState.State): Boolean {
-        val currentState = getState()
-        return currentState.binaryPath != state.binaryPath ||
-                currentState.permissionTimeoutSeconds != state.permissionTimeoutSeconds ||
-                currentState.inlineCodeColor != state.inlineCodeColor ||
-                currentState.listNumberColor != state.listNumberColor
+    fun isModified(settings: OpenCodeSettingsState): Boolean {
+        return binaryPathField.text.trim() != settings.binaryPath ||
+                (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
+                inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
+                listNumberColorField.text.trim() != settings.listNumberColor
     }
 
     private fun showStatus(msg: String, success: Boolean) {

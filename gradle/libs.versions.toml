@@ -26,7 +26,7 @@ kotlinx-collections-immutable = { group = "org.jetbrains.kotlinx", name = "kotli
 
 # Ktor
 ktor-client-core = { group = "io.ktor", name = "ktor-client-core", version.ref = "ktor" }
-ktor-client-cio = { group = "io.ktor", name = "ktor-client-cio", version.ref = "ktor" }
+ktor-client-java = { group = "io.ktor", name = "ktor-client-java", version.ref = "ktor" }
 ktor-client-content-negotiation = { group = "io.ktor", name = "ktor-client-content-negotiation", version.ref = "ktor" }
 ktor-serialization-json = { group = "io.ktor", name = "ktor-serialization-kotlinx-json", version.ref = "ktor" }
 
@@ -51,7 +51,7 @@ wiremock = { group = "org.wiremock", name = "wiremock-standalone", version.ref =
 
 [bundles]
 acp = ["acp-sdk"]
-ktor-client = ["ktor-client-core", "ktor-client-cio", "ktor-client-content-negotiation", "ktor-serialization-json"]
+ktor-client = ["ktor-client-core", "ktor-client-java", "ktor-client-content-negotiation", "ktor-serialization-json"]
 kotlinx = ["kotlinx-serialization-json", "kotlinx-coroutines-core", "kotlinx-collections-immutable"]
 flexmark = ["flexmark-core", "flexmark-ext-strikethrough", "flexmark-ext-tables"]
 test = ["junit-api", "junit-engine", "kotest-runner", "kotest-assertions", "kotlinx-coroutines-test"]

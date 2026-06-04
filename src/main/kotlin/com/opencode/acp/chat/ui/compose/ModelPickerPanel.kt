@@ -112,16 +112,20 @@ fun ModelPickerPanel(
     val searchFocusRequester = remember { FocusRequester() }
     val searchQuery = searchState.text.toString()
 
-    // Collapsible section state — all expanded by default
-    var favoritesExpanded by remember { mutableStateOf(true) }
-    val providerExpanded = remember { mutableStateOf(mutableMapOf<String, Boolean>()) }
-
     // Track favorites version to trigger recomposition when favorites change
     var favoritesVersion by remember { mutableIntStateOf(0) }
 
     // Group models: favorites first, then by provider
     val grouped = remember(models, searchQuery, favoritesVersion) {
         buildModelGroups(models, settings, searchQuery)
+    }
+
+    // Collapsible section state — providers collapsed by default when favorites exist
+    var favoritesExpanded by remember { mutableStateOf(true) }
+    val providerExpanded = remember {
+        mutableStateOf(
+            grouped.providers.keys.associateWith { grouped.favorites.isEmpty() }.toMutableMap()
+        )
     }
 
     // Auto-focus search field

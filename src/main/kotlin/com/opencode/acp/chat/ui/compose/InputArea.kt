@@ -1,5 +1,6 @@
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -8,15 +9,21 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.rememberTextFieldState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -36,17 +43,22 @@ import androidx.compose.ui.draganddrop.dragData
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.node.ModifierNodeElement
 import androidx.compose.ui.platform.InspectorInfo
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.intellij.icons.AllIcons
@@ -58,7 +70,6 @@ import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.component.TextArea
 import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
@@ -77,24 +88,22 @@ data class AttachedFile(
     val dataUri: String
 )
 
+/** Result of reading the clipboard — either an image/file attachment or plain text. */
+sealed class ClipboardResult {
+    data class FileResult(val file: AttachedFile) : ClipboardResult()
+    data class TextResult(val text: String) : ClipboardResult()
+}
+
 /**
- * Reads an image or image file from the system clipboard.
- * Returns an AttachedFile with a data URI if an image is present, null otherwise.
- *
- * Clipboard may contain images in different formats:
- * - DataFlavor.imageFlavor (e.g. screenshot via Print Screen)
- * - DataFlavor.javaFileListFlavor (e.g. copied image file from file manager)
+ * Reads the system clipboard for images, files, or text.
+ * Returns [ClipboardResult] if content is present, null otherwise.
  *
  * AWT clipboard access MUST happen on the Event Dispatch Thread.
  */
-suspend fun readClipboardImage(): AttachedFile? {
-    // Read clipboard — in IntelliJ, the Compose UI thread IS the AWT EDT,
-    // so we can check directly. For safety, we detect the thread context.
+suspend fun readClipboardContent(): ClipboardResult? {
     val clipResult: Any? = if (java.awt.EventQueue.isDispatchThread()) {
-        // Already on EDT — read clipboard directly
         readClipboardOnEdt()
     } else {
-        // Not on EDT — dispatch to EDT and wait
         withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 var result: Any? = null
@@ -109,7 +118,6 @@ suspend fun readClipboardImage(): AttachedFile? {
         }
     }
 
-    // Process clipboard data on IO dispatcher
     return withContext(Dispatchers.IO) {
         try {
             when (clipResult) {
@@ -121,26 +129,30 @@ suspend fun readClipboardImage(): AttachedFile? {
                     val base64 = Base64.getEncoder().encodeToString(bytes)
                     val dataUri = "data:image/png;base64,$base64"
                     println("[ClipboardPaste] Created data URI from image, size=${bytes.size} bytes")
-                    AttachedFile(name = "clipboard-image.png", path = "", mime = "image/png", dataUri = dataUri)
+                    ClipboardResult.FileResult(AttachedFile(name = "clipboard-image.png", path = "", mime = "image/png", dataUri = dataUri))
                 }
                 is List<*> -> {
-                    // List of image files from clipboard
                     val files = clipResult.filterIsInstance<java.io.File>()
                     if (files.isEmpty()) return@withContext null
-                    // Attach the first image file
-                    files.first().toAttachedFile()
+                    ClipboardResult.FileResult(files.first().toAttachedFile())
+                }
+                is String -> {
+                    if (clipResult.isNotBlank()) {
+                        println("[ClipboardPaste] Got text from clipboard, length=${clipResult.length}")
+                        ClipboardResult.TextResult(clipResult)
+                    } else null
                 }
                 else -> null
             }
         } catch (e: Exception) {
-            println("[ClipboardPaste] Image processing failed: ${e.message}")
+            println("[ClipboardPaste] Processing failed: ${e.message}")
             null
         }
     }
 }
 
 /**
- * Reads clipboard content on the EDT. Returns java.awt.Image, List<java.io.File>, or null.
+ * Reads clipboard content on the EDT. Returns java.awt.Image, List<java.io.File>, String (text), or null.
  */
 private fun readClipboardOnEdt(): Any? {
     try {
@@ -181,7 +193,30 @@ private fun readClipboardOnEdt(): Any? {
             }
         }
 
-        println("[ClipboardPaste] No image or image file found in clipboard")
+        // 3. Try stringFlavor / plain text (text paste from editors, browsers, etc.)
+        for (flavor in flavors) {
+            if (flavor.mimeType.startsWith("text/plain") && flavor.isRepresentationClassReader) {
+                try {
+                    val reader = transferable.getTransferData(flavor) as? java.io.Reader
+                    if (reader != null) {
+                        val text = reader.readText()
+                        if (text.isNotBlank()) {
+                            println("[ClipboardPaste] Got plain text from flavor: ${flavor.humanPresentableName}, length=${text.length}")
+                            return text
+                        }
+                    }
+                } catch (_: Exception) { }
+            }
+        }
+        if (transferable.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+            val text = transferable.getTransferData(DataFlavor.stringFlavor) as? String
+            if (!text.isNullOrBlank()) {
+                println("[ClipboardPaste] Got text from stringFlavor, length=${text.length}")
+                return text
+            }
+        }
+
+        println("[ClipboardPaste] No image, file, or text found in clipboard")
     } catch (e: Exception) {
         println("[ClipboardPaste] EDT clipboard read failed: ${e.message}")
     }
@@ -260,6 +295,8 @@ fun InputArea(
     onAttachFile: (AttachedFile) -> Unit = {},
     onRemoveFile: (Int) -> Unit = {},
     onImagePasted: (AttachedFile) -> Unit = {},
+    onImagePreview: (String) -> Unit = {},
+    pasteTextSignal: kotlinx.coroutines.flow.SharedFlow<String>? = null,
     recentFiles: List<RecentFile> = emptyList(),
     searchResults: List<RecentFile> = emptyList(),
     onSearch: (String) -> Unit = {},
@@ -371,6 +408,19 @@ fun InputArea(
         focusRequester.requestFocus()
     }
 
+    // Collect text paste signals and insert into text field
+    if (pasteTextSignal != null) {
+        LaunchedEffect(pasteTextSignal) {
+            pasteTextSignal.collect { text ->
+                val cursorPos = textState.selection.start
+                textState.edit {
+                    replace(cursorPos, cursorPos, text)
+                }
+                println("[InputArea] Pasted text from clipboard, length=${text.length}")
+            }
+        }
+    }
+
     val inputBg = Color(0xFF2B2B2B)
     val inputBorder = Color(0xFF3E3E3E)
     val mutedText = Color(0xFF808080)
@@ -400,173 +450,273 @@ fun InputArea(
                     )
                 ),
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.Bottom,
-            ) {
-                // Attach button — opens the attach menu popup
-                Box(
-                    modifier = Modifier
-                        .size(32.dp)
-                        .clip(CircleShape)
-                        .clickable(enabled = enabled) {
-                            showAttachMenu = !showAttachMenu
-                            println("[InputArea] Attach button clicked, showAttachMenu=$showAttachMenu, recentFiles=${recentFiles.size}")
-                        }
-                        .padding(8.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add),
-                        contentDescription = "Attach",
-                        modifier = Modifier.size(16.dp),
-                        tint = mutedText,
-                    )
-
-                    // Attach menu popup anchored to the + button
-                    if (showAttachMenu) {
-                        println("[InputArea] Showing AttachMenu popup with ${recentFiles.size} recentFiles")
-                        Popup(
-                            alignment = Alignment.BottomStart,
-                            offset = IntOffset(0, 4),
-                            properties = PopupProperties(
-                                focusable = true,
-                                dismissOnBackPress = true,
-                                dismissOnClickOutside = true,
-                            ),
-                            onDismissRequest = { showAttachMenu = false },
-                        ) {
-                            AttachMenu(
-                                recentFiles = recentFiles,
-                                searchResults = searchResults,
-                                onFilesAndFolders = {
-                                    onFilesAndFolders()
-                                },
-                                onImage = {
-                                    onImage()
-                                },
-                                onRecentFileClick = { file ->
-                                    onRecentFileClick(file)
-                                },
-                                onDismiss = { showAttachMenu = false },
-                                onSearch = onSearch,
-                            )
+            Column {
+                // Attached images — thumbnails inside the box
+                if (attachedFiles.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        attachedFiles.forEachIndexed { index, file ->
+                            val isImage = file.mime.startsWith("image/")
+                            if (isImage) {
+                                // Image thumbnail with click-to-preview
+                                val bitmap = remember(file.dataUri) {
+                                    decodeDataUriToBitmap(file.dataUri)
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(Color(0xFF3E3E3E))
+                                        .clickable { onImagePreview(file.dataUri) },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    if (bitmap != null) {
+                                        ComposeImage(
+                                            bitmap = bitmap,
+                                            contentDescription = file.name,
+                                            modifier = Modifier
+                                                .size(48.dp)
+                                                .clip(RoundedCornerShape(6.dp)),
+                                            contentScale = ContentScale.Crop,
+                                        )
+                                    } else {
+                                        Icon(
+                                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.FileTypes.Image),
+                                            contentDescription = file.name,
+                                            modifier = Modifier.size(20.dp),
+                                            tint = Color(0xFFBBBBBB),
+                                        )
+                                    }
+                                    // Remove button overlay
+                                    Box(
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .size(16.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF555555))
+                                            .clickable { onRemoveFile(index) },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
+                                            contentDescription = "Remove",
+                                            modifier = Modifier.size(10.dp),
+                                            tint = Color(0xFFCCCCCC),
+                                        )
+                                    }
+                                }
+                            } else {
+                                // Non-image file pill
+                                Row(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(Color(0xFF3E3E3E))
+                                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.FileTypes.Text),
+                                        contentDescription = null,
+                                        modifier = Modifier.size(14.dp),
+                                        tint = Color(0xFFBBBBBB),
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = file.name,
+                                        fontSize = 11.sp,
+                                        color = Color(0xFFBBBBBB),
+                                        maxLines = 1,
+                                        modifier = Modifier.widthIn(max = 120.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .size(14.dp)
+                                            .clip(CircleShape)
+                                            .clickable { onRemoveFile(index) },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
+                                            contentDescription = "Remove",
+                                            modifier = Modifier.size(10.dp),
+                                            tint = Color(0xFF808080),
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
-                // Text area
-                TextArea(
-                    state = textState,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(40.dp)
-                        .focusRequester(focusRequester)
-                        .onPreviewKeyEvent { event ->
-                            if (event.type == KeyEventType.KeyDown) {
-                                when {
-                                    event.key == Key.Enter && !event.isShiftPressed -> {
-                                        val text = textState.text.toString().trim()
-                                        if (text.isNotEmpty()) {
-                                            onSend(text)
-                                            textState.edit { replace(0, length, "") }
-                                        }
-                                        true
-                                    }
-                                    event.key == Key.Enter && event.isShiftPressed -> false
-                                    event.key == Key.Escape -> {
-                                        if (showAttachMenu) {
-                                            showAttachMenu = false
-                                            true
-                                        } else {
-                                            onCancel()
-                                            true
-                                        }
-                                    }
-                                    else -> false
-                                }
-                            } else false
-                        },
-                    enabled = enabled,
-                    placeholder = { Text("Type a message...", color = mutedText) },
-                )
-
-                // Send / Stop button — green rounded rect (play) or red square (stop)
-                Box(
-                    modifier = Modifier
-                        .size(32.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(
-                            if (isStreaming) stopRed else accentGreen
-                        )
-                        .clickable(enabled = enabled) {
-                            if (isStreaming) {
-                                onCancel()
-                            } else {
-                                val text = textState.text.toString().trim()
-                                if (text.isNotEmpty()) {
-                                    onSend(text)
-                                    textState.edit { replace(0, length, "") }
-                                }
-                            }
-                        },
-                    contentAlignment = Alignment.Center,
+                // Buttons row: + button | Text area | Send button
+                Row(
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.Bottom,
                 ) {
-                    Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(
-                            if (isStreaming) AllIcons.Actions.Suspend
-                            else AllIcons.Actions.MoveUp
-                        ),
-                        contentDescription = if (isStreaming) "Stop" else "Send",
-                        modifier = Modifier.size(16.dp),
-                        tint = Color.White,
-                    )
-                }
-            }
-        }
-
-        // Attached file pills
-        if (attachedFiles.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(6.dp))
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                attachedFiles.forEachIndexed { index, file ->
-                    Row(
+                    // Attach button — opens the attach menu popup
+                    Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(Color(0xFF3E3E3E))
-                            .padding(horizontal = 6.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                            .size(32.dp)
+                            .clip(CircleShape)
+                            .clickable(enabled = enabled) {
+                                showAttachMenu = !showAttachMenu
+                                println("[InputArea] Attach button clicked, showAttachMenu=$showAttachMenu, recentFiles=${recentFiles.size}")
+                            }
+                            .padding(8.dp),
+                        contentAlignment = Alignment.Center,
                     ) {
                         Icon(
-                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.FileTypes.Text),
-                            contentDescription = null,
-                            modifier = Modifier.size(14.dp),
-                            tint = Color(0xFFBBBBBB),
+                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add),
+                            contentDescription = "Attach",
+                            modifier = Modifier.size(16.dp),
+                            tint = mutedText,
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = file.name,
-                            fontSize = 11.sp,
-                            color = Color(0xFFBBBBBB),
-                            maxLines = 1,
-                            modifier = Modifier.widthIn(max = 120.dp),
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
+
+                        // Attach menu popup anchored to the + button
+                        if (showAttachMenu) {
+                            println("[InputArea] Showing AttachMenu popup with ${recentFiles.size} recentFiles")
+                            Popup(
+                                alignment = Alignment.BottomStart,
+                                offset = IntOffset(0, 4),
+                                properties = PopupProperties(
+                                    focusable = true,
+                                    dismissOnBackPress = true,
+                                    dismissOnClickOutside = true,
+                                ),
+                                onDismissRequest = { showAttachMenu = false },
+                            ) {
+                                AttachMenu(
+                                    recentFiles = recentFiles,
+                                    searchResults = searchResults,
+                                    onFilesAndFolders = {
+                                        onFilesAndFolders()
+                                    },
+                                    onImage = {
+                                        onImage()
+                                    },
+                                    onRecentFileClick = { file ->
+                                        onRecentFileClick(file)
+                                    },
+                                    onDismiss = { showAttachMenu = false },
+                                    onSearch = onSearch,
+                                )
+                            }
+                        }
+                    }
+
+                    // Text area — grows with content, max ~7 lines
+                    val scrollState = rememberScrollState()
+                    val lineCount = textState.text.lines().size.coerceAtLeast(1)
+                    val maxLines = 7
+                    val lineHeight = 20.dp
+                    val targetHeight = (lineCount.coerceAtMost(maxLines) * lineHeight.value).dp + 16.dp // 16dp for vertical padding
+                    val textFieldHeight = targetHeight.coerceIn(40.dp, 156.dp)
+
+                    BasicTextField(
+                        state = textState,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(textFieldHeight)
+                            .focusRequester(focusRequester)
+                            .onPreviewKeyEvent { event ->
+                                if (event.type == KeyEventType.KeyDown) {
+                                    when {
+                                        event.key == Key.Enter && !event.isShiftPressed -> {
+                                            val text = textState.text.toString().trim()
+                                            if (text.isNotEmpty()) {
+                                                onSend(text)
+                                                textState.edit { replace(0, length, "") }
+                                            }
+                                            true
+                                        }
+                                        event.key == Key.Enter && event.isShiftPressed -> {
+                                            // Explicitly insert newline — CMP BasicTextField
+                                            // doesn't always handle this via pass-through
+                                            val pos = textState.selection.start
+                                            textState.edit { replace(pos, pos, "\n") }
+                                            true
+                                        }
+                                        event.key == Key.Escape -> {
+                                            if (showAttachMenu) {
+                                                showAttachMenu = false
+                                                true
+                                            } else {
+                                                onCancel()
+                                                true
+                                            }
+                                        }
+                                        else -> false
+                                    }
+                                } else false
+                            },
+                        enabled = enabled,
+                        cursorBrush = SolidColor(Color.White),
+                        textStyle = TextStyle(
+                            color = Color(0xFFCCCCCC),
+                            fontSize = 13.sp,
+                        ),
+                        decorator = { innerTextField ->
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .verticalScroll(scrollState),
+                                contentAlignment = Alignment.CenterStart,
+                            ) {
+                                if (textState.text.isEmpty()) {
+                                    Text(
+                                        text = "Type a message...",
+                                        color = mutedText,
+                                        fontSize = 13.sp,
+                                    )
+                                }
+                                innerTextField()
+                            }
+                        },
+                    )
+
+                    // Send / Stop button
+                    if (isStreaming) {
+                        // Streaming: red outlined square with small filled square inside
                         Box(
                             modifier = Modifier
-                                .size(14.dp)
-                                .clip(CircleShape)
-                                .clickable { onRemoveFile(index) },
+                                .size(28.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .border(2.dp, stopRed, RoundedCornerShape(6.dp))
+                                .clickable(enabled = enabled) { onCancel() },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(stopRed),
+                            )
+                        }
+                    } else {
+                        // Idle: bordered rounded rect with play triangle
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .border(1.dp, Color(0xFF555555), RoundedCornerShape(6.dp))
+                                .clickable(enabled = enabled) {
+                                    val text = textState.text.toString().trim()
+                                    if (text.isNotEmpty()) {
+                                        onSend(text)
+                                        textState.edit { replace(0, length, "") }
+                                    }
+                                },
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
-                                key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
-                                contentDescription = "Remove",
-                                modifier = Modifier.size(10.dp),
-                                tint = Color(0xFF808080),
+                                key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute),
+                                contentDescription = "Send",
+                                modifier = Modifier.size(16.dp),
+                                tint = Color(0xFFCCCCCC),
                             )
                         }
                     }
@@ -624,6 +774,29 @@ fun InputArea(
             Spacer(modifier = Modifier.weight(1f))
         }
     }
+}
+
+/**
+ * Decodes a data URI string into an AWT [BufferedImage], or returns null if decoding fails.
+ * Supports data URIs in the format: data:<mime>;base64,<encoded>
+ */
+internal fun decodeDataUriToImage(dataUri: String): BufferedImage? {
+    try {
+        val base64Data = if (dataUri.contains(",")) dataUri.substringAfter(",") else dataUri
+        val bytes = Base64.getDecoder().decode(base64Data)
+        val inputStream = bytes.inputStream()
+        return ImageIO.read(inputStream)
+    } catch (e: Exception) {
+        return null
+    }
+}
+
+/**
+ * Decodes a data URI into a Compose [ImageBitmap], or null if not an image or decoding fails.
+ */
+internal fun decodeDataUriToBitmap(dataUri: String): ImageBitmap? {
+    val bufferedImage = decodeDataUriToImage(dataUri) ?: return null
+    return bufferedImage.toComposeImageBitmap()
 }
 
 /**
