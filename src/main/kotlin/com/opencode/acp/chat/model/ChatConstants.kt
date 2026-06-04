@@ -7,4 +7,5 @@ object ChatConstants {
     const val PERMISSION_TIMEOUT_MS = 60_000L
     const val RECONNECT_DELAY_MS = 1_000L
     const val RECONNECT_MAX_DELAY_MS = 30_000L
+    const val SIDEBAR_WIDTH_DP = 260
 }

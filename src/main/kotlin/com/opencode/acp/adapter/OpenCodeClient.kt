@@ -338,11 +338,11 @@ class OpenCodeClient(
         sessionId: String,
         limit: Int? = null
     ): List<OpenCodeMessage> {
-        val response = httpClient.get("$baseUrl/session/$sessionId/message") {
-            applyAuth()
-            limit?.let { parameter("limit", it) }
+        val path = buildString {
+            append("/session/$sessionId/message")
+            if (limit != null) append("?limit=$limit")
         }
-        return json.decodeFromString(response.bodyAsText())
+        return getJson(path)
     }
 
     // -------------------------------------------------------------------------

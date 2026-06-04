@@ -104,3 +104,21 @@ enum class PermissionResponse(val optionId: String) {
     REJECT_ONCE("reject-once"),
     ALLOW_ALWAYS("allow-always")
 }
+
+/** Display model for a session in the sidebar list. */
+data class SessionItem(
+    val id: String,
+    val title: String,
+    val createdAt: Long,      // epoch millis from OpenCodeSession.time.created
+    val cost: Double,          // USD from OpenCodeSession.cost
+    val inputTokens: Long,     // from OpenCodeSession.tokens.input
+    val outputTokens: Long,    // from OpenCodeSession.tokens.output
+    val parentID: String? = null  // non-null for subtask sessions
+)
+
+/** Sealed state for the session list sidebar — distinguishes loading/error/loaded. */
+sealed interface SessionListState {
+    data object Loading : SessionListState
+    data class Loaded(val sessions: List<SessionItem>, val selectedId: String?) : SessionListState
+    data class Error(val message: String) : SessionListState
+}

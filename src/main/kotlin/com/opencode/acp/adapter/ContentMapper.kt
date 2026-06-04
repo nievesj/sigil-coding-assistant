@@ -68,6 +68,12 @@ class ContentMapper {
                     is OpenCodePart.File -> "[File: ${childPart.filename ?: childPart.url}]"
                     is OpenCodePart.ToolUse -> "[ToolUse: ${childPart.name} (${childPart.id})]"
                     is OpenCodePart.ToolResult -> "[ToolResult: ${childPart.toolUseId}]"
+                    is OpenCodePart.StepStart -> "[StepStart]"
+                    is OpenCodePart.StepFinish -> "[StepFinish]"
+                    is OpenCodePart.Thinking -> childPart.text
+                    is OpenCodePart.Reasoning -> childPart.text
+                    is OpenCodePart.Image -> "[Image: ${childPart.filename ?: childPart.url}]"
+                    is OpenCodePart.Unknown -> "[${childPart.type}]"
                 }
             }
             val fullText = if (part.isError) {
@@ -77,6 +83,12 @@ class ContentMapper {
             }
             ContentBlock.Text(text = fullText)
         }
+        is OpenCodePart.StepStart -> ContentBlock.Text(text = "[StepStart]")
+        is OpenCodePart.StepFinish -> ContentBlock.Text(text = "[StepFinish]")
+        is OpenCodePart.Thinking -> ContentBlock.Text(text = part.text)
+        is OpenCodePart.Reasoning -> ContentBlock.Text(text = part.text)
+        is OpenCodePart.Image -> ContentBlock.Text(text = "[Image: ${part.filename ?: part.url}]")
+        is OpenCodePart.Unknown -> ContentBlock.Text(text = "[${part.type}]")
     }
 
     /**

@@ -29,6 +29,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var listNumberColor: String = "#6BBE50"
     /** Last selected model key in format "providerID/modelID". */
     var lastSelectedModelKey: String = ""
+    /** Whether the session sidebar is visible. Persisted across tool window reopens. */
+    var sidebarVisible: Boolean = true
 
     override fun getState(): OpenCodeSettingsState {
         println("[OpenCodeSettings] getState() called — favorites=${favoriteModels}, lastModel=$lastSelectedModelKey")
@@ -43,6 +45,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         inlineCodeColor = state.inlineCodeColor
         listNumberColor = state.listNumberColor
         lastSelectedModelKey = state.lastSelectedModelKey
+        sidebarVisible = state.sidebarVisible
         println("[OpenCodeSettings] loadState() done — favorites=${favoriteModels}, lastModel=$lastSelectedModelKey")
     }
 

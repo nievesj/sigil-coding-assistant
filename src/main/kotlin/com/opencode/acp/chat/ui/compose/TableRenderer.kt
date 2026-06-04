@@ -64,7 +64,7 @@ fun ChatTable(
 
     // Calculate column widths based on content
     val allRows = listOf(table.header) + table.rows
-    val columnCount = table.header.size
+    val columnCount = allRows.maxOfOrNull { it.size } ?: table.header.size
     val columnWidths = remember(allRows) {
         List(columnCount) { col ->
             val maxWidth = allRows.maxOfOrNull { row ->
@@ -96,7 +96,7 @@ fun ChatTable(
                     fontWeight = FontWeight.Bold,
                     fontSize = cellFontSize,
                     modifier = Modifier
-                        .width(columnWidths[colIdx])
+                        .width(columnWidths.getOrElse(colIdx) { 100.dp })
                         .padding(horizontal = cellPaddingHorizontal),
                 )
             }
@@ -127,7 +127,7 @@ fun ChatTable(
                         color = cellTextColor,
                         fontSize = cellFontSize,
                         modifier = Modifier
-                            .width(columnWidths[colIdx])
+                            .width(columnWidths.getOrElse(colIdx) { 100.dp })
                             .padding(horizontal = cellPaddingHorizontal),
                     )
                 }

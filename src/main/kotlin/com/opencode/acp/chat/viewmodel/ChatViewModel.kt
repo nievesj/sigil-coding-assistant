@@ -5,6 +5,8 @@ import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.adapter.OpenCodePart
+import com.opencode.acp.adapter.toSessionItem
+import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.ui.compose.AttachedFile
 import com.opencode.acp.chat.util.generateId
@@ -28,6 +30,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import java.io.Closeable
 
@@ -61,6 +65,17 @@ class ChatViewModel(
     private val _pasteTextSignal = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val pasteTextSignal = _pasteTextSignal.asSharedFlow()
 
+    /** Session list state for the sidebar. */
+    private val _sessionListState = MutableStateFlow<SessionListState>(SessionListState.Loading)
+    val sessionListState: StateFlow<SessionListState> = _sessionListState.asStateFlow()
+
+    /** Whether the sidebar is visible. Persisted in settings. */
+    private val _isSidebarVisible = MutableStateFlow(OpenCodeSettingsState.getInstance().sidebarVisible)
+    val isSidebarVisible: StateFlow<Boolean> = _isSidebarVisible.asStateFlow()
+
+    /** Mutex to prevent concurrent session switches. NOT reentrant. */
+    private val switchMutex = Mutex()
+
     /** Emits a signal to check the clipboard for an image. Called by the IntelliJ Ctrl+V action. */
     fun requestImagePaste() {
         _pasteImageSignal.tryEmit(Unit)
@@ -69,6 +84,34 @@ class ChatViewModel(
     /** Emits a signal to insert text into the input field. Called by the paste handler. */
     fun requestTextPaste(text: String) {
         _pasteTextSignal.tryEmit(text)
+    }
+
+    /**
+     * Starts an SSE subscription for the given session, filtering events by sessionId.
+     * Returns the Job so the caller can cancel it.
+     */
+    private fun startSseSubscription(client: OpenCodeClient, targetSessionId: String): Job {
+        val capturedId = targetSessionId
+        return scope.launch {
+            client.subscribeGlobalEvents()
+                .filter { event -> event.sessionId == capturedId }
+                .collect { event -> handleSseEvent(event) }
+        }
+    }
+
+    private fun resetSessionState() {
+        _messages.value = emptyList()
+        messageIndex.clear()
+        toolCallIndex.clear()
+        _isStreaming.value = false
+        activeAssistantMessageId = null
+        firstTextChunkReceived = false
+        responseDeferred?.complete(Unit)
+        responseDeferred = null
+        _permissionPrompt.value = null
+        permissionTimeoutJob?.cancel()
+        permissionTimeoutJob = null
+        lastUserText = null
     }
 
     // --- Internal: OpenCode engine connection ---
@@ -203,11 +246,24 @@ class ChatViewModel(
                 logger.warn(e) { "Failed to load agents (non-fatal)" }
             }
 
-            // Create session (agent is per-message, not per-session)
-            logger.info { "Creating session" }
-            val session = opencodeClient.createSession()
-            sessionId = session.id
-            logger.info { "Session created: ${session.id}" }
+            // Load existing sessions instead of always creating a new one
+            loadSessions()
+
+            val existingSessions = (_sessionListState.value as? SessionListState.Loaded)?.sessions
+            if (!existingSessions.isNullOrEmpty()) {
+                switchSession(existingSessions.first().id)
+                if (sessionId == null) {
+                    createAndSwitchSession()
+                }
+            } else {
+                createAndSwitchSession()
+            }
+
+            if (sessionId == null) {
+                _connectionState.value = ConnectionState.ERROR
+                logger.error { "Failed to establish an active session" }
+                return
+            }
 
             // Select the default agent in the control state
             if (defaultAgent != null) {
@@ -254,13 +310,8 @@ class ChatViewModel(
             }
 
             // Subscribe to global SSE events (long-lived background subscription)
-            val currentSessionId = sessionId ?: return
-            logger.info { "Subscribing to SSE events for session $currentSessionId" }
-            sseJob = scope.launch {
-                opencodeClient.subscribeGlobalEvents()
-                    .filter { event -> event.sessionId == currentSessionId }
-                    .collect { event -> handleSseEvent(event) }
-            }
+            logger.info { "Subscribing to SSE events for session ${sessionId!!}" }
+            sseJob = startSseSubscription(opencodeClient, sessionId!!)
 
             _connectionState.value = ConnectionState.CONNECTED
             logger.info { "Connected to OpenCode successfully" }
@@ -284,6 +335,149 @@ class ChatViewModel(
 
     fun selectThinkingEffort(effort: ThinkingEffort) {
         _controlState.value = _controlState.value.copy(thinkingEffort = effort)
+    }
+
+    fun toggleSidebar() {
+        val newValue = !_isSidebarVisible.value
+        _isSidebarVisible.value = newValue
+        OpenCodeSettingsState.getInstance().sidebarVisible = newValue
+    }
+
+    suspend fun loadSessions() {
+        val client = openCodeClient ?: return
+        try {
+            val sessionList = client.listSessions()
+            val currentId = sessionId
+            // TODO: Filter by current project's projectID when multi-project support is added.
+            val items = sessionList
+                .sortedByDescending { it.time?.updated ?: it.time?.created ?: 0L }
+                .map { it.toSessionItem() }
+            _sessionListState.value = SessionListState.Loaded(
+                sessions = items,
+                selectedId = currentId
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn(e) { "Failed to load sessions" }
+            _sessionListState.value = SessionListState.Error(
+                e.message ?: "Failed to load sessions"
+            )
+        }
+    }
+
+    suspend fun switchSession(targetSessionId: String) {
+        switchMutex.withLock {
+            val client = openCodeClient ?: return
+            if (sessionId == targetSessionId) return
+
+            val previousSessionId = sessionId
+
+            try {
+                sseJob?.cancel()
+                sseJob = null
+                try { cancel() } catch (_: Exception) { /* best-effort */ }
+                resetSessionState()
+
+                val messages = client.listMessages(targetSessionId, limit = null)
+                sessionId = targetSessionId
+
+                val chatMessages = messages.map { it.toChatMessage() }
+                _messages.value = chatMessages
+                chatMessages.forEachIndexed { i, msg -> messageIndex[msg.id] = i }
+                chatMessages.forEach { msg ->
+                    msg.toolCalls.forEach { pill -> toolCallIndex[pill.toolCallId] = msg.id }
+                }
+
+                sseJob = startSseSubscription(client, targetSessionId)
+                updateSessionSelection(targetSessionId)
+                logger.info { "Switched to session $targetSessionId (${chatMessages.size} messages loaded)" }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(e) { "Failed to switch session $targetSessionId" }
+                sessionId = previousSessionId
+                updateSessionSelection(previousSessionId)
+                if (previousSessionId != null) {
+                    try {
+                        val msgs = client.listMessages(previousSessionId, limit = null)
+                        val chatMsgs = msgs.map { it.toChatMessage() }
+                        _messages.value = chatMsgs
+                        chatMsgs.forEachIndexed { i, msg -> messageIndex[msg.id] = i }
+                        chatMsgs.forEach { msg ->
+                            msg.toolCalls.forEach { pill -> toolCallIndex[pill.toolCallId] = msg.id }
+                        }
+                        sseJob = startSseSubscription(client, previousSessionId)
+                    } catch (_: Exception) {
+                        // Revert failed too — leave empty state
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun createAndSwitchSession(title: String? = null) {
+        val client = openCodeClient ?: return
+
+        val session = try {
+            client.createSession(title)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to create session" }
+            return
+        }
+
+        switchMutex.withLock {
+            try { cancel() } catch (_: Exception) { /* best-effort */ }
+            sseJob?.cancel()
+            sseJob = null
+            resetSessionState()
+            sessionId = session.id
+            sseJob = startSseSubscription(client, session.id)
+        }
+
+        loadSessions()
+        updateSessionSelection(session.id)
+        logger.info { "Created and switched to new session: ${session.id}" }
+    }
+
+    suspend fun archiveSession(targetSessionId: String) {
+        val client = openCodeClient ?: return
+        try {
+            val success = client.deleteSession(targetSessionId)
+            if (!success) {
+                logger.warn { "Server returned false for deleteSession($targetSessionId)" }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to archive session $targetSessionId" }
+            try { loadSessions() } catch (e2: Exception) { logger.warn(e2) { "Also failed to refresh sessions" } }
+            return
+        }
+
+        if (targetSessionId == sessionId) {
+            val previousSessionId = sessionId
+            createAndSwitchSession()
+            if (sessionId == previousSessionId) {
+                logger.error { "Failed to create replacement session after archiving active session" }
+                sessionId = null
+                resetSessionState()
+                updateSessionSelection(null)
+            }
+        } else {
+            loadSessions()
+        }
+
+        logger.info { "Archived session $targetSessionId" }
+    }
+
+    private fun updateSessionSelection(selectedId: String?) {
+        val current = _sessionListState.value
+        if (current is SessionListState.Loaded) {
+            _sessionListState.value = current.copy(selectedId = selectedId)
+        }
     }
 
     /** Send a user message to the OpenCode engine. Suspends until the response is complete. */

@@ -5,11 +5,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -32,6 +37,7 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
+import com.opencode.acp.chat.model.ChatConstants
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import kotlinx.coroutines.flow.collectLatest
@@ -123,6 +129,8 @@ fun ChatScreen(
     val controlState by viewModel.controlState.collectAsState()
     val isStreaming by viewModel.isStreaming.collectAsState()
     val permissionPrompt by viewModel.permissionPrompt.collectAsState()
+    val sessionListState by viewModel.sessionListState.collectAsState()
+    val isSidebarVisible by viewModel.isSidebarVisible.collectAsState()
     val scope = rememberCoroutineScope()
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
     var previewImageUri by remember { mutableStateOf<String?>(null) }
@@ -255,19 +263,45 @@ fun ChatScreen(
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            // Connection banner (shows/hides based on state)
-            ConnectionBanner(
-                state = connectionState,
-                onRetry = { scope.launch { viewModel.initialize(project.basePath ?: ".") } }
-            )
+            // Top section: sidebar + chat area
+            Row(modifier = Modifier.weight(1f)) {
+                // Sidebar — animated horizontal expand/collapse
+                AnimatedVisibility(
+                    visible = isSidebarVisible,
+                    enter = expandHorizontally(expandFrom = Alignment.Start),
+                    exit = shrinkHorizontally(shrinkTowards = Alignment.Start)
+                ) {
+                    SessionSidebar(
+                        state = sessionListState,
+                        onNewSession = { scope.launch { viewModel.createAndSwitchSession() } },
+                        onSessionSelected = { scope.launch { viewModel.switchSession(it) } },
+                        onSessionArchived = { scope.launch { viewModel.archiveSession(it) } },
+                        onRetry = { scope.launch { viewModel.loadSessions() } },
+                        modifier = Modifier.width(ChatConstants.SIDEBAR_WIDTH_DP.dp)
+                    )
+                }
+                // Main chat area
+                Column(modifier = Modifier.weight(1f)) {
+                    ChatHeader(
+                        isSidebarVisible = isSidebarVisible,
+                        onToggleSidebar = { viewModel.toggleSidebar() }
+                    )
+                    // Connection banner (shows/hides based on state)
+                    ConnectionBanner(
+                        state = connectionState,
+                        onRetry = { scope.launch { viewModel.initialize(project.basePath ?: ".") } }
+                    )
 
-            // Message list (fills remaining space)
-            MessageList(
-                messages = messages,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                project = project
-            )
+                    // Message list (fills remaining space)
+                    MessageList(
+                        messages = messages,
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        project = project
+                    )
+                }
+            }
 
+            // Bottom section spans full width (including sidebar)
             // Permission prompt (shows/hides based on state)
             permissionPrompt?.let { prompt ->
                 PermissionPrompt(
