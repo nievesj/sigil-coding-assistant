@@ -22,6 +22,8 @@
         <module name="intellij.libraries.skiko"/>
     </dependencies>
 
+    <depends optional="true">Git4Idea</depends>
+
     <extensions defaultExtensionNs="com.intellij">
         <applicationService
             serviceImplementation="com.opencode.acp.config.settings.OpenCodeSettingsState"/>

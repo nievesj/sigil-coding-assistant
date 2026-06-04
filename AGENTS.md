@@ -186,9 +186,33 @@ Use `IntelliJIconKey.fromPlatformIcon(AllIcons.X.Y)` to wrap for Jewel `Icon`.
 - `AllIcons.FileTypes.Kotlin` — use `AllIcons.Language.Kotlin` instead
 - `AllIcons.FileTypes.TypeScript` — use `AllIcons.FileTypes.JavaScript` instead
 - `AllIcons.FileTypes.Markdown` — use `AllIcons.FileTypes.Text` instead
-- `AllIcons.Nodes.Gradle` — use `AllIcons.Nodes.Gradle` (may exist but untested)
+- `AllIcons.Nodes.Gradle` — use `AllIcons.Nodes.Folder` as fallback (no Gradle-specific icon confirmed)
 - `AllIcons.FileTypes.Any_type` — use `AllIcons.FileTypes.Text` instead
 - `AllIcons.Nodes.File` — use `AllIcons.FileTypes.Text` instead
+
+### File Type Icon Mapping (Review Tab)
+
+The Review tab uses file type icons for visual identification. Use `getFileTypeIcon()` in `ReviewPanel.kt`:
+
+| Extension | Icon Constant |
+|-----------|--------------|
+| `.kt`, `.kts` | `AllIcons.Language.Kotlin` |
+| `.java` | `AllIcons.FileTypes.Java` |
+| `.xml` | `AllIcons.FileTypes.Xml` |
+| `.json` | `AllIcons.FileTypes.Json` |
+| `.yaml`, `.yml` | `AllIcons.FileTypes.Yaml` |
+| `.md`, `.txt`, `.properties`, `.gitignore` | `AllIcons.FileTypes.Text` |
+| `.js`, `.jsx`, `.ts`, `.tsx` | `AllIcons.FileTypes.JavaScript` |
+| `.css` | `AllIcons.FileTypes.Css` |
+| `.html`, `.htm` | `AllIcons.FileTypes.Html` |
+| `.py` | `AllIcons.Language.Python` |
+| `.rb` | `AllIcons.Language.Ruby` |
+| `.rs` | `AllIcons.Language.Rust` |
+| `.go` | `AllIcons.Language.GO` |
+| `.scala` | `AllIcons.Language.Scala` |
+| `.php` | `AllIcons.Language.Php` |
+| `.svg`, `.png`, `.jpg`, etc. | `AllIcons.FileTypes.Image` |
+| Default | `AllIcons.FileTypes.Text` |
 
 ---
 

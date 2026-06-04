@@ -170,4 +170,4 @@ data class SessionContext(
 )
 
 /** Sidebar tab identifiers. */
-enum class SidebarTab { SESSIONS, CONTEXT }
+enum class SidebarTab { SESSIONS, CONTEXT, REVIEW }

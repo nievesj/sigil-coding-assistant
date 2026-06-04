@@ -271,6 +271,7 @@ fun ChatScreen(
                     when (selectedSidebarTab) {
                         SidebarTab.SESSIONS -> ChatConstants.SIDEBAR_WIDTH_DP
                         SidebarTab.CONTEXT -> ChatConstants.SIDEBAR_CONTEXT_WIDTH_DP
+                        SidebarTab.REVIEW -> ChatConstants.SIDEBAR_REVIEW_WIDTH_DP
                     }
                 } else 0
                 val sidebarWidth by animateDpAsState(
@@ -290,6 +291,7 @@ fun ChatScreen(
                         onRetry = { scope.launch { viewModel.loadSessions() } },
                         onContextRetry = { viewModel.retryContextFetch() },
                         onShowDetails = { /* Context tab is already showing */ },
+                        project = project,
                         modifier = Modifier.width(sidebarWidth)
                     )
                 }

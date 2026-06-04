@@ -35,6 +35,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intellij.icons.AllIcons
+import com.intellij.openapi.project.Project
 import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.SessionItem
 import com.opencode.acp.chat.model.SessionListState
@@ -65,6 +66,7 @@ fun SessionSidebar(
     onRetry: () -> Unit,
     onContextRetry: () -> Unit,
     onShowDetails: () -> Unit,
+    project: Project,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -110,6 +112,12 @@ fun SessionSidebar(
                     modifier = Modifier.weight(1f)
                 )
             }
+            SidebarTab.REVIEW -> {
+                ReviewPanel(
+                    project = project,
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
     }
 }
@@ -142,6 +150,12 @@ private fun SidebarTabRow(
             label = "Context",
             isSelected = selectedTab == SidebarTab.CONTEXT,
             onClick = { onTabSelected(SidebarTab.CONTEXT) },
+            modifier = Modifier.weight(1f)
+        )
+        SidebarTabButton(
+            label = "Review",
+            isSelected = selectedTab == SidebarTab.REVIEW,
+            onClick = { onTabSelected(SidebarTab.REVIEW) },
             modifier = Modifier.weight(1f)
         )
     }
