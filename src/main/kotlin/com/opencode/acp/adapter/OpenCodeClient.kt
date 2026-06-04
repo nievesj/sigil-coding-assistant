@@ -230,6 +230,13 @@ class OpenCodeClient(
         deleteSuccess("/session/$sessionId")
 
     /**
+     * Gets a single session by ID, including full token counts, cost, and model info.
+     * GET /session/{id}
+     */
+    suspend fun getSession(sessionId: String): OpenCodeSession =
+        getJson("/session/$sessionId")
+
+    /**
      * Aborts a running session.
      * POST /session/{id}/abort
      */

@@ -12,9 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandHorizontally
-import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -39,6 +37,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ChatConstants
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -131,6 +130,8 @@ fun ChatScreen(
     val permissionPrompt by viewModel.permissionPrompt.collectAsState()
     val sessionListState by viewModel.sessionListState.collectAsState()
     val isSidebarVisible by viewModel.isSidebarVisible.collectAsState()
+    val sessionContextState by viewModel.sessionContextState.collectAsState()
+    var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
     val scope = rememberCoroutineScope()
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
     var previewImageUri by remember { mutableStateOf<String?>(null) }
@@ -265,19 +266,31 @@ fun ChatScreen(
         Column(Modifier.fillMaxSize()) {
             // Top section: sidebar + chat area
             Row(modifier = Modifier.weight(1f)) {
-                // Sidebar — animated horizontal expand/collapse
-                AnimatedVisibility(
-                    visible = isSidebarVisible,
-                    enter = expandHorizontally(expandFrom = Alignment.Start),
-                    exit = shrinkHorizontally(shrinkTowards = Alignment.Start)
-                ) {
+                // Sidebar — animated width for show/hide and tab switching
+                val sidebarTargetWidth = if (isSidebarVisible) {
+                    when (selectedSidebarTab) {
+                        SidebarTab.SESSIONS -> ChatConstants.SIDEBAR_WIDTH_DP
+                        SidebarTab.CONTEXT -> ChatConstants.SIDEBAR_CONTEXT_WIDTH_DP
+                    }
+                } else 0
+                val sidebarWidth by animateDpAsState(
+                    targetValue = sidebarTargetWidth.dp,
+                    label = "sidebarWidth"
+                )
+
+                if (isSidebarVisible) {
                     SessionSidebar(
                         state = sessionListState,
+                        contextState = sessionContextState,
+                        selectedTab = selectedSidebarTab,
+                        onTabSelected = { selectedSidebarTab = it },
                         onNewSession = { scope.launch { viewModel.createAndSwitchSession() } },
                         onSessionSelected = { scope.launch { viewModel.switchSession(it) } },
                         onSessionArchived = { scope.launch { viewModel.archiveSession(it) } },
                         onRetry = { scope.launch { viewModel.loadSessions() } },
-                        modifier = Modifier.width(ChatConstants.SIDEBAR_WIDTH_DP.dp)
+                        onContextRetry = { viewModel.retryContextFetch() },
+                        onShowDetails = { /* Context tab is already showing */ },
+                        modifier = Modifier.width(sidebarWidth)
                     )
                 }
                 // Main chat area
@@ -318,6 +331,7 @@ fun ChatScreen(
                 enabled = inputEnabled,
                 isStreaming = isStreaming,
                 controlState = controlState,
+                contextState = sessionContextState,
                 onSend = { text ->
                     scope.launch {
                         viewModel.sendMessage(text, attachedFiles.toList())
@@ -328,6 +342,12 @@ fun ChatScreen(
                 onAgentChanged = { viewModel.selectAgent(it) },
                 onModelChanged = { viewModel.selectModel(it) },
                 onThinkingChanged = { viewModel.selectThinkingEffort(it) },
+                onShowContextDetails = {
+                    // Open sidebar and switch to context tab
+                    if (!isSidebarVisible) viewModel.toggleSidebar()
+                    selectedSidebarTab = SidebarTab.CONTEXT
+                },
+                onRetryContext = { viewModel.retryContextFetch() },
                 attachedFiles = attachedFiles,
                 onAttachFile = { file -> attachedFiles.add(file) },
                 onRemoveFile = onRemoveFile,

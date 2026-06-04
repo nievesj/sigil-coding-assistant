@@ -21,6 +21,7 @@ import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -32,6 +33,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import java.io.Closeable
 
@@ -73,6 +75,13 @@ class ChatViewModel(
     private val _isSidebarVisible = MutableStateFlow(OpenCodeSettingsState.getInstance().sidebarVisible)
     val isSidebarVisible: StateFlow<Boolean> = _isSidebarVisible.asStateFlow()
 
+    /** Context state for the active session — loading, loaded, or error. */
+    private val _sessionContextState = MutableStateFlow<SessionContextState>(SessionContextState.Loading)
+    val sessionContextState: StateFlow<SessionContextState> = _sessionContextState.asStateFlow()
+
+    /** Job for in-flight context fetch — cancelled on session switch and close. */
+    private var contextFetchJob: Job? = null
+
     /** Mutex to prevent concurrent session switches. NOT reentrant. */
     private val switchMutex = Mutex()
 
@@ -112,6 +121,9 @@ class ChatViewModel(
         permissionTimeoutJob?.cancel()
         permissionTimeoutJob = null
         lastUserText = null
+        _sessionContextState.value = SessionContextState.Loading
+        contextFetchJob?.cancel()
+        contextFetchJob = null
     }
 
     // --- Internal: OpenCode engine connection ---
@@ -292,7 +304,22 @@ class ChatViewModel(
                             )
                     }
                 }
-                logger.info { "Loaded ${models.size} models from ${providerResponse.all.size} providers" }
+                // ALL models from ALL providers (including disconnected) — for context limit lookup
+                val allModels = providerResponse.all
+                    .flatMap { provider ->
+                        provider.models.map { (_, modelData) ->
+                            ProviderModel(
+                                providerID = provider.id,
+                                modelID = modelData.id,
+                                displayName = "${provider.name} / ${modelData.name}",
+                                reasoning = modelData.reasoning,
+                                contextWindow = modelData.limit?.context ?: 0,
+                                providerIconId = provider.id,
+                                variants = modelData.variants?.keys?.toList() ?: emptyList()
+                            )
+                        }
+                    }
+                logger.info { "Loaded ${models.size} connected models, ${allModels.size} total models from ${providerResponse.all.size} providers" }
                 // Restore last selected model, or fall back to first
                 val savedKey = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance()
                     .lastSelectedModelKey
@@ -303,6 +330,7 @@ class ChatViewModel(
                 } else null
                 _controlState.value = _controlState.value.copy(
                     models = models,
+                    allModels = allModels,
                     selectedModel = restoredModel ?: models.firstOrNull()
                 )
             } catch (e: Exception) {
@@ -312,6 +340,9 @@ class ChatViewModel(
             // Subscribe to global SSE events (long-lived background subscription)
             logger.info { "Subscribing to SSE events for session ${sessionId!!}" }
             sseJob = startSseSubscription(opencodeClient, sessionId!!)
+
+            // Fetch initial context for the active session
+            fetchSessionContext()
 
             _connectionState.value = ConnectionState.CONNECTED
             logger.info { "Connected to OpenCode successfully" }
@@ -391,6 +422,8 @@ class ChatViewModel(
 
                 sseJob = startSseSubscription(client, targetSessionId)
                 updateSessionSelection(targetSessionId)
+                // Fetch context for the new session
+                fetchSessionContext()
                 logger.info { "Switched to session $targetSessionId (${chatMessages.size} messages loaded)" }
             } catch (e: CancellationException) {
                 throw e
@@ -439,6 +472,8 @@ class ChatViewModel(
 
         loadSessions()
         updateSessionSelection(session.id)
+        // Fetch context for the new session
+        fetchSessionContext()
         logger.info { "Created and switched to new session: ${session.id}" }
     }
 
@@ -603,6 +638,8 @@ class ChatViewModel(
     override fun close() {
         sseJob?.cancel()
         sseJob = null
+        contextFetchJob?.cancel()
+        contextFetchJob = null
         permissionTimeoutJob?.cancel()
         permissionTimeoutJob = null
         responseDeferred?.complete(Unit)
@@ -616,6 +653,209 @@ class ChatViewModel(
         // Kill the launched OpenCode process if we own it
         openCodeProcess?.destroyForcibly()
         openCodeProcess = null
+    }
+
+    // --- Context Fetching ---
+
+    /** Fetches session context from the server and updates [sessionContextState]. */
+    private fun fetchSessionContext() {
+        val currentSessionId = sessionId ?: return
+        val client = openCodeClient ?: return
+
+        // Cancel any in-flight fetch
+        contextFetchJob?.cancel()
+
+        contextFetchJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            delay(ChatConstants.CONTEXT_REFRESH_DELAY_MS)
+            val capturedSessionId = currentSessionId
+            try {
+                val session = withTimeout(ChatConstants.CONTEXT_FETCH_TIMEOUT_MS) {
+                    client.getSession(capturedSessionId)
+                }
+                // Discard stale results if session changed during fetch
+                if (sessionId != capturedSessionId) return@launch
+
+                // Debug logging: raw API response
+                logger.info { "Context fetch: session.id=${session.id}, session.model=${session.model}, session.tokens=${session.tokens}, session.cost=${session.cost}" }
+                logger.info { "Context fetch: model.id=${session.model?.id}, model.providerID=${session.model?.providerID}" }
+                logger.info { "Context fetch: tokens.input=${session.tokens?.input}, tokens.output=${session.tokens?.output}, tokens.reasoning=${session.tokens?.reasoning}" }
+                logger.info { "Context fetch: tokens.cache.read=${session.tokens?.cache?.read}, tokens.cache.write=${session.tokens?.cache?.write}" }
+
+                val tokens = session.tokens
+                val sessionTotalTokens = (tokens?.input ?: 0L) +
+                        (tokens?.output ?: 0L) +
+                        (tokens?.reasoning ?: 0L) +
+                        (tokens?.cache?.read ?: 0L) +
+                        (tokens?.cache?.write ?: 0L)
+
+                // OpenCode's TUI gets tokens from the LAST ASSISTANT MESSAGE, not session.tokens.
+                // session.tokens can be stale/null, but last assistant message always has correct data.
+                val lastAssistant = _messages.value.lastOrNull {
+                    it.role == MessageRole.ASSISTANT && it.outputTokens > 0
+                }
+
+                // Use last assistant message's tokens if available, fall back to session tokens
+                val inputTokens: Long
+                val outputTokens: Long
+                val reasoningTokens: Long
+                val cacheReadTokens: Long
+                val cacheWriteTokens: Long
+                val totalTokens: Long
+                val totalCost: Double
+
+                if (lastAssistant != null && (lastAssistant.inputTokens > 0 || lastAssistant.outputTokens > 0)) {
+                    inputTokens = lastAssistant.inputTokens
+                    outputTokens = lastAssistant.outputTokens
+                    reasoningTokens = lastAssistant.reasoningTokens
+                    cacheReadTokens = lastAssistant.cacheReadTokens
+                    cacheWriteTokens = lastAssistant.cacheWriteTokens
+                    totalTokens = inputTokens + outputTokens + reasoningTokens + cacheReadTokens + cacheWriteTokens
+                    totalCost = session.cost.coerceAtLeast(lastAssistant.cost)
+                    logger.info { "Context fetch: using last assistant message tokens: total=$totalTokens, cost=$totalCost" }
+                } else {
+                    inputTokens = tokens?.input ?: 0L
+                    outputTokens = tokens?.output ?: 0L
+                    reasoningTokens = tokens?.reasoning ?: 0L
+                    cacheReadTokens = tokens?.cache?.read ?: 0L
+                    cacheWriteTokens = tokens?.cache?.write ?: 0L
+                    totalTokens = sessionTotalTokens
+                    totalCost = session.cost
+                    logger.info { "Context fetch: using session tokens: total=$totalTokens, cost=$totalCost" }
+                }
+
+                // Resolve model info: try session.model first, fall back to last assistant message
+                var modelId = session.model?.id
+                var providerId = session.model?.providerID
+                if (modelId.isNullOrBlank() || providerId.isNullOrBlank()) {
+                    // Fall back to last assistant message's model info
+                    val lastAssistant = _messages.value.lastOrNull {
+                        it.role == MessageRole.ASSISTANT && !it.modelID.isNullOrBlank()
+                    }
+                    if (lastAssistant != null) {
+                        if (modelId.isNullOrBlank()) modelId = lastAssistant.modelID
+                        if (providerId.isNullOrBlank()) providerId = lastAssistant.providerID
+                        logger.info { "Context fetch: using last assistant message model as fallback: $providerId/$modelId" }
+                    } else {
+                        // Final fallback: use selected model from control state
+                        val selectedModel = _controlState.value.selectedModel
+                        if (selectedModel != null && modelId.isNullOrBlank()) {
+                            modelId = selectedModel.modelID
+                            providerId = selectedModel.providerID
+                            logger.info { "Context fetch: using selected model as fallback: $providerId/$modelId" }
+                        }
+                    }
+                }
+
+                val (providerName, modelName) = resolveModelNames(modelId, providerId)
+                val contextLimit = resolveContextLimit(providerId, modelId)
+
+                logger.info { "Context fetch: resolved providerName=$providerName, modelName=$modelName, contextLimit=$contextLimit, totalTokens=$totalTokens" }
+
+                val usagePercent = if (contextLimit > 0L) {
+                    (totalTokens.toFloat() / contextLimit.toFloat()) * 100f
+                } else 0f
+
+                _sessionContextState.value = SessionContextState.Loaded(
+                    context = SessionContext(
+                        sessionId = capturedSessionId,
+                        title = session.title.ifBlank { "Untitled" },
+                        providerID = providerId ?: "",
+                        modelID = modelId ?: "",
+                        providerName = providerName,
+                        modelName = modelName,
+                        contextLimit = contextLimit,
+                        totalTokens = totalTokens,
+                        inputTokens = inputTokens,
+                        outputTokens = outputTokens,
+                        reasoningTokens = reasoningTokens,
+                        cacheReadTokens = cacheReadTokens,
+                        cacheWriteTokens = cacheWriteTokens,
+                        usagePercent = usagePercent,
+                        totalCost = totalCost,
+                        messageCount = _messages.value.size,
+                        userMessageCount = _messages.value.count { it.role == MessageRole.USER },
+                        assistantMessageCount = _messages.value.count { it.role == MessageRole.ASSISTANT },
+                        additions = session.summary?.additions ?: 0,
+                        deletions = session.summary?.deletions ?: 0,
+                        filesModified = session.summary?.files ?: 0,
+                        sessionCreated = session.time?.created ?: 0L,
+                        lastUpdated = session.time?.updated ?: 0L
+                    )
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (sessionId == capturedSessionId) {
+                    _sessionContextState.value = SessionContextState.Error(
+                        message = e.message ?: "Failed to load context",
+                        retryable = true
+                    )
+                }
+            }
+        }
+    }
+
+    /** Retries fetching session context (called from UI on error state click). */
+    fun retryContextFetch() {
+        fetchSessionContext()
+    }
+
+    /**
+     * Resolves provider + model IDs to display names using the loaded provider list.
+     * Falls back to raw IDs if provider data is unavailable.
+     */
+    private fun resolveModelNames(modelId: String?, providerId: String?): Pair<String, String> {
+        if (modelId.isNullOrBlank() && providerId.isNullOrBlank()) return Pair("Unknown", "Unknown")
+
+        val models = _controlState.value.models
+        if (models.isEmpty()) return Pair(providerId ?: "Unknown", modelId ?: "Unknown")
+
+        // Try exact match first (both provider and model must match)
+        val exactMatch = models.find {
+            it.providerID == providerId && it.modelID == modelId
+        }
+        if (exactMatch != null) {
+            val parts = exactMatch.displayName.split(" / ", limit = 2)
+            return Pair(parts.getOrElse(0) { exactMatch.providerID }, parts.getOrElse(1) { exactMatch.modelID })
+        }
+
+        // Try exact match by model ID only (provider may differ)
+        val modelOnlyMatch = models.find { it.modelID == modelId }
+        if (modelOnlyMatch != null) {
+            val parts = modelOnlyMatch.displayName.split(" / ", limit = 2)
+            return Pair(parts.getOrElse(0) { modelOnlyMatch.providerID }, parts.getOrElse(1) { modelOnlyMatch.modelID })
+        }
+
+        // Fall back to raw IDs
+        return Pair(providerId ?: "Unknown", modelId ?: "Unknown")
+    }
+
+    /**
+     * Resolves the context window limit from the loaded provider model data.
+     * Uses allModels (including disconnected providers) for context limit lookup.
+     * Returns 0 to indicate "unknown" if the model isn't found.
+     */
+    private fun resolveContextLimit(providerId: String?, modelId: String?): Long {
+        if (modelId.isNullOrBlank()) return 0L
+        // Use allModels (includes disconnected providers) for context limit lookup
+        val models = _controlState.value.allModels.ifEmpty { _controlState.value.models }
+        if (models.isEmpty()) return 0L
+
+        // Try exact match first (both provider and model)
+        val exactMatch = models.find {
+            it.providerID == providerId && it.modelID == modelId
+        }
+        if (exactMatch != null && exactMatch.contextWindow > 0) {
+            return exactMatch.contextWindow.toLong()
+        }
+
+        // Try match by model ID only
+        val modelOnlyMatch = models.find { it.modelID == modelId }
+        if (modelOnlyMatch != null && modelOnlyMatch.contextWindow > 0) {
+            return modelOnlyMatch.contextWindow.toLong()
+        }
+
+        return 0L
     }
 
     // --- SSE Event Handling ---
@@ -653,6 +893,8 @@ class ChatViewModel(
             is SseEvent.Stop -> {
                 markStreamingComplete(msgId)
                 responseDeferred?.complete(Unit)
+                // Refresh context after each response completes
+                fetchSessionContext()
             }
 
             is SseEvent.Permission -> {

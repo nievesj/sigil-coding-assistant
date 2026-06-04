@@ -65,6 +65,7 @@ import com.intellij.icons.AllIcons
 import com.opencode.acp.chat.model.ControlBarState
 import com.opencode.acp.chat.model.OpenCodeAgentInfo
 import com.opencode.acp.chat.model.ProviderModel
+import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.ThinkingEffort
 import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
@@ -286,11 +287,14 @@ fun InputArea(
     enabled: Boolean,
     isStreaming: Boolean,
     controlState: ControlBarState,
+    contextState: SessionContextState = SessionContextState.Loading,
     onSend: (String) -> Unit,
     onCancel: () -> Unit,
     onAgentChanged: (OpenCodeAgentInfo) -> Unit,
     onModelChanged: (ProviderModel) -> Unit,
     onThinkingChanged: (ThinkingEffort) -> Unit,
+    onShowContextDetails: () -> Unit = {},
+    onRetryContext: () -> Unit = {},
     attachedFiles: List<AttachedFile> = emptyList(),
     onAttachFile: (AttachedFile) -> Unit = {},
     onRemoveFile: (Int) -> Unit = {},
@@ -772,6 +776,14 @@ fun InputArea(
             }
 
             Spacer(modifier = Modifier.weight(1f))
+
+            // Context indicator — fillable circle showing context usage
+            ContextIndicator(
+                state = contextState,
+                isStreaming = isStreaming,
+                onShowDetails = onShowContextDetails,
+                onRetry = onRetryContext
+            )
         }
     }
 }

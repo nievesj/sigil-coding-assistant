@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,9 +35,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intellij.icons.AllIcons
-import com.opencode.acp.chat.model.ChatConstants
+import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.SessionItem
 import com.opencode.acp.chat.model.SessionListState
+import com.opencode.acp.chat.model.SidebarTab
 import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.ui.component.Icon
@@ -54,41 +56,132 @@ import java.util.concurrent.TimeUnit
 @Composable
 fun SessionSidebar(
     state: SessionListState,
+    contextState: SessionContextState,
+    selectedTab: SidebarTab,
+    onTabSelected: (SidebarTab) -> Unit,
     onNewSession: () -> Unit,
     onSessionSelected: (String) -> Unit,
     onSessionArchived: (String) -> Unit,
     onRetry: () -> Unit,
+    onContextRetry: () -> Unit,
+    onShowDetails: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
         modifier = modifier
-            .width(ChatConstants.SIDEBAR_WIDTH_DP.dp)
             .fillMaxHeight()
             .clip(RoundedCornerShape(topStart = 12.dp, bottomStart = 12.dp))
             .background(JewelTheme.globalColors.panelBackground),
     ) {
-        // New session button
-        NewSessionButton(onClick = onNewSession)
+        // Tab row
+        SidebarTabRow(selectedTab = selectedTab, onTabSelected = onTabSelected)
 
-        // Content based on state
-        when (state) {
-            is SessionListState.Loading -> LoadingContent()
-            is SessionListState.Error -> ErrorContent(
-                message = state.message,
-                onRetry = onRetry
-            )
-            is SessionListState.Loaded -> {
-                if (state.sessions.isEmpty()) {
-                    EmptyContent()
-                } else {
-                    SessionList(
-                        sessions = state.sessions,
-                        selectedId = state.selectedId,
-                        onSessionSelected = onSessionSelected,
-                        onSessionArchived = onSessionArchived,
+        // Content based on selected tab
+        when (selectedTab) {
+            SidebarTab.SESSIONS -> {
+                // New session button
+                NewSessionButton(onClick = onNewSession)
+
+                // Session list content based on state
+                when (state) {
+                    is SessionListState.Loading -> LoadingContent()
+                    is SessionListState.Error -> ErrorContent(
+                        message = state.message,
+                        onRetry = onRetry
                     )
+                    is SessionListState.Loaded -> {
+                        if (state.sessions.isEmpty()) {
+                            EmptyContent()
+                        } else {
+                            SessionList(
+                                sessions = state.sessions,
+                                selectedId = state.selectedId,
+                                onSessionSelected = onSessionSelected,
+                                onSessionArchived = onSessionArchived,
+                            )
+                        }
+                    }
                 }
             }
+            SidebarTab.CONTEXT -> {
+                ContextPanel(
+                    state = contextState,
+                    onRetry = onContextRetry,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+// ── Tab Row ──────────────────────────────────────────────────────────────────
+
+@Composable
+private fun SidebarTabRow(
+    selectedTab: SidebarTab,
+    onTabSelected: (SidebarTab) -> Unit
+) {
+    val tabBg = retrieveColorOrUnspecified("TabbedPane.borderColor")
+    val selectedUnderline = retrieveColorOrUnspecified("Link.activeForeground")
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(32.dp)
+            .background(tabBg.copy(alpha = 0.3f)),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SidebarTabButton(
+            label = "Sessions",
+            isSelected = selectedTab == SidebarTab.SESSIONS,
+            onClick = { onTabSelected(SidebarTab.SESSIONS) },
+            modifier = Modifier.weight(1f)
+        )
+        SidebarTabButton(
+            label = "Context",
+            isSelected = selectedTab == SidebarTab.CONTEXT,
+            onClick = { onTabSelected(SidebarTab.CONTEXT) },
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+private fun SidebarTabButton(
+    label: String,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val selectedColor = retrieveColorOrUnspecified("Link.activeForeground")
+    val unselectedColor = JewelTheme.globalColors.text.disabled.copy(alpha = 0.7f)
+    val underlineColor = if (isSelected) selectedColor else Color.Transparent
+
+    Box(
+        modifier = modifier
+            .fillMaxHeight()
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = label,
+                fontSize = 12.sp,
+                fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
+                color = if (isSelected) selectedColor else unselectedColor
+            )
+            Spacer(Modifier.height(2.dp))
+            Box(
+                modifier = Modifier
+                    .width(32.dp)
+                    .height(2.dp)
+                    .clip(RoundedCornerShape(1.dp))
+                    .background(underlineColor)
+            )
         }
     }
 }

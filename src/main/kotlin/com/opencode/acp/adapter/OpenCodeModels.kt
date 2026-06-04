@@ -28,23 +28,31 @@ import kotlinx.serialization.json.jsonPrimitive
 data class OpenCodeSession(
     val id: String,
     val slug: String = "",
-    val projectID: String = "",
+    @SerialName("projectID") val projectID: String = "",
     val directory: String = "",
     val path: String = "",
-    val parentID: String? = null,
+    @SerialName("parentID") val parentID: String? = null,
     val title: String = "",
     val agent: String? = null,
     val model: SessionModel? = null,
     val version: String = "",
     val cost: Double = 0.0,
     val tokens: SessionTokens? = null,
-    val time: SessionTime? = null
+    val time: SessionTime? = null,
+    val summary: SessionSummary? = null
+)
+
+@Serializable
+data class SessionSummary(
+    val additions: Int = 0,
+    val deletions: Int = 0,
+    val files: Int = 0
 )
 
 @Serializable
 data class SessionModel(
     val id: String = "",
-    val providerID: String = "",
+    @SerialName("providerID") val providerID: String = "",
     val variant: String? = null
 )
 
@@ -79,7 +87,12 @@ data class MessageInfo(
     val id: String,
     val role: String,
     val createdAt: String? = null,
-    val error: MessageError? = null
+    val error: MessageError? = null,
+    // Fields from AssistantMessage — present only when role == "assistant"
+    @SerialName("modelID") val modelID: String? = null,
+    @SerialName("providerID") val providerID: String? = null,
+    val cost: Double? = null,
+    val tokens: SessionTokens? = null
 )
 
 @Serializable
@@ -320,6 +333,14 @@ fun OpenCodeMessage.toChatMessage(): ChatMessage {
         timestamp = timestamp,
         toolCalls = toolCalls,
         thinkingContent = "",
-        isStreaming = false
+        isStreaming = false,
+        modelID = info.modelID,
+        providerID = info.providerID,
+        inputTokens = info.tokens?.input ?: 0L,
+        outputTokens = info.tokens?.output ?: 0L,
+        reasoningTokens = info.tokens?.reasoning ?: 0L,
+        cacheReadTokens = info.tokens?.cache?.read ?: 0L,
+        cacheWriteTokens = info.tokens?.cache?.write ?: 0L,
+        cost = info.cost ?: 0.0
     )
 }

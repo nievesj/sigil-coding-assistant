@@ -11,7 +11,17 @@ data class ChatMessage(
     val timestamp: Long,
     val toolCalls: List<ToolCallPill> = emptyList(),
     val thinkingContent: String = "",
-    val isStreaming: Boolean = false
+    val isStreaming: Boolean = false,
+    // Model info from AssistantMessage — present only for assistant messages
+    val modelID: String? = null,
+    val providerID: String? = null,
+    // Token info from AssistantMessage — present only for assistant messages
+    val inputTokens: Long = 0,
+    val outputTokens: Long = 0,
+    val reasoningTokens: Long = 0,
+    val cacheReadTokens: Long = 0,
+    val cacheWriteTokens: Long = 0,
+    val cost: Double = 0.0
 )
 
 enum class MessageRole { USER, ASSISTANT }
@@ -38,6 +48,8 @@ data class ControlBarState(
     val agents: List<OpenCodeAgentInfo> = emptyList(),
     val selectedAgent: OpenCodeAgentInfo? = null,
     val models: List<ProviderModel> = emptyList(),
+    /** All models from all providers (including disconnected) — used for context limit lookup. */
+    val allModels: List<ProviderModel> = emptyList(),
     val selectedModel: ProviderModel? = null,
     val thinkingEffort: ThinkingEffort = ThinkingEffort.DEFAULT
 )
@@ -122,3 +134,40 @@ sealed interface SessionListState {
     data class Loaded(val sessions: List<SessionItem>, val selectedId: String?) : SessionListState
     data class Error(val message: String) : SessionListState
 }
+
+/** Sealed state for session context — distinguishes loading, loaded, and error. */
+sealed interface SessionContextState {
+    data object Loading : SessionContextState
+    data class Loaded(val context: SessionContext) : SessionContextState
+    data class Error(val message: String, val retryable: Boolean = true) : SessionContextState
+}
+
+/** Context information for the active session, derived from GET /session/:id. */
+data class SessionContext(
+    val sessionId: String,
+    val title: String,
+    val providerID: String,
+    val modelID: String,
+    val providerName: String,
+    val modelName: String,
+    val contextLimit: Long,          // 0 = unknown → "N/A"
+    val totalTokens: Long,           // input + output + reasoning + cacheRead + cacheWrite
+    val inputTokens: Long,
+    val outputTokens: Long,
+    val reasoningTokens: Long,
+    val cacheReadTokens: Long,
+    val cacheWriteTokens: Long,
+    val usagePercent: Float,         // totalTokens / contextLimit * 100 (can exceed 100f)
+    val totalCost: Double,
+    val messageCount: Int,           // total number of messages in the session
+    val userMessageCount: Int,       // number of user messages
+    val assistantMessageCount: Int,  // number of assistant messages
+    val additions: Int,              // lines added (from session summary)
+    val deletions: Int,              // lines deleted (from session summary)
+    val filesModified: Int,          // files modified (from session summary)
+    val sessionCreated: Long,        // epoch millis
+    val lastUpdated: Long           // epoch millis
+)
+
+/** Sidebar tab identifiers. */
+enum class SidebarTab { SESSIONS, CONTEXT }
