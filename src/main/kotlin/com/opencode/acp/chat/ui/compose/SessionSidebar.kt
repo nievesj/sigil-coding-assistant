@@ -282,7 +282,7 @@ private fun buildSessionTree(sessions: List<SessionItem>): List<TreeItem> {
         processed.add(session.id)
         val children = childrenMap[session.id]
             ?.filter { it.id !in processed }
-            ?.sortedBy { it.createdAt }
+            ?.sortedBy { it.updatedAt }
             ?: emptyList()
         result.add(TreeItem(session, depth, hasChildren = children.isNotEmpty()))
         for (child in children) {
@@ -293,7 +293,7 @@ private fun buildSessionTree(sessions: List<SessionItem>): List<TreeItem> {
     // Add parent sessions (no parentID) first, sorted by creation time
     val parents = sessions
         .filter { it.parentID == null }
-        .sortedByDescending { it.createdAt }
+        .sortedByDescending { it.updatedAt }
     for (parent in parents) {
         addWithChildren(parent, 0)
     }
@@ -564,7 +564,7 @@ private fun SessionRow(
     ) {
         // Timestamp
         Text(
-            text = formatRelativeTime(session.createdAt),
+            text = formatRelativeTime(session.updatedAt),
             fontSize = 11.sp,
             color = metaColor,
             maxLines = 1,

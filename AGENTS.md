@@ -468,18 +468,6 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 - **Action:** Add `ImageContent` to message parts, render inline in chat messages.
 - **Files:** `ChatModels.kt`, `MessageListComponent.kt`, `OpenCodeClient.kt`.
 
-### Multi-Tab Sessions (v2)
-
-- **Status:** Single active session only. Multi-tab planned for v2.
-- **Action:** Allow multiple concurrent sessions with tab-based switching.
-- **Files:** `ChatPanel.kt`, `ChatViewModel.kt`, `MessageListComponent.kt`.
-
-### Tool Pill Detail Expansion
-
-- **Status:** Tool pills show name + status. No expandable detail view.
-- **Action:** Add click-to-expand showing tool input/output JSON.
-- **Files:** `MessageListComponent.kt`, `ToolCallPill` model.
-
 ---
 
 ## Technical Debt
@@ -498,8 +486,8 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 
 ### Permission Bridge (ACP SDK)
 
-- **Status:** `PermissionBridge.kt` exists but is unused — the chat UI uses `OpenCodeClient.respondPermission()` directly.
-- **Action:** Either remove `PermissionBridge.kt` or reconcile with the ACP SDK approach.
+- **Status:** `PermissionBridge.kt` is used by the ACP SDK path (`OpenCodeAgentSession`, `OpenCodeAgentSupport`). The chat UI uses `OpenCodeClient.respondPermission()` directly. Both paths are valid for their respective use cases.
+- **Action:** No action needed — `PermissionBridge` serves the ACP SDK integration, not the chat UI.
 - **File:** `PermissionBridge.kt`
 
 ---
@@ -527,3 +515,19 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 - [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
 - [x] SSE reconnection with exponential backoff (1s→2s→4s→...→30s cap, ±20% jitter, abort in-flight response, retryConnection for ERROR state)
 - [x] Input command history with Up/Down arrow navigation (configurable size, persists with attachments, draft save/restore, `onSend` signature fixed to pass files)
+- [x] `toChatMessage()` now uses `ToolMapper.toAcpKind()` instead of hardcoded `ToolKind.OTHER` — historical tool pills match live ones
+- [x] `ToolPill` defaults collapsed (`expanded = false`) — was defaulting expanded
+- [x] `SseEvent.ToolResult.content` now populated from V2 and V1 SSE events — tool output visible in expanded pills
+- [x] `handleSseEvent()` no longer drops `TodoUpdated`/`QuestionAsked`/`SessionCreated`/`UserMessage` when `activeAssistantMessageId` is null — these events are handled before the null check
+- [x] `SubagentStatus` now inferred from session token usage (`outputTokens > 0` → COMPLETED, else RUNNING) — was always RUNNING
+- [x] `CommandHistoryEntry` dedup now compares `attachedFileDataUris` in addition to paths — clipboard images with same text no longer falsely deduped
+- [x] Removed unreachable `MimeTypes` compound extension entry `"gradle.kts"` (never matched by `substringAfterLast('.')`)
+- [x] Removed empty `loadSettings()` method and its call from `ChatViewModel.initialize()`
+- [x] Removed all `println()` debug statements from production code (ChatScreen.kt, InputArea.kt, AttachMenu.kt, OpenCodeSettingsState.kt, ProviderIconLoader.kt)
+- [x] `SseEventListener` now handles V2 event types (`session.next.*`) and passes `patterns` to `SseEvent.Permission`
+- [x] `addMessage()` FIFO eviction now rebuilds `toolCallIndex` alongside `messageIndex` — no stale entries after 500+ messages
+- [x] `pendingFileChanges` cleared on session switch via `resetSessionState()` — no memory leak across sessions
+- [x] `addShutdownHook` only registered once (stored in `shutdownHook` field) — no thread leak on re-initialization
+- [x] `respondPermission`/`respondQuestion`/`rejectQuestion` in `OpenCodeClient` now throw on failure instead of swallowing — ViewModel catch blocks are reachable
+- [x] `SessionItem.createdAt` renamed to `updatedAt` (was actually `time.updated`, not `time.created`)
+- [x] `SessionContext` fields (`additions`/`deletions`/`filesModified`/`sessionCreated`/`lastUpdated`) now populated from `GET /session/:id` summary — were hardcoded to 0

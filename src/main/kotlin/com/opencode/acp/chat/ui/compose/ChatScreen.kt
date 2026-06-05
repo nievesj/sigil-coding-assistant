@@ -167,7 +167,6 @@ fun ChatScreen(
         }
         recentFiles.clear()
         recentFiles.addAll(initial)
-        println("[AttachMenu] Initial recentFiles: ${initial.size} files, names=${initial.map { it.name }}")
 
         // Listen for file open/close events to update the list reactively
         val connection = project.messageBus.connect()
@@ -178,7 +177,6 @@ fun ChatScreen(
                 }
                 recentFiles.clear()
                 recentFiles.addAll(updated)
-                println("[AttachMenu] fileOpened -> recentFiles: ${updated.size} files")
             }
 
             override fun fileClosed(source: FileEditorManager, file: VirtualFile) {
@@ -187,7 +185,6 @@ fun ChatScreen(
                 }
                 recentFiles.clear()
                 recentFiles.addAll(updated)
-                println("[AttachMenu] fileClosed -> recentFiles: ${updated.size} files")
             }
         })
 
@@ -209,11 +206,9 @@ fun ChatScreen(
             when (val result = readClipboardContent()) {
                 is ClipboardResult.FileResult -> {
                     attachedFiles.add(result.file)
-                    println("[ChatScreen] Pasted file from clipboard: ${result.file.name}")
                 }
                 is ClipboardResult.TextResult -> {
                     viewModel.requestTextPaste(result.text)
-                    println("[ChatScreen] Pasted text from clipboard, length=${result.text.length}")
                 }
                 null -> { /* nothing on clipboard */ }
             }
@@ -248,20 +243,14 @@ fun ChatScreen(
 
     // Recent file click — attach a recent file
     val onRecentFileClick: (RecentFile) -> Unit = { recentFile ->
-        println("[AttachMenu] onRecentFileClick: name=${recentFile.name}, path=${recentFile.path}")
         val vfs = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
         var vf = vfs.findFileByPath(recentFile.path)
-        println("[AttachMenu] LocalFileSystem.findFileByPath result: ${vf?.let { "${it.name} (${it.path})" } ?: "null"}")
         if (vf == null) {
             // Try via URL for non-local paths (jar://, etc.)
             vf = com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl("file://${recentFile.path}")
-            println("[AttachMenu] VirtualFileManager.findFileByUrl result: ${vf?.let { "${it.name} (${it.path})" } ?: "null"}")
         }
         if (vf != null) {
             addFileAttachment(vf, attachedFiles)
-            println("[AttachMenu] Attached file: ${vf.name}")
-        } else {
-            println("[AttachMenu] FAILED to resolve file for path: ${recentFile.path}")
         }
     }
 
@@ -278,7 +267,6 @@ fun ChatScreen(
             }
             searchResults.clear()
             searchResults.addAll(results)
-            println("[AttachMenu] onSearch('$query') -> ${results.size} results")
         }
     }
 

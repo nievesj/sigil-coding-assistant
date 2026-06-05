@@ -79,7 +79,6 @@ fun AttachMenu(
 
     // Filter recent files by search query — computed directly so TextFieldState changes trigger recomposition
     val searchQuery = searchState.text.toString()
-    println("[AttachMenu] searchQuery='$searchQuery' (length=${searchQuery.length})")
     val filteredRecent = if (searchQuery.isBlank()) recentFiles
         else recentFiles.filter {
             it.name.contains(searchQuery, ignoreCase = true) ||
@@ -89,7 +88,6 @@ fun AttachMenu(
     // Combine: when searching, show search results from project files; otherwise show recent files
     val displayFiles = if (searchQuery.isNotBlank()) searchResults else filteredRecent
     val sectionLabel = if (searchQuery.isNotBlank()) "Search results" else "Recent files"
-    println("[AttachMenu] displayFiles=${displayFiles.size} (searchResults=${searchResults.size}, filteredRecent=${filteredRecent.size})")
 
     // Reset hover when filter changes
     LaunchedEffect(searchQuery) {
@@ -99,12 +97,10 @@ fun AttachMenu(
 
     // Auto-focus search field when popup appears
     LaunchedEffect(Unit) {
-        println("[AttachMenu] LaunchedEffect(Unit): requesting focus on search field")
         try {
             searchFocusRequester.requestFocus()
-            println("[AttachMenu] Focus requested successfully")
-        } catch (e: Exception) {
-            println("[AttachMenu] Focus request FAILED: ${e.message}")
+        } catch (_: Exception) {
+            // Focus request can fail if the composable is not yet laid out
         }
     }
 

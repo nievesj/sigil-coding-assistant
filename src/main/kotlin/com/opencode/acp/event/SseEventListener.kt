@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -63,7 +65,135 @@ class SseEventListener(
         }
 
         private fun parseByType(type: String, obj: JsonObject, sessionId: String): SseEvent? {
-            return when (type) {
+            // Strip V2 version suffix (e.g. "session.next.text.delta.1" → "session.next.text.delta")
+            val normalizedType = type.replace(Regex("\\.\\d+$"), "")
+
+            return when (normalizedType) {
+                // V2 Text events
+                "session.next.text.started" -> null
+                "session.next.text.delta" -> SseEvent.TextChunk(
+                    sessionId = sessionId,
+                    text = obj["delta"]?.jsonPrimitive?.contentOrNull ?: ""
+                )
+                "session.next.text.ended" -> SseEvent.TextReplace(
+                    sessionId = sessionId,
+                    text = obj["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                )
+
+                // V2 Reasoning events
+                "session.next.reasoning.started" -> null
+                "session.next.reasoning.delta" -> SseEvent.ThinkingChunk(
+                    sessionId = sessionId,
+                    text = obj["delta"]?.jsonPrimitive?.contentOrNull ?: ""
+                )
+                "session.next.reasoning.ended" -> SseEvent.ThinkingReplace(
+                    sessionId = sessionId,
+                    text = obj["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                )
+
+                // V2 Tool events
+                "session.next.tool.input.started" -> null
+                "session.next.tool.called" -> SseEvent.ToolUse(
+                    sessionId = sessionId,
+                    toolCallId = obj["callID"]?.jsonPrimitive?.contentOrNull ?: "",
+                    toolName = obj["tool"]?.jsonPrimitive?.contentOrNull ?: "tool",
+                    title = obj["tool"]?.jsonPrimitive?.contentOrNull ?: "tool",
+                    input = obj["input"]?.jsonObject
+                )
+                "session.next.tool.success" -> SseEvent.ToolResult(
+                    sessionId = sessionId,
+                    toolCallId = obj["callID"]?.jsonPrimitive?.contentOrNull ?: "",
+                    isError = false
+                )
+                "session.next.tool.failed" -> SseEvent.ToolResult(
+                    sessionId = sessionId,
+                    toolCallId = obj["callID"]?.jsonPrimitive?.contentOrNull ?: "",
+                    isError = true
+                )
+
+                // V2 Step events
+                "session.next.step.started" -> null
+                "session.next.step.ended" -> null
+                "session.next.step.failed" -> null
+
+                // V2 Prompted event
+                "session.next.prompted" -> {
+                    val prompt = obj["prompt"]?.jsonObject
+                    if (prompt != null) {
+                        SseEvent.UserMessage(
+                            sessionId = sessionId,
+                            text = prompt["text"]?.jsonPrimitive?.contentOrNull ?: "",
+                            files = prompt["files"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+                        )
+                    } else null
+                }
+
+                // V2 Permission event
+                "session.next.permission" -> SseEvent.Permission(
+                    sessionId = sessionId,
+                    permissionId = obj["id"]?.jsonPrimitive?.contentOrNull ?: "",
+                    toolCallId = obj["tool"]?.jsonObject?.get("callID")?.jsonPrimitive?.contentOrNull ?: "",
+                    action = obj["permission"]?.jsonPrimitive?.contentOrNull ?: "",
+                    description = obj["description"]?.jsonPrimitive?.contentOrNull,
+                    patterns = obj["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+                )
+
+                // V2 Question event
+                "session.next.question" -> {
+                    val requestId = obj["id"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val questionsArray = obj["questions"]?.jsonArray ?: return null
+                    val questions = questionsArray.mapNotNull { element ->
+                        val qObj = element.jsonObject
+                        val question = qObj["question"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                        val header = qObj["header"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val multiple = qObj["multiple"]?.jsonPrimitive?.booleanOrNull ?: false
+                        val custom = qObj["custom"]?.jsonPrimitive?.booleanOrNull ?: true
+                        val options = qObj["options"]?.jsonArray?.mapNotNull { optElement ->
+                            val optObj = optElement.jsonObject
+                            val label = optObj["label"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                            val desc = optObj["description"]?.jsonPrimitive?.contentOrNull ?: ""
+                            com.opencode.acp.SseQuestionOption(label = label, description = desc)
+                        } ?: emptyList()
+                        com.opencode.acp.SseQuestionInfo(
+                            question = question,
+                            header = header,
+                            options = options,
+                            multiple = multiple,
+                            custom = custom
+                        )
+                    }
+                    SseEvent.QuestionAsked(
+                        sessionId = sessionId,
+                        requestId = requestId,
+                        questions = questions
+                    )
+                }
+
+                // V2 Todo event
+                "session.next.todo.updated" -> {
+                    val todosArray = obj["todos"]?.jsonArray
+                    if (todosArray != null) {
+                        val todos = todosArray.mapNotNull { element ->
+                            val todoObj = element.jsonObject
+                            val content = todoObj["content"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                            val status = todoObj["status"]?.jsonPrimitive?.contentOrNull ?: "pending"
+                            val priority = todoObj["priority"]?.jsonPrimitive?.contentOrNull ?: "medium"
+                            com.opencode.acp.SseTodoItem(content = content, status = status, priority = priority)
+                        }
+                        SseEvent.TodoUpdated(sessionId = sessionId, todos = todos)
+                    } else null
+                }
+
+                // V2 Stop event
+                "session.next.stopped" -> SseEvent.Stop(
+                    sessionId = sessionId,
+                    stopReason = obj["stopReason"]?.jsonPrimitive?.contentOrNull ?: "stop"
+                )
+
+                // V2 Session created
+                "session.next.created" -> SseEvent.SessionCreated(sessionId = sessionId)
+
+                // Legacy events
                 "text_chunk" -> SseEvent.TextChunk(
                     sessionId = sessionId,
                     text = obj["text"]?.jsonPrimitive?.content ?: ""
@@ -105,7 +235,8 @@ class SseEventListener(
                     permissionId = obj["permissionId"]?.jsonPrimitive?.content ?: "",
                     toolCallId = obj["toolCallId"]?.jsonPrimitive?.content ?: "",
                     action = obj["action"]?.jsonPrimitive?.content ?: "",
-                    description = obj["description"]?.jsonPrimitive?.content
+                    description = obj["description"]?.jsonPrimitive?.content,
+                    patterns = obj["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
                 )
                 "error" -> SseEvent.Error(
                     sessionId = sessionId,

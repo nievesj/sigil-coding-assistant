@@ -120,7 +120,7 @@ suspend fun readClipboardContent(): ClipboardResult? {
                 }
                 result
             } catch (e: Exception) {
-                println("[ClipboardPaste] invokeAndWait failed: ${e.message}")
+
                 null
             }
         }
@@ -136,7 +136,7 @@ suspend fun readClipboardContent(): ClipboardResult? {
                     val bytes = baos.toByteArray()
                     val base64 = Base64.getEncoder().encodeToString(bytes)
                     val dataUri = "data:image/png;base64,$base64"
-                    println("[ClipboardPaste] Created data URI from image, size=${bytes.size} bytes")
+
                     ClipboardResult.FileResult(AttachedFile(name = "clipboard-image.png", path = "", mime = "image/png", dataUri = dataUri))
                 }
                 is List<*> -> {
@@ -146,14 +146,14 @@ suspend fun readClipboardContent(): ClipboardResult? {
                 }
                 is String -> {
                     if (clipResult.isNotBlank()) {
-                        println("[ClipboardPaste] Got text from clipboard, length=${clipResult.length}")
+
                         ClipboardResult.TextResult(clipResult)
                     } else null
                 }
                 else -> null
             }
         } catch (e: Exception) {
-            println("[ClipboardPaste] Processing failed: ${e.message}")
+
             null
         }
     }
@@ -167,19 +167,17 @@ private fun readClipboardOnEdt(): Any? {
         val clipboard = Toolkit.getDefaultToolkit().systemClipboard
         val transferable = clipboard.getContents(null)
         if (transferable == null) {
-            println("[ClipboardPaste] Clipboard contents are null")
+
             return null
         }
 
-        // Log available flavors for debugging
         val flavors = transferable.transferDataFlavors
-        println("[ClipboardPaste] Available flavors: ${flavors.map { it.humanPresentableName }}")
 
         // 1. Try imageFlavor (screenshot, copied image from image editor)
         if (transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
             val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
             if (image != null) {
-                println("[ClipboardPaste] Got image from imageFlavor")
+
                 return image
             }
         }
@@ -195,7 +193,7 @@ private fun readClipboardOnEdt(): Any? {
                     f.extension.lowercase() in imageExts
                 }
                 if (imageFiles.isNotEmpty()) {
-                    println("[ClipboardPaste] Got ${imageFiles.size} image file(s) from javaFileListFlavor: ${imageFiles.map { it.name }}")
+
                     return imageFiles
                 }
             }
@@ -209,7 +207,7 @@ private fun readClipboardOnEdt(): Any? {
                     if (reader != null) {
                         val text = reader.readText()
                         if (text.isNotBlank()) {
-                            println("[ClipboardPaste] Got plain text from flavor: ${flavor.humanPresentableName}, length=${text.length}")
+
                             return text
                         }
                     }
@@ -219,14 +217,14 @@ private fun readClipboardOnEdt(): Any? {
         if (transferable.isDataFlavorSupported(DataFlavor.stringFlavor)) {
             val text = transferable.getTransferData(DataFlavor.stringFlavor) as? String
             if (!text.isNullOrBlank()) {
-                println("[ClipboardPaste] Got text from stringFlavor, length=${text.length}")
+
                 return text
             }
         }
 
-        println("[ClipboardPaste] No image, file, or text found in clipboard")
+
     } catch (e: Exception) {
-        println("[ClipboardPaste] EDT clipboard read failed: ${e.message}")
+
     }
     return null
 }
@@ -377,7 +375,7 @@ fun InputArea(
                             try {
                                 java.io.File(java.net.URI(uri)).toAttachedFile()
                             } catch (e: Exception) {
-                                println("[InputArea] Failed to read dropped file: $uri — ${e.message}")
+
                                 null
                             }
                         }.filterNotNull().forEach { file ->
@@ -423,7 +421,7 @@ fun InputArea(
                                 return true
                             }
                         } catch (e: Exception) {
-                            println("[InputArea] Failed to extract image from AWT transferable: ${e.message}")
+
                         }
                     }
 
@@ -435,13 +433,13 @@ fun InputArea(
                             try {
                                 onAttachFile(file.toAttachedFile())
                             } catch (e: Exception) {
-                                println("[InputArea] Failed to process dropped AWT file: ${file.name} — ${e.message}")
+
                             }
                         }
                         return !files.isNullOrEmpty()
                     }
                 } catch (e: Exception) {
-                    println("[InputArea] AWT drag-and-drop fallback failed: ${e.message}")
+
                 }
 
                 return false
@@ -461,7 +459,7 @@ fun InputArea(
                 textState.edit {
                     replace(cursorPos, cursorPos, text)
                 }
-                println("[InputArea] Pasted text from clipboard, length=${text.length}")
+
             }
         }
     }
@@ -858,7 +856,7 @@ fun InputArea(
                                 .clip(CircleShape)
                                 .clickable(enabled = enabled) {
                                     showAttachMenu = !showAttachMenu
-                                    println("[InputArea] Attach button clicked, showAttachMenu=$showAttachMenu, recentFiles=${recentFiles.size}")
+
                                 }
                                 .padding(8.dp),
                             contentAlignment = Alignment.Center,
@@ -872,7 +870,7 @@ fun InputArea(
 
                             // Attach menu popup anchored to the + button
                             if (showAttachMenu) {
-                                println("[InputArea] Showing AttachMenu popup with ${recentFiles.size} recentFiles")
+
                                 Popup(
                                     alignment = Alignment.BottomStart,
                                     offset = IntOffset(0, 4),

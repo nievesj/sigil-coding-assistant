@@ -279,7 +279,7 @@ data class TerminalOutputChunk(
 fun OpenCodeSession.toSessionItem() = SessionItem(
     id = id,
     title = title.ifBlank { "New session" },
-    createdAt = time?.updated ?: time?.created ?: 0L,
+    updatedAt = time?.updated ?: time?.created ?: 0L,
     cost = cost,
     inputTokens = tokens?.input ?: 0L,
     outputTokens = tokens?.output ?: 0L,
@@ -332,7 +332,7 @@ fun OpenCodeMessage.toChatMessage(): ChatMessage {
             toolCallId = toolUse.id,
             toolName = toolUse.name,
             title = toolUse.name,
-            kind = ToolKind.OTHER,
+            kind = com.opencode.acp.adapter.ToolMapper.toAcpKind(toolUse.name),
             status = status
         )
     }

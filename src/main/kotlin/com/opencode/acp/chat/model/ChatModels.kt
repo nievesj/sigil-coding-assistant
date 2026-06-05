@@ -227,7 +227,7 @@ enum class PermissionResponse(val optionId: String) {
 data class SessionItem(
     val id: String,
     val title: String,
-    val createdAt: Long,      // epoch millis from OpenCodeSession.time.created
+    val updatedAt: Long,      // epoch millis from OpenCodeSession.time.updated
     val cost: Double,          // USD from OpenCodeSession.cost
     val inputTokens: Long,     // from OpenCodeSession.tokens.input
     val outputTokens: Long,    // from OpenCodeSession.tokens.output

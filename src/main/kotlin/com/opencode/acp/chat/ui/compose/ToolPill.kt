@@ -35,7 +35,7 @@ import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 
 @Composable
 fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
-    var expanded by remember { mutableStateOf(true) }
+    var expanded by remember { mutableStateOf(false) }
 
     val iconKey = when (pill.status) {
         ToolCallStatus.PENDING -> IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute)

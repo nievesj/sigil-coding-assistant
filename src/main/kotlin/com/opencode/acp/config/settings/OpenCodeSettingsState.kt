@@ -39,12 +39,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
 
     override fun getState(): OpenCodeSettingsState {
-        println("[OpenCodeSettings] getState() called — favorites=${favoriteModels}, lastModel=$lastSelectedModelKey, historySize=${commandHistory.size}")
         return this
     }
 
     override fun loadState(state: OpenCodeSettingsState) {
-        println("[OpenCodeSettings] loadState() called — incoming favorites=${state.favoriteModels}, lastModel=${state.lastSelectedModelKey}")
         binaryPath = state.binaryPath
         permissionTimeoutSeconds = state.permissionTimeoutSeconds
         favoriteModels = state.favoriteModels
@@ -54,7 +52,6 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         sidebarVisible = state.sidebarVisible
         commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
         commandHistory = state.commandHistory
-        println("[OpenCodeSettings] loadState() done — favorites=${favoriteModels}, lastModel=$lastSelectedModelKey, historySize=${commandHistory.size}")
     }
 
     companion object {
@@ -67,27 +64,21 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     fun isFavoriteModel(providerID: String, modelID: String): Boolean {
         val key = modelKey(providerID, modelID)
-        val result = favoriteModels.contains(key)
-        println("[OpenCodeSettings] isFavoriteModel($providerID, $modelID) -> key=$key, found=$result, allFavorites=$favoriteModels")
-        return result
+        return favoriteModels.contains(key)
     }
 
     fun toggleFavoriteModel(providerID: String, modelID: String) {
         val key = modelKey(providerID, modelID)
         if (favoriteModels.contains(key)) {
             favoriteModels.remove(key)
-            println("[OpenCodeSettings] toggleFavoriteModel REMOVE key=$key → favorites=$favoriteModels")
         } else {
             favoriteModels.add(key)
-            println("[OpenCodeSettings] toggleFavoriteModel ADD key=$key → favorites=$favoriteModels")
         }
     }
 
     /** Remove stale favorites for models that no longer exist. Only runs when models are loaded. */
     fun cleanupStaleFavorites(allModels: List<ProviderModel>) {
         val validKeys = allModels.map { modelKey(it.providerID, it.modelID) }.toSet()
-        val before = favoriteModels.size
         favoriteModels.removeAll { it !in validKeys }
-        println("[OpenCodeSettings] cleanupStaleFavorites: ${before} → ${favoriteModels.size} (removed ${before - favoriteModels.size} stale)")
     }
 }

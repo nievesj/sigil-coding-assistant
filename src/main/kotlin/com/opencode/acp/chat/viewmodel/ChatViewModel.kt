@@ -163,6 +163,7 @@ class ChatViewModel(
         _messages.value = emptyList()
         messageIndex.clear()
         toolCallIndex.clear()
+        pendingFileChanges.clear()
         _isStreaming.value = false
         activeAssistantMessageId = null
         firstTextChunkReceived = false
@@ -184,6 +185,7 @@ class ChatViewModel(
     private var sessionId: String? = null
     private var sseJob: Job? = null
     private var openCodeProcess: Process? = null
+    private var shutdownHook: Thread? = null
     private var permissionTimeoutJob: Job? = null
     private var reconnectJob: Job? = null
     private var reconnectAttempt: Int = 0
@@ -209,11 +211,6 @@ class ChatViewModel(
     private var projectBasePath: String = ""
 
     // --- Public API ---
-
-    /** Read settings from persistent state and update local fields. */
-    private fun loadSettings() {
-        // host, port, authToken use AcpDefaults — no user configuration needed
-    }
 
     /** Check if the OpenCode server is already reachable (e.g., from a previous IDE session). */
     private fun isServerReachable(): Boolean {
@@ -264,9 +261,13 @@ class ChatViewModel(
             }
 
             // Register shutdown hook to kill process on IDE exit
-            Runtime.getRuntime().addShutdownHook(Thread({
-                killProcess(openCodeProcess)
-            }, "opencode-shutdown").apply { isDaemon = true })
+            // Only register once — reuse the same hook if re-initialized
+            if (shutdownHook == null) {
+                shutdownHook = Thread({
+                    killProcess(openCodeProcess)
+                }, "opencode-shutdown").apply { isDaemon = true }
+                Runtime.getRuntime().addShutdownHook(shutdownHook)
+            }
         } catch (e: Exception) {
             logger.error(e) { "Failed to launch OpenCode binary at $binaryPath" }
         }
@@ -300,9 +301,6 @@ class ChatViewModel(
         _connectionState.value = ConnectionState.CONNECTING
         this.projectBasePath = projectBasePath
         try {
-            // Load persisted settings
-            loadSettings()
-
             // Always launch the OpenCode binary if a path is configured
             val settings = OpenCodeSettingsState.getInstance().state
             if (settings.binaryPath.isNotBlank()) {
@@ -940,9 +938,17 @@ class ChatViewModel(
     // --- Context Fetching ---
 
     /** Computes session context from in-memory messages + providers (like TUI's getSessionContextMetrics). */
-    private fun computeSessionContext() {
+    private suspend fun computeSessionContext() {
         val currentSessionId = sessionId ?: return
+        val client = openCodeClient ?: return
         val messages = _messages.value
+
+        // Fetch session details for summary (additions/deletions/filesModified) and timestamps
+        val session = try {
+            client.getSession(currentSessionId)
+        } catch (_: Exception) {
+            null
+        }
 
         // Find last assistant message with non-zero tokens (matches TUI's lastAssistantWithTokens)
         val lastAssistant = messages.findLast {
@@ -997,18 +1003,18 @@ class ChatViewModel(
                 messageCount = messages.size,
                 userMessageCount = messages.count { it.role == MessageRole.USER },
                 assistantMessageCount = messages.count { it.role == MessageRole.ASSISTANT },
-                additions = 0,
-                deletions = 0,
-                filesModified = 0,
-                sessionCreated = 0L,
-                lastUpdated = 0L
+                additions = session?.summary?.additions ?: 0,
+                deletions = session?.summary?.deletions ?: 0,
+                filesModified = session?.summary?.files ?: 0,
+                sessionCreated = session?.time?.created ?: 0L,
+                lastUpdated = session?.time?.updated ?: 0L
             )
         )
     }
 
     /** Recomputes session context from in-memory data. */
     fun retryContextFetch() {
-        computeSessionContext()
+        scope.launch { computeSessionContext() }
     }
 
     /**
@@ -1040,11 +1046,13 @@ class ChatViewModel(
         val entry = CommandHistoryEntry(text = text, files = files)
         val maxSize = OpenCodeSettingsState.getInstance().commandHistorySize.coerceIn(1, 100)
         val current = _commandHistory.value.toMutableList()
-        // Remove any existing duplicate (same text + same file paths) to move it to front
+        // Remove any existing duplicate (same text + same file paths + same data URIs) to move it to front
         current.removeAll { existing ->
             existing.text == text &&
                 existing.attachedFilePaths.size == files.size &&
-                existing.attachedFilePaths.zip(files.map { it.path }).all { (a, b) -> a == b }
+                existing.attachedFilePaths.zip(files.map { it.path }).all { (a, b) -> a == b } &&
+                existing.attachedFileDataUris.size == files.size &&
+                existing.attachedFileDataUris.zip(files.map { it.dataUri }).all { (a, b) -> a == b }
         }
         current.add(0, entry)
         val trimmed = if (current.size > maxSize) current.take(maxSize) else current
@@ -1166,6 +1174,57 @@ class ChatViewModel(
     // --- SSE Event Handling ---
 
     private fun handleSseEvent(event: SseEvent) {
+        // Events that don't require an active streaming message
+        when (event) {
+            is SseEvent.TodoUpdated -> {
+                if (event.sessionId == sessionId) {
+                    _todoItems.value = event.todos.map { todo ->
+                        TodoItem(content = todo.content, status = todo.status, priority = todo.priority)
+                    }
+                }
+                return
+            }
+            is SseEvent.QuestionAsked -> {
+                if (event.sessionId == sessionId && event.questions.isNotEmpty()) {
+                    val q = event.questions.first()
+                    _selectionPrompt.value = SelectionPrompt(
+                        promptId = event.requestId,
+                        question = q.question,
+                        subtitle = q.header.ifBlank { null },
+                        options = q.options.map { opt ->
+                            SelectionOption(title = opt.label, description = opt.description, label = opt.label)
+                        },
+                        allowCustomInput = q.custom,
+                        multiSelect = q.multiple
+                    )
+                }
+                return
+            }
+            is SseEvent.SessionCreated -> {
+                // A child session was created (e.g., subagent spawned).
+                scope.launch {
+                    try {
+                        loadSessions()
+                        val currentMsgId = activeAssistantMessageId
+                        if (currentMsgId != null) {
+                            val children = _childSessionMap.value[sessionId] ?: emptyList()
+                            if (children.isNotEmpty()) {
+                                injectSubagentRefsIntoMessage(currentMsgId, children)
+                            }
+                        }
+                    } catch (_: Exception) { /* best-effort refresh */ }
+                }
+                return
+            }
+            is SseEvent.UserMessage -> {
+                if (event.sessionId == sessionId) {
+                    logger.debug { "User message received from server: ${event.text.take(100)}" }
+                }
+                return
+            }
+            else -> { /* handled below */ }
+        }
+
         val msgId = activeAssistantMessageId
         if (msgId == null) {
             debugLog("VM DROP: ${event::class.simpleName} — activeAssistantMessageId is null")
@@ -1241,8 +1300,10 @@ class ChatViewModel(
                 }
                 responseDeferred?.complete(Unit)
                 // Refresh context and todos after each response completes
-                computeSessionContext()
-                fetchTodos()
+                scope.launch {
+                    computeSessionContext()
+                    fetchTodos()
+                }
                 // Refresh session list to pick up any new child sessions (subagents)
                 // spawned during this turn and inject their refs into the message
                 scope.launch {
@@ -1279,61 +1340,8 @@ class ChatViewModel(
                 // Plan events are informational; could be surfaced in UI later
             }
 
-            is SseEvent.SessionCreated -> {
-                // A child session was created (e.g., subagent spawned).
-                // Refresh session list and inject subagent refs into the current message.
-                scope.launch {
-                    try {
-                        loadSessions()
-                        // Inject subagent refs into the active streaming message
-                        val currentMsgId = activeAssistantMessageId
-                        if (currentMsgId != null) {
-                            val children = _childSessionMap.value[sessionId] ?: emptyList()
-                            if (children.isNotEmpty()) {
-                                injectSubagentRefsIntoMessage(currentMsgId, children)
-                            }
-                        }
-                    } catch (_: Exception) { /* best-effort refresh */ }
-                }
-            }
-
             is SseEvent.MessageComplete -> {
                 // Message fully persisted on the server side
-            }
-
-            is SseEvent.TodoUpdated -> {
-                // Update todo items — only if for our active session
-                if (event.sessionId == sessionId) {
-                    _todoItems.value = event.todos.map { todo ->
-                        TodoItem(content = todo.content, status = todo.status, priority = todo.priority)
-                    }
-                }
-            }
-
-            is SseEvent.UserMessage -> {
-                // User message from server - we already add user messages locally
-                // when sending, so we don't need to add them again here.
-                // This event is mainly for logging/debugging purposes.
-                if (event.sessionId == sessionId) {
-                    logger.debug { "User message received from server: ${event.text.take(100)}" }
-                }
-            }
-
-            is SseEvent.QuestionAsked -> {
-                if (event.sessionId == sessionId && event.questions.isNotEmpty()) {
-                    // Use the first question (the server currently sends one per event)
-                    val q = event.questions.first()
-                    _selectionPrompt.value = SelectionPrompt(
-                        promptId = event.requestId,
-                        question = q.question,
-                        subtitle = q.header.ifBlank { null },
-                        options = q.options.map { opt ->
-                            SelectionOption(title = opt.label, description = opt.description, label = opt.label)
-                        },
-                        allowCustomInput = q.custom,
-                        multiSelect = q.multiple
-                    )
-                }
             }
         }
     }
@@ -1362,15 +1370,23 @@ class ChatViewModel(
     private fun addMessage(message: ChatMessage) {
         _messages.value = _messages.value + message
         messageIndex[message.id] = _messages.value.size - 1
+        message.toolCalls.forEach { pill -> toolCallIndex[pill.toolCallId] = message.id }
         // FIFO eviction
         if (_messages.value.size > ChatConstants.MAX_MESSAGE_HISTORY) {
             val evictCount = _messages.value.size - ChatConstants.MAX_MESSAGE_HISTORY
             val evicted = _messages.value.take(evictCount)
             val remaining = _messages.value.drop(evictCount)
-            evicted.forEach { messageIndex.remove(it.id) }
+            evicted.forEach { msg ->
+                messageIndex.remove(msg.id)
+                msg.toolCalls.forEach { pill -> toolCallIndex.remove(pill.toolCallId) }
+            }
             _messages.value = remaining
             messageIndex.clear()
-            _messages.value.forEachIndexed { i, msg -> messageIndex[msg.id] = i }
+            toolCallIndex.clear()
+            _messages.value.forEachIndexed { i, msg ->
+                messageIndex[msg.id] = i
+                msg.toolCalls.forEach { pill -> toolCallIndex[pill.toolCallId] = msg.id }
+            }
         }
     }
 
@@ -1513,7 +1529,7 @@ class ChatViewModel(
                 sessionId = child.id,
                 agentName = child.title.replaceFirstChar { it.uppercase() },
                 taskDescription = child.title,
-                status = SubagentStatus.RUNNING,
+                status = inferSubagentStatus(child),
             )
         }
         val updated = messages.toMutableList()
@@ -1535,12 +1551,21 @@ class ChatViewModel(
                 sessionId = child.id,
                 agentName = child.title.replaceFirstChar { it.uppercase() },
                 taskDescription = child.title,
-                status = SubagentStatus.RUNNING,
+                status = inferSubagentStatus(child),
             )
         }
         messages[index] = msg.copy(subagentRefs = refs)
         _messages.value = messages
         debugLog("VM SUBAGENT: injected ${refs.size} refs into msg $messageId")
+    }
+
+    /**
+     * Infers [SubagentStatus] from a child session's token usage.
+     * If the session has output tokens > 0, it has completed at least one turn → COMPLETED.
+     * Otherwise → RUNNING (still active or just created).
+     */
+    private fun inferSubagentStatus(child: SessionItem): SubagentStatus {
+        return if (child.outputTokens > 0) SubagentStatus.COMPLETED else SubagentStatus.RUNNING
     }
 
     /**

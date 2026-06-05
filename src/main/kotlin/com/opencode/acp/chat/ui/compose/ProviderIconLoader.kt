@@ -39,8 +39,7 @@ object ProviderIconLoader {
             val bitmap = image.toComposeImageBitmap()
             cache[providerId] = bitmap
             bitmap
-        } catch (e: Exception) {
-            System.err.println("[ProviderIconLoader] Failed to render SVG for '$providerId': ${e.message}")
+        } catch (_: Exception) {
             missingCache.add(providerId)
             null
         }

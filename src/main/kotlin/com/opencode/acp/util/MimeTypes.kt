@@ -67,7 +67,6 @@ object MimeTypes {
 
         // Build / project files
         put("gradle", "text/x-gradle")
-        put("gradle.kts", "text/x-kotlin")
         put("properties", "text/x-properties")
         put("ini", "text/x-ini")
         put("cfg", "text/x-config")

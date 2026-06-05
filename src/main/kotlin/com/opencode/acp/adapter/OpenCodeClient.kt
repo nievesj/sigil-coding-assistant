@@ -451,14 +451,10 @@ class OpenCodeClient(
         permissionId: String,
         response: String
     ) {
-        try {
-            httpClient.post("$baseUrl/permission/$permissionId/reply") {
-                applyAuth()
-                contentType(ContentType.Application.Json)
-                setBody(json.encodeToString(PermissionRequest(response = response)))
-            }
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to respond to permission $permissionId" }
+        httpClient.post("$baseUrl/permission/$permissionId/reply") {
+            applyAuth()
+            contentType(ContentType.Application.Json)
+            setBody(json.encodeToString(PermissionRequest(response = response)))
         }
     }
 
@@ -471,14 +467,10 @@ class OpenCodeClient(
         requestId: String,
         answers: List<List<String>>
     ) {
-        try {
-            httpClient.post("$baseUrl/question/$requestId/reply") {
-                applyAuth()
-                contentType(ContentType.Application.Json)
-                setBody(json.encodeToString(QuestionReplyRequest(answers = answers)))
-            }
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to respond to question $requestId" }
+        httpClient.post("$baseUrl/question/$requestId/reply") {
+            applyAuth()
+            contentType(ContentType.Application.Json)
+            setBody(json.encodeToString(QuestionReplyRequest(answers = answers)))
         }
     }
 
@@ -487,14 +479,10 @@ class OpenCodeClient(
      * POST /question/{requestID}/reject
      */
     suspend fun rejectQuestion(requestId: String) {
-        try {
-            httpClient.post("$baseUrl/question/$requestId/reject") {
-                applyAuth()
-                contentType(ContentType.Application.Json)
-                setBody("{}")
-            }
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to reject question $requestId" }
+        httpClient.post("$baseUrl/question/$requestId/reject") {
+            applyAuth()
+            contentType(ContentType.Application.Json)
+            setBody("{}")
         }
     }
 
@@ -646,19 +634,25 @@ class OpenCodeClient(
 
                 "session.next.tool.success" -> {
                     val callID = props["callID"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? JsonObject) }
                     SseEvent.ToolResult(
                         sessionId = sessionId,
                         toolCallId = callID,
-                        isError = false
+                        isError = false,
+                        content = output
                     )
                 }
 
                 "session.next.tool.failed" -> {
                     val callID = props["callID"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? JsonObject) }
                     SseEvent.ToolResult(
                         sessionId = sessionId,
                         toolCallId = callID,
-                        isError = true
+                        isError = true,
+                        content = output
                     )
                 }
 
@@ -737,17 +731,27 @@ class OpenCodeClient(
                                 debugLog("SSE TOOL: callID=$toolCallId, tool=$toolName, status=$status, stateKeys=${stateObj?.keys}")
                                 when (status) {
                                     "completed" -> {
+                                        val output = (stateObj?.get("output") as? kotlinx.serialization.json.JsonArray)
+                                            ?.mapNotNull { (it as? JsonObject) }
+                                            ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
+                                                ?.mapNotNull { (it as? JsonObject) }
                                         SseEvent.ToolResult(
                                             sessionId = sessionId,
                                             toolCallId = toolCallId,
-                                            isError = false
+                                            isError = false,
+                                            content = output
                                         )
                                     }
                                     "error" -> {
+                                        val output = (stateObj?.get("output") as? kotlinx.serialization.json.JsonArray)
+                                            ?.mapNotNull { (it as? JsonObject) }
+                                            ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
+                                                ?.mapNotNull { (it as? JsonObject) }
                                         SseEvent.ToolResult(
                                             sessionId = sessionId,
                                             toolCallId = toolCallId,
-                                            isError = true
+                                            isError = true,
+                                            content = output
                                         )
                                     }
                                     else -> {
@@ -765,10 +769,13 @@ class OpenCodeClient(
                             }
                             "tool_result" -> {
                                 val toolCallId = part["id"]?.jsonPrimitive?.contentOrNull ?: return null
+                                val output = (part["output"] as? kotlinx.serialization.json.JsonArray)
+                                    ?.mapNotNull { (it as? JsonObject) }
                                 SseEvent.ToolResult(
                                     sessionId = sessionId,
                                     toolCallId = toolCallId,
-                                    isError = part["isError"]?.jsonPrimitive?.contentOrNull == "true"
+                                    isError = part["isError"]?.jsonPrimitive?.contentOrNull == "true",
+                                    content = output
                                 )
                             }
                             else -> {
@@ -823,10 +830,13 @@ class OpenCodeClient(
                     val isError = props["isError"]?.jsonPrimitive?.let {
                         if (it.isString) it.content.lowercase() == "true" else it.toString().lowercase() == "true"
                     } ?: false
+                    val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? JsonObject) }
                     SseEvent.ToolResult(
                         sessionId = sessionId,
                         toolCallId = toolCallId,
-                        isError = isError
+                        isError = isError,
+                        content = output
                     )
                 }
 
