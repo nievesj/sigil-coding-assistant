@@ -1,6 +1,6 @@
 package com.opencode.acp.chat.ui.compose
 
-import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -24,11 +24,13 @@ import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.TodoItem
 import org.jetbrains.jewel.ui.component.Text
 
-private val TodoHeaderColor = Color(0xFFCCCCCC)
+private val TodoBg = Color(0xFF252525)
+private val TodoHeaderColor = Color(0xFF808080)
 private val TodoPendingColor = Color(0xFF808080)
 private val TodoInProgressColor = Color(0xFFE5A617)
 private val TodoCompletedColor = Color(0xFF6BBE50)
 private val TodoCancelledColor = Color(0xFF666666)
+private val TodoAccent = Color(0xFF3574F0)
 
 /**
  * Collapsible todo list panel showing the current session's tasks.
@@ -47,14 +49,14 @@ fun TodoListPanel(
     val incomplete = todos.filter { it.status != "completed" && it.status != "cancelled" }
     if (incomplete.isEmpty()) return
 
-    var expanded by remember(incomplete.size) { mutableStateOf(incomplete.size <= 4) }
+    var expanded by remember { mutableStateOf(true) }
 
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .animateContentSize()
-            .clip(RoundedCornerShape(6.dp))
-            .padding(vertical = 4.dp),
+            .clip(RoundedCornerShape(8.dp))
+            .background(TodoBg)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
         // Header with toggle
@@ -63,7 +65,7 @@ fun TodoListPanel(
                 .fillMaxWidth()
                 .clickable(enabled = incomplete.size > 4) { expanded = !expanded }
                 .padding(vertical = 2.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
@@ -75,7 +77,7 @@ fun TodoListPanel(
                 text = "Todo",
                 fontSize = 11.sp,
                 fontWeight = FontWeight.SemiBold,
-                color = TodoHeaderColor,
+                color = TodoAccent,
             )
             Text(
                 text = "${incomplete.size}",
@@ -127,7 +129,7 @@ private fun TodoRow(todo: TodoItem) {
             color = if (todo.status == "completed" || todo.status == "cancelled") TodoPendingColor
                     else Color(0xFFDDDDDD),
             lineHeight = 14.sp,
-            modifier = Modifier.weight(1f)
+            modifier = Modifier.weight(1f).padding(end = 4.dp)
         )
     }
 }

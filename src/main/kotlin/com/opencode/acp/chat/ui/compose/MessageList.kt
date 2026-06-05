@@ -78,6 +78,7 @@ fun MessageList(
     modifier: Modifier = Modifier,
     project: Project? = null,
     onSubagentClick: ((String) -> Unit)? = null,
+    onImagePreview: ((String) -> Unit)? = null,
 ) {
     val listState = rememberLazyListState()
 
@@ -98,21 +99,21 @@ fun MessageList(
             count = messages.size,
             key = { index -> messages[messages.size - 1 - index].id }
         ) { index ->
-            MessageItem(messages[messages.size - 1 - index], project, onSubagentClick)
+            MessageItem(messages[messages.size - 1 - index], project, onSubagentClick, onImagePreview)
         }
     }
 }
 
 @Composable
-fun MessageItem(message: ChatMessage, project: Project? = null, onSubagentClick: ((String) -> Unit)? = null) {
+fun MessageItem(message: ChatMessage, project: Project? = null, onSubagentClick: ((String) -> Unit)? = null, onImagePreview: ((String) -> Unit)? = null) {
     when (message.role) {
-        MessageRole.USER -> UserMessage(message)
+        MessageRole.USER -> UserMessage(message, onImagePreview)
         MessageRole.ASSISTANT -> AssistantMessage(message, project, onSubagentClick)
     }
 }
 
 @Composable
-fun UserMessage(message: ChatMessage) {
+fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.End
@@ -132,6 +133,10 @@ fun UserMessage(message: ChatMessage) {
                                     .size(100.dp)
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(Color(0xFF3E3E3E))
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                    ) { onImagePreview?.invoke(file.dataUri) }
                             ) {
                                 ComposeImage(
                                     bitmap = bitmap,

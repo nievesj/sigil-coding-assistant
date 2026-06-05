@@ -92,8 +92,7 @@ class OpenCodeClient(
 
     @Serializable
     private data class PermissionRequest(
-        val response: String,
-        val remember: Boolean? = null
+        val response: String
     )
 
     @Serializable
@@ -441,19 +440,17 @@ class OpenCodeClient(
 
     /**
      * Responds to a permission request.
-     * POST /session/{id}/permissions/{permId}
+     * POST /permission/{requestID}/reply
      */
     suspend fun respondPermission(
-        sessionId: String,
         permissionId: String,
-        response: String,
-        remember: Boolean? = null
+        response: String
     ) {
         try {
-            httpClient.post("$baseUrl/session/$sessionId/permissions/$permissionId") {
+            httpClient.post("$baseUrl/permission/$permissionId/reply") {
                 applyAuth()
                 contentType(ContentType.Application.Json)
-                setBody(json.encodeToString(PermissionRequest(response = response, remember = remember)))
+                setBody(json.encodeToString(PermissionRequest(response = response)))
             }
         } catch (e: Exception) {
             logger.warn(e) { "Failed to respond to permission $permissionId" }
@@ -686,16 +683,18 @@ class OpenCodeClient(
                             }
                             "tool_use", "tool" -> {
                                 // OpenCode server uses "tool" for V1, "tool_use" is the alternate name
+                                // part.id is the part ID (prt_xxx), part.callID is the tool call ID
                                 val toolCallId = part["callID"]?.jsonPrimitive?.contentOrNull
                                     ?: part["id"]?.jsonPrimitive?.contentOrNull
                                     ?: return null
                                 val toolName = part["tool"]?.jsonPrimitive?.contentOrNull
                                     ?: part["name"]?.jsonPrimitive?.contentOrNull
                                     ?: "tool"
-                                val state = part["state"]?.jsonPrimitive?.contentOrNull
-                                // "running" = in progress, "completed" = done, "failed" = error
-                                // Only emit ToolUse for started/running; ToolResult for completed/failed
-                                when (state) {
+                                // state is a nested object: { status: "running"|"completed"|"error"|..., input, output, ... }
+                                val stateObj = part["state"]?.jsonObject
+                                val status = stateObj?.get("status")?.jsonPrimitive?.contentOrNull
+                                debugLog("SSE TOOL: callID=$toolCallId, tool=$toolName, status=$status, stateKeys=${stateObj?.keys}")
+                                when (status) {
                                     "completed" -> {
                                         SseEvent.ToolResult(
                                             sessionId = sessionId,
@@ -703,7 +702,7 @@ class OpenCodeClient(
                                             isError = false
                                         )
                                     }
-                                    "failed" -> {
+                                    "error" -> {
                                         SseEvent.ToolResult(
                                             sessionId = sessionId,
                                             toolCallId = toolCallId,
@@ -712,12 +711,13 @@ class OpenCodeClient(
                                     }
                                     else -> {
                                         // "running", "pending", or null — emit as ToolUse
+                                        val input = stateObj?.get("input")?.jsonObject ?: part["input"]?.jsonObject
                                         SseEvent.ToolUse(
                                             sessionId = sessionId,
                                             toolCallId = toolCallId,
                                             toolName = toolName,
-                                            title = part["name"]?.jsonPrimitive?.contentOrNull ?: toolName,
-                                            input = part["input"]?.jsonObject
+                                            title = stateObj?.get("title")?.jsonPrimitive?.contentOrNull ?: toolName,
+                                            input = input
                                         )
                                     }
                                 }
@@ -789,14 +789,18 @@ class OpenCodeClient(
                     )
                 }
 
-                "permission" -> {
-                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val action = props["action"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val description = props["description"]?.jsonPrimitive?.contentOrNull
+                "permission.asked" -> {
+                    val permissionId = props["id"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val permission = props["permission"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val toolObj = props["tool"]?.jsonObject
+                    val toolCallId = toolObj?.get("callID")?.jsonPrimitive?.contentOrNull ?: ""
+                    val patterns = props["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                    val description = if (patterns.isNullOrEmpty()) permission else "$permission: ${patterns.joinToString(", ")}"
                     SseEvent.Permission(
                         sessionId = sessionId,
+                        permissionId = permissionId,
                         toolCallId = toolCallId,
-                        action = action,
+                        action = permission,
                         description = description
                     )
                 }

@@ -112,57 +112,21 @@ fun ContextIndicator(
                     } else 0f
                     val alpha = if (isStreaming) pulseAlpha else 1f
 
-                    // Outer ring(s) for high usage
-                    if (ctx.contextLimit > 0L) {
-                        when {
-                            ctx.isOverflow -> {
-                                // Double pulsing ring for context overflow
-                                Canvas(
-                                    modifier = Modifier
-                                        .size((sizeDp + 6).dp)
-                                        .align(Alignment.Center)
-                                ) {
-                                    val outerDiameter = (sizeDp + 6).dp.toPx()
-                                    val ringRadius = outerDiameter / 2f - 2.dp.toPx()
-                                    drawCircle(
-                                        color = color.copy(alpha = alpha),
-                                        radius = ringRadius,
-                                        center = center,
-                                        style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
-                                    )
-                                }
-                                Canvas(
-                                    modifier = Modifier
-                                        .size((sizeDp + 10).dp)
-                                        .align(Alignment.Center)
-                                ) {
-                                    val outerDiameter = (sizeDp + 10).dp.toPx()
-                                    val ringRadius = outerDiameter / 2f - 2.dp.toPx()
-                                    drawCircle(
-                                        color = color.copy(alpha = alpha * 0.5f),
-                                        radius = ringRadius,
-                                        center = center,
-                                        style = Stroke(width = 1.5.dp.toPx(), cap = StrokeCap.Round)
-                                    )
-                                }
-                            }
-                            ctx.usagePercent >= 75f -> {
-                                // Single ring for high usage
-                                Canvas(
-                                    modifier = Modifier
-                                        .size((sizeDp + 4).dp)
-                                        .align(Alignment.Center)
-                                ) {
-                                    val outerDiameter = (sizeDp + 4).dp.toPx()
-                                    val ringRadius = outerDiameter / 2f - 2.dp.toPx()
-                                    drawCircle(
-                                        color = color.copy(alpha = alpha),
-                                        radius = ringRadius,
-                                        center = center,
-                                        style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
-                                    )
-                                }
-                            }
+                    // Outer ring for high usage
+                    if (ctx.contextLimit > 0L && ctx.usagePercent >= 75f) {
+                        Canvas(
+                            modifier = Modifier
+                                .size((sizeDp + 4).dp)
+                                .align(Alignment.Center)
+                        ) {
+                            val outerDiameter = (sizeDp + 4).dp.toPx()
+                            val ringRadius = outerDiameter / 2f - 2.dp.toPx()
+                            drawCircle(
+                                color = color.copy(alpha = alpha),
+                                radius = ringRadius,
+                                center = center,
+                                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
+                            )
                         }
                     }
 
@@ -335,14 +299,6 @@ private fun ContextTooltip(
                         fontSize = 10.sp,
                         color = contextColorForPercent(ctx.usagePercent)
                     )
-                    if (ctx.isOverflow && ctx.contextLimit > 0L) {
-                        Text(
-                            text = "⚠ Context overflow — compact to free space",
-                            fontSize = 10.sp,
-                            color = ContextRed,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
                     // Cost line
                     Text(
                         text = "Cost: ${formatTooltipCost(ctx.totalCost)}",

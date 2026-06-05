@@ -66,7 +66,6 @@ fun SessionSidebar(
     onSessionArchived: (String) -> Unit,
     onRetry: () -> Unit,
     onContextRetry: () -> Unit,
-    onContextCompact: () -> Unit,
     onShowDetails: () -> Unit,
     project: Project,
     modifier: Modifier = Modifier
@@ -111,7 +110,6 @@ fun SessionSidebar(
                 ContextPanel(
                     state = contextState,
                     onRetry = onContextRetry,
-                    onCompact = onContextCompact,
                     modifier = Modifier.weight(1f)
                 )
             }

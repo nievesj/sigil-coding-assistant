@@ -59,7 +59,9 @@ data class ToolCallPill(
     val toolName: String,
     val title: String,
     val kind: ToolKind,
-    val status: ToolCallStatus
+    val status: ToolCallStatus,
+    val input: kotlinx.serialization.json.JsonObject? = null,
+    val output: List<kotlinx.serialization.json.JsonObject>? = null,
 )
 
 /** A file modified by a tool call, displayed in the assistant message. */
@@ -75,7 +77,8 @@ data class PermissionPrompt(
     val permissionId: String,
     val toolCallId: String,
     val toolName: String,
-    val description: String?
+    val description: String?,
+    val patterns: List<String> = emptyList()
 )
 
 /** Bottom bar state. */
@@ -147,9 +150,9 @@ enum class ConnectionState {
 
 /** Permission response options (strongly typed). */
 enum class PermissionResponse(val optionId: String) {
-    ALLOW_ONCE("allow-once"),
-    REJECT_ONCE("reject-once"),
-    ALLOW_ALWAYS("allow-always")
+    ALLOW_ONCE("once"),
+    REJECT_ONCE("reject"),
+    ALLOW_ALWAYS("always")
 }
 
 /** Display model for a session in the sidebar list. */
@@ -201,8 +204,7 @@ data class SessionContext(
     val deletions: Int,              // lines deleted (from session summary)
     val filesModified: Int,          // files modified (from session summary)
     val sessionCreated: Long,        // epoch millis
-    val lastUpdated: Long,          // epoch millis
-    val isOverflow: Boolean = false  // true when context usage exceeds usable threshold
+    val lastUpdated: Long           // epoch millis
 )
 
 /** A single todo item from the OpenCode todowrite tool. */

@@ -102,6 +102,7 @@ class SseEventListener(
                 )
                 "permission" -> SseEvent.Permission(
                     sessionId = sessionId,
+                    permissionId = obj["permissionId"]?.jsonPrimitive?.content ?: "",
                     toolCallId = obj["toolCallId"]?.jsonPrimitive?.content ?: "",
                     action = obj["action"]?.jsonPrimitive?.content ?: "",
                     description = obj["description"]?.jsonPrimitive?.content

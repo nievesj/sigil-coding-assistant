@@ -41,6 +41,9 @@ import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.viewmodel.ChatViewModel
+import com.intellij.icons.AllIcons
+import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
+import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
@@ -134,7 +137,18 @@ fun ChatScreen(
     val isSidebarVisible by viewModel.isSidebarVisible.collectAsState()
     val sessionContextState by viewModel.sessionContextState.collectAsState()
     val todoItems by viewModel.todoItems.collectAsState()
+    val availableCommands by viewModel.availableCommands.collectAsState()
     var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
+
+    // Local (non-server) slash commands — always shown first
+    val localCommands = remember {
+        listOf(
+            SlashCommand("clear", "Start a new session", IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add)),
+            SlashCommand("cancel", "Cancel current response", IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Suspend)),
+        )
+    }
+    // Merged list: local commands first, then server commands
+    val allSlashCommands = localCommands + availableCommands
     val scope = rememberCoroutineScope()
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
     var previewImageUri by remember { mutableStateOf<String?>(null) }
@@ -292,7 +306,6 @@ fun ChatScreen(
                     onSessionArchived = { scope.launch { viewModel.archiveSession(it) } },
                     onRetry = { scope.launch { viewModel.loadSessions() } },
                     onContextRetry = { viewModel.retryContextFetch() },
-                    onContextCompact = { viewModel.compactSession() },
                     onShowDetails = { /* Context tab is already showing */ },
                     project = project,
                     modifier = Modifier.width(sidebarWidth)
@@ -309,12 +322,6 @@ fun ChatScreen(
                         onRetry = { scope.launch { viewModel.retryConnection(project.basePath ?: ".") } }
                     )
 
-                    // Todo list panel (shows only when there are active todos)
-                    TodoListPanel(
-                        todos = todoItems,
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)
-                    )
-
                     // Message list (fills remaining space)
                     MessageList(
                         messages = messages,
@@ -323,6 +330,7 @@ fun ChatScreen(
                         onSubagentClick = { subagentId ->
                             scope.launch { viewModel.switchSession(subagentId) }
                         },
+                        onImagePreview = { uri -> previewImageUri = uri },
                     )
                 }
             }
@@ -377,16 +385,19 @@ fun ChatScreen(
                 onSlashCommand = { command ->
                     scope.launch {
                         when (command.name) {
-                            "compact" -> viewModel.compactSession()
                             "clear" -> viewModel.createAndSwitchSession()
                             "cancel" -> viewModel.cancel()
+                            else -> viewModel.executeServerCommand(command.name)
                         }
                     }
                 },
+                commands = allSlashCommands,
+                todos = todoItems,
             )
         }
 
-        // Image preview overlay — centered in the entire plugin window
+        // Image preview overlay — centered in the entire plugin window.
+        // Only the dark background dismisses the preview; clicking the image itself does not.
         previewImageUri?.let { uri ->
             val bitmap = remember(uri) { decodeDataUriToBitmap(uri) }
             if (bitmap != null) {
@@ -394,7 +405,10 @@ fun ChatScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .background(Color(0x88000000))
-                        .clickable { previewImageUri = null },
+                        .clickable(
+                            interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                            indication = null,
+                        ) { previewImageUri = null },
                     contentAlignment = Alignment.Center,
                 ) {
                     ComposeImage(
@@ -403,7 +417,11 @@ fun ChatScreen(
                         modifier = Modifier
                             .fillMaxWidth(0.85f)
                             .fillMaxHeight(0.85f)
-                            .clip(RoundedCornerShape(8.dp)),
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(
+                                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                                indication = null,
+                            ) { /* Consume click — don't dismiss preview when clicking the image */ },
                         contentScale = ContentScale.Fit,
                     )
                 }

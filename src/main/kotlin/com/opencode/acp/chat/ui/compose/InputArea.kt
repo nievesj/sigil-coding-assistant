@@ -68,6 +68,7 @@ import com.opencode.acp.chat.model.OpenCodeAgentInfo
 import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.ThinkingEffort
+import com.opencode.acp.chat.model.TodoItem
 import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
@@ -301,7 +302,9 @@ fun InputArea(
     onFilesAndFolders: () -> Unit = {},
     onImage: () -> Unit = {},
     onRecentFileClick: (RecentFile) -> Unit = {},
-    onSlashCommand: (SlashCommand) -> Unit = {}
+    onSlashCommand: (SlashCommand) -> Unit = {},
+    commands: List<SlashCommand> = emptyList(),
+    todos: List<TodoItem> = emptyList()
 ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
@@ -461,6 +464,7 @@ fun InputArea(
                     onDismissRequest = { showSlashPalette = false },
                 ) {
                     SlashCommandPalette(
+                        commands = commands,
                         query = slashQuery,
                         onCommandSelected = { command ->
                             showSlashPalette = false
@@ -470,6 +474,17 @@ fun InputArea(
                         onDismiss = { showSlashPalette = false },
                     )
                 }
+            }
+        }
+
+        // Todo list panel — shown above input when there are active todos
+        if (todos.isNotEmpty()) {
+            val incomplete = todos.filter { it.status != "completed" && it.status != "cancelled" }
+            if (incomplete.isNotEmpty()) {
+                TodoListPanel(
+                    todos = todos,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         }
 
@@ -669,7 +684,7 @@ fun InputArea(
                                     when {
                                         // Enter with slash palette: execute first matching command
                                         event.key == Key.Enter && !event.isShiftPressed && showSlashPalette -> {
-                                            val match = SLASH_COMMANDS.filter { it.name.startsWith(slashQuery, ignoreCase = true) }
+                                            val match = commands.filter { it.name.startsWith(slashQuery, ignoreCase = true) }
                                             if (match.isNotEmpty()) {
                                                 showSlashPalette = false
                                                 textState.edit { replace(0, length, "") }

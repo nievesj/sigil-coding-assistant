@@ -7,6 +7,25 @@ that are intentionally left for future implementation.
 
 ## Developer Notes
 
+### Auto-Compaction is Server-Side
+
+OpenCode handles context compaction automatically on the server. After each
+assistant response, the server's prompt loop checks `compaction.isOverflow()`
+(`packages/opencode/src/session/overflow.ts`) and, if token usage exceeds the
+usable limit, creates a compaction task with `auto: true`. The plugin does NOT
+need to detect overflow or trigger compaction — the server does it transparently.
+
+The plugin's context indicator shows usage percentage (from the last assistant
+message's tokens vs. the model's context limit) for informational purposes only.
+There is no `/compact` command or overflow banner — compaction is automatic.
+
+- **Server source:** `packages/opencode/src/session/prompt.ts` (lines 1322-1328),
+  `packages/opencode/src/session/overflow.ts`, `packages/opencode/src/session/compaction.ts`
+- **Config:** `compaction.auto` defaults to `true`; can be disabled server-side
+- **Warning:** Do NOT re-add client-side overflow detection or a `/compact` command.
+  The server already handles this. Adding client-side compaction would be redundant
+  and could race with the server's auto-compaction.
+
 ### runIde Log Location
 
 Logs for the plugin when running via `runIde` are NOT in the main IDEA log.
@@ -221,20 +240,30 @@ showing only the first 2 and a "+N more…" hint.
 ### Slash Command Palette — `/` Prefix Triggering
 
 Typing `/` at the start of the input field shows a popup palette with slash commands.
-The palette filters as the user types (e.g., `/co` shows `/compact`).
+The palette filters as the user types (e.g., `/cl` shows `/clear`).
 
-**Available commands:**
-- `/compact` — compacts session context (calls `compactSession()`)
-- `/clear` — starts a new session (calls `createAndSwitchSession()`)
-- `/cancel` — cancels the current response (calls `cancel()`)
+**Command sources:**
+1. **Local commands** (handled by plugin, not sent to server): `/clear`, `/cancel`
+2. **Server commands** (fetched from `GET /command`): `/init`, `/review`, `/simplify`, etc.
+   — any command the OpenCode server exposes dynamically
 
-**Implementation:** `InputArea.kt` watches `textState` via `snapshotFlow`. When text
-starts with `/` and has no newlines, `showSlashPalette` becomes true and a `Popup`
-with `SlashCommandPalette` appears above the input. Enter confirms the first match.
-Escape dismisses. The `onSlashCommand` callback in `ChatScreen.kt` routes commands
-to the appropriate ViewModel method.
+**Flow:**
+1. On init and session switch, `ChatViewModel.fetchAvailableCommands()` calls
+   `client.listCommands()` (GET /command) and stores results in `_availableCommands`
+   StateFlow as `SlashCommand(isServerCommand = true)` instances.
+2. `ChatScreen.kt` merges local commands (clear/cancel) with server commands
+   (`localCommands + availableCommands`) and passes the combined list to `InputArea`.
+3. `InputArea` passes the list to `SlashCommandPalette` for filtering/display.
+4. On selection: local commands route to ViewModel methods
+   (`createAndSwitchSession()`, `cancel()`). Server commands route to
+   `executeServerCommand(name)` → `client.executeCommand(sessionId, name, "")`.
 
-- **Files:** `SlashCommandPalette.kt`, `InputArea.kt` (palette state + Popup), `ChatScreen.kt` (`onSlashCommand` handler)
+**Key detail:** `CommandInfo.id` (not `name`) is the command string sent to the server.
+
+- **Files:** `SlashCommandPalette.kt` (data class + composable), `ChatViewModel.kt`
+  (`_availableCommands`, `fetchAvailableCommands()`, `executeServerCommand()`),
+  `InputArea.kt` (palette state + Popup + `commands` param),
+  `ChatScreen.kt` (merges commands + `onSlashCommand` handler)
 
 - **Docs:** https://opencode.ai/docs/server/
 - **OpenAPI spec:** http://127.0.0.1:4096/doc (when server is running)
@@ -242,6 +271,8 @@ to the appropriate ViewModel method.
 - **Create session:** `POST /session` → body `{ parentID?, title? }` → returns `Session` object
 - **Session model:** `id` (required, starts with `ses_`), `slug`, `projectID`, `directory`, `title`, `version`, `time` (required), plus optional fields
 - **Send message:** `POST /session/:id/message` → body `{ parts }` → returns message
+- **List commands:** `GET /command` → returns `CommandInfo[]` (each with `id`, `name`, `description`)
+- **Execute command:** `POST /session/:id/command` → body `{ command, arguments }` → returns message
 - **SSE events:** `GET /event` (global) or `GET /global/event` → stream of typed events
 - **Todo events:** SSE `todo.updated` event sends `{ type: "todo.updated", properties: { todos: [...] } }` with same schema as GET
 - **OpenCodeAgentSession:** `SseEvent.TodoUpdated` branch added to exhaustive `when` (informational only for ACP path; chat UI handles via ChatViewModel)
@@ -401,10 +432,10 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 - [x] Dark theme chat UI with proper typography and colors
 - [x] Code block rendering with custom ChatFencedCodeBlock via MarkdownSegmenter (bypasses dead DefaultMarkdownBlockRenderer override)
 - [x] Inline code gray background removed — fix was SpanStyle(background=Transparent) propagation to Heading.H1–H6 (not a composable-level background)
-- [x] Context overflow detection (80% threshold) with "Compact Session" action
+- [x] Context usage indicator (doughnut ring + tooltip + sidebar panel) — auto-compaction is server-side
 - [x] SSE `todo.updated` event handling + `GET /session/:id/todo` fetch
 - [x] Todo list panel (collapsible, `✓`/`•`/`○` status indicators, auto-collapse >4 items)
-- [x] Slash command palette (`/compact`, `/clear`, `/cancel`) triggered by `/` prefix in input
+- [x] Slash command palette (`/clear`, `/cancel`) triggered by `/` prefix in input
 - [x] StreamHealer for inline markdown formatting during streaming
 - [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
 - [x] SSE reconnection with exponential backoff (1s→2s→4s→...→30s cap, ±20% jitter, abort in-flight response, retryConnection for ERROR state)

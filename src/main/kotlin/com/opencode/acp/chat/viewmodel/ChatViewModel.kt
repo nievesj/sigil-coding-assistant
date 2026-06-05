@@ -8,6 +8,7 @@ import com.opencode.acp.adapter.OpenCodePart
 import com.opencode.acp.adapter.toSessionItem
 import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.chat.model.*
+import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
@@ -95,8 +96,9 @@ class ChatViewModel(
     private val _todoItems = MutableStateFlow<List<TodoItem>>(emptyList())
     val todoItems: StateFlow<List<TodoItem>> = _todoItems.asStateFlow()
 
-    /** Job for in-flight context fetch — cancelled on session switch and close. */
-    private var contextFetchJob: Job? = null
+    /** Available slash commands fetched from the server. */
+    private val _availableCommands = MutableStateFlow<List<SlashCommand>>(emptyList())
+    val availableCommands: StateFlow<List<SlashCommand>> = _availableCommands.asStateFlow()
 
     /** Mutex to prevent concurrent session switches. NOT reentrant. */
     private val switchMutex = Mutex()
@@ -146,6 +148,7 @@ class ChatViewModel(
         _isStreaming.value = false
         activeAssistantMessageId = null
         firstTextChunkReceived = false
+        userEchoStripped = false
         responseDeferred?.complete(Unit)
         responseDeferred = null
         _permissionPrompt.value = null
@@ -154,8 +157,6 @@ class ChatViewModel(
         lastUserText = null
         _sessionContextState.value = SessionContextState.Loading
         _todoItems.value = emptyList()
-        contextFetchJob?.cancel()
-        contextFetchJob = null
     }
 
     // --- Internal: OpenCode engine connection ---
@@ -433,11 +434,23 @@ class ChatViewModel(
                 sseJob = startSseSubscription(opencodeClient, sessionId!!)
 
                 // Fetch initial context and todos for the active session
-                fetchSessionContext()
+                computeSessionContext()
                 fetchTodos()
+
+                // TEMP: Test permission prompt to show rendering
+                _permissionPrompt.value = PermissionPrompt(
+                    permissionId = "test-perm-1",
+                    toolCallId = "test-tc-1",
+                    toolName = "read_file",
+                    description = "This tool wants to read \"src/main/Secrets.kt\" on your disk.",
+                    patterns = listOf("src/main/**")
+                )
             } else {
                 logger.info { "No active session on IDE load - skipping SSE subscription (user can create session manually)" }
             }
+
+            // Fetch available slash commands from the server
+            fetchAvailableCommands()
 
             _connectionState.value = ConnectionState.CONNECTED
             initialized = true
@@ -530,8 +543,9 @@ class ChatViewModel(
                 sseJob = startSseSubscription(client, targetSessionId)
                 updateSessionSelection(targetSessionId)
                 // Fetch context and todos for the new session
-                fetchSessionContext()
+                computeSessionContext()
                 fetchTodos()
+                fetchAvailableCommands()
                 logger.info { "Switched to session $targetSessionId (${chatMessages.size} messages loaded)" }
             } catch (e: CancellationException) {
                 throw e
@@ -583,7 +597,7 @@ class ChatViewModel(
         loadSessions()
         updateSessionSelection(session.id)
         // Fetch context and todos for the new session
-        fetchSessionContext()
+        computeSessionContext()
         fetchTodos()
         logger.info { "Created and switched to new session: ${session.id}" }
     }
@@ -653,6 +667,7 @@ class ChatViewModel(
         addMessage(assistantMsg)
         activeAssistantMessageId = assistantMsg.id
         firstTextChunkReceived = false
+        userEchoStripped = false
 
         _isStreaming.value = true
         val deferred = CompletableDeferred<Unit>()
@@ -702,6 +717,7 @@ class ChatViewModel(
             responseDeferred = null
             activeAssistantMessageId = null
             firstTextChunkReceived = false
+            userEchoStripped = false
         }
     }
 
@@ -717,17 +733,16 @@ class ChatViewModel(
         responseDeferred = null
         _isStreaming.value = false
         firstTextChunkReceived = false
+        userEchoStripped = false
     }
 
     /** Respond to a permission prompt from the OpenCode engine. */
     suspend fun respondPermission(response: PermissionResponse) {
         val prompt = _permissionPrompt.value ?: return
         val client = openCodeClient
-        val currentSessionId = sessionId
-        if (client != null && currentSessionId != null) {
+        if (client != null) {
             try {
                 client.respondPermission(
-                    sessionId = currentSessionId,
                     permissionId = prompt.permissionId,
                     response = response.optionId
                 )
@@ -752,8 +767,6 @@ class ChatViewModel(
         reconnectJob = null
         sseJob?.cancel()
         sseJob = null
-        contextFetchJob?.cancel()
-        contextFetchJob = null
         permissionTimeoutJob?.cancel()
         permissionTimeoutJob = null
         responseDeferred?.complete(Unit)
@@ -870,148 +883,76 @@ class ChatViewModel(
 
     // --- Context Fetching ---
 
-    /** Fetches session context from the server and updates [sessionContextState]. */
-    private fun fetchSessionContext() {
+    /** Computes session context from in-memory messages + providers (like TUI's getSessionContextMetrics). */
+    private fun computeSessionContext() {
         val currentSessionId = sessionId ?: return
-        val client = openCodeClient ?: return
+        val messages = _messages.value
 
-        // Cancel any in-flight fetch
-        contextFetchJob?.cancel()
-
-        contextFetchJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            delay(ChatConstants.CONTEXT_REFRESH_DELAY_MS)
-            val capturedSessionId = currentSessionId
-            try {
-                val session = withTimeout(ChatConstants.CONTEXT_FETCH_TIMEOUT_MS) {
-                    client.getSession(capturedSessionId)
-                }
-                // Discard stale results if session changed during fetch
-                if (sessionId != capturedSessionId) return@launch
-
-                // Debug logging: raw API response
-                logger.info { "Context fetch: session.id=${session.id}, session.model=${session.model}, session.tokens=${session.tokens}, session.cost=${session.cost}" }
-                logger.info { "Context fetch: model.id=${session.model?.id}, model.providerID=${session.model?.providerID}" }
-                logger.info { "Context fetch: tokens.input=${session.tokens?.input}, tokens.output=${session.tokens?.output}, tokens.reasoning=${session.tokens?.reasoning}" }
-                logger.info { "Context fetch: tokens.cache.read=${session.tokens?.cache?.read}, tokens.cache.write=${session.tokens?.cache?.write}" }
-
-                val tokens = session.tokens
-                val sessionTotalTokens = (tokens?.input ?: 0L) +
-                        (tokens?.output ?: 0L) +
-                        (tokens?.reasoning ?: 0L) +
-                        (tokens?.cache?.read ?: 0L) +
-                        (tokens?.cache?.write ?: 0L)
-
-                // OpenCode's TUI gets tokens from the LAST ASSISTANT MESSAGE, not session.tokens.
-                // session.tokens can be stale/null, but last assistant message always has correct data.
-                val lastAssistant = _messages.value.lastOrNull {
-                    it.role == MessageRole.ASSISTANT && it.outputTokens > 0
-                }
-
-                // Use last assistant message's tokens if available, fall back to session tokens
-                val inputTokens: Long
-                val outputTokens: Long
-                val reasoningTokens: Long
-                val cacheReadTokens: Long
-                val cacheWriteTokens: Long
-                val totalTokens: Long
-                val totalCost: Double
-
-                if (lastAssistant != null && (lastAssistant.inputTokens > 0 || lastAssistant.outputTokens > 0)) {
-                    inputTokens = lastAssistant.inputTokens
-                    outputTokens = lastAssistant.outputTokens
-                    reasoningTokens = lastAssistant.reasoningTokens
-                    cacheReadTokens = lastAssistant.cacheReadTokens
-                    cacheWriteTokens = lastAssistant.cacheWriteTokens
-                    totalTokens = inputTokens + outputTokens + reasoningTokens + cacheReadTokens + cacheWriteTokens
-                    totalCost = session.cost.coerceAtLeast(lastAssistant.cost)
-                    logger.info { "Context fetch: using last assistant message tokens: total=$totalTokens, cost=$totalCost" }
-                } else {
-                    inputTokens = tokens?.input ?: 0L
-                    outputTokens = tokens?.output ?: 0L
-                    reasoningTokens = tokens?.reasoning ?: 0L
-                    cacheReadTokens = tokens?.cache?.read ?: 0L
-                    cacheWriteTokens = tokens?.cache?.write ?: 0L
-                    totalTokens = sessionTotalTokens
-                    totalCost = session.cost
-                    logger.info { "Context fetch: using session tokens: total=$totalTokens, cost=$totalCost" }
-                }
-
-                // Resolve model info: try session.model first, fall back to last assistant message
-                var modelId = session.model?.id
-                var providerId = session.model?.providerID
-                if (modelId.isNullOrBlank() || providerId.isNullOrBlank()) {
-                    // Fall back to last assistant message's model info
-                    val lastAssistant = _messages.value.lastOrNull {
-                        it.role == MessageRole.ASSISTANT && !it.modelID.isNullOrBlank()
-                    }
-                    if (lastAssistant != null) {
-                        if (modelId.isNullOrBlank()) modelId = lastAssistant.modelID
-                        if (providerId.isNullOrBlank()) providerId = lastAssistant.providerID
-                        logger.info { "Context fetch: using last assistant message model as fallback: $providerId/$modelId" }
-                    } else {
-                        // Final fallback: use selected model from control state
-                        val selectedModel = _controlState.value.selectedModel
-                        if (selectedModel != null && modelId.isNullOrBlank()) {
-                            modelId = selectedModel.modelID
-                            providerId = selectedModel.providerID
-                            logger.info { "Context fetch: using selected model as fallback: $providerId/$modelId" }
-                        }
-                    }
-                }
-
-                val (providerName, modelName) = resolveModelNames(modelId, providerId)
-                val contextLimit = resolveContextLimit(providerId, modelId)
-
-                logger.info { "Context fetch: resolved providerName=$providerName, modelName=$modelName, contextLimit=$contextLimit, totalTokens=$totalTokens" }
-
-                val usagePercent = if (contextLimit > 0L) {
-                    (totalTokens.toFloat() / contextLimit.toFloat()) * 100f
-                } else 0f
-
-                _sessionContextState.value = SessionContextState.Loaded(
-                    context = SessionContext(
-                        sessionId = capturedSessionId,
-                        title = session.title.ifBlank { "Untitled" },
-                        providerID = providerId ?: "",
-                        modelID = modelId ?: "",
-                        providerName = providerName,
-                        modelName = modelName,
-                        contextLimit = contextLimit,
-                        totalTokens = totalTokens,
-                        inputTokens = inputTokens,
-                        outputTokens = outputTokens,
-                        reasoningTokens = reasoningTokens,
-                        cacheReadTokens = cacheReadTokens,
-                        cacheWriteTokens = cacheWriteTokens,
-                        usagePercent = usagePercent,
-                        totalCost = totalCost,
-                        messageCount = _messages.value.size,
-                        userMessageCount = _messages.value.count { it.role == MessageRole.USER },
-                        assistantMessageCount = _messages.value.count { it.role == MessageRole.ASSISTANT },
-                        additions = session.summary?.additions ?: 0,
-                        deletions = session.summary?.deletions ?: 0,
-                        filesModified = session.summary?.files ?: 0,
-                        sessionCreated = session.time?.created ?: 0L,
-                        lastUpdated = session.time?.updated ?: 0L,
-                        isOverflow = contextLimit > 0L && usagePercent >= ChatConstants.OVERFLOW_THRESHOLD_PERCENT
-                    )
-                )
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                if (sessionId == capturedSessionId) {
-                    _sessionContextState.value = SessionContextState.Error(
-                        message = e.message ?: "Failed to load context",
-                        retryable = true
-                    )
-                }
-            }
+        // Find last assistant message with non-zero tokens (matches TUI's lastAssistantWithTokens)
+        val lastAssistant = messages.findLast {
+            it.role == MessageRole.ASSISTANT && (it.inputTokens + it.outputTokens + it.reasoningTokens + it.cacheReadTokens + it.cacheWriteTokens) > 0
         }
+
+        // Total cost across all assistant messages
+        val totalCost = messages.filter { it.role == MessageRole.ASSISTANT }.sumOf { it.cost }
+
+        // Resolve model + provider from last assistant message, then session, then selected model
+        val modelId = lastAssistant?.modelID
+            ?: _controlState.value.selectedModel?.modelID
+        val providerId = lastAssistant?.providerID
+            ?: _controlState.value.selectedModel?.providerID
+
+        val (providerName, modelName) = resolveModelNames(modelId, providerId)
+        val contextLimit = resolveContextLimit(providerId, modelId)
+
+        // Token counts from last assistant message
+        val inputTokens = lastAssistant?.inputTokens ?: 0L
+        val outputTokens = lastAssistant?.outputTokens ?: 0L
+        val reasoningTokens = lastAssistant?.reasoningTokens ?: 0L
+        val cacheReadTokens = lastAssistant?.cacheReadTokens ?: 0L
+        val cacheWriteTokens = lastAssistant?.cacheWriteTokens ?: 0L
+        val totalTokens = inputTokens + outputTokens + reasoningTokens + cacheReadTokens + cacheWriteTokens
+
+        val usagePercent = if (contextLimit > 0L) {
+            (totalTokens.toFloat() / contextLimit.toFloat()) * 100f
+        } else 0f
+
+        // Session title from sidebar list
+        val sessionTitle = (_sessionListState.value as? SessionListState.Loaded)
+            ?.sessions?.find { it.id == currentSessionId }?.title ?: "Untitled"
+
+        _sessionContextState.value = SessionContextState.Loaded(
+            context = SessionContext(
+                sessionId = currentSessionId,
+                title = sessionTitle,
+                providerID = providerId ?: "",
+                modelID = modelId ?: "",
+                providerName = providerName,
+                modelName = modelName,
+                contextLimit = contextLimit,
+                totalTokens = totalTokens,
+                inputTokens = inputTokens,
+                outputTokens = outputTokens,
+                reasoningTokens = reasoningTokens,
+                cacheReadTokens = cacheReadTokens,
+                cacheWriteTokens = cacheWriteTokens,
+                usagePercent = usagePercent,
+                totalCost = totalCost,
+                messageCount = messages.size,
+                userMessageCount = messages.count { it.role == MessageRole.USER },
+                assistantMessageCount = messages.count { it.role == MessageRole.ASSISTANT },
+                additions = 0,
+                deletions = 0,
+                filesModified = 0,
+                sessionCreated = 0L,
+                lastUpdated = 0L
+            )
+        )
     }
 
-    /** Retries fetching session context (called from UI on error state click). */
+    /** Recomputes session context from in-memory data. */
     fun retryContextFetch() {
-        fetchSessionContext()
+        computeSessionContext()
     }
 
     /**
@@ -1034,34 +975,44 @@ class ChatViewModel(
     }
 
     /**
-     * Requests compaction of the current session to free context space.
-     * Called from UI when the user clicks "Compact" or automatically when context overflows.
-     *
-     * The server will create a compaction message, run the compaction agent to summarize
-     * the conversation history, and then continue the session with reduced context.
+     * Fetches available slash commands from the OpenCode server.
+     * Called after client initialization and after session switch.
      */
-    fun compactSession() {
-        val currentSessionId = sessionId ?: return
+    fun fetchAvailableCommands() {
         val client = openCodeClient ?: return
-        val context = (_sessionContextState.value as? SessionContextState.Loaded)?.context ?: return
-        if (context.providerID.isBlank() || context.modelID.isBlank()) return
-
         scope.launch {
             try {
-                logger.info { "Compacting session $currentSessionId with provider=${context.providerID}, model=${context.modelID}" }
-                client.compactSession(
-                    sessionId = currentSessionId,
-                    providerID = context.providerID,
-                    modelID = context.modelID,
-                    auto = false
-                )
-                // Refresh context after compaction (the summary response will stream in via SSE)
-                delay(2000) // Give the server time to process the compaction
-                fetchSessionContext()
+                val commands = client.listCommands()
+                _availableCommands.value = commands.map { cmd ->
+                    SlashCommand(
+                        name = cmd.id,
+                        description = cmd.description ?: cmd.name,
+                        iconKey = null,
+                        isServerCommand = true
+                    )
+                }
+                logger.info { "Loaded ${commands.size} server commands" }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                logger.warn(e) { "Failed to compact session $currentSessionId" }
+                logger.warn(e) { "Failed to fetch available commands" }
+            }
+        }
+    }
+
+    /**
+     * Executes a server-side slash command.
+     */
+    fun executeServerCommand(commandName: String, args: String = "") {
+        val currentSessionId = sessionId ?: return
+        val client = openCodeClient ?: return
+        scope.launch {
+            try {
+                client.executeCommand(currentSessionId, commandName, args)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "Failed to execute command: $commandName" }
             }
         }
     }
@@ -1158,7 +1109,8 @@ class ChatViewModel(
                     toolName = event.toolName,
                     title = event.title ?: event.toolName,
                     kind = toolKind,
-                    status = ToolCallStatus.IN_PROGRESS
+                    status = ToolCallStatus.IN_PROGRESS,
+                    input = event.input,
                 )
                 toolCallIndex[event.toolCallId] = msgId
 
@@ -1186,7 +1138,7 @@ class ChatViewModel(
             is SseEvent.ToolResult -> {
                 val targetMessageId = toolCallIndex[event.toolCallId] ?: msgId
                 val resolvedStatus = if (event.isError) ToolCallStatus.FAILED else ToolCallStatus.COMPLETED
-                updateToolCallStatus(targetMessageId, event.toolCallId, resolvedStatus)
+                updateToolCallStatus(targetMessageId, event.toolCallId, resolvedStatus, event.content)
             }
 
             is SseEvent.Stop -> {
@@ -1203,17 +1155,18 @@ class ChatViewModel(
                 }
                 responseDeferred?.complete(Unit)
                 // Refresh context and todos after each response completes
-                fetchSessionContext()
+                computeSessionContext()
                 fetchTodos()
             }
 
             is SseEvent.Permission -> {
                 updateToolCallStatus(event.toolCallId, ToolCallStatus.PENDING)
                 val prompt = PermissionPrompt(
-                    permissionId = event.toolCallId,
+                    permissionId = event.permissionId,
                     toolCallId = event.toolCallId,
                     toolName = event.action,
-                    description = event.description
+                    description = event.description,
+                    patterns = event.patterns
                 )
                 _permissionPrompt.value = prompt
                 startPermissionTimeout()
@@ -1275,6 +1228,7 @@ class ChatViewModel(
         _isStreaming.value = false
         activeAssistantMessageId = null
         firstTextChunkReceived = false
+        userEchoStripped = false
     }
 
     private fun addMessage(message: ChatMessage) {
@@ -1295,6 +1249,9 @@ class ChatViewModel(
     /** Whether the first non-empty text chunk for the current assistant response has been received. */
     private var firstTextChunkReceived = false
 
+    /** Whether user echo text has been stripped from the assistant response. */
+    private var userEchoStripped = false
+
     private fun appendTextToMessage(messageId: String, text: String) {
         val toAppend = if (!firstTextChunkReceived && text.isNotBlank()) {
             firstTextChunkReceived = true
@@ -1302,6 +1259,7 @@ class ChatViewModel(
             // This is needed because the server sometimes returns the user's text as part of the assistant's response
             val userText = lastUserText
             if (userText != null && text.startsWith(userText, ignoreCase = true)) {
+                userEchoStripped = true
                 text.substring(userText.length)
             } else {
                 text
@@ -1334,7 +1292,16 @@ class ChatViewModel(
         val messages = _messages.value.toMutableList()
         val index = messageIndex[messageId] ?: return
         val msg = messages[index]
-        messages[index] = msg.copy(content = text)
+        // Strip user echo text from server's full-state snapshot.
+        // The server includes the user's prompt in the assistant's text part.
+        // We only strip once — after that, the content no longer starts with the echo.
+        val stripped = if (!userEchoStripped && lastUserText != null && text.startsWith(lastUserText!!, ignoreCase = true)) {
+            userEchoStripped = true
+            text.substring(lastUserText!!.length)
+        } else {
+            text
+        }
+        messages[index] = msg.copy(content = stripped)
         _messages.value = messages
     }
 
@@ -1374,21 +1341,21 @@ class ChatViewModel(
         _messages.value = messages
     }
 
-    private fun updateToolCallStatus(messageId: String, toolCallId: String, status: ToolCallStatus?) {
+    private fun updateToolCallStatus(messageId: String, toolCallId: String, status: ToolCallStatus?, output: List<kotlinx.serialization.json.JsonObject>? = null) {
         if (status == null) return
         val messages = _messages.value.toMutableList()
         val index = messageIndex[messageId] ?: return
         val msg = messages[index]
         val updatedPills = msg.toolCalls.map { pill ->
-            if (pill.toolCallId == toolCallId) pill.copy(status = status) else pill
+            if (pill.toolCallId == toolCallId) pill.copy(status = status, output = output ?: pill.output) else pill
         }
         messages[index] = msg.copy(toolCalls = updatedPills)
         _messages.value = messages
     }
 
-    private fun updateToolCallStatus(toolCallId: String, status: ToolCallStatus) {
+    private fun updateToolCallStatus(toolCallId: String, status: ToolCallStatus, output: List<kotlinx.serialization.json.JsonObject>? = null) {
         val messageId = toolCallIndex[toolCallId] ?: return
-        updateToolCallStatus(messageId, toolCallId, status)
+        updateToolCallStatus(messageId, toolCallId, status, output)
     }
 
     private fun startPermissionTimeout() {

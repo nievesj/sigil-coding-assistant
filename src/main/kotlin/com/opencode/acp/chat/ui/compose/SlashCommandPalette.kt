@@ -22,12 +22,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.intellij.icons.AllIcons
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 
 /**
  * A slash command definition.
@@ -38,16 +35,8 @@ import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 data class SlashCommand(
     val name: String,
     val description: String,
-    val iconKey: IconKey? = null
-)
-
-/**
- * Available slash commands.
- */
-val SLASH_COMMANDS = listOf(
-    SlashCommand("compact", "Compact session context", IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Lightning)),
-    SlashCommand("clear", "Start a new session", IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add)),
-    SlashCommand("cancel", "Cancel current response", IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Suspend)),
+    val iconKey: IconKey? = null,
+    val isServerCommand: Boolean = false
 )
 
 private val PaletteBg = Color(0xFF252525)
@@ -61,20 +50,22 @@ private val PaletteAccent = Color(0xFF3574F0)
  * Slash command palette popup. Shown when the user types `/` at the start of the input.
  * Filters commands by the text after `/`.
  *
+ * @param commands the list of available slash commands to display
  * @param query the text after `/` (e.g. "co" for `/co`) — used for filtering
  * @param onCommandSelected callback with the selected SlashCommand
  * @param onDismiss callback when the palette should close (Escape, click outside)
  */
 @Composable
 fun SlashCommandPalette(
+    commands: List<SlashCommand>,
     query: String,
     onCommandSelected: (SlashCommand) -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val filtered = remember(query) {
-        if (query.isBlank()) SLASH_COMMANDS
-        else SLASH_COMMANDS.filter { it.name.startsWith(query, ignoreCase = true) }
+    val filtered = remember(query, commands) {
+        if (query.isBlank()) commands
+        else commands.filter { it.name.startsWith(query, ignoreCase = true) }
     }
 
     if (filtered.isEmpty()) {

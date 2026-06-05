@@ -53,9 +53,11 @@ sealed interface SseEvent {
     /** Permission check requested by OpenCode. */
     data class Permission(
         override val sessionId: String,
+        val permissionId: String,
         val toolCallId: String,
         val action: String,
-        val description: String? = null
+        val description: String? = null,
+        val patterns: List<String> = emptyList()
     ) : SseEvent
 
     /** Error event from OpenCode. */
