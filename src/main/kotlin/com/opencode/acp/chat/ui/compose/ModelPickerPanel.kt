@@ -35,6 +35,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -274,7 +275,7 @@ fun ModelPickerPanel(
 
 @OptIn(ExperimentalJewelApi::class)
 @Composable
-private fun SectionHeader(
+internal fun SectionHeader(
     title: String,
     iconText: String? = null,
     iconColor: Color = MutedTextColor,
@@ -344,7 +345,7 @@ private fun ModelRow(
             .clip(RoundedCornerShape(4.dp))
             .background(bgColor)
             .hoverable(interactionSource)
-            .clickable(onClick = onClick)
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -364,6 +365,26 @@ private fun ModelRow(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+
+        // Feature indicator icons
+        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+            if (model.reasoning) {
+                Text(
+                    text = "\u26A1",
+                    fontSize = 10.sp,
+                    color = Color(0xFFE5C100),
+                )
+            }
+            if (hasVisionCapability(model)) {
+                Text(
+                    text = "\u25C9",
+                    fontSize = 10.sp,
+                    color = Color(0xFF4285F4),
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.width(4.dp))
 
         // Context window
         if (model.contextWindow > 0) {
@@ -392,9 +413,10 @@ private fun ModelRow(
 // ── Provider icon ───────────────────────────────────────────────────────────
 
 @Composable
-private fun ProviderIcon(
+internal fun ProviderIcon(
     providerId: String,
     modifier: Modifier = Modifier,
+    tint: Color? = null,
 ) {
     val bitmap = remember(providerId) { ProviderIconLoader.load(providerId, 20) }
 
@@ -404,10 +426,11 @@ private fun ProviderIcon(
             contentDescription = providerId,
             modifier = modifier,
             contentScale = ContentScale.Fit,
+            colorFilter = tint?.let { ColorFilter.tint(it) },
         )
     } else {
         // Fallback: text-based colored circle with initial
-        val color = providerColors[providerId] ?: MutedTextColor
+        val color = tint ?: (providerColors[providerId] ?: MutedTextColor)
         val initial = providerId.firstOrNull()?.uppercaseChar()?.toString() ?: "?"
 
         Box(
@@ -482,4 +505,24 @@ private fun formatContextWindow(tokens: Int): String = when {
         if (k == k.toLong().toDouble()) "${k.toLong()}K" else "${"%.1f".format(k)}K"
     }
     else -> tokens.toString()
+}
+
+/**
+ * Heuristic detection of vision/multimodal capability from model name.
+ * Covers known vision-capable model families.
+ */
+private fun hasVisionCapability(model: ProviderModel): Boolean {
+    val id = model.modelID.lowercase()
+    val name = model.displayName.lowercase()
+    return id.contains("vision") ||
+        id.startsWith("gpt-4o") ||
+        id.startsWith("gpt-4.1") ||
+        id.contains("gemini") ||
+        id.contains("claude-3") ||
+        id.contains("claude-4") ||
+        id.contains("qwen2.5-vl") ||
+        id.contains("qwen-vl") ||
+        id.contains("kimi-k2.6") ||
+        id.contains("kimi-k2") ||
+        name.contains("vision")
 }

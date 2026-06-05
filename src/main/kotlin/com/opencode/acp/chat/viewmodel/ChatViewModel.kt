@@ -8,7 +8,6 @@ import com.opencode.acp.adapter.OpenCodePart
 import com.opencode.acp.adapter.toSessionItem
 import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.chat.model.*
-import com.opencode.acp.chat.ui.compose.AttachedFile
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
@@ -24,6 +23,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -42,6 +42,14 @@ class ChatViewModel(
 ) : Closeable {
 
     private val logger = KotlinLogging.logger {}
+
+    /** Write debug log to a file we can read from outside the IDE sandbox. */
+    private val debugLogFile = System.getProperty("java.io.tmpdir") + "/opencode-sse-debug.log"
+    private fun debugLog(msg: String) {
+        try {
+            java.io.File(debugLogFile).appendText("${System.currentTimeMillis()} $msg\n")
+        } catch (_: Exception) {}
+    }
 
     // --- State ---
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
@@ -71,6 +79,10 @@ class ChatViewModel(
     private val _sessionListState = MutableStateFlow<SessionListState>(SessionListState.Loading)
     val sessionListState: StateFlow<SessionListState> = _sessionListState.asStateFlow()
 
+    /** Child sessions keyed by parent session ID. Updated after loadSessions / switchSession. */
+    private val _childSessionMap = MutableStateFlow<Map<String, List<SessionItem>>>(emptyMap())
+    val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = _childSessionMap.asStateFlow()
+
     /** Whether the sidebar is visible. Persisted in settings. */
     private val _isSidebarVisible = MutableStateFlow(OpenCodeSettingsState.getInstance().sidebarVisible)
     val isSidebarVisible: StateFlow<Boolean> = _isSidebarVisible.asStateFlow()
@@ -79,11 +91,18 @@ class ChatViewModel(
     private val _sessionContextState = MutableStateFlow<SessionContextState>(SessionContextState.Loading)
     val sessionContextState: StateFlow<SessionContextState> = _sessionContextState.asStateFlow()
 
+    /** Todo items for the current session, updated via SSE and initial fetch. */
+    private val _todoItems = MutableStateFlow<List<TodoItem>>(emptyList())
+    val todoItems: StateFlow<List<TodoItem>> = _todoItems.asStateFlow()
+
     /** Job for in-flight context fetch — cancelled on session switch and close. */
     private var contextFetchJob: Job? = null
 
     /** Mutex to prevent concurrent session switches. NOT reentrant. */
     private val switchMutex = Mutex()
+
+    /** Pending file changes collected from tool calls, keyed by message ID. */
+    private val pendingFileChanges = mutableMapOf<String, MutableList<ChatFileChange>>()
 
     /** Emits a signal to check the clipboard for an image. Called by the IntelliJ Ctrl+V action. */
     fun requestImagePaste() {
@@ -98,13 +117,25 @@ class ChatViewModel(
     /**
      * Starts an SSE subscription for the given session, filtering events by sessionId.
      * Returns the Job so the caller can cancel it.
+     * When the SSE stream ends (not cancelled), triggers automatic reconnection.
      */
     private fun startSseSubscription(client: OpenCodeClient, targetSessionId: String): Job {
         val capturedId = targetSessionId
         return scope.launch {
-            client.subscribeGlobalEvents()
-                .filter { event -> event.sessionId == capturedId }
-                .collect { event -> handleSseEvent(event) }
+            try {
+                client.subscribeGlobalEvents()
+                    .filter { event -> event.sessionId == capturedId }
+                    .collect { event -> handleSseEvent(event) }
+            } catch (e: CancellationException) {
+                throw e // Don't reconnect on cancellation (user-initiated close/switch)
+            } catch (_: Exception) {
+                // SSE error — stream ended, will trigger reconnect below
+            }
+            // Stream ended without cancellation — trigger automatic reconnection
+            if (isActive && initialized && sessionId == capturedId) {
+                logger.info { "SSE stream ended for session $capturedId — triggering reconnection" }
+                triggerReconnect()
+            }
         }
     }
 
@@ -122,6 +153,7 @@ class ChatViewModel(
         permissionTimeoutJob = null
         lastUserText = null
         _sessionContextState.value = SessionContextState.Loading
+        _todoItems.value = emptyList()
         contextFetchJob?.cancel()
         contextFetchJob = null
     }
@@ -133,6 +165,8 @@ class ChatViewModel(
     private var sseJob: Job? = null
     private var openCodeProcess: Process? = null
     private var permissionTimeoutJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var reconnectAttempt: Int = 0
 
     /** Tracks the assistant message currently being streamed. */
     private var activeAssistantMessageId: String? = null
@@ -151,6 +185,8 @@ class ChatViewModel(
     private var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
     private var port: Int = AcpDefaults.DEFAULT_OPENCODE_PORT
     private var authToken: String? = null
+    private var initialized = false
+    private var projectBasePath: String = ""
 
     // --- Public API ---
 
@@ -159,10 +195,27 @@ class ChatViewModel(
         // host, port, authToken use AcpDefaults — no user configuration needed
     }
 
-    /** Launch the OpenCode binary as a subprocess if auto-launch is enabled. */
+    /** Check if the OpenCode server is already reachable (e.g., from a previous IDE session). */
+    private fun isServerReachable(): Boolean {
+        return try {
+            val url = java.net.URL("http://$host:$port/global/health")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 1000
+            conn.readTimeout = 1000
+            conn.requestMethod = "GET"
+            val reachable = conn.responseCode == 200
+            conn.disconnect()
+            reachable
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Launch the OpenCode binary as a subprocess if the server isn't already running. */
     private fun launchOpenCodeBinary(binaryPath: String) {
-        if (openCodeProcess?.isAlive == true) {
-            logger.info { "OpenCode process already running, skipping launch" }
+        // Check if a server is already responding on this port (e.g., from previous IDE session)
+        if (isServerReachable()) {
+            logger.info { "OpenCode server already running at $host:$port — skipping launch" }
             return
         }
 
@@ -184,15 +237,43 @@ class ChatViewModel(
                 isDaemon = true
                 start()
             }
+
+            // Register shutdown hook to kill process on IDE exit
+            Runtime.getRuntime().addShutdownHook(Thread({
+                killProcess(openCodeProcess)
+            }, "opencode-shutdown").apply { isDaemon = true })
         } catch (e: Exception) {
             logger.error(e) { "Failed to launch OpenCode binary at $binaryPath" }
         }
     }
 
+    /** Kill a process and its children. Uses taskkill on Windows for reliable tree kill. */
+    private fun killProcess(process: Process?) {
+        if (process == null || !process.isAlive) return
+        try {
+            val pid = process.pid()
+            if (System.getProperty("os.name").lowercase().contains("windows")) {
+                // Windows: taskkill /F /T kills the process tree
+                Runtime.getRuntime().exec("taskkill /F /T /PID $pid").waitFor()
+            } else {
+                // Unix: destroyForcibly works better here
+                process.destroyForcibly()
+            }
+        } catch (_: Exception) {
+            process.destroyForcibly()
+        }
+    }
+
     /** Initialise the connection: launch binary, create client, health check, create session. */
     suspend fun initialize(projectBasePath: String) {
+        if (initialized) {
+            logger.info { "Already initialized — skipping" }
+            return
+        }
+
         logger.info { "Initializing connection to OpenCode at $host:$port" }
         _connectionState.value = ConnectionState.CONNECTING
+        this.projectBasePath = projectBasePath
         try {
             // Load persisted settings
             loadSettings()
@@ -258,23 +339,31 @@ class ChatViewModel(
                 logger.warn(e) { "Failed to load agents (non-fatal)" }
             }
 
-            // Load existing sessions instead of always creating a new one
+            // Load existing sessions — restore most recent one if available
             loadSessions()
 
-            val existingSessions = (_sessionListState.value as? SessionListState.Loaded)?.sessions
-            if (!existingSessions.isNullOrEmpty()) {
-                switchSession(existingSessions.first().id)
-                if (sessionId == null) {
-                    createAndSwitchSession()
+            when (val sessionState = _sessionListState.value) {
+                is SessionListState.Loaded -> {
+                    if (sessionState.sessions.isNotEmpty()) {
+                        // Switch to the most recent session
+                        switchSession(sessionState.sessions.first().id)
+                    }
+                    // If no sessions, stay disconnected — user can create one manually
                 }
-            } else {
-                createAndSwitchSession()
-            }
-
-            if (sessionId == null) {
-                _connectionState.value = ConnectionState.ERROR
-                logger.error { "Failed to establish an active session" }
-                return
+                is SessionListState.Error -> {
+                    // Failed to load sessions — retry once
+                    logger.warn { "Session list load failed, retrying..." }
+                    loadSessions()
+                    val retryState = _sessionListState.value as? SessionListState.Loaded
+                    if (retryState != null && retryState.sessions.isNotEmpty()) {
+                        switchSession(retryState.sessions.first().id)
+                    }
+                    // If still no sessions after retry, stay disconnected
+                }
+                is SessionListState.Loading -> {
+                    // Shouldn't happen
+                    logger.warn { "Session list still in Loading state after loadSessions()" }
+                }
             }
 
             // Select the default agent in the control state
@@ -338,13 +427,20 @@ class ChatViewModel(
             }
 
             // Subscribe to global SSE events (long-lived background subscription)
-            logger.info { "Subscribing to SSE events for session ${sessionId!!}" }
-            sseJob = startSseSubscription(opencodeClient, sessionId!!)
+            // Only subscribe if we have an active session
+            if (sessionId != null) {
+                logger.info { "Subscribing to SSE events for session $sessionId" }
+                sseJob = startSseSubscription(opencodeClient, sessionId!!)
 
-            // Fetch initial context for the active session
-            fetchSessionContext()
+                // Fetch initial context and todos for the active session
+                fetchSessionContext()
+                fetchTodos()
+            } else {
+                logger.info { "No active session on IDE load - skipping SSE subscription (user can create session manually)" }
+            }
 
             _connectionState.value = ConnectionState.CONNECTED
+            initialized = true
             logger.info { "Connected to OpenCode successfully" }
         } catch (e: Exception) {
             logger.error(e) { "Failed to initialize connection" }
@@ -379,7 +475,6 @@ class ChatViewModel(
         try {
             val sessionList = client.listSessions()
             val currentId = sessionId
-            // TODO: Filter by current project's projectID when multi-project support is added.
             val items = sessionList
                 .sortedByDescending { it.time?.updated ?: it.time?.created ?: 0L }
                 .map { it.toSessionItem() }
@@ -387,6 +482,10 @@ class ChatViewModel(
                 sessions = items,
                 selectedId = currentId
             )
+            // Update child session map
+            val children = items.filter { it.parentID != null }
+                .groupBy { it.parentID!! }
+            _childSessionMap.value = children
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -405,6 +504,8 @@ class ChatViewModel(
             val previousSessionId = sessionId
 
             try {
+                reconnectJob?.cancel()
+                reconnectJob = null
                 sseJob?.cancel()
                 sseJob = null
                 try { cancel() } catch (_: Exception) { /* best-effort */ }
@@ -413,7 +514,13 @@ class ChatViewModel(
                 val messages = client.listMessages(targetSessionId, limit = null)
                 sessionId = targetSessionId
 
-                val chatMessages = messages.map { it.toChatMessage() }
+                // Inject subagent refs into the latest assistant message
+                val children = _childSessionMap.value[targetSessionId] ?: emptyList()
+                val chatMessages = if (children.isNotEmpty()) {
+                    injectSubagentRefs(messages.map { it.toChatMessage() }, children)
+                } else {
+                    messages.map { it.toChatMessage() }
+                }
                 _messages.value = chatMessages
                 chatMessages.forEachIndexed { i, msg -> messageIndex[msg.id] = i }
                 chatMessages.forEach { msg ->
@@ -422,8 +529,9 @@ class ChatViewModel(
 
                 sseJob = startSseSubscription(client, targetSessionId)
                 updateSessionSelection(targetSessionId)
-                // Fetch context for the new session
+                // Fetch context and todos for the new session
                 fetchSessionContext()
+                fetchTodos()
                 logger.info { "Switched to session $targetSessionId (${chatMessages.size} messages loaded)" }
             } catch (e: CancellationException) {
                 throw e
@@ -462,6 +570,8 @@ class ChatViewModel(
         }
 
         switchMutex.withLock {
+            reconnectJob?.cancel()
+            reconnectJob = null
             try { cancel() } catch (_: Exception) { /* best-effort */ }
             sseJob?.cancel()
             sseJob = null
@@ -472,8 +582,9 @@ class ChatViewModel(
 
         loadSessions()
         updateSessionSelection(session.id)
-        // Fetch context for the new session
+        // Fetch context and todos for the new session
         fetchSessionContext()
+        fetchTodos()
         logger.info { "Created and switched to new session: ${session.id}" }
     }
 
@@ -520,12 +631,13 @@ class ChatViewModel(
         val client = openCodeClient ?: return
         val currentSessionId = sessionId ?: return
 
-        // Add user message to chat
+        // Add user message to chat for immediate display
         val userMsg = ChatMessage(
             id = generateId(),
             role = MessageRole.USER,
             content = text,
-            timestamp = System.currentTimeMillis()
+            timestamp = System.currentTimeMillis(),
+            attachedFiles = files
         )
         addMessage(userMsg)
         lastUserText = text
@@ -636,6 +748,8 @@ class ChatViewModel(
     }
 
     override fun close() {
+        reconnectJob?.cancel()
+        reconnectJob = null
         sseJob?.cancel()
         sseJob = null
         contextFetchJob?.cancel()
@@ -650,9 +764,108 @@ class ChatViewModel(
         httpClient?.close()
         httpClient = null
         sessionId = null
+        initialized = false
         // Kill the launched OpenCode process if we own it
-        openCodeProcess?.destroyForcibly()
+        killProcess(openCodeProcess)
         openCodeProcess = null
+    }
+
+    // --- Reconnection ---
+
+    /**
+     * Triggers automatic reconnection with exponential backoff.
+     * Called when the SSE stream ends unexpectedly.
+     *
+     * Strategy:
+     * 1. Set state to RECONNECTING
+     * 2. Health check with exponential backoff (1s → 2s → 4s → ... → 30s cap)
+     * 3. If healthy, re-subscribe SSE and set state to CONNECTED
+     * 4. If scope cancelled or client lost, set state to ERROR
+     */
+    private fun triggerReconnect() {
+        reconnectJob?.cancel()
+        reconnectAttempt = 0
+
+        // Abort any in-flight streaming response — the SSE stream is gone
+        abortInFlightResponse("Connection lost — reconnecting")
+
+        reconnectJob = scope.launch {
+            _connectionState.value = ConnectionState.RECONNECTING
+            logger.info { "Starting reconnection..." }
+
+            while (isActive && initialized) {
+                val delayMs = calculateBackoff(reconnectAttempt)
+                if (reconnectAttempt > 0) {
+                    logger.info { "Reconnect attempt ${reconnectAttempt + 1}, waiting ${delayMs}ms" }
+                    delay(delayMs)
+                }
+
+                val client = openCodeClient
+                if (client == null) {
+                    logger.warn { "No client available for reconnection" }
+                    _connectionState.value = ConnectionState.ERROR
+                    initialized = false
+                    return@launch
+                }
+
+                // Health check
+                try {
+                    if (!client.healthCheck()) {
+                        reconnectAttempt++
+                        logger.warn { "Health check failed on attempt $reconnectAttempt" }
+                        continue
+                    }
+                } catch (_: Exception) {
+                    reconnectAttempt++
+                    logger.warn { "Health check error on attempt $reconnectAttempt" }
+                    continue
+                }
+
+                // Server is healthy — re-subscribe SSE
+                val currentSessionId = sessionId
+                if (currentSessionId != null) {
+                    sseJob = startSseSubscription(client, currentSessionId)
+                    logger.info { "SSE re-subscribed for session $currentSessionId" }
+                }
+
+                _connectionState.value = ConnectionState.CONNECTED
+                reconnectAttempt = 0
+                logger.info { "Reconnected successfully" }
+                return@launch
+            }
+
+            // Exited loop — scope cancelled or no longer initialized
+            if (initialized && _connectionState.value == ConnectionState.RECONNECTING) {
+                _connectionState.value = ConnectionState.ERROR
+                initialized = false
+            }
+        }
+    }
+
+    /**
+     * Calculates exponential backoff delay with jitter.
+     * Base: 1s, doubles each attempt, capped at 30s.
+     * Adds ±20% random jitter to prevent synchronization.
+     */
+    private fun calculateBackoff(attempt: Int): Long {
+        val base = ChatConstants.RECONNECT_DELAY_MS
+        val max = ChatConstants.RECONNECT_MAX_DELAY_MS
+        val exponential = (base * (1L shl attempt.coerceAtMost(10))).coerceAtMost(max)
+        // Add 0-20% random jitter
+        val jitter = (exponential * kotlin.random.Random.nextDouble(0.0, 0.2)).toLong()
+        return (exponential + jitter).coerceAtMost(max)
+    }
+
+    /**
+     * Full re-initialization after connection failure.
+     * Called by the "Retry" button in the ERROR connection banner.
+     * Closes everything and starts fresh.
+     */
+    suspend fun retryConnection(projectBasePath: String) {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        close()
+        initialize(projectBasePath)
     }
 
     // --- Context Fetching ---
@@ -779,7 +992,8 @@ class ChatViewModel(
                         deletions = session.summary?.deletions ?: 0,
                         filesModified = session.summary?.files ?: 0,
                         sessionCreated = session.time?.created ?: 0L,
-                        lastUpdated = session.time?.updated ?: 0L
+                        lastUpdated = session.time?.updated ?: 0L,
+                        isOverflow = contextLimit > 0L && usagePercent >= ChatConstants.OVERFLOW_THRESHOLD_PERCENT
                     )
                 )
             } catch (e: CancellationException) {
@@ -798,6 +1012,58 @@ class ChatViewModel(
     /** Retries fetching session context (called from UI on error state click). */
     fun retryContextFetch() {
         fetchSessionContext()
+    }
+
+    /**
+     * Fetches the todo list for the current session from the server.
+     * Called on session initialization and after each response completes.
+     */
+    private fun fetchTodos() {
+        val currentSessionId = sessionId ?: return
+        val client = openCodeClient ?: return
+        scope.launch {
+            try {
+                val todos = client.getTodos(currentSessionId)
+                _todoItems.value = todos.map { TodoItem(content = it.content, status = it.status, priority = it.priority) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Silently fail — todos are not critical
+            }
+        }
+    }
+
+    /**
+     * Requests compaction of the current session to free context space.
+     * Called from UI when the user clicks "Compact" or automatically when context overflows.
+     *
+     * The server will create a compaction message, run the compaction agent to summarize
+     * the conversation history, and then continue the session with reduced context.
+     */
+    fun compactSession() {
+        val currentSessionId = sessionId ?: return
+        val client = openCodeClient ?: return
+        val context = (_sessionContextState.value as? SessionContextState.Loaded)?.context ?: return
+        if (context.providerID.isBlank() || context.modelID.isBlank()) return
+
+        scope.launch {
+            try {
+                logger.info { "Compacting session $currentSessionId with provider=${context.providerID}, model=${context.modelID}" }
+                client.compactSession(
+                    sessionId = currentSessionId,
+                    providerID = context.providerID,
+                    modelID = context.modelID,
+                    auto = false
+                )
+                // Refresh context after compaction (the summary response will stream in via SSE)
+                delay(2000) // Give the server time to process the compaction
+                fetchSessionContext()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "Failed to compact session $currentSessionId" }
+            }
+        }
     }
 
     /**
@@ -861,26 +1127,59 @@ class ChatViewModel(
     // --- SSE Event Handling ---
 
     private fun handleSseEvent(event: SseEvent) {
-        val msgId = activeAssistantMessageId ?: return
+        val msgId = activeAssistantMessageId
+        if (msgId == null) {
+            debugLog("VM DROP: ${event::class.simpleName} — activeAssistantMessageId is null")
+            return
+        }
+        debugLog("VM HANDLE: ${event::class.simpleName}, msgId=$msgId")
 
         when (event) {
             is SseEvent.TextChunk -> {
                 appendTextToMessage(msgId, event.text)
             }
 
+            is SseEvent.TextReplace -> {
+                replaceTextInMessage(msgId, event.text)
+            }
+
             is SseEvent.ThinkingChunk -> {
                 appendThinkingContent(msgId, event.text)
             }
 
+            is SseEvent.ThinkingReplace -> {
+                replaceThinkingInMessage(msgId, event.text)
+            }
+
             is SseEvent.ToolUse -> {
+                val toolKind = com.opencode.acp.adapter.ToolMapper.toAcpKind(event.toolName)
                 val pill = ToolCallPill(
                     toolCallId = event.toolCallId,
                     toolName = event.toolName,
                     title = event.title ?: event.toolName,
-                    kind = ToolKind.OTHER,
+                    kind = toolKind,
                     status = ToolCallStatus.IN_PROGRESS
                 )
                 toolCallIndex[event.toolCallId] = msgId
+
+                // Extract file path from tool input for edit/write tools
+                if (toolKind == ToolKind.EDIT && event.input != null) {
+                    val pathElement = event.input["file_path"]
+                    val filePath: String? = pathElement?.let { el ->
+                        try {
+                            (el as? kotlinx.serialization.json.JsonPrimitive)?.content
+                        } catch (_: Exception) { null }
+                    }
+                    if (filePath != null) {
+                        val fileName = filePath.substringAfterLast('/')
+                        val change = ChatFileChange(
+                            filePath = filePath,
+                            fileName = fileName,
+                        )
+                        pendingFileChanges.getOrPut(msgId) { mutableListOf() }.add(change)
+                    }
+                }
+
                 addToolCallPill(msgId, pill)
             }
 
@@ -892,9 +1191,20 @@ class ChatViewModel(
 
             is SseEvent.Stop -> {
                 markStreamingComplete(msgId)
+                // Attach any pending file changes collected from tool calls
+                val changes = pendingFileChanges.remove(msgId)
+                if (changes != null && changes.isNotEmpty()) {
+                    val msgs = _messages.value.toMutableList()
+                    val idx = messageIndex[msgId]
+                    if (idx != null) {
+                        msgs[idx] = msgs[idx].copy(fileChanges = changes)
+                        _messages.value = msgs
+                    }
+                }
                 responseDeferred?.complete(Unit)
-                // Refresh context after each response completes
+                // Refresh context and todos after each response completes
                 fetchSessionContext()
+                fetchTodos()
             }
 
             is SseEvent.Permission -> {
@@ -926,10 +1236,46 @@ class ChatViewModel(
             is SseEvent.MessageComplete -> {
                 // Message fully persisted on the server side
             }
+
+            is SseEvent.TodoUpdated -> {
+                // Update todo items — only if for our active session
+                if (event.sessionId == sessionId) {
+                    _todoItems.value = event.todos.map { todo ->
+                        TodoItem(content = todo.content, status = todo.status, priority = todo.priority)
+                    }
+                }
+            }
+
+            is SseEvent.UserMessage -> {
+                // User message from server - we already add user messages locally
+                // when sending, so we don't need to add them again here.
+                // This event is mainly for logging/debugging purposes.
+                if (event.sessionId == sessionId) {
+                    logger.debug { "User message received from server: ${event.text.take(100)}" }
+                }
+            }
         }
     }
 
     // --- State Mutations ---
+
+    /**
+     * Aborts any in-flight streaming response, appending an error message.
+     * Called when the SSE stream drops to unblock [sendMessage] and mark the
+     * partial response as complete.
+     */
+    private fun abortInFlightResponse(reason: String) {
+        val msgId = activeAssistantMessageId
+        if (msgId != null && _isStreaming.value) {
+            appendTextToMessage(msgId, "\n\n**Error:** $reason")
+            markStreamingComplete(msgId)
+        }
+        responseDeferred?.complete(Unit)
+        responseDeferred = null
+        _isStreaming.value = false
+        activeAssistantMessageId = null
+        firstTextChunkReceived = false
+    }
 
     private fun addMessage(message: ChatMessage) {
         _messages.value = _messages.value + message
@@ -952,6 +1298,8 @@ class ChatViewModel(
     private fun appendTextToMessage(messageId: String, text: String) {
         val toAppend = if (!firstTextChunkReceived && text.isNotBlank()) {
             firstTextChunkReceived = true
+            // Strip user's text from the beginning of the assistant's response
+            // This is needed because the server sometimes returns the user's text as part of the assistant's response
             val userText = lastUserText
             if (userText != null && text.startsWith(userText, ignoreCase = true)) {
                 text.substring(userText.length)
@@ -976,6 +1324,32 @@ class ChatViewModel(
         _messages.value = messages
     }
 
+    /**
+     * Replaces the entire text content of a message.
+     * Used for "message.part.updated" events which carry full accumulated text,
+     * NOT incremental deltas. This prevents duplication from appending
+     * full-state snapshots on top of already-accumulated deltas.
+     */
+    private fun replaceTextInMessage(messageId: String, text: String) {
+        val messages = _messages.value.toMutableList()
+        val index = messageIndex[messageId] ?: return
+        val msg = messages[index]
+        messages[index] = msg.copy(content = text)
+        _messages.value = messages
+    }
+
+    /**
+     * Replaces the entire thinking content of a message.
+     * Used for "message.part.updated" events which carry full accumulated thinking text.
+     */
+    private fun replaceThinkingInMessage(messageId: String, text: String) {
+        val messages = _messages.value.toMutableList()
+        val index = messageIndex[messageId] ?: return
+        val msg = messages[index]
+        messages[index] = msg.copy(thinkingContent = text)
+        _messages.value = messages
+    }
+
     private fun markStreamingComplete(messageId: String) {
         val messages = _messages.value.toMutableList()
         val index = messageIndex[messageId] ?: return
@@ -988,7 +1362,15 @@ class ChatViewModel(
         val messages = _messages.value.toMutableList()
         val index = messageIndex[messageId] ?: return
         val msg = messages[index]
-        messages[index] = msg.copy(toolCalls = msg.toolCalls + pill)
+        // Deduplicate: if a pill with this toolCallId already exists (e.g. from
+        // session.next.tool.input.started), update it instead of appending a duplicate
+        val existing = msg.toolCalls.indexOfFirst { it.toolCallId == pill.toolCallId }
+        val updatedToolCalls = if (existing >= 0) {
+            msg.toolCalls.toMutableList().apply { set(existing, pill) }
+        } else {
+            msg.toolCalls + pill
+        }
+        messages[index] = msg.copy(toolCalls = updatedToolCalls)
         _messages.value = messages
     }
 
@@ -1017,5 +1399,31 @@ class ChatViewModel(
             delay(timeoutSeconds * 1000L)
             _permissionPrompt.value = null
         }
+    }
+
+    /**
+     * Injects [SubagentRef] objects into the most recent assistant message
+     * that precedes any child sessions. Child sessions are mapped to the latest
+     * assistant message in the conversation flow.
+     */
+    private fun injectSubagentRefs(
+        messages: List<ChatMessage>,
+        children: List<SessionItem>
+    ): List<ChatMessage> {
+        if (messages.isEmpty()) return messages
+        val lastAssistantIdx = messages.indexOfLast { it.role == MessageRole.ASSISTANT }
+        if (lastAssistantIdx == -1) return messages
+        val refs = children.map { child ->
+            SubagentRef(
+                sessionId = child.id,
+                agentName = child.title.replaceFirstChar { it.uppercase() },
+                taskDescription = child.title,
+                status = SubagentStatus.RUNNING,
+            )
+        }
+        val updated = messages.toMutableList()
+        val msg = updated[lastAssistantIdx]
+        updated[lastAssistantIdx] = msg.copy(subagentRefs = refs)
+        return updated
     }
 }

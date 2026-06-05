@@ -34,7 +34,6 @@ enum class FileChangeStatus {
 sealed interface ReviewState {
     data object Loading : ReviewState
     data class Loaded(val files: List<ChangedFile>) : ReviewState
-    data object Empty : ReviewState           // Git repo exists but no changes
-    data object NoGitRepository : ReviewState
+    data object Empty : ReviewState           // No changes in any VCS
     data class Error(val message: String, val retryable: Boolean = true) : ReviewState
 }

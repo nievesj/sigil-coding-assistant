@@ -77,6 +77,13 @@ data class SessionTime(
 )
 
 @Serializable
+data class TodoItem(
+    val content: String,
+    val status: String,
+    val priority: String
+)
+
+@Serializable
 data class OpenCodeMessage(
     val info: MessageInfo,
     val parts: List<OpenCodePart>
@@ -191,18 +198,31 @@ object OpenCodePartSerializer : KSerializer<OpenCodePart> {
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("OpenCodePart")
 
     override fun serialize(encoder: Encoder, value: OpenCodePart) {
-        when (value) {
-            is OpenCodePart.Text -> encoder.encodeSerializableValue(OpenCodePart.Text.serializer(), value)
-            is OpenCodePart.File -> encoder.encodeSerializableValue(OpenCodePart.File.serializer(), value)
-            is OpenCodePart.ToolUse -> encoder.encodeSerializableValue(OpenCodePart.ToolUse.serializer(), value)
-            is OpenCodePart.ToolResult -> encoder.encodeSerializableValue(OpenCodePart.ToolResult.serializer(), value)
-            is OpenCodePart.StepStart -> encoder.encodeSerializableValue(OpenCodePart.StepStart.serializer(), value)
-            is OpenCodePart.StepFinish -> encoder.encodeSerializableValue(OpenCodePart.StepFinish.serializer(), value)
-            is OpenCodePart.Thinking -> encoder.encodeSerializableValue(OpenCodePart.Thinking.serializer(), value)
-            is OpenCodePart.Reasoning -> encoder.encodeSerializableValue(OpenCodePart.Reasoning.serializer(), value)
-            is OpenCodePart.Image -> encoder.encodeSerializableValue(OpenCodePart.Image.serializer(), value)
-            is OpenCodePart.Unknown -> { /* Unknown types are not serialized back */ }
+        val jsonEncoder = encoder as? kotlinx.serialization.json.JsonEncoder
+            ?: error("OpenCodePartSerializer requires JsonEncoder")
+        val jsonElement: kotlinx.serialization.json.JsonElement = when (value) {
+            is OpenCodePart.Text -> kotlinx.serialization.json.buildJsonObject {
+                put("type", kotlinx.serialization.json.JsonPrimitive("text"))
+                put("text", kotlinx.serialization.json.JsonPrimitive(value.text))
+            }
+            is OpenCodePart.File -> kotlinx.serialization.json.buildJsonObject {
+                put("type", kotlinx.serialization.json.JsonPrimitive("file"))
+                put("mime", kotlinx.serialization.json.JsonPrimitive(value.mime))
+                put("url", kotlinx.serialization.json.JsonPrimitive(value.url))
+                value.filename?.let { put("filename", kotlinx.serialization.json.JsonPrimitive(it)) }
+            }
+            is OpenCodePart.Image -> kotlinx.serialization.json.buildJsonObject {
+                put("type", kotlinx.serialization.json.JsonPrimitive("image"))
+                put("mime", kotlinx.serialization.json.JsonPrimitive(value.mime))
+                put("url", kotlinx.serialization.json.JsonPrimitive(value.url))
+            }
+            else -> {
+                // ToolUse, ToolResult, StepStart, StepFinish, Thinking, Reasoning, Unknown
+                // These aren't sent outbound — encode as empty object
+                kotlinx.serialization.json.buildJsonObject {}
+            }
         }
+        jsonEncoder.encodeJsonElement(jsonElement)
     }
 
     override fun deserialize(decoder: Decoder): OpenCodePart {

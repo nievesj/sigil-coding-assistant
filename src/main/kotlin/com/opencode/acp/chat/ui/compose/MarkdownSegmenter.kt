@@ -139,7 +139,7 @@ object MarkdownSegmenter {
         var fenceLength = 3
 
         fun flushText() {
-            val text = textBuilder.toString().trimEnd('\n', '\r')
+            val text = textBuilder.toString().trim('\n', '\r')
             if (text.isNotBlank()) {
                 segments.add(MarkdownSegment(MarkdownSegment.Type.TEXT, text))
             }
@@ -263,4 +263,12 @@ object MarkdownSegmenter {
 
         return segments
     }
+
+    /**
+     * Segment markdown after healing incomplete formatting (unclosed backticks,
+     * bold, incomplete links). Use this for streaming content to prevent raw
+     * syntax from flashing in the UI.
+     */
+    fun segmentHealed(markdown: String): List<MarkdownSegment> =
+        segment(StreamHealer.heal(markdown))
 }

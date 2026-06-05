@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.opencode.acp.chat.model.ChatConstants
 import com.opencode.acp.chat.model.SessionContext
 import com.opencode.acp.chat.model.SessionContextState
 import org.jetbrains.jewel.ui.component.Link
@@ -34,6 +35,7 @@ import org.jetbrains.jewel.foundation.theme.JewelTheme
 fun ContextPanel(
     state: SessionContextState,
     onRetry: () -> Unit,
+    onCompact: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     when (state) {
@@ -41,7 +43,7 @@ fun ContextPanel(
             LoadingContent(modifier = modifier)
         }
         is SessionContextState.Loaded -> {
-            ContextDetails(context = state.context, modifier = modifier)
+            ContextDetails(context = state.context, onCompact = onCompact, modifier = modifier)
         }
         is SessionContextState.Error -> {
             ErrorContent(message = state.message, retryable = state.retryable, onRetry = onRetry, modifier = modifier)
@@ -91,7 +93,7 @@ private fun ErrorContent(message: String, retryable: Boolean, onRetry: () -> Uni
 }
 
 @Composable
-private fun ContextDetails(context: SessionContext, modifier: Modifier = Modifier) {
+private fun ContextDetails(context: SessionContext, onCompact: () -> Unit, modifier: Modifier = Modifier) {
     val sectionColor = Color(0xFFCCCCCC)
     val labelColor = Color(0xFF999999)
     val valueColor = Color(0xFFDDDDDD)
@@ -121,6 +123,24 @@ private fun ContextDetails(context: SessionContext, modifier: Modifier = Modifie
             totalTokens = context.totalTokens,
             progressBg = progressBg
         )
+
+        // ── Overflow warning ──
+        if (context.isOverflow && context.contextLimit > 0L) {
+            Spacer(Modifier.height(10.dp))
+            HorizontalSeparator(separator)
+            Spacer(Modifier.height(10.dp))
+
+            SectionHeader("⚠ Context Full", Color(0xFFE5534B))
+            Text(
+                text = "Context usage exceeds ${ChatConstants.OVERFLOW_THRESHOLD_PERCENT.toInt()}%. " +
+                       "Compact the session to free up space.",
+                fontSize = 11.sp,
+                color = Color(0xFFCCCCCC),
+                lineHeight = 14.sp
+            )
+            Spacer(Modifier.height(6.dp))
+            Link("Compact Session", onClick = onCompact)
+        }
 
         Spacer(Modifier.height(10.dp))
         HorizontalSeparator(separator)

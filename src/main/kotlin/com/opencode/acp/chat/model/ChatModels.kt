@@ -3,6 +3,14 @@ package com.opencode.acp.chat.model
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
 
+/** Attached file/image in a user message. */
+data class AttachedFile(
+    val name: String,
+    val path: String,
+    val mime: String,
+    val dataUri: String
+)
+
 /** Display model for a single message in the chat list. */
 data class ChatMessage(
     val id: String,
@@ -10,8 +18,11 @@ data class ChatMessage(
     val content: String,
     val timestamp: Long,
     val toolCalls: List<ToolCallPill> = emptyList(),
+    val fileChanges: List<ChatFileChange> = emptyList(),
     val thinkingContent: String = "",
     val isStreaming: Boolean = false,
+    // Attached images/files from user message
+    val attachedFiles: List<AttachedFile> = emptyList(),
     // Model info from AssistantMessage — present only for assistant messages
     val modelID: String? = null,
     val providerID: String? = null,
@@ -21,8 +32,24 @@ data class ChatMessage(
     val reasoningTokens: Long = 0,
     val cacheReadTokens: Long = 0,
     val cacheWriteTokens: Long = 0,
-    val cost: Double = 0.0
+    val cost: Double = 0.0,
+    // Subagent sessions spawned by this assistant message
+    val subagentRefs: List<SubagentRef> = emptyList(),
 )
+
+/** Reference to a subagent/child session spawned from an assistant message. */
+data class SubagentRef(
+    val sessionId: String,
+    val agentName: String,
+    val taskDescription: String,
+    val status: SubagentStatus = SubagentStatus.RUNNING,
+)
+
+enum class SubagentStatus {
+    RUNNING,
+    COMPLETED,
+    FAILED,
+}
 
 enum class MessageRole { USER, ASSISTANT }
 
@@ -33,6 +60,14 @@ data class ToolCallPill(
     val title: String,
     val kind: ToolKind,
     val status: ToolCallStatus
+)
+
+/** A file modified by a tool call, displayed in the assistant message. */
+data class ChatFileChange(
+    val filePath: String,
+    val fileName: String,
+    val additions: Int = 0,
+    val deletions: Int = 0
 )
 
 /** Display model for a permission prompt inline in chat. */
@@ -166,7 +201,15 @@ data class SessionContext(
     val deletions: Int,              // lines deleted (from session summary)
     val filesModified: Int,          // files modified (from session summary)
     val sessionCreated: Long,        // epoch millis
-    val lastUpdated: Long           // epoch millis
+    val lastUpdated: Long,          // epoch millis
+    val isOverflow: Boolean = false  // true when context usage exceeds usable threshold
+)
+
+/** A single todo item from the OpenCode todowrite tool. */
+data class TodoItem(
+    val content: String,
+    val status: String,    // "pending", "in_progress", "completed"
+    val priority: String   // "high", "medium", "low"
 )
 
 /** Sidebar tab identifiers. */

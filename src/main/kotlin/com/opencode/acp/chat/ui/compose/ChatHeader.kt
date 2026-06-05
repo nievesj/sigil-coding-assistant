@@ -35,7 +35,5 @@ fun ChatHeader(
                 .size(16.dp)
                 .clickable { onToggleSidebar() }
         )
-        Spacer(Modifier.width(8.dp))
-        Text("OpenCode")
     }
 }

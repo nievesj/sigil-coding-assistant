@@ -56,6 +56,42 @@ via `mapLanguageId()` (e.g., "css" → "CSS", "js" → "JavaScript").
 - **Warning:** Do NOT attempt to override `DefaultMarkdownBlockRenderer` methods
   for code blocks again — it compiles but does not dispatch at runtime in IU-261.
 
+### Markdown Streaming: StreamHealer for Inline Formatting
+
+During streaming, incomplete markdown (unclosed `**`, backticks, partial links)
+causes raw syntax to flash in the UI because the CommonMark parser treats unclosed
+delimiters as literal text.
+
+**Solution:** `StreamHealer.heal()` is called on streaming message content before
+segmentation. It closes unclosed backticks, bold markers, and strips incomplete
+link syntax (`[text](` without closing `)`). This mirrors OpenCode's `remend`
+library behavior.
+
+`MessageList.kt` uses `MarkdownSegmenter.segmentHealed()` (which calls
+`StreamHealer.heal()` then `segment()`) for streaming messages, and the regular
+`segment()` for completed messages.
+
+- **Files:** `StreamHealer.kt`, `MarkdownSegmenter.kt`, `MessageList.kt`
+- **Why not in Jewel:** Jewel's `Markdown` composable re-parses on each recomposition.
+  Healing before parsing eliminates the visual "flash of raw syntax" during streaming.
+
+### Markdown Tables: Inline Formatting and Column Alignment
+
+Table cells now render inline markdown (bold, italic, code, strikethrough) via
+`InlineMarkdownText` composable, and column alignment (`:---`, `:---:`, `---:`)
+is now applied to header and data cells.
+
+- **Files:** `InlineMarkdownText.kt`, `TableRenderer.kt`, `MarkdownSegmenter.kt`
+- **Note:** `InlineMarkdownText` strips delimiters and applies `SpanStyle` directly
+  — it does NOT use Jewel's `Markdown` composable. This avoids the overhead of
+  creating a full markdown processor per table cell.
+
+### Markdown Segmenter: Leading Newline Fix
+
+`MarkdownSegmenter.flushText()` now uses `trim('\n', '\r')` instead of
+`trimEnd('\n', '\r')` to eliminate leading newlines that caused empty paragraph
+artifacts between code blocks and text segments.
+
 ### Jewel Markdown: Inline Code Background (InlinesStyling Propagation)
 
 Jewel renders inline code backgrounds via `SpanStyle.background` in
@@ -87,6 +123,61 @@ MarkdownStyling.create(
   factory methods default to creating fresh `InlinesStyling` instances when the
   parameter is not explicitly provided.
 
+### SSE Reconnection — Automatic with Exponential Backoff
+
+When the SSE stream (`/event`) drops unexpectedly (not cancelled by user action),
+`startSseSubscription()` detects the stream end and calls `triggerReconnect()`.
+This sets `ConnectionState.RECONNECTING`, which the `ConnectionBanner` renders as
+"Reconnecting..." (no Retry link — reconnection is automatic).
+
+**Reconnection strategy:**
+1. Health check with exponential backoff: 1s → 2s → 4s → ... → 30s cap
+2. ±20% random jitter on each delay to prevent synchronization
+3. On success: re-subscribe SSE, set `CONNECTED`
+4. On scope cancellation or client loss: set `ERROR`, `initialized = false`
+5. In-flight streaming responses are aborted with an error message via `abortInFlightResponse()`
+
+**Key guards:**
+- `CancellationException` in `startSseSubscription()` is re-thrown (no reconnect on user-initiated cancel)
+- `triggerReconnect()` checks `isActive && initialized && sessionId == capturedId` before firing
+- `reconnectJob` is cancelled in `close()`, `switchSession()`, `createAndSwitchSession()`
+- `retryConnection()` (for the "Retry" button in ERROR state) does full `close()` + `initialize()`
+
+**Constants:** `ChatConstants.RECONNECT_DELAY_MS = 1000`, `RECONNECT_MAX_DELAY_MS = 30000`
+
+- **Files:** `ChatViewModel.kt` (`triggerReconnect`, `calculateBackoff`, `abortInFlightResponse`, `retryConnection`), `ConnectionBanner.kt` (RECONNECTING branch), `ChatScreen.kt` (onRetry → retryConnection)
+
+### SSE V2 SyncEvent Wire Format — Critical Parsing Fix
+
+OpenCode server sends two different SSE wire formats depending on event version:
+
+**V1 BusEvents** (legacy):
+```json
+{ "type": "message.part.delta", "properties": { "sessionID": "...", "field": "text", "delta": "..." } }
+```
+
+**V2 SyncEvents** (new):
+```json
+{ "id": "...", "seq": 1, "type": "session.next.text.delta.1", "aggregateID": "...", "data": { "timestamp": "...", "sessionID": "...", "delta": "..." } }
+```
+
+**Key differences:**
+1. V2 types have a version suffix: `"session.next.text.delta.1"` (not `"session.next.text.delta"`)
+2. V2 payload is in `"data"` (not `"properties"`)
+3. V2 puts `sessionID` inside `data` (not at root or in `properties`)
+
+**Actual server behavior (as of June 2026):** The OpenCode server sends V1 BusEvents exclusively, NOT V2 SyncEvents. All events use `"properties"` wrapper. Tool parts use `"type": "tool"` (not `"tool_use"`) with `"callID"` (not `"id"`), `"state"` (running/completed/failed), and `"tool"` (not `"name"`). The V2 parsing code is retained for future compatibility but the server currently uses V1 only.
+
+**Detection logic:** Check for `jsonObj["data"]` (V2) vs `jsonObj["properties"]` (V1). For V2, strip the `.N` version suffix from the type and extract all fields from the `data` object.
+
+**Without this fix:** Every V2 event (thinking, tools, text streaming) was silently dropped because (a) `sessionId` extraction failed, and (b) versioned type names didn't match any `when` branch.
+
+**Tool pill deduplication:** Both `session.next.tool.input.started` and `session.next.tool.called` fire for the same tool call. Only `called` creates a pill (it has full data including tool name and input). `input.started` is skipped to avoid duplicates.
+
+**V1 tool part format:** `message.part.updated` with `part.type = "tool"` uses `part.callID`, `part.tool`, `part.state` (running/completed/failed), and `part.input`. This differs from the documented `"tool_use"` + `"id"` + `"name"` format.
+
+- **Files:** `OpenCodeClient.kt` (`subscribeGlobalEvents` — V2 format detection + version suffix stripping + `data` extraction), `ChatViewModel.kt` (`addToolCallPill` — deduplication by `toolCallId`)
+
 ### Ctrl+V / Clipboard Image Paste — Must Use IntelliJ AnAction, NOT Compose onPreviewKeyEvent
 
 IntelliJ's action system (`IdeKeyEventDispatcher`) intercepts Ctrl+V (the `$Paste`
@@ -108,7 +199,42 @@ to check the clipboard for images and attach them.
 - **Reference:** phodal/auto-dev uses the same pattern (`IdeaDevInInput.kt`) —
   `DumbAwareAction` + `registerCustomShortcutSet` for Ctrl+V on Swing components
 
-### OpenCode Server API
+### Todo List Panel — Collapsible Status Indicators
+
+The todo panel shows active (non-completed, non-cancelled) tasks from
+`GET /session/:id/todo`. It auto-collapses when >4 incomplete items exist,
+showing only the first 2 and a "+N more…" hint.
+
+**Status indicators:** `✓` completed (green), `•` in_progress (amber), `○` pending (gray),
+`✗` cancelled (dim gray).
+
+**Data flow:**
+1. SSE `todo.updated` event → updates `_todoItems` StateFlow in ChatViewModel
+2. `fetchTodos()` called on init, session switch, and after each response
+3. `TodoListPanel` composable reads `todoItems` and renders header + items
+4. Clicking header toggles expanded/collapsed state
+
+- **Files:** `TodoListPanel.kt`, `ChatViewModel.kt` (`_todoItems`, `fetchTodos()`),
+  `ChatScreen.kt` (wires `todoItems` to `TodoListPanel`), `ChatModels.kt` (`TodoItem`),
+  `OpenCodeClient.kt` (`getTodos()`), `SseEvent.kt` (`SseEvent.TodoUpdated`)
+
+### Slash Command Palette — `/` Prefix Triggering
+
+Typing `/` at the start of the input field shows a popup palette with slash commands.
+The palette filters as the user types (e.g., `/co` shows `/compact`).
+
+**Available commands:**
+- `/compact` — compacts session context (calls `compactSession()`)
+- `/clear` — starts a new session (calls `createAndSwitchSession()`)
+- `/cancel` — cancels the current response (calls `cancel()`)
+
+**Implementation:** `InputArea.kt` watches `textState` via `snapshotFlow`. When text
+starts with `/` and has no newlines, `showSlashPalette` becomes true and a `Popup`
+with `SlashCommandPalette` appears above the input. Enter confirms the first match.
+Escape dismisses. The `onSlashCommand` callback in `ChatScreen.kt` routes commands
+to the appropriate ViewModel method.
+
+- **Files:** `SlashCommandPalette.kt`, `InputArea.kt` (palette state + Popup), `ChatScreen.kt` (`onSlashCommand` handler)
 
 - **Docs:** https://opencode.ai/docs/server/
 - **OpenAPI spec:** http://127.0.0.1:4096/doc (when server is running)
@@ -117,6 +243,8 @@ to check the clipboard for images and attach them.
 - **Session model:** `id` (required, starts with `ses_`), `slug`, `projectID`, `directory`, `title`, `version`, `time` (required), plus optional fields
 - **Send message:** `POST /session/:id/message` → body `{ parts }` → returns message
 - **SSE events:** `GET /event` (global) or `GET /global/event` → stream of typed events
+- **Todo events:** SSE `todo.updated` event sends `{ type: "todo.updated", properties: { todos: [...] } }` with same schema as GET
+- **OpenCodeAgentSession:** `SseEvent.TodoUpdated` branch added to exhaustive `when` (informational only for ACP path; chat UI handles via ChatViewModel)
 - **TUI vs serve:** `opencode` starts TUI + server. `opencode serve` starts server only. Both expose the same HTTP API.
 
 ### ACP Mode (not used by this plugin)
@@ -218,12 +346,6 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 
 ## Deferred Features
 
-### ConnectionState.RECONNECTING
-
-- **Status:** Enum value defined, `ConnectionBannerComponent` has a UI branch for it, but no reconnect logic triggers it.
-- **Action:** Implement exponential-backoff reconnection when the SSE stream drops or the health check fails intermittently.
-- **Files:** `ChatModels.kt` (enum), `ConnectionBannerComponent.kt` (branch), `ChatViewModel.kt` (trigger logic).
-
 ### Image Content Support (v2)
 
 - **Status:** Planned per TDD but not yet implemented.
@@ -273,8 +395,16 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 - [x] Dead code cleanup (configure(), setConnectionState(), getViewModel(), ProviderInfo, ModelInfo, OpenCodePlugin, BinaryDiscovery.verify())
 - [x] Plugin always launches its own OpenCode instance on tool window open
 - [x] Fixed SSE event parsing to match actual server format (message.part.delta, message.updated, etc.)
+- [x] Fixed SSE V2 SyncEvent parsing — V2 events use `data` wrapper + versioned type names (`.1` suffix) instead of `properties` wrapper; all V2 events (thinking, tools, text) were silently dropped
 - [x] Fixed SVG icon (was symlink with @media style rules)
 - [x] Fixed CSS rendering crash (Swing HTML renderer can't handle border-radius, margin, etc.)
 - [x] Dark theme chat UI with proper typography and colors
 - [x] Code block rendering with custom ChatFencedCodeBlock via MarkdownSegmenter (bypasses dead DefaultMarkdownBlockRenderer override)
 - [x] Inline code gray background removed — fix was SpanStyle(background=Transparent) propagation to Heading.H1–H6 (not a composable-level background)
+- [x] Context overflow detection (80% threshold) with "Compact Session" action
+- [x] SSE `todo.updated` event handling + `GET /session/:id/todo` fetch
+- [x] Todo list panel (collapsible, `✓`/`•`/`○` status indicators, auto-collapse >4 items)
+- [x] Slash command palette (`/compact`, `/clear`, `/cancel`) triggered by `/` prefix in input
+- [x] StreamHealer for inline markdown formatting during streaming
+- [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
+- [x] SSE reconnection with exponential backoff (1s→2s→4s→...→30s cap, ±20% jitter, abort in-flight response, retryConnection for ERROR state)

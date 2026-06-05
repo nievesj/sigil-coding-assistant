@@ -54,7 +54,6 @@ dependencies {
     intellijPlatform {
         intellijIdea(providers.gradleProperty("platformVersion"))
         bundledPlugin("com.intellij.java")
-        bundledPlugin("Git4Idea")
 
         // Jewel/Compose bundled modules
         composeUI()

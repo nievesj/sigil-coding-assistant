@@ -25,9 +25,6 @@
     <depends optional="true">Git4Idea</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <applicationService
-            serviceImplementation="com.opencode.acp.config.settings.OpenCodeSettingsState"/>
-
         <applicationConfigurable
             parentId="tools"
             instance="com.opencode.acp.config.settings.OpenCodeSettingsConfigurable"
@@ -35,7 +32,7 @@
             displayName="OpenCode"/>
 
         <toolWindow
-            id="OpenCode Chat"
+            id="AI Coding Assistant - OpenCode"
             secondary="true"
             icon="/icons/opencode-toolwindow.svg"
             factoryClass="com.opencode.acp.chat.ChatToolWindowFactory"/>

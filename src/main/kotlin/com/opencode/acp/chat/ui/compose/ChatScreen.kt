@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.animation.core.animateDpAsState
@@ -38,6 +39,7 @@ import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ChatConstants
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.model.SidebarTab
+import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -131,6 +133,7 @@ fun ChatScreen(
     val sessionListState by viewModel.sessionListState.collectAsState()
     val isSidebarVisible by viewModel.isSidebarVisible.collectAsState()
     val sessionContextState by viewModel.sessionContextState.collectAsState()
+    val todoItems by viewModel.todoItems.collectAsState()
     var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
     val scope = rememberCoroutineScope()
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
@@ -279,22 +282,21 @@ fun ChatScreen(
                     label = "sidebarWidth"
                 )
 
-                if (isSidebarVisible) {
-                    SessionSidebar(
-                        state = sessionListState,
-                        contextState = sessionContextState,
-                        selectedTab = selectedSidebarTab,
-                        onTabSelected = { selectedSidebarTab = it },
-                        onNewSession = { scope.launch { viewModel.createAndSwitchSession() } },
-                        onSessionSelected = { scope.launch { viewModel.switchSession(it) } },
-                        onSessionArchived = { scope.launch { viewModel.archiveSession(it) } },
-                        onRetry = { scope.launch { viewModel.loadSessions() } },
-                        onContextRetry = { viewModel.retryContextFetch() },
-                        onShowDetails = { /* Context tab is already showing */ },
-                        project = project,
-                        modifier = Modifier.width(sidebarWidth)
-                    )
-                }
+                SessionSidebar(
+                    state = sessionListState,
+                    contextState = sessionContextState,
+                    selectedTab = selectedSidebarTab,
+                    onTabSelected = { selectedSidebarTab = it },
+                    onNewSession = { scope.launch { viewModel.createAndSwitchSession() } },
+                    onSessionSelected = { scope.launch { viewModel.switchSession(it) } },
+                    onSessionArchived = { scope.launch { viewModel.archiveSession(it) } },
+                    onRetry = { scope.launch { viewModel.loadSessions() } },
+                    onContextRetry = { viewModel.retryContextFetch() },
+                    onContextCompact = { viewModel.compactSession() },
+                    onShowDetails = { /* Context tab is already showing */ },
+                    project = project,
+                    modifier = Modifier.width(sidebarWidth)
+                )
                 // Main chat area
                 Column(modifier = Modifier.weight(1f)) {
                     ChatHeader(
@@ -304,14 +306,23 @@ fun ChatScreen(
                     // Connection banner (shows/hides based on state)
                     ConnectionBanner(
                         state = connectionState,
-                        onRetry = { scope.launch { viewModel.initialize(project.basePath ?: ".") } }
+                        onRetry = { scope.launch { viewModel.retryConnection(project.basePath ?: ".") } }
+                    )
+
+                    // Todo list panel (shows only when there are active todos)
+                    TodoListPanel(
+                        todos = todoItems,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)
                     )
 
                     // Message list (fills remaining space)
                     MessageList(
                         messages = messages,
                         modifier = Modifier.weight(1f).fillMaxWidth(),
-                        project = project
+                        project = project,
+                        onSubagentClick = { subagentId ->
+                            scope.launch { viewModel.switchSession(subagentId) }
+                        },
                     )
                 }
             }
@@ -335,9 +346,10 @@ fun ChatScreen(
                 controlState = controlState,
                 contextState = sessionContextState,
                 onSend = { text ->
+                    val files = attachedFiles.toList()
+                    attachedFiles.clear()
                     scope.launch {
-                        viewModel.sendMessage(text, attachedFiles.toList())
-                        attachedFiles.clear()
+                        viewModel.sendMessage(text, files)
                     }
                 },
                 onCancel = { scope.launch { viewModel.cancel() } },
@@ -362,6 +374,15 @@ fun ChatScreen(
                 onFilesAndFolders = onFilesAndFolders,
                 onImage = onImage,
                 onRecentFileClick = onRecentFileClick,
+                onSlashCommand = { command ->
+                    scope.launch {
+                        when (command.name) {
+                            "compact" -> viewModel.compactSession()
+                            "clear" -> viewModel.createAndSwitchSession()
+                            "cancel" -> viewModel.cancel()
+                        }
+                    }
+                },
             )
         }
 

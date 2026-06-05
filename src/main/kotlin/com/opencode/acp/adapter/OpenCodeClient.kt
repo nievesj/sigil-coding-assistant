@@ -2,6 +2,7 @@ package com.opencode.acp.adapter
 
 import com.opencode.acp.PlanEntry
 import com.opencode.acp.SseEvent
+import com.opencode.acp.SseTodoItem
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.java.Java
@@ -21,6 +22,14 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 
 private val logger = KotlinLogging.logger {}
+
+/** Write debug log to a file we can read from outside the IDE sandbox. */
+private val debugLogFile = System.getProperty("java.io.tmpdir") + "/opencode-sse-debug.log"
+private fun debugLog(msg: String) {
+    try {
+        java.io.File(debugLogFile).appendText("${System.currentTimeMillis()} $msg\n")
+    } catch (_: Exception) {}
+}
 
 /**
  * HTTP client for the OpenCode REST API using Ktor.
@@ -94,6 +103,13 @@ class OpenCodeClient(
     private data class RevertMessageRequest(
         val messageId: String,
         val partId: String? = null
+    )
+
+    @Serializable
+    private data class CompactSessionRequest(
+        val providerID: String,
+        val modelID: String,
+        val auto: Boolean = false
     )
 
     // -------------------------------------------------------------------------
@@ -275,11 +291,27 @@ class OpenCodeClient(
     }
 
     /**
-     * Requests summarization of a session.
+     * Requests summarization (compaction) of a session.
      * POST /session/{id}/summarize
+     *
+     * The server will create a compaction user message, then run the compaction
+     * agent to summarize the conversation history and free context space.
+     *
+     * @param providerID The provider ID for the model to use for compaction.
+     * @param modelID The model ID to use for compaction.
+     * @param auto Whether this is an automatic (vs user-initiated) compaction.
      */
-    suspend fun summarizeSession(sessionId: String): Boolean =
-        postSuccess("/session/$sessionId/summarize")
+    suspend fun compactSession(
+        sessionId: String,
+        providerID: String,
+        modelID: String,
+        auto: Boolean = false
+    ): Boolean =
+        postSuccess("/session/$sessionId/summarize", CompactSessionRequest(
+            providerID = providerID,
+            modelID = modelID,
+            auto = auto
+        ))
 
     /**
      * Reverts a specific message (and optionally a part within it) from the session.
@@ -351,6 +383,13 @@ class OpenCodeClient(
         }
         return getJson(path)
     }
+
+    /**
+     * Gets the todo list for a session.
+     * GET /session/{id}/todo
+     */
+    suspend fun getTodos(sessionId: String): List<TodoItem> =
+        getJson("/session/$sessionId/todo")
 
     // -------------------------------------------------------------------------
     // Agents
@@ -446,19 +485,52 @@ class OpenCodeClient(
                         } catch (_: Exception) {
                             return@collect
                         }
-                        val eventType = event.event ?: jsonObj["type"]?.jsonPrimitive?.contentOrNull ?: return@collect
-                        val props = jsonObj["properties"]?.jsonObject ?: jsonObj
+                        // The SSE event type is always "message" from the server.
+                        // The actual event type is in jsonObj["type"].
+                        val rawEventType = jsonObj["type"]?.jsonPrimitive?.contentOrNull
+                            ?: event.event
+                            ?: return@collect
+
+                        // V2 SyncEvents use {id, seq, type: "session.next.text.delta.1", data: {sessionID, delta, ...}}
+                        // V1 BusEvents use {type: "session.next.text.delta", properties: {sessionID, delta, ...}}
+                        // Detect V2 by presence of "data" object (V2) vs "properties" object (V1)
+                        val v2Data = jsonObj["data"]?.jsonObject
+                        val props: JsonObject
+                        val eventType: String
+
+                        if (v2Data != null) {
+                            // V2 SyncEvent: payload is in "data", type has version suffix (e.g. ".1")
+                            props = v2Data
+                            // Strip version suffix: "session.next.text.delta.1" → "session.next.text.delta"
+                            eventType = rawEventType.replace(Regex("\\.\\d+$"), "")
+                        } else {
+                            // V1 BusEvent: payload is in "properties" (or flat at root)
+                            props = jsonObj["properties"]?.jsonObject ?: jsonObj
+                            eventType = rawEventType
+                        }
 
                         // Extract sessionId from various possible locations
                         val sessionId = when {
                             props["sessionID"] != null -> props["sessionID"]?.jsonPrimitive?.contentOrNull
                             props["sessionId"] != null -> props["sessionId"]?.jsonPrimitive?.contentOrNull
+                            jsonObj["sessionID"] != null -> jsonObj["sessionID"]?.jsonPrimitive?.contentOrNull
+                            jsonObj["sessionId"] != null -> jsonObj["sessionId"]?.jsonPrimitive?.contentOrNull
                             else -> null
-                        } ?: return@collect
+                        }
+                        
+                        if (sessionId == null) {
+                            debugLog("SSE MISS: rawType=$rawEventType, type=$eventType, hasData=${v2Data != null}, hasProps=${jsonObj["properties"] != null}, keys=${jsonObj.keys}")
+                            return@collect
+                        }
+
+                        debugLog("SSE IN: rawType=$rawEventType → eventType=$eventType, v2=${v2Data != null}, sid=$sessionId, pKeys=${props.keys}")
 
                         val parsed = parseSseEvent(eventType, props, sessionId)
                         if (parsed != null) {
+                            debugLog("SSE OK: ${parsed::class.simpleName}")
                             send(parsed)
+                        } else {
+                            debugLog("SSE SKIP: type=$eventType")
                         }
                     }
                     logger.info { "SSE stream ended" }
@@ -476,10 +548,115 @@ class OpenCodeClient(
     /**
      * Parses SSE event data into our internal [SseEvent] hierarchy.
      * Handles both old format (flat JSON) and new format (properties wrapper).
+     * Now handles v2 events from OpenCode server.
      */
     private fun parseSseEvent(eventType: String, props: JsonObject, sessionId: String): SseEvent? {
         return try {
+            logger.debug { "Parsing SSE event: type=$eventType, sessionId=$sessionId" }
             when (eventType) {
+                // V2 Text events
+                "session.next.text.started" -> {
+                    // Text generation started - no action needed yet
+                    null
+                }
+
+                "session.next.text.delta" -> {
+                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
+                    SseEvent.TextChunk(sessionId = sessionId, text = delta)
+                }
+
+                "session.next.text.ended" -> {
+                    val text = props["text"]?.jsonPrimitive?.contentOrNull ?: return null
+                    SseEvent.TextReplace(sessionId = sessionId, text = text)
+                }
+
+                // V2 Reasoning events
+                "session.next.reasoning.started" -> {
+                    // Reasoning started - no action needed yet
+                    null
+                }
+
+                "session.next.reasoning.delta" -> {
+                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
+                    SseEvent.ThinkingChunk(sessionId = sessionId, text = delta)
+                }
+
+                "session.next.reasoning.ended" -> {
+                    val text = props["text"]?.jsonPrimitive?.contentOrNull ?: return null
+                    SseEvent.ThinkingReplace(sessionId = sessionId, text = text)
+                }
+
+                // V2 Tool events
+                "session.next.tool.input.started" -> {
+                    // Skip: pill is created from "called" event which has full data (tool name + input).
+                    // Creating from "input.started" would produce incomplete pills without input data.
+                    null
+                }
+
+                "session.next.tool.called" -> {
+                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val tool = props["tool"]?.jsonPrimitive?.contentOrNull ?: "tool"
+                    val input = props["input"]?.jsonObject
+                    SseEvent.ToolUse(
+                        sessionId = sessionId,
+                        toolCallId = callID,
+                        toolName = tool,
+                        title = tool,
+                        input = input
+                    )
+                }
+
+                "session.next.tool.success" -> {
+                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull ?: return null
+                    SseEvent.ToolResult(
+                        sessionId = sessionId,
+                        toolCallId = callID,
+                        isError = false
+                    )
+                }
+
+                "session.next.tool.failed" -> {
+                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull ?: return null
+                    SseEvent.ToolResult(
+                        sessionId = sessionId,
+                        toolCallId = callID,
+                        isError = true
+                    )
+                }
+
+                // V2 Step events (for status indication)
+                "session.next.step.started" -> {
+                    // Step started - could be used for status indication
+                    null
+                }
+
+                "session.next.step.ended" -> {
+                    // Step ended - could be used for status indication
+                    null
+                }
+
+                "session.next.step.failed" -> {
+                    // Step failed - could be used for error indication
+                    null
+                }
+
+                // V2 Prompted event (user message from server)
+                "session.next.prompted" -> {
+                    val prompt = props["prompt"]?.jsonObject
+                    if (prompt != null) {
+                        val text = prompt["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val files = prompt["files"]?.jsonArray?.mapNotNull { 
+                            it.jsonPrimitive.contentOrNull 
+                        } ?: emptyList()
+                        SseEvent.UserMessage(
+                            sessionId = sessionId,
+                            text = text,
+                            files = files
+                        )
+                    } else null
+                }
+
+                // Legacy events (kept for backward compatibility)
                 "message.part.delta" -> {
                     val field = props["field"]?.jsonPrimitive?.contentOrNull
                     val delta = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
@@ -498,25 +675,52 @@ class OpenCodeClient(
                             "text" -> {
                                 val text = part["text"]?.jsonPrimitive?.contentOrNull
                                 if (text != null) {
-                                    SseEvent.TextChunk(sessionId = sessionId, text = text)
+                                    SseEvent.TextReplace(sessionId = sessionId, text = text)
                                 } else null
                             }
                             "reasoning", "thinking" -> {
                                 val text = part["text"]?.jsonPrimitive?.contentOrNull
                                 if (text != null) {
-                                    SseEvent.ThinkingChunk(sessionId = sessionId, text = text)
+                                    SseEvent.ThinkingReplace(sessionId = sessionId, text = text)
                                 } else null
                             }
-                            "tool_use" -> {
-                                val toolCallId = part["id"]?.jsonPrimitive?.contentOrNull ?: return null
-                                val toolName = part["name"]?.jsonPrimitive?.contentOrNull ?: "tool"
-                                SseEvent.ToolUse(
-                                    sessionId = sessionId,
-                                    toolCallId = toolCallId,
-                                    toolName = toolName,
-                                    title = part["name"]?.jsonPrimitive?.contentOrNull,
-                                    input = part["input"]?.jsonObject
-                                )
+                            "tool_use", "tool" -> {
+                                // OpenCode server uses "tool" for V1, "tool_use" is the alternate name
+                                val toolCallId = part["callID"]?.jsonPrimitive?.contentOrNull
+                                    ?: part["id"]?.jsonPrimitive?.contentOrNull
+                                    ?: return null
+                                val toolName = part["tool"]?.jsonPrimitive?.contentOrNull
+                                    ?: part["name"]?.jsonPrimitive?.contentOrNull
+                                    ?: "tool"
+                                val state = part["state"]?.jsonPrimitive?.contentOrNull
+                                // "running" = in progress, "completed" = done, "failed" = error
+                                // Only emit ToolUse for started/running; ToolResult for completed/failed
+                                when (state) {
+                                    "completed" -> {
+                                        SseEvent.ToolResult(
+                                            sessionId = sessionId,
+                                            toolCallId = toolCallId,
+                                            isError = false
+                                        )
+                                    }
+                                    "failed" -> {
+                                        SseEvent.ToolResult(
+                                            sessionId = sessionId,
+                                            toolCallId = toolCallId,
+                                            isError = true
+                                        )
+                                    }
+                                    else -> {
+                                        // "running", "pending", or null — emit as ToolUse
+                                        SseEvent.ToolUse(
+                                            sessionId = sessionId,
+                                            toolCallId = toolCallId,
+                                            toolName = toolName,
+                                            title = part["name"]?.jsonPrimitive?.contentOrNull ?: toolName,
+                                            input = part["input"]?.jsonObject
+                                        )
+                                    }
+                                }
                             }
                             "tool_result" -> {
                                 val toolCallId = part["id"]?.jsonPrimitive?.contentOrNull ?: return null
@@ -526,7 +730,10 @@ class OpenCodeClient(
                                     isError = part["isError"]?.jsonPrimitive?.contentOrNull == "true"
                                 )
                             }
-                            else -> null
+                            else -> {
+                                debugLog("SSE SKIP part.updated: partType=$partType, partKeys=${part.keys}")
+                                null
+                            }
                         }
                     } else null
                 }
@@ -599,10 +806,27 @@ class OpenCodeClient(
                     SseEvent.Error(sessionId = sessionId, message = message)
                 }
 
-                else -> null
+                "todo.updated" -> {
+                    val todosArray = props["todos"]?.jsonArray
+                    if (todosArray != null) {
+                        val todos = todosArray.mapNotNull { element ->
+                            val obj = element.jsonObject
+                            val content = obj["content"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                            val status = obj["status"]?.jsonPrimitive?.contentOrNull ?: "pending"
+                            val priority = obj["priority"]?.jsonPrimitive?.contentOrNull ?: "medium"
+                            SseTodoItem(content = content, status = status, priority = priority)
+                        }
+                        SseEvent.TodoUpdated(sessionId = sessionId, todos = todos)
+                    } else null
+                }
+
+                else -> {
+                    debugLog("SSE UNKNOWN: type=$eventType, pKeys=${props.keys}")
+                    null
+                }
             }
         } catch (e: Exception) {
-            logger.warn(e) { "Error parsing SSE event: $eventType" }
+            logger.warn(e) { "Failed to parse SSE event: $eventType" }
             null
         }
     }

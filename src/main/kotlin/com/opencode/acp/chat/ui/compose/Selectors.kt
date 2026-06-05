@@ -1,5 +1,7 @@
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -61,7 +63,7 @@ fun AgentSelector(
 ) {
     val selected = controlState.selectedAgent
     val agents = controlState.agents
-    val displayText = selected?.name ?: "Agent"
+    val displayText = selected?.name?.replaceFirstChar { it.uppercase() } ?: "Agent"
     var showPopup by remember { mutableStateOf(false) }
 
     Box {
@@ -85,7 +87,7 @@ fun AgentSelector(
                     title = "AGENT",
                     items = agents.map { agent ->
                         PickerItem(
-                            label = agent.name,
+                            label = agent.name.replaceFirstChar { it.uppercase() },
                             isSelected = agent == selected,
                             onClick = {
                                 onAgentChanged(agent)
@@ -158,37 +160,62 @@ fun ThinkingSelector(
 // ── Shared SelectorChip ─────────────────────────────────────────────────────
 
 /**
- * Chip-style selector matching the model picker aesthetic.
- * Dark background, rounded corners, subtle border, wider than before.
+ * Chip-style selector: transparent background, blue tint fades in on hover.
+ * @param leadingIcon optional composable shown before the text (e.g. provider icon)
  */
 @Composable
 internal fun SelectorChip(
     text: String,
     enabled: Boolean = true,
     onClick: (() -> Unit)? = null,
+    leadingIcon: (@Composable () -> Unit)? = null,
 ) {
-    val bgColor = if (enabled) ChipBg else Color(0xFF252525)
     val textColor = if (enabled) ChipText else ChipTextDisabled
     val borderColor = if (enabled) ChipBorder else ChipBorderDisabled
+
+    val interactionSource = remember { MutableInteractionSource() }
+    val isHovered by interactionSource.collectIsHoveredAsState()
+    val hoverAlpha by animateFloatAsState(
+        targetValue = if (isHovered && enabled) 1f else 0f,
+        animationSpec = tween(durationMillis = 150),
+        label = "chipHoverAlpha",
+    )
+
+    val tintBase = Color(0xFF3574F0) // IntelliJ blue
+    val bgColor = tintBase.copy(alpha = 0.12f * hoverAlpha)
 
     val modifier = Modifier
         .clip(RoundedCornerShape(6.dp))
         .background(bgColor)
-        .border(1.dp, borderColor, RoundedCornerShape(6.dp))
+        .border(1.dp, if (isHovered && enabled) tintBase.copy(alpha = 0.3f) else borderColor, RoundedCornerShape(6.dp))
         .padding(horizontal = 10.dp, vertical = 5.dp)
+        .hoverable(interactionSource)
 
     val finalModifier = if (onClick != null && enabled) {
-        modifier.clickable(onClick = onClick)
+        modifier.clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
     } else {
         modifier
     }
 
-    Text(
-        text = text,
-        fontSize = 12.sp,
-        color = textColor,
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
         modifier = finalModifier,
-    )
+    ) {
+        if (leadingIcon != null) {
+            leadingIcon()
+        }
+        Text(
+            text = text,
+            fontSize = 12.sp,
+            color = textColor,
+        )
+        Text(
+            text = "\u25BE",
+            fontSize = 14.sp,
+            color = textColor.copy(alpha = 0.7f),
+        )
+    }
 }
 
 // ── Simple Picker Panel (used by Agent + Thinking) ──────────────────────────
@@ -201,7 +228,7 @@ private data class PickerItem(
 
 /**
  * Lightweight picker panel matching ModelPickerPanel's visual style.
- * Used for Agent and Thinking selectors.
+ * Uses the same SectionHeader, row height, and colors.
  */
 @Composable
 private fun SimplePickerPanel(
@@ -211,19 +238,17 @@ private fun SimplePickerPanel(
 ) {
     Column(
         modifier = Modifier
-            .widthIn(min = 100.dp, max = 180.dp)
-            .heightIn(max = 280.dp)
+            .widthIn(min = 140.dp, max = 240.dp)
+            .heightIn(max = 320.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(PanelBg)
             .border(1.dp, PanelBorder, RoundedCornerShape(8.dp)),
     ) {
-        // Section header
-        Text(
-            text = title,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
-            color = SectionHeaderColor,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+        // Section header — same as ModelPickerPanel
+        SectionHeader(
+            title = title,
+            expanded = true,
+            onToggle = {},
         )
 
         // Items
@@ -265,11 +290,11 @@ private fun PickerItemRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(30.dp)
+            .height(32.dp)
             .clip(RoundedCornerShape(4.dp))
             .background(bgColor)
             .hoverable(interactionSource)
-            .clickable(onClick = onClick)
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

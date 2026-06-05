@@ -1,7 +1,6 @@
 package com.opencode.acp.chat.ui.compose
 
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vcs.changes.ChangeListManager
 import com.intellij.openapi.vcs.changes.Change
@@ -15,82 +14,19 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Service layer — wraps IntelliJ VCS APIs.
  *
+ * Uses platform ChangeListManager (VCS-agnostic) — works with any VCS
+ * (git, svn, mercurial, perforce) without requiring specific VCS plugins.
+ *
  * CRITICAL: All methods that touch VCS data must be called inside
- * runReadAction on Dispatchers.IO. Git4Idea classes are accessed
- * via reflection to avoid NoClassDefFoundError when the plugin is absent.
+ * runReadAction on Dispatchers.IO.
  *
  * PERFORMANCE: Caches LineDelta results keyed by file path + revision hash
  * to avoid recomputing LCS diff on every VCS event.
  */
 class GitService(private val project: Project) {
 
-    companion object {
-        private const val GIT4IDEA_PLUGIN_ID = "Git4Idea"
-
-        // Cache reflection results to avoid repeated Class.forName/getMethod calls
-        private var gitPluginInstalledCache: Boolean? = null
-        private var gitRepositoryManagerClass: Class<*>? = null
-        private var gitGetInstanceMethod: java.lang.reflect.Method? = null
-        private var gitGetRepositoriesMethod: java.lang.reflect.Method? = null
-
-        /** Check if git4idea is installed via PluginManager (cached). */
-        fun isGitPluginInstalled(): Boolean {
-            gitPluginInstalledCache?.let { return it }
-            return try {
-                val pluginId = PluginId.getId(GIT4IDEA_PLUGIN_ID)
-                val installed = com.intellij.ide.plugins.PluginManager.isPluginInstalled(pluginId)
-                gitPluginInstalledCache = installed
-                installed
-            } catch (_: Exception) {
-                gitPluginInstalledCache = false
-                false
-            }
-        }
-
-        /** Clear cached state (for testing or plugin reload). */
-        fun clearCache() {
-            gitPluginInstalledCache = null
-            gitRepositoryManagerClass = null
-            gitGetInstanceMethod = null
-            gitGetRepositoriesMethod = null
-        }
-    }
-
     // Cache LineDelta results keyed by file path + revision hash
     private val lineDeltaCache = ConcurrentHashMap<String, LineDelta>()
-
-    // Cache git availability check per project
-    private var gitAvailableCache: Boolean? = null
-
-    /** Returns true if git4idea is installed AND at least one git repo exists (cached). */
-    fun isGitAvailable(): Boolean {
-        gitAvailableCache?.let { return it }
-        if (!isGitPluginInstalled()) {
-            gitAvailableCache = false
-            return false
-        }
-        // Access GitRepositoryManager via reflection to avoid NoClassDefFoundError
-        return try {
-            val managerClass = gitRepositoryManagerClass
-                ?: Class.forName("git4idea.repo.GitRepositoryManager").also { gitRepositoryManagerClass = it }
-            val getInstance = gitGetInstanceMethod
-                ?: managerClass.getMethod("getInstance", Project::class.java).also { gitGetInstanceMethod = it }
-            val manager = getInstance.invoke(null, project)
-            val getRepositories = gitGetRepositoriesMethod
-                ?: managerClass.getMethod("getRepositories").also { gitGetRepositoriesMethod = it }
-            @Suppress("UNCHECKED_CAST")
-            val repos = getRepositories.invoke(manager) as? List<*> ?: emptyList<Any>()
-            val available = repos.isNotEmpty()
-            gitAvailableCache = available
-            available
-        } catch (_: Exception) {
-            // Catch Exception for git4idea reflection failures.
-            // Note: NoClassDefFoundError extends Error, not Exception — it is caught
-            // by the outer produceState's catch (Throwable) block, not here.
-            gitAvailableCache = false
-            false
-        }
-    }
 
     /**
      * Returns list of changed files with line deltas.
@@ -289,7 +225,6 @@ class GitService(private val project: Project) {
     /** Invalidate cached data (call when project changes or VCS state resets). */
     fun invalidateCache() {
         lineDeltaCache.clear()
-        gitAvailableCache = null
     }
 }
 

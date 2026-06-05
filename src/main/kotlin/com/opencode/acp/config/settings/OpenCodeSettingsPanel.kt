@@ -40,7 +40,7 @@ class OpenCodeSettingsPanel {
     /** Inline code text color — hex string like "#6BBE50" */
     val inlineCodeColorField: JBTextField = JBTextField("#6BBE50", 8)
 
-    val inlineCodeColorButton: JButton = JButton("Choose...").apply {
+    val inlineCodeColorButton: JButton = JButton("\u25BC").apply {
         addActionListener(ActionListener {
             val currentColor = parseColor(inlineCodeColorField.text)
             val chooser = javax.swing.JColorChooser(currentColor)
@@ -61,7 +61,7 @@ class OpenCodeSettingsPanel {
     /** List number color — hex string like "#6BBE50" */
     val listNumberColorField: JBTextField = JBTextField("#6BBE50", 8)
 
-    val listNumberColorButton: JButton = JButton("Choose...").apply {
+    val listNumberColorButton: JButton = JButton("\u25BC").apply {
         addActionListener(ActionListener {
             val currentColor = parseColor(listNumberColorField.text)
             val chooser = javax.swing.JColorChooser(currentColor)

@@ -46,6 +46,7 @@ import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -65,6 +66,7 @@ fun SessionSidebar(
     onSessionArchived: (String) -> Unit,
     onRetry: () -> Unit,
     onContextRetry: () -> Unit,
+    onContextCompact: () -> Unit,
     onShowDetails: () -> Unit,
     project: Project,
     modifier: Modifier = Modifier
@@ -109,6 +111,7 @@ fun SessionSidebar(
                 ContextPanel(
                     state = contextState,
                     onRetry = onContextRetry,
+                    onCompact = onContextCompact,
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -129,31 +132,30 @@ private fun SidebarTabRow(
     selectedTab: SidebarTab,
     onTabSelected: (SidebarTab) -> Unit
 ) {
-    val tabBg = retrieveColorOrUnspecified("TabbedPane.borderColor")
-    val selectedUnderline = retrieveColorOrUnspecified("Link.activeForeground")
-
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(32.dp)
-            .background(tabBg.copy(alpha = 0.3f)),
+            .height(32.dp),
         horizontalArrangement = Arrangement.SpaceEvenly,
         verticalAlignment = Alignment.CenterVertically
     ) {
         SidebarTabButton(
             label = "Sessions",
+            iconKey = IntelliJIconKey.fromPlatformIcon(AllIcons.Nodes.Console),
             isSelected = selectedTab == SidebarTab.SESSIONS,
             onClick = { onTabSelected(SidebarTab.SESSIONS) },
             modifier = Modifier.weight(1f)
         )
         SidebarTabButton(
             label = "Context",
+            iconKey = IntelliJIconKey.fromPlatformIcon(AllIcons.Nodes.Folder),
             isSelected = selectedTab == SidebarTab.CONTEXT,
             onClick = { onTabSelected(SidebarTab.CONTEXT) },
             modifier = Modifier.weight(1f)
         )
         SidebarTabButton(
             label = "Review",
+            iconKey = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Checked),
             isSelected = selectedTab == SidebarTab.REVIEW,
             onClick = { onTabSelected(SidebarTab.REVIEW) },
             modifier = Modifier.weight(1f)
@@ -164,30 +166,55 @@ private fun SidebarTabRow(
 @Composable
 private fun SidebarTabButton(
     label: String,
+    iconKey: IconKey,
     isSelected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val selectedColor = retrieveColorOrUnspecified("Link.activeForeground")
-    val unselectedColor = JewelTheme.globalColors.text.disabled.copy(alpha = 0.7f)
+    val interactionSource = remember { MutableInteractionSource() }
+    val isHovered by interactionSource.collectIsHoveredAsState()
+    val linkColor = retrieveColorOrUnspecified("Link.activeForeground")
+    val selectedColor = if (linkColor == Color.Unspecified) Color(0xFF3574F0) else linkColor
+    val unselectedColor = retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.55f)
     val underlineColor = if (isSelected) selectedColor else Color.Transparent
+    val bgColor = if (isHovered) selectedColor.copy(alpha = 0.12f) else Color.Transparent
 
     Box(
         modifier = modifier
             .fillMaxHeight()
-            .clickable(onClick = onClick),
+            .clip(RoundedCornerShape(4.dp))
+            .background(bgColor)
+            .hoverable(interactionSource)
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Text(
-                text = label,
-                fontSize = 12.sp,
-                fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
-                color = if (isSelected) selectedColor else unselectedColor
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Icon(
+                    key = iconKey,
+                    contentDescription = label,
+                    modifier = Modifier.size(12.dp),
+                    tint = if (isSelected) selectedColor else unselectedColor,
+                )
+                Text(
+                    text = label,
+                    fontSize = 12.sp,
+                    fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
+                    color = if (isSelected) selectedColor else unselectedColor,
+                )
+                Icon(
+                    key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.ChevronDown),
+                    contentDescription = null,
+                    modifier = Modifier.size(8.dp),
+                    tint = if (isSelected) selectedColor else unselectedColor.copy(alpha = 0.7f),
+                )
+            }
             Spacer(Modifier.height(2.dp))
             Box(
                 modifier = Modifier
@@ -405,8 +432,8 @@ private fun SessionRow(
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
 
-    val selectedBg = retrieveColorOrUnspecified("ComboBox.selectionBackground")
-    val hoverBg = retrieveColorOrUnspecified("MenuItem.selectionBackground")
+    val selectedBg = retrieveColorOrUnspecified("List.selectionBackground")
+    val hoverBg = retrieveColorOrUnspecified("MenuItem.selectionBackground").copy(alpha = 0.5f)
     val bgColor = when {
         isSelected -> selectedBg
         isHovered -> hoverBg
@@ -415,12 +442,39 @@ private fun SessionRow(
 
     val indentDp = (depth * 16).dp
 
+    // Text colors: use IntelliJ theme keys for proper dark-theme contrast
+    val titleColor = if (isSelected) {
+        retrieveColorOrUnspecified("List.selectionForeground")
+    } else {
+        retrieveColorOrUnspecified("Panel.foreground")
+    }
+    val metaColor = if (isSelected) {
+        retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.75f)
+    } else {
+        retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.6f)
+    }
+    val sepColor = if (isSelected) {
+        retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.45f)
+    } else {
+        retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.4f)
+    }
+    val iconTint = if (isSelected) {
+        retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.8f)
+    } else {
+        retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.55f)
+    }
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 4.dp, vertical = 1.dp)
+            .padding(horizontal = 4.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(bgColor)
+            .border(
+                width = if (isSelected) 1.dp else 0.dp,
+                color = if (isSelected) retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.3f) else Color.Transparent,
+                shape = RoundedCornerShape(6.dp)
+            )
             .hoverable(interactionSource),
     ) {
         Row(
@@ -431,28 +485,37 @@ private fun SessionRow(
             if (hasChildren) {
                 Box(
                     modifier = Modifier
-                        .size(20.dp)
+                        .size(24.dp)
                         .clickable(onClick = onToggle),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(
-                            if (isExpanded) AllIcons.General.ChevronDown else AllIcons.General.ChevronRight
-                        ),
-                        contentDescription = if (isExpanded) "Collapse" else "Expand",
-                        modifier = Modifier.size(12.dp),
-                        tint = JewelTheme.globalColors.text.disabled,
+                Icon(
+                    key = IntelliJIconKey.fromPlatformIcon(
+                        if (isExpanded) AllIcons.General.ChevronDown else AllIcons.General.ChevronRight
+                    ),
+                    contentDescription = if (isExpanded) "Collapse" else "Expand",
+                        modifier = Modifier.size(16.dp),
+                        tint = iconTint,
                     )
                 }
                 Spacer(Modifier.width(4.dp))
             } else if (depth > 0) {
                 // Child session indicator
-                Icon(
-                    key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Forward),
-                    contentDescription = null,
-                    modifier = Modifier.size(10.dp),
-                    tint = JewelTheme.globalColors.text.disabled,
-                )
+                Box(
+                    modifier = Modifier.size(24.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Forward),
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = iconTint,
+                    )
+                }
+                Spacer(Modifier.width(4.dp))
+            } else {
+                // Spacer so text aligns with rows that have chevrons
+                Spacer(Modifier.width(24.dp))
                 Spacer(Modifier.width(4.dp))
             }
 
@@ -471,61 +534,63 @@ private fun SessionRow(
                         text = session.title.ifBlank { "Untitled" },
                         fontSize = 12.sp,
                         fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
-                        color = if (isSelected) Color.White else JewelTheme.globalColors.text.normal,
+                        color = titleColor,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
-                    // Archive button — visible on hover
-                    if (isHovered) {
-                        Icon(
-                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
-                            contentDescription = "Archive",
-                            modifier = Modifier
-                                .size(16.dp)
-                                .clip(RoundedCornerShape(4.dp))
-                                .clickable(onClick = onArchive)
-                                .padding(2.dp),
-                    tint = JewelTheme.globalColors.text.disabled,
-                        )
-                    }
+                    // Archive button — always visible, subtle until hover
+                    Icon(
+                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
+                        contentDescription = "Archive",
+                        modifier = Modifier
+                            .size(20.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .clickable(onClick = onArchive)
+                            .padding(2.dp),
+                        tint = if (isHovered) {
+                            retrieveColorOrUnspecified("Component.errorFocusColor")
+                        } else {
+                            retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.35f)
+                        },
+                    )
                 }
 
                 // Metadata row: timestamp + cost + tokens
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // Timestamp
-                    Text(
-                        text = formatRelativeTime(session.createdAt),
-                        fontSize = 11.sp,
-                        color = JewelTheme.globalColors.text.disabled,
-                        maxLines = 1,
-                    )
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        // Timestamp
+        Text(
+            text = formatRelativeTime(session.createdAt),
+            fontSize = 11.sp,
+            color = metaColor,
+            maxLines = 1,
+        )
 
-                    // Separator
+        // Separator
+        Text(
+            text = "\u00B7",
+            fontSize = 11.sp,
+            color = sepColor,
+            maxLines = 1,
+        )
+
+        // Cost
+        Text(
+            text = formatCost(session.cost),
+            fontSize = 11.sp,
+            color = metaColor,
+            maxLines = 1,
+        )
+
+        // Separator
                     Text(
                         text = "\u00B7",
                         fontSize = 11.sp,
-                        color = JewelTheme.globalColors.text.disabled,
-                        maxLines = 1,
-                    )
-
-                    // Cost
-                    Text(
-                        text = formatCost(session.cost),
-                        fontSize = 11.sp,
-                        color = JewelTheme.globalColors.text.disabled,
-                        maxLines = 1,
-                    )
-
-                    // Separator
-                    Text(
-                        text = "\u00B7",
-                        fontSize = 11.sp,
-                        color = JewelTheme.globalColors.text.disabled,
+                        color = sepColor,
                         maxLines = 1,
                     )
 
@@ -533,7 +598,7 @@ private fun SessionRow(
                     Text(
                         text = formatTokens(session.inputTokens + session.outputTokens),
                         fontSize = 11.sp,
-                        color = JewelTheme.globalColors.text.disabled,
+                        color = metaColor,
                         maxLines = 1,
                     )
                 }
@@ -596,7 +661,7 @@ private fun ErrorContent(
             key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.BalloonError),
             contentDescription = null,
             modifier = Modifier.size(24.dp),
-            tint = Color(0xFFDB4437),
+            tint = retrieveColorOrUnspecified("Component.errorFocusColor"),
         )
         Spacer(Modifier.height(8.dp))
         Text(

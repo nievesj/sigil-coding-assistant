@@ -23,7 +23,7 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
         // addComposeTab() automatically handles SwingBridgeTheme, enableNewSwingCompositing(),
         // and JewelComposePanel creation — no explicit SwingBridgeTheme {} wrapper needed.
-        toolWindow.addComposeTab("OpenCode") {
+        toolWindow.addComposeTab("") {
             ChatScreen(viewModel, project)
         }
 

@@ -62,6 +62,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.intellij.icons.AllIcons
+import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.model.ControlBarState
 import com.opencode.acp.chat.model.OpenCodeAgentInfo
 import com.opencode.acp.chat.model.ProviderModel
@@ -81,13 +82,6 @@ import javax.imageio.ImageIO
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-data class AttachedFile(
-    val name: String,
-    val path: String,
-    val mime: String,
-    val dataUri: String
-)
 
 /** Result of reading the clipboard — either an image/file attachment or plain text. */
 sealed class ClipboardResult {
@@ -306,13 +300,19 @@ fun InputArea(
     onSearch: (String) -> Unit = {},
     onFilesAndFolders: () -> Unit = {},
     onImage: () -> Unit = {},
-    onRecentFileClick: (RecentFile) -> Unit = {}
+    onRecentFileClick: (RecentFile) -> Unit = {},
+    onSlashCommand: (SlashCommand) -> Unit = {}
 ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
     var showAttachMenu by remember { mutableStateOf(false) }
     var showModelPicker by remember { mutableStateOf(false) }
     var isDragging by remember { mutableStateOf(false) }
+
+    // Slash command palette state: shown when text starts with "/"
+    var showSlashPalette by remember { mutableStateOf(false) }
+    val currentText = textState.text.toString()
+    val slashQuery = if (currentText.startsWith("/")) currentText.substring(1) else ""
 
     // Drag-and-drop target for file drops
     val fileDropTarget = remember(onAttachFile, onImagePasted) {
@@ -431,11 +431,48 @@ fun InputArea(
     val accentGreen = Color(0xFF6BBE50)
     val stopRed = Color(0xFFE5534B)
 
+    // Watch text changes to show/hide slash palette
+    LaunchedEffect(Unit) {
+        androidx.compose.runtime.snapshotFlow { textState.text.toString() }
+            .collect { text ->
+                showSlashPalette = text.startsWith("/") && text.length < 30 && !text.contains("\n")
+            }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
+        // Slash command palette — shown above the input when text starts with "/"
+        if (showSlashPalette) {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.BottomStart
+            ) {
+                Popup(
+                    alignment = Alignment.BottomStart,
+                    offset = IntOffset(0, -4),
+                    properties = PopupProperties(
+                        focusable = false,
+                        dismissOnBackPress = true,
+                        dismissOnClickOutside = true,
+                    ),
+                    onDismissRequest = { showSlashPalette = false },
+                ) {
+                    SlashCommandPalette(
+                        query = slashQuery,
+                        onCommandSelected = { command ->
+                            showSlashPalette = false
+                            textState.edit { replace(0, length, "") }
+                            onSlashCommand(command)
+                        },
+                        onDismiss = { showSlashPalette = false },
+                    )
+                }
+            }
+        }
+
         // Text area container with rounded corners and border
         Box(
             modifier = Modifier
@@ -630,12 +667,23 @@ fun InputArea(
                             .onPreviewKeyEvent { event ->
                                 if (event.type == KeyEventType.KeyDown) {
                                     when {
+                                        // Enter with slash palette: execute first matching command
+                                        event.key == Key.Enter && !event.isShiftPressed && showSlashPalette -> {
+                                            val match = SLASH_COMMANDS.filter { it.name.startsWith(slashQuery, ignoreCase = true) }
+                                            if (match.isNotEmpty()) {
+                                                showSlashPalette = false
+                                                textState.edit { replace(0, length, "") }
+                                                onSlashCommand(match.first())
+                                            }
+                                            true
+                                        }
                                         event.key == Key.Enter && !event.isShiftPressed -> {
                                             val text = textState.text.toString().trim()
                                             if (text.isNotEmpty()) {
                                                 onSend(text)
                                                 textState.edit { replace(0, length, "") }
                                             }
+                                            showSlashPalette = false
                                             true
                                         }
                                         event.key == Key.Enter && event.isShiftPressed -> {
@@ -643,10 +691,14 @@ fun InputArea(
                                             // doesn't always handle this via pass-through
                                             val pos = textState.selection.start
                                             textState.edit { replace(pos, pos, "\n") }
+                                            showSlashPalette = false
                                             true
                                         }
                                         event.key == Key.Escape -> {
-                                            if (showAttachMenu) {
+                                            if (showSlashPalette) {
+                                                showSlashPalette = false
+                                                true
+                                            } else if (showAttachMenu) {
                                                 showAttachMenu = false
                                                 true
                                             } else {
@@ -741,9 +793,13 @@ fun InputArea(
             // Model picker chip + popup
             Box {
                 val modelDisplayText = controlState.selectedModel?.displayName?.substringAfter(" / ")?.trim() ?: "Model"
+                val selectedProviderIconId = controlState.selectedModel?.providerIconId
                 SelectorChip(
                     text = modelDisplayText,
                     onClick = { showModelPicker = !showModelPicker },
+                    leadingIcon = if (selectedProviderIconId != null) {
+                        { ProviderIcon(providerId = selectedProviderIconId, modifier = Modifier.size(14.dp), tint = Color(0xFFCCCCCC)) }
+                    } else null,
                 )
 
                 if (showModelPicker) {

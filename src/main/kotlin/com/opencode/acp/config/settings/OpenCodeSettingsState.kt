@@ -2,6 +2,7 @@ package com.opencode.acp.config.settings
 
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.PersistentStateComponent
+import com.intellij.openapi.components.RoamingType
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
@@ -16,7 +17,7 @@ import com.opencode.acp.chat.model.ProviderModel
  * invoke via reflection.
  */
 @Service(Service.Level.APP)
-@State(name = "OpenCodeSettings", storages = [Storage("opencode-settings.xml")])
+@State(name = "OpenCodeSettings", storages = [Storage("opencode-settings.xml", roamingType = RoamingType.DISABLED)])
 class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     var binaryPath: String = ""

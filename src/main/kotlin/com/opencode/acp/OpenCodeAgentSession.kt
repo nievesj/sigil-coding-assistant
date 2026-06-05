@@ -99,6 +99,12 @@ class OpenCodeAgentSession(
                         )
                     ))
 
+                    is SseEvent.TextReplace -> emit(Event.SessionUpdateEvent(
+                        update = SessionUpdate.AgentMessageChunk(
+                            content = ContentBlock.Text(text = sseEvent.text)
+                        )
+                    ))
+
                     is SseEvent.ToolUse -> emit(Event.SessionUpdateEvent(
                         // Initial tool call: use SessionUpdate.ToolCall for the first appearance
                         update = SessionUpdate.ToolCall(
@@ -178,6 +184,20 @@ class OpenCodeAgentSession(
                         // Thinking content is handled by ChatViewModel for the chat UI.
                         // In the ACP SDK path, this is informational only.
                         logger.debug { "Thinking chunk: ${sseEvent.text.take(100)}" }
+                    }
+
+                    is SseEvent.ThinkingReplace -> {
+                        logger.debug { "Thinking replace: ${sseEvent.text.take(100)}" }
+                    }
+
+                    is SseEvent.TodoUpdated -> {
+                        // Todo updates are handled by ChatViewModel for the chat UI.
+                        logger.debug { "Todo updated: ${sseEvent.todos.size} items" }
+                    }
+
+                    is SseEvent.UserMessage -> {
+                        // User message from server - handled by ChatViewModel for the chat UI.
+                        logger.debug { "User message received: ${sseEvent.text.take(100)}" }
                     }
                 }
             }

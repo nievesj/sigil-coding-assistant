@@ -120,18 +120,13 @@ fun ReviewPanel(
             refreshMutex.withLock {
                 value = withContext(Dispatchers.IO) {
                     ApplicationManager.getApplication().runReadAction<ReviewState> {
-                        if (!gitService.isGitAvailable()) {
-                            ReviewState.NoGitRepository
-                        } else {
-                            val files = gitService.getChangedFiles()
-                            if (files.isEmpty()) ReviewState.Empty
-                            else ReviewState.Loaded(files)
-                        }
+                        val files = gitService.getChangedFiles()
+                        if (files.isEmpty()) ReviewState.Empty
+                        else ReviewState.Loaded(files)
                     }
                 }
             }
         } catch (e: Throwable) {
-            // Catch Throwable to handle NoClassDefFoundError from optional git4idea dependency
             value = ReviewState.Error(
                 message = e.message ?: "Failed to load changes",
                 retryable = true
@@ -142,7 +137,6 @@ fun ReviewPanel(
     // Render based on state
     when (val s = state) {
         is ReviewState.Loading -> ReviewLoadingContent(modifier)
-        is ReviewState.NoGitRepository -> ReviewNoGitContent(modifier)
         is ReviewState.Empty -> ReviewEmptyContent(modifier)
         is ReviewState.Error -> ReviewErrorContent(
             message = s.message,
@@ -208,9 +202,9 @@ private fun ChangedFileRow(
 
     // Colors — retrieveColorOrUnspecified is @Composable so must be called directly
     val hoverBg = retrieveColorOrUnspecified("MenuItem.selectionBackground")
-    val addedColor = retrieveColorOrUnspecified("FileStatus.AddedColor")
-    val deletedColor = retrieveColorOrUnspecified("FileStatus.DeletedColor")
-    val disabledColor = JewelTheme.globalColors.text.disabled
+    val addedColor = Color(0xFF7EE787)   // Bright mint green like OpenCode
+    val deletedColor = Color(0xFFFF7B72) // Salmon/coral red like OpenCode
+    val pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)
     val normalColor = JewelTheme.globalColors.text.normal
 
     Row(
@@ -257,11 +251,11 @@ private fun ChangedFileRow(
                     )
                 }
             }
-            // Relative path (dimmed)
+            // Relative path (dimmed, tinted)
             Text(
                 text = file.filePath,
                 fontSize = 10.sp,
-                color = disabledColor,
+                color = pathColor,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
@@ -291,7 +285,7 @@ private fun ChangedFileRow(
                     Text(
                         text = "0",
                         fontSize = 11.sp,
-                        color = disabledColor
+                        color = pathColor
                     )
                 }
             }
@@ -299,22 +293,22 @@ private fun ChangedFileRow(
                 Text(
                     text = "—",
                     fontSize = 11.sp,
-                    color = disabledColor
+                    color = pathColor
                 )
             }
         }
 
-        // Open file chevron icon (visible on hover)
-        if (isHovered && file.virtualFile != null) {
+        // Open file icon (always visible target icon)
+        if (file.virtualFile != null) {
             Spacer(Modifier.width(8.dp))
             Icon(
-                key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Forward),
+                key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Locate),
                 contentDescription = "Open file",
                 modifier = Modifier
-                    .size(14.dp)
+                    .size(18.dp)
                     .clickable(onClick = onOpenFile)
                     .padding(1.dp),
-                tint = disabledColor
+                tint = pathColor
             )
         }
     }
@@ -363,35 +357,6 @@ private fun ReviewLoadingContent(modifier: Modifier = Modifier) {
         Text(
             text = "Loading changes...",
             fontSize = 12.sp,
-            color = JewelTheme.globalColors.text.disabled
-        )
-    }
-}
-
-@Composable
-private fun ReviewNoGitContent(modifier: Modifier = Modifier) {
-    Column(
-        modifier = modifier.fillMaxSize().padding(horizontal = 16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Icon(
-            key = IntelliJIconKey.fromPlatformIcon(AllIcons.Nodes.Console),
-            contentDescription = null,
-            modifier = Modifier.size(24.dp),
-            tint = JewelTheme.globalColors.text.disabled,
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = "No git repository detected",
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            color = JewelTheme.globalColors.text.disabled
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            text = "Initialize git to track changes.",
-            fontSize = 11.sp,
             color = JewelTheme.globalColors.text.disabled
         )
     }
@@ -502,8 +467,8 @@ private fun openUntrackedFile(project: Project, virtualFile: com.intellij.openap
     }
 }
 
-/** Opens a file in the editor (not diff). Used by the chevron icon on hover. */
-private fun openFileInEditor(project: Project, virtualFile: com.intellij.openapi.vfs.VirtualFile) {
+/** Opens a file in the editor (not diff). Used by the target icon. */
+internal fun openFileInEditor(project: Project, virtualFile: com.intellij.openapi.vfs.VirtualFile) {
     ApplicationManager.getApplication().invokeLater {
         FileEditorManager.getInstance(project).openFile(virtualFile, true)
     }
