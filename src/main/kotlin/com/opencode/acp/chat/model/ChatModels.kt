@@ -81,6 +81,30 @@ data class PermissionPrompt(
     val patterns: List<String> = emptyList()
 )
 
+/** A single option in a selection prompt. */
+data class SelectionOption(
+    val title: String,
+    val description: String,
+    /** Server-side label used in the answer payload. Maps to `label` in the wire format. */
+    val label: String = title
+)
+
+/** Display model for a multi-select prompt inline in chat. */
+data class SelectionPrompt(
+    val promptId: String,
+    val question: String,
+    val subtitle: String? = null,
+    val options: List<SelectionOption>,
+    val allowCustomInput: Boolean = true,
+    val multiSelect: Boolean = true
+)
+
+/** Response from a selection prompt. */
+data class SelectionResponse(
+    val selectedIndices: Set<Int>,
+    val customInput: String? = null
+)
+
 /** Bottom bar state. */
 data class ControlBarState(
     val agents: List<OpenCodeAgentInfo> = emptyList(),

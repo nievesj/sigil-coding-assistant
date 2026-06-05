@@ -199,6 +199,11 @@ class OpenCodeAgentSession(
                         // User message from server - handled by ChatViewModel for the chat UI.
                         logger.debug { "User message received: ${sseEvent.text.take(100)}" }
                     }
+
+                    is SseEvent.QuestionAsked -> {
+                        // Question prompts are handled by ChatViewModel for the chat UI.
+                        logger.debug { "Question asked: ${sseEvent.requestId}" }
+                    }
                 }
             }
         } catch (e: CancellationException) {

@@ -197,6 +197,50 @@ OpenCode server sends two different SSE wire formats depending on event version:
 
 - **Files:** `OpenCodeClient.kt` (`subscribeGlobalEvents` — V2 format detection + version suffix stripping + `data` extraction), `ChatViewModel.kt` (`addToolCallPill` — deduplication by `toolCallId`)
 
+### Question/Selection Prompt — `question.asked` SSE Event
+
+The OpenCode server sends `question.asked` events when the agent uses the `question` tool to ask the user for input (multiple-choice or freeform). The plugin renders these as `SelectionPrompt` inline in the chat.
+
+**Wire format (V1 BusEvent):**
+```json
+{
+  "type": "question.asked",
+  "properties": {
+    "id": "que_abc123",
+    "sessionID": "ses_xyz789",
+    "questions": [{
+      "question": "What is your favorite animal?",
+      "header": "Animal choice",
+      "options": [{ "label": "Dog", "description": "Loyal companion" }],
+      "multiple": false,
+      "custom": true
+    }]
+  }
+}
+```
+
+**Response endpoints:**
+- `POST /question/:requestID/reply` — body: `{ "answers": [["selectedLabel"]] }` (one array per question, containing label strings)
+- `POST /question/:requestID/reject` — empty body
+
+**Data flow:**
+1. SSE `question.asked` → `SseEvent.QuestionAsked` → sets `_selectionPrompt` StateFlow
+2. `SelectionPrompt` composable renders the UI
+3. User selects options → `respondSelection()` → `client.respondQuestion(requestId, answers)` or `client.rejectQuestion(requestId)`
+
+**Key detail:** `SelectionOption.label` stores the server's `label` field for round-tripping in the answer payload. The UI displays `title` (which defaults to `label`).
+
+- **Files:** `SseEvent.kt` (`QuestionAsked`, `SseQuestionInfo`, `SseQuestionOption`), `OpenCodeClient.kt` (`respondQuestion`, `rejectQuestion`, `question.asked` parsing), `ChatViewModel.kt` (`_selectionPrompt`, `respondSelection`), `ChatModels.kt` (`SelectionPrompt`, `SelectionOption`, `SelectionResponse`), `SelectionPrompt.kt` (UI), `ChatScreen.kt` (wiring)
+
+### MIME Type Detection for File Attachments
+
+`URLConnection.guessContentTypeFromName()` only knows ~20 common extensions and returns `null` (→ `application/octet-stream`) for most source code files (`.kt`, `.json`, `.yaml`, `.py`, `.rs`, `.go`, `.ts`, `.tsx`, etc.). The server rejects `application/octet-stream` for file parts.
+
+**Solution:** `MimeTypes.guessFromFileName()` in `util/MimeTypes.kt` provides a comprehensive extension→MIME mapping for 80+ development file types, falling back to `URLConnection` and then `application/octet-stream`.
+
+- **Files:** `util/MimeTypes.kt`, `ChatScreen.kt:454` (`addFileAttachment`), `InputArea.kt:891` (`toAttachedFile`)
+- **Warning:** Do NOT revert to `URLConnection.guessContentTypeFromName()` alone — it causes "file part media type application/octet-stream" errors for most dev files.
+
 ### Ctrl+V / Clipboard Image Paste — Must Use IntelliJ AnAction, NOT Compose onPreviewKeyEvent
 
 IntelliJ's action system (`IdeKeyEventDispatcher`) intercepts Ctrl+V (the `$Paste`
@@ -437,5 +481,7 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 - [x] Todo list panel (collapsible, `✓`/`•`/`○` status indicators, auto-collapse >4 items)
 - [x] Slash command palette (`/clear`, `/cancel`) triggered by `/` prefix in input
 - [x] StreamHealer for inline markdown formatting during streaming
+- [x] Question/selection prompt wired to server (`question.asked` SSE → `POST /question/:id/reply` or `/reject`)
+- [x] MIME type detection for file attachments — `MimeTypes.guessFromFileName()` replaces `URLConnection.guessContentTypeFromName()` (which returns `application/octet-stream` for most dev files)
 - [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
 - [x] SSE reconnection with exponential backoff (1s→2s→4s→...→30s cap, ±20% jitter, abort in-flight response, retryConnection for ERROR state)

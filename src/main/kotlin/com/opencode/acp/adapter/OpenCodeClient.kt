@@ -96,6 +96,11 @@ class OpenCodeClient(
     )
 
     @Serializable
+    private data class QuestionReplyRequest(
+        val answers: List<List<String>>
+    )
+
+    @Serializable
     private data class ForkSessionRequest(val messageId: String? = null)
 
     @Serializable
@@ -457,6 +462,42 @@ class OpenCodeClient(
         }
     }
 
+    /**
+     * Responds to a question from the agent.
+     * POST /question/{requestID}/reply
+     * Body: { "answers": [["selectedLabel1"], ["labelA", "labelB"]] }
+     */
+    suspend fun respondQuestion(
+        requestId: String,
+        answers: List<List<String>>
+    ) {
+        try {
+            httpClient.post("$baseUrl/question/$requestId/reply") {
+                applyAuth()
+                contentType(ContentType.Application.Json)
+                setBody(json.encodeToString(QuestionReplyRequest(answers = answers)))
+            }
+        } catch (e: Exception) {
+            logger.warn(e) { "Failed to respond to question $requestId" }
+        }
+    }
+
+    /**
+     * Rejects / dismisses a question from the agent.
+     * POST /question/{requestID}/reject
+     */
+    suspend fun rejectQuestion(requestId: String) {
+        try {
+            httpClient.post("$baseUrl/question/$requestId/reject") {
+                applyAuth()
+                contentType(ContentType.Application.Json)
+                setBody("{}")
+            }
+        } catch (e: Exception) {
+            logger.warn(e) { "Failed to reject question $requestId" }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // SSE (Server-Sent Events)
     // -------------------------------------------------------------------------
@@ -802,6 +843,37 @@ class OpenCodeClient(
                         toolCallId = toolCallId,
                         action = permission,
                         description = description
+                    )
+                }
+
+                "question.asked" -> {
+                    val requestId = props["id"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val questionsArray = props["questions"]?.jsonArray ?: return null
+                    val questions = questionsArray.mapNotNull { element ->
+                        val obj = element.jsonObject
+                        val question = obj["question"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                        val header = obj["header"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val multiple = obj["multiple"]?.jsonPrimitive?.booleanOrNull ?: false
+                        val custom = obj["custom"]?.jsonPrimitive?.booleanOrNull ?: true
+                        val optionsArray = obj["options"]?.jsonArray ?: emptyList()
+                        val options = optionsArray.mapNotNull { optElement ->
+                            val optObj = optElement.jsonObject
+                            val label = optObj["label"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                            val desc = optObj["description"]?.jsonPrimitive?.contentOrNull ?: ""
+                            com.opencode.acp.SseQuestionOption(label = label, description = desc)
+                        }
+                        com.opencode.acp.SseQuestionInfo(
+                            question = question,
+                            header = header,
+                            options = options,
+                            multiple = multiple,
+                            custom = custom
+                        )
+                    }
+                    SseEvent.QuestionAsked(
+                        sessionId = sessionId,
+                        requestId = requestId,
+                        questions = questions
                     )
                 }
 

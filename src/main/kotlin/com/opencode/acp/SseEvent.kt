@@ -102,6 +102,13 @@ sealed interface SseEvent {
         val text: String,
         val files: List<String> = emptyList()
     ) : SseEvent
+
+    /** Question asked by the agent (question.asked) — needs user selection/input. */
+    data class QuestionAsked(
+        override val sessionId: String,
+        val requestId: String,
+        val questions: List<SseQuestionInfo>
+    ) : SseEvent
 }
 
 /**
@@ -120,4 +127,19 @@ data class SseTodoItem(
     val content: String,
     val status: String,
     val priority: String
+)
+
+/** A single question from a question.asked SSE event. */
+data class SseQuestionInfo(
+    val question: String,
+    val header: String,
+    val options: List<SseQuestionOption>,
+    val multiple: Boolean = false,
+    val custom: Boolean = true
+)
+
+/** A single option in a question.asked event. */
+data class SseQuestionOption(
+    val label: String,
+    val description: String
 )

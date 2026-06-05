@@ -68,6 +68,9 @@ class ChatViewModel(
     private val _permissionPrompt = MutableStateFlow<PermissionPrompt?>(null)
     val permissionPrompt: StateFlow<PermissionPrompt?> = _permissionPrompt.asStateFlow()
 
+    private val _selectionPrompt = MutableStateFlow<SelectionPrompt?>(null)
+    val selectionPrompt: StateFlow<SelectionPrompt?> = _selectionPrompt.asStateFlow()
+
     /** Signal emitted by the Ctrl+V IntelliJ action to trigger clipboard image paste in Compose. */
     private val _pasteImageSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val pasteImageSignal = _pasteImageSignal.asSharedFlow()
@@ -152,6 +155,7 @@ class ChatViewModel(
         responseDeferred?.complete(Unit)
         responseDeferred = null
         _permissionPrompt.value = null
+        _selectionPrompt.value = null
         permissionTimeoutJob?.cancel()
         permissionTimeoutJob = null
         lastUserText = null
@@ -224,6 +228,11 @@ class ChatViewModel(
             logger.info { "Launching: $binaryPath serve --host $host --port $port" }
             val pb = ProcessBuilder(binaryPath, "serve", "--host", host, "--port", port.toString())
                 .redirectErrorStream(true)
+                .apply {
+                    // Ensure the question tool is registered. OpenCode only enables
+                    // it when OPENCODE_CLIENT is "app", "cli", or "desktop".
+                    environment().putIfAbsent("OPENCODE_CLIENT", "cli")
+                }
             openCodeProcess = pb.start()
             logger.info { "OpenCode process started (PID: ${openCodeProcess?.pid()})" }
 
@@ -437,14 +446,6 @@ class ChatViewModel(
                 computeSessionContext()
                 fetchTodos()
 
-                // TEMP: Test permission prompt to show rendering
-                _permissionPrompt.value = PermissionPrompt(
-                    permissionId = "test-perm-1",
-                    toolCallId = "test-tc-1",
-                    toolName = "read_file",
-                    description = "This tool wants to read \"src/main/Secrets.kt\" on your disk.",
-                    patterns = listOf("src/main/**")
-                )
             } else {
                 logger.info { "No active session on IDE load - skipping SSE subscription (user can create session manually)" }
             }
@@ -761,6 +762,37 @@ class ChatViewModel(
         permissionTimeoutJob?.cancel()
         permissionTimeoutJob = null
     }
+
+    fun respondSelection(response: SelectionResponse) {
+        val prompt = _selectionPrompt.value ?: return
+        val client = openCodeClient ?: return
+        scope.launch {
+            try {
+                // Build answers array: one inner list per question.
+                // The server expects the selected option *labels*, not indices.
+                val selectedLabels = response.selectedIndices.mapNotNull { idx ->
+                    prompt.options.getOrNull(idx)?.label
+                }
+                val answers = mutableListOf<List<String>>()
+                if (selectedLabels.isNotEmpty()) {
+                    answers.add(selectedLabels)
+                }
+                // Custom input is added as a separate answer entry if provided
+                response.customInput?.let { answers.add(listOf(it)) }
+                if (answers.isEmpty()) {
+                    // Nothing selected and no custom input — reject the question
+                    client.rejectQuestion(prompt.promptId)
+                } else {
+                    client.respondQuestion(prompt.promptId, answers)
+                }
+                _selectionPrompt.value = null
+            } catch (e: Exception) {
+                logger.warn(e) { "Failed to respond to question ${prompt.promptId}" }
+            }
+        }
+    }
+
+
 
     override fun close() {
         reconnectJob?.cancel()
@@ -1205,6 +1237,23 @@ class ChatViewModel(
                 // This event is mainly for logging/debugging purposes.
                 if (event.sessionId == sessionId) {
                     logger.debug { "User message received from server: ${event.text.take(100)}" }
+                }
+            }
+
+            is SseEvent.QuestionAsked -> {
+                if (event.sessionId == sessionId && event.questions.isNotEmpty()) {
+                    // Use the first question (the server currently sends one per event)
+                    val q = event.questions.first()
+                    _selectionPrompt.value = SelectionPrompt(
+                        promptId = event.requestId,
+                        question = q.question,
+                        subtitle = q.header.ifBlank { null },
+                        options = q.options.map { opt ->
+                            SelectionOption(title = opt.label, description = opt.description, label = opt.label)
+                        },
+                        allowCustomInput = q.custom,
+                        multiSelect = q.multiple
+                    )
                 }
             }
         }

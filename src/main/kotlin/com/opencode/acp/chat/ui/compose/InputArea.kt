@@ -888,7 +888,7 @@ internal fun decodeDataUriToBitmap(dataUri: String): ImageBitmap? {
 private fun java.io.File.toAttachedFile(): AttachedFile {
     val bytes = readBytes()
     val base64 = Base64.getEncoder().encodeToString(bytes)
-    val mime = java.net.URLConnection.guessContentTypeFromName(name) ?: "application/octet-stream"
+    val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(name)
     val dataUri = "data:$mime;base64,$base64"
     return AttachedFile(name = name, path = absolutePath, mime = mime, dataUri = dataUri)
 }

@@ -38,6 +38,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ChatConstants
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.viewmodel.ChatViewModel
@@ -133,6 +134,7 @@ fun ChatScreen(
     val controlState by viewModel.controlState.collectAsState()
     val isStreaming by viewModel.isStreaming.collectAsState()
     val permissionPrompt by viewModel.permissionPrompt.collectAsState()
+    val selectionPrompt by viewModel.selectionPrompt.collectAsState()
     val sessionListState by viewModel.sessionListState.collectAsState()
     val isSidebarVisible by viewModel.isSidebarVisible.collectAsState()
     val sessionContextState by viewModel.sessionContextState.collectAsState()
@@ -346,8 +348,17 @@ fun ChatScreen(
                 )
             }
 
-            // Input area (always visible at bottom, disabled when disconnected or permission active)
-            val inputEnabled = connectionState == ConnectionState.CONNECTED && permissionPrompt == null
+            // Selection prompt (shows/hides based on state)
+            selectionPrompt?.let { prompt ->
+                SelectionPrompt(
+                    prompt = prompt,
+                    onSubmit = { response -> viewModel.respondSelection(response) },
+                    onDismiss = { viewModel.respondSelection(SelectionResponse(emptySet())) }
+                )
+            }
+
+            // Input area (always visible at bottom, disabled when disconnected or prompt active)
+            val inputEnabled = connectionState == ConnectionState.CONNECTED && permissionPrompt == null && selectionPrompt == null
             InputArea(
                 enabled = inputEnabled,
                 isStreaming = isStreaming,
@@ -440,7 +451,7 @@ private fun addFileAttachment(
     try {
         val bytes = file.contentsToByteArray()
         val base64 = java.util.Base64.getEncoder().encodeToString(bytes)
-        val mime = java.net.URLConnection.guessContentTypeFromName(file.name) ?: "application/octet-stream"
+        val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(file.name)
         val dataUri = "data:$mime;base64,$base64"
         attachedFiles.add(AttachedFile(name = file.name, path = file.path, mime = mime, dataUri = dataUri))
     } catch (_: Exception) {
