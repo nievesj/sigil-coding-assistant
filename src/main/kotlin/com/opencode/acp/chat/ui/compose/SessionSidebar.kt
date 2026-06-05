@@ -68,7 +68,8 @@ fun SessionSidebar(
     onContextRetry: () -> Unit,
     onShowDetails: () -> Unit,
     project: Project,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    fileChangeSignal: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
 ) {
     Column(
         modifier = modifier
@@ -116,7 +117,8 @@ fun SessionSidebar(
             SidebarTab.REVIEW -> {
                 ReviewPanel(
                     project = project,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    fileChangeSignal = fileChangeSignal,
                 )
             }
         }

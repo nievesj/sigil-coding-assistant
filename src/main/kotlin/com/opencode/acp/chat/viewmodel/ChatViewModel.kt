@@ -27,6 +27,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -99,6 +100,12 @@ class ChatViewModel(
     private val _todoItems = MutableStateFlow<List<TodoItem>>(emptyList())
     val todoItems: StateFlow<List<TodoItem>> = _todoItems.asStateFlow()
 
+    /** Command history — most recent first. */
+    private val _commandHistory = MutableStateFlow<List<CommandHistoryEntry>>(
+        OpenCodeSettingsState.getInstance().commandHistory.toList()
+    )
+    val commandHistory: StateFlow<List<CommandHistoryEntry>> = _commandHistory.asStateFlow()
+
     /** Available slash commands fetched from the server. */
     private val _availableCommands = MutableStateFlow<List<SlashCommand>>(emptyList())
     val availableCommands: StateFlow<List<SlashCommand>> = _availableCommands.asStateFlow()
@@ -108,6 +115,10 @@ class ChatViewModel(
 
     /** Pending file changes collected from tool calls, keyed by message ID. */
     private val pendingFileChanges = mutableMapOf<String, MutableList<ChatFileChange>>()
+
+    /** Signal emitted whenever a tool call modifies a file, so the review panel can refresh immediately. */
+    private val _fileChangeSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val fileChangeSignal: SharedFlow<Unit> = _fileChangeSignal.asSharedFlow()
 
     /** Emits a signal to check the clipboard for an image. Called by the IntelliJ Ctrl+V action. */
     fun requestImagePaste() {
@@ -129,7 +140,11 @@ class ChatViewModel(
         return scope.launch {
             try {
                 client.subscribeGlobalEvents()
-                    .filter { event -> event.sessionId == capturedId }
+                    .filter { event ->
+                        // Pass through events for our session, plus SessionCreated events
+                        // which may come from child sessions (subagents) with different IDs
+                        event.sessionId == capturedId || event is SseEvent.SessionCreated
+                    }
                     .collect { event -> handleSseEvent(event) }
             } catch (e: CancellationException) {
                 throw e // Don't reconnect on cancellation (user-initiated close/switch)
@@ -522,7 +537,13 @@ class ChatViewModel(
                 reconnectJob = null
                 sseJob?.cancel()
                 sseJob = null
-                try { cancel() } catch (_: Exception) { /* best-effort */ }
+                // Complete any pending deferred so sendMessage() unblocks,
+                // but do NOT abort the server-side session — let it keep running.
+                responseDeferred?.complete(Unit)
+                responseDeferred = null
+                _isStreaming.value = false
+                firstTextChunkReceived = false
+                userEchoStripped = false
                 resetSessionState()
 
                 val messages = client.listMessages(targetSessionId, limit = null)
@@ -645,6 +666,9 @@ class ChatViewModel(
     suspend fun sendMessage(text: String, files: List<AttachedFile> = emptyList()) {
         val client = openCodeClient ?: return
         val currentSessionId = sessionId ?: return
+
+        // Record in history before sending (so it's available even if send fails)
+        recordCommand(text, files)
 
         // Add user message to chat for immediate display
         val userMsg = ChatMessage(
@@ -1007,6 +1031,38 @@ class ChatViewModel(
     }
 
     /**
+     * Records a sent command in the persistent history.
+     * Called at the top of [sendMessage] before any network activity.
+     * Deduplicates by text, moving the matching entry to the front.
+     */
+    private fun recordCommand(text: String, files: List<AttachedFile>) {
+        if (text.isBlank() && files.isEmpty()) return
+        val entry = CommandHistoryEntry(text = text, files = files)
+        val maxSize = OpenCodeSettingsState.getInstance().commandHistorySize.coerceIn(1, 100)
+        val current = _commandHistory.value.toMutableList()
+        // Remove any existing duplicate (same text + same file paths) to move it to front
+        current.removeAll { existing ->
+            existing.text == text &&
+                existing.attachedFilePaths.size == files.size &&
+                existing.attachedFilePaths.zip(files.map { it.path }).all { (a, b) -> a == b }
+        }
+        current.add(0, entry)
+        val trimmed = if (current.size > maxSize) current.take(maxSize) else current
+        _commandHistory.value = trimmed
+        // Persist
+        val settings = OpenCodeSettingsState.getInstance()
+        settings.commandHistory = java.util.ArrayList(trimmed)
+    }
+
+    /**
+     * Clears the input command history entirely.
+     */
+    fun clearCommandHistory() {
+        _commandHistory.value = emptyList()
+        OpenCodeSettingsState.getInstance().commandHistory = java.util.ArrayList()
+    }
+
+    /**
      * Fetches available slash commands from the OpenCode server.
      * Called after client initialization and after session switch.
      */
@@ -1148,12 +1204,7 @@ class ChatViewModel(
 
                 // Extract file path from tool input for edit/write tools
                 if (toolKind == ToolKind.EDIT && event.input != null) {
-                    val pathElement = event.input["file_path"]
-                    val filePath: String? = pathElement?.let { el ->
-                        try {
-                            (el as? kotlinx.serialization.json.JsonPrimitive)?.content
-                        } catch (_: Exception) { null }
-                    }
+                    val filePath = extractFilePath(event.input)
                     if (filePath != null) {
                         val fileName = filePath.substringAfterLast('/')
                         val change = ChatFileChange(
@@ -1161,6 +1212,9 @@ class ChatViewModel(
                             fileName = fileName,
                         )
                         pendingFileChanges.getOrPut(msgId) { mutableListOf() }.add(change)
+                        debugLog("VM FILE_CHANGE: tracked $filePath for tool ${event.toolName}")
+                        // Signal the review panel to refresh immediately
+                        _fileChangeSignal.tryEmit(Unit)
                     }
                 }
 
@@ -1189,6 +1243,17 @@ class ChatViewModel(
                 // Refresh context and todos after each response completes
                 computeSessionContext()
                 fetchTodos()
+                // Refresh session list to pick up any new child sessions (subagents)
+                // spawned during this turn and inject their refs into the message
+                scope.launch {
+                    try {
+                        loadSessions()
+                        val children = _childSessionMap.value[sessionId] ?: emptyList()
+                        if (children.isNotEmpty()) {
+                            injectSubagentRefsIntoMessage(msgId, children)
+                        }
+                    } catch (_: Exception) { /* best-effort refresh */ }
+                }
             }
 
             is SseEvent.Permission -> {
@@ -1215,7 +1280,21 @@ class ChatViewModel(
             }
 
             is SseEvent.SessionCreated -> {
-                // Already handled during initialization
+                // A child session was created (e.g., subagent spawned).
+                // Refresh session list and inject subagent refs into the current message.
+                scope.launch {
+                    try {
+                        loadSessions()
+                        // Inject subagent refs into the active streaming message
+                        val currentMsgId = activeAssistantMessageId
+                        if (currentMsgId != null) {
+                            val children = _childSessionMap.value[sessionId] ?: emptyList()
+                            if (children.isNotEmpty()) {
+                                injectSubagentRefsIntoMessage(currentMsgId, children)
+                            }
+                        }
+                    } catch (_: Exception) { /* best-effort refresh */ }
+                }
             }
 
             is SseEvent.MessageComplete -> {
@@ -1441,5 +1520,42 @@ class ChatViewModel(
         val msg = updated[lastAssistantIdx]
         updated[lastAssistantIdx] = msg.copy(subagentRefs = refs)
         return updated
+    }
+
+    /**
+     * Injects [SubagentRef] objects into a specific message by ID (for live streaming).
+     * Used when a child session is created while the assistant is still streaming.
+     */
+    private fun injectSubagentRefsIntoMessage(messageId: String, children: List<SessionItem>) {
+        val messages = _messages.value.toMutableList()
+        val index = messageIndex[messageId] ?: return
+        val msg = messages[index]
+        val refs = children.map { child ->
+            SubagentRef(
+                sessionId = child.id,
+                agentName = child.title.replaceFirstChar { it.uppercase() },
+                taskDescription = child.title,
+                status = SubagentStatus.RUNNING,
+            )
+        }
+        messages[index] = msg.copy(subagentRefs = refs)
+        _messages.value = messages
+        debugLog("VM SUBAGENT: injected ${refs.size} refs into msg $messageId")
+    }
+
+    /**
+     * Extracts a file path from tool input JSON, trying multiple common key names.
+     * Returns null if no path found.
+     */
+    private fun extractFilePath(input: kotlinx.serialization.json.JsonObject): String? {
+        // Try common file path key names used by OpenCode tools
+        for (key in listOf("file_path", "filePath", "path")) {
+            val element = input[key] ?: continue
+            val path = try {
+                (element as? kotlinx.serialization.json.JsonPrimitive)?.content
+            } catch (_: Exception) { null }
+            if (!path.isNullOrEmpty()) return path
+        }
+        return null
     }
 }

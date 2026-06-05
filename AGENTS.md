@@ -322,6 +322,47 @@ The palette filters as the user types (e.g., `/cl` shows `/clear`).
 - **OpenCodeAgentSession:** `SseEvent.TodoUpdated` branch added to exhaustive `when` (informational only for ACP path; chat UI handles via ChatViewModel)
 - **TUI vs serve:** `opencode` starts TUI + server. `opencode serve` starts server only. Both expose the same HTTP API.
 
+### Input Command History — Up/Down Arrow Navigation
+
+The input area remembers past commands (including file attachments) and lets the
+user recall them with Up/Down arrow keys, similar to a shell history.
+
+**Behavior:**
+- **Up arrow** at the input: saves the current draft (text + files), then loads
+  the next older history entry.
+- **Down arrow** while navigating: loads the next newer entry. At the newest
+  entry, restores the saved draft.
+- **Escape** while navigating: restores the draft and exits history mode.
+- **Enter** (send): sends the current text + files, exits history mode, and
+  resets the history index.
+- History only cycles when the slash command palette is NOT visible.
+- Deduplication: sending the same text again moves the existing entry to the
+  front rather than creating a duplicate.
+
+**Persistence:** History is stored in `OpenCodeSettingsState` (`commandHistory:
+ArrayList<CommandHistoryEntry>`), which is an XStream-serialized
+`PersistentStateComponent`. The entries survive IDE restarts.
+
+**History size setting:** Configurable in `Settings → Tools → OpenCode` as
+"Command history size" (default 15, clamped to 1–100). Changing the setting
+trims the history on the next `recordCommand` call.
+
+**`CommandHistoryEntry`** is a non-data class with parallel `ArrayList<String>`
+fields (`attachedFileNames`, `attachedFilePaths`, `attachedFileMimes`,
+`attachedFileDataUris`) for XStream compatibility. `toAttachedFiles()` reconstructs
+the original `List<AttachedFile>`.
+
+**Bug fix included:** The `onSend` callback signature changed from `(String) -> Unit`
+to `(String, List<AttachedFile>) -> Unit`. Previously, clicking the green Send
+button or pressing Enter did NOT pass attached files — they were silently lost.
+Now both paths pass the current `attachedFiles` list to `onSend`.
+
+- **Files:** `ChatModels.kt` (`CommandHistoryEntry`), `OpenCodeSettingsState.kt`
+  (`commandHistorySize`, `commandHistory`), `OpenCodeSettingsPanel.kt`
+  (`commandHistorySizeField`), `ChatViewModel.kt` (`_commandHistory`,
+  `recordCommand()`), `InputArea.kt` (Up/Down key handlers, `commandHistory` +
+  `onLoadHistoryEntry` params, `onSend` signature), `ChatScreen.kt` (wiring)
+
 ### ACP Mode (not used by this plugin)
 
 - **Docs:** https://opencode.ai/docs/acp/
@@ -485,3 +526,4 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 - [x] MIME type detection for file attachments — `MimeTypes.guessFromFileName()` replaces `URLConnection.guessContentTypeFromName()` (which returns `application/octet-stream` for most dev files)
 - [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
 - [x] SSE reconnection with exponential backoff (1s→2s→4s→...→30s cap, ±20% jitter, abort in-flight response, retryConnection for ERROR state)
+- [x] Input command history with Up/Down arrow navigation (configurable size, persists with attachments, draft save/restore, `onSend` signature fixed to pass files)

@@ -140,6 +140,7 @@ fun ChatScreen(
     val sessionContextState by viewModel.sessionContextState.collectAsState()
     val todoItems by viewModel.todoItems.collectAsState()
     val availableCommands by viewModel.availableCommands.collectAsState()
+    val commandHistory by viewModel.commandHistory.collectAsState()
     var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
 
     // Local (non-server) slash commands — always shown first
@@ -310,7 +311,8 @@ fun ChatScreen(
                     onContextRetry = { viewModel.retryContextFetch() },
                     onShowDetails = { /* Context tab is already showing */ },
                     project = project,
-                    modifier = Modifier.width(sidebarWidth)
+                    modifier = Modifier.width(sidebarWidth),
+                    fileChangeSignal = viewModel.fileChangeSignal,
                 )
                 // Main chat area
                 Column(modifier = Modifier.weight(1f)) {
@@ -364,8 +366,7 @@ fun ChatScreen(
                 isStreaming = isStreaming,
                 controlState = controlState,
                 contextState = sessionContextState,
-                onSend = { text ->
-                    val files = attachedFiles.toList()
+                onSend = { text, files ->
                     attachedFiles.clear()
                     scope.launch {
                         viewModel.sendMessage(text, files)
@@ -404,6 +405,11 @@ fun ChatScreen(
                 },
                 commands = allSlashCommands,
                 todos = todoItems,
+                commandHistory = commandHistory,
+                onLoadHistoryEntry = { entry ->
+                    attachedFiles.clear()
+                    attachedFiles.addAll(entry.toAttachedFiles())
+                },
             )
         }
 

@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -45,6 +46,9 @@ import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vcs.changes.ChangeListAdapter
 import com.intellij.openapi.vcs.changes.ChangeListManager
+import com.intellij.openapi.vfs.AsyncFileListener
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.opencode.acp.chat.model.ChangedFile
 import com.opencode.acp.chat.model.FileChangeStatus
 import com.opencode.acp.chat.model.LineDelta
@@ -82,31 +86,61 @@ import org.jetbrains.jewel.foundation.theme.JewelTheme
 @Composable
 fun ReviewPanel(
     project: Project,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    fileChangeSignal: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
 ) {
     val gitService = remember { GitService(project) }
     val refreshSignal = remember { MutableStateFlow(0) }
     val refreshMutex = remember { Mutex() }
 
-    // Register ChangeListListener with debounce in a SINGLE DisposableEffect.
-    // The listener emits to refreshSignal, which is debounced before triggering produceState.
+    // Register ChangeListListener + VFS listener for immediate file change detection.
+    // ChangeListManager fires when VCS state updates (has its own internal polling).
+    // VFS listener fires immediately when files are created/modified/deleted on disk.
     DisposableEffect(project) {
         val changeListManager = ChangeListManager.getInstance(project)
-        val listener = object : ChangeListAdapter() {
+        val clListener = object : ChangeListAdapter() {
             override fun changeListUpdateDone() {
                 refreshSignal.tryEmit(refreshSignal.value + 1)
             }
         }
-        changeListManager.addChangeListListener(listener)
+        changeListManager.addChangeListListener(clListener)
+
+        // VFS listener — fires immediately on any file change (create, modify, delete)
+        val vfsListener = object : AsyncFileListener {
+            override fun prepareChange(events: List<VFileEvent>): AsyncFileListener.ChangeApplier? {
+                // Emit on any non-transactional file event (skip .git internal, build dirs, etc.)
+                val relevant = events.any { ev ->
+                    val path = ev.file?.path ?: return@any false
+                    !path.contains("/.git/") && !path.contains("\\.git\\") &&
+                    !path.contains("/.idea/") && !path.contains("\\.idea\\") &&
+                    !path.contains("/build/") && !path.contains("\\build\\")
+                }
+                if (relevant) {
+                    refreshSignal.tryEmit(refreshSignal.value + 1)
+                }
+                return null // no custom change applier needed
+            }
+        }
+        VirtualFileManager.getInstance().addAsyncFileListener(vfsListener, project)
+
         onDispose {
-            changeListManager.removeChangeListListener(listener)
+            changeListManager.removeChangeListListener(clListener)
         }
     }
 
-    // Debounce the refresh signal (2000ms - increased from 500ms to prevent
-    // thundering herd during rapid VCS events like branch switch, git rebase)
+    // Listen to ViewModel's file change signal for immediate refresh when tool calls modify files.
+    // This bypasses ChangeListManager's internal polling delay.
+    if (fileChangeSignal != null) {
+        LaunchedEffect(Unit) {
+            fileChangeSignal.collect {
+                refreshSignal.tryEmit(refreshSignal.value + 1)
+            }
+        }
+    }
+
+    // Debounce the refresh signal (300ms — responsive but prevents rapid-fire during bulk ops)
     val debouncedRefresh by refreshSignal
-        .debounce(2000)
+        .debounce(300)
         .collectAsState(initial = 0)
 
     // Fetch data on background thread inside read action, update state on EDT.

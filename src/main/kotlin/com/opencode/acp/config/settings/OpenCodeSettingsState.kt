@@ -6,6 +6,7 @@ import com.intellij.openapi.components.RoamingType
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
+import com.opencode.acp.chat.model.CommandHistoryEntry
 import com.opencode.acp.chat.model.ProviderModel
 
 /**
@@ -32,9 +33,13 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var lastSelectedModelKey: String = ""
     /** Whether the session sidebar is visible. Persisted across tool window reopens. */
     var sidebarVisible: Boolean = true
+    /** Maximum number of entries kept in the input command history. */
+    var commandHistorySize: Int = 15
+    /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save. */
+    var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
 
     override fun getState(): OpenCodeSettingsState {
-        println("[OpenCodeSettings] getState() called — favorites=${favoriteModels}, lastModel=$lastSelectedModelKey")
+        println("[OpenCodeSettings] getState() called — favorites=${favoriteModels}, lastModel=$lastSelectedModelKey, historySize=${commandHistory.size}")
         return this
     }
 
@@ -47,7 +52,9 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         listNumberColor = state.listNumberColor
         lastSelectedModelKey = state.lastSelectedModelKey
         sidebarVisible = state.sidebarVisible
-        println("[OpenCodeSettings] loadState() done — favorites=${favoriteModels}, lastModel=$lastSelectedModelKey")
+        commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
+        commandHistory = state.commandHistory
+        println("[OpenCodeSettings] loadState() done — favorites=${favoriteModels}, lastModel=$lastSelectedModelKey, historySize=${commandHistory.size}")
     }
 
     companion object {

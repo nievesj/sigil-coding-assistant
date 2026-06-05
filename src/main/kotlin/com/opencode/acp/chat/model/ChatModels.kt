@@ -11,6 +11,50 @@ data class AttachedFile(
     val dataUri: String
 )
 
+/**
+ * A single entry in the input command history.
+ *
+ * Stores the message text plus its attachments (with full data URI) so that
+ * recalling an entry re-populates the input area with the exact same content
+ * the user previously sent — including clipboard images (which have no
+ * on-disk path and must be restored from the stored dataUri).
+ */
+class CommandHistoryEntry {
+    var text: String = ""
+    var attachedFileNames: ArrayList<String> = ArrayList()
+    var attachedFilePaths: ArrayList<String> = ArrayList()
+    var attachedFileMimes: ArrayList<String> = ArrayList()
+    var attachedFileDataUris: ArrayList<String> = ArrayList()
+
+    /** No-arg constructor required for XStream deserialization. */
+    constructor()
+
+    constructor(text: String, files: List<AttachedFile>) {
+        this.text = text
+        files.forEach { f ->
+            attachedFileNames.add(f.name)
+            attachedFilePaths.add(f.path)
+            attachedFileMimes.add(f.mime)
+            attachedFileDataUris.add(f.dataUri)
+        }
+    }
+
+    /** Reconstruct the original [AttachedFile] list. */
+    fun toAttachedFiles(): List<AttachedFile> = buildList {
+        val n = attachedFileNames.size
+        for (i in 0 until n) {
+            add(
+                AttachedFile(
+                    name = attachedFileNames[i],
+                    path = attachedFilePaths[i],
+                    mime = attachedFileMimes[i],
+                    dataUri = attachedFileDataUris[i],
+                )
+            )
+        }
+    }
+}
+
 /** Display model for a single message in the chat list. */
 data class ChatMessage(
     val id: String,

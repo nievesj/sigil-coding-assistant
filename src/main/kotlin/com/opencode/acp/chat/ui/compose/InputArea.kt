@@ -46,6 +46,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
@@ -63,6 +74,7 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.intellij.icons.AllIcons
 import com.opencode.acp.chat.model.AttachedFile
+import com.opencode.acp.chat.model.CommandHistoryEntry
 import com.opencode.acp.chat.model.ControlBarState
 import com.opencode.acp.chat.model.OpenCodeAgentInfo
 import com.opencode.acp.chat.model.ProviderModel
@@ -283,7 +295,7 @@ fun InputArea(
     isStreaming: Boolean,
     controlState: ControlBarState,
     contextState: SessionContextState = SessionContextState.Loading,
-    onSend: (String) -> Unit,
+    onSend: (String, List<AttachedFile>) -> Unit,
     onCancel: () -> Unit,
     onAgentChanged: (OpenCodeAgentInfo) -> Unit,
     onModelChanged: (ProviderModel) -> Unit,
@@ -304,8 +316,10 @@ fun InputArea(
     onRecentFileClick: (RecentFile) -> Unit = {},
     onSlashCommand: (SlashCommand) -> Unit = {},
     commands: List<SlashCommand> = emptyList(),
-    todos: List<TodoItem> = emptyList()
-) {
+    todos: List<TodoItem> = emptyList(),
+    commandHistory: List<CommandHistoryEntry> = emptyList(),
+    onLoadHistoryEntry: (CommandHistoryEntry) -> Unit = {},
+    ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
     var showAttachMenu by remember { mutableStateOf(false) }
@@ -316,6 +330,30 @@ fun InputArea(
     var showSlashPalette by remember { mutableStateOf(false) }
     val currentText = textState.text.toString()
     val slashQuery = if (currentText.startsWith("/")) currentText.substring(1) else ""
+
+    // Command history navigation state
+    var historyIndex by remember { mutableStateOf(-1) }  // -1 = not navigating, 0 = newest, 1 = next older...
+    var draftText by remember { mutableStateOf("") }
+    var draftFiles by remember { mutableStateOf<List<AttachedFile>>(emptyList()) }
+    var inHistoryMode by remember { mutableStateOf(false) }
+
+    /** Snapshot the current input as the draft (only once per history session). */
+    fun saveDraftIfNeeded(currentAttachedFiles: List<AttachedFile>) {
+        if (!inHistoryMode) {
+            draftText = textState.text.toString()
+            draftFiles = currentAttachedFiles.toList() // snapshot
+            inHistoryMode = true
+        }
+    }
+
+    /** Load a history entry into the text field and attached files. */
+    fun loadHistoryEntry(index: Int) {
+        if (index !in commandHistory.indices) return
+        val entry = commandHistory[index]
+        textState.edit { replace(0, length, entry.text) }
+        historyIndex = index
+        onLoadHistoryEntry(entry)
+    }
 
     // Drag-and-drop target for file drops
     val fileDropTarget = remember(onAttachFile, onImagePasted) {
@@ -490,22 +528,94 @@ fun InputArea(
 
         // Text area container with rounded corners and border
         Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .background(if (isDragging) Color(0xFF2E3A2E) else inputBg)
-                .border(
-                    width = if (isDragging) 2.dp else 1.dp,
-                    color = if (isDragging) accentGreen else inputBorder,
-                    shape = RoundedCornerShape(12.dp),
-                )
-                .then(
-                    DropTargetElement(
-                        target = fileDropTarget,
-                        shouldStartDragAndDrop = { true },
-                    )
-                ),
+            modifier = Modifier.fillMaxWidth()
         ) {
+            // Animated blue glow when LLM is streaming
+            if (isStreaming) {
+                val infiniteTransition = rememberInfiniteTransition(label = "glow")
+                val rotation by infiniteTransition.animateFloat(
+                    initialValue = 0f,
+                    targetValue = 360f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(2500, easing = LinearEasing)
+                    ),
+                    label = "rotation"
+                )
+                val density = LocalDensity.current
+                val cornerRadiusPx = with(density) { 12.dp.toPx() }
+                val glowPath = remember { androidx.compose.ui.graphics.Path() }
+
+                // Shift gradient stops based on rotation to animate the bright spot.
+                // Single bright spot with wide, smooth fade — avoids jumpy corners.
+                val offset = rotation / 360f
+                val baseStops = floatArrayOf(
+                    0.00f, 0.10f, 0.18f, 0.22f, 0.25f, 0.28f, 0.32f, 0.40f, 1.00f
+                )
+                val baseColors = arrayOf(
+                    Color.Transparent,                              // 0.00
+                    Color.Transparent,                              // 0.10
+                    Color(0xFF4A9EFF).copy(alpha = 0.15f),          // 0.18
+                    Color(0xFF4A9EFF).copy(alpha = 0.45f),          // 0.22
+                    Color(0xFF00D4FF).copy(alpha = 0.85f),          // 0.25  ← peak
+                    Color(0xFF4A9EFF).copy(alpha = 0.45f),          // 0.28
+                    Color(0xFF4A9EFF).copy(alpha = 0.15f),          // 0.32
+                    Color.Transparent,                              // 0.40
+                    Color.Transparent,                              // 1.00
+                )
+                val shiftedStops = FloatArray(baseStops.size) { i ->
+                    ((baseStops[i] + offset) % 1f)
+                }
+                val shiftedColors = Array(baseColors.size) { i ->
+                    baseColors[(i - 0 + baseColors.size) % baseColors.size]
+                }
+                // Re-sort by stop position to keep sweepGradient happy
+                val paired = shiftedStops.indices.map { shiftedStops[it] to baseColors[it] }
+                val sorted = paired.sortedBy { it.first }
+
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .drawBehind {
+                            val glowPx = 3.dp.toPx()
+                            glowPath.reset()
+                            glowPath.addRoundRect(
+                                RoundRect(
+                                    left = 0f,
+                                    top = 0f,
+                                    right = size.width,
+                                    bottom = size.height,
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(cornerRadiusPx, cornerRadiusPx)
+                                )
+                            )
+                            drawPath(
+                                path = glowPath,
+                                brush = Brush.sweepGradient(
+                                    colorStops = sorted.toTypedArray(),
+                                    center = center
+                                ),
+                                style = Stroke(width = glowPx)
+                            )
+                        }
+                )
+            }
+            
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (isDragging) Color(0xFF2E3A2E) else inputBg)
+                    .border(
+                        width = if (isDragging) 2.dp else 1.dp,
+                        color = if (isDragging) accentGreen else inputBorder,
+                        shape = RoundedCornerShape(12.dp),
+                    )
+                    .then(
+                        DropTargetElement(
+                            target = fileDropTarget,
+                            shouldStartDragAndDrop = { true },
+                        )
+                    ),
+            ) {
             Column {
                 // Attached images — thumbnails inside the box
                 if (attachedFiles.isNotEmpty()) {
@@ -609,190 +719,236 @@ fun InputArea(
                     }
                 }
 
-                // Buttons row: + button | Text area | Send button
-                Row(
+                // Input area: Text field on top, buttons below
+                Column(
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.Bottom,
                 ) {
-                    // Attach button — opens the attach menu popup
-                    Box(
-                        modifier = Modifier
-                            .size(32.dp)
-                            .clip(CircleShape)
-                            .clickable(enabled = enabled) {
-                                showAttachMenu = !showAttachMenu
-                                println("[InputArea] Attach button clicked, showAttachMenu=$showAttachMenu, recentFiles=${recentFiles.size}")
-                            }
-                            .padding(8.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add),
-                            contentDescription = "Attach",
-                            modifier = Modifier.size(16.dp),
-                            tint = mutedText,
-                        )
-
-                        // Attach menu popup anchored to the + button
-                        if (showAttachMenu) {
-                            println("[InputArea] Showing AttachMenu popup with ${recentFiles.size} recentFiles")
-                            Popup(
-                                alignment = Alignment.BottomStart,
-                                offset = IntOffset(0, 4),
-                                properties = PopupProperties(
-                                    focusable = true,
-                                    dismissOnBackPress = true,
-                                    dismissOnClickOutside = true,
-                                ),
-                                onDismissRequest = { showAttachMenu = false },
-                            ) {
-                                AttachMenu(
-                                    recentFiles = recentFiles,
-                                    searchResults = searchResults,
-                                    onFilesAndFolders = {
-                                        onFilesAndFolders()
-                                    },
-                                    onImage = {
-                                        onImage()
-                                    },
-                                    onRecentFileClick = { file ->
-                                        onRecentFileClick(file)
-                                    },
-                                    onDismiss = { showAttachMenu = false },
-                                    onSearch = onSearch,
-                                )
-                            }
-                        }
-                    }
-
-                    // Text area — grows with content, max ~7 lines
+                    // Text area — grows with content, 2 rows min, max ~7 lines
                     val scrollState = rememberScrollState()
                     val lineCount = textState.text.lines().size.coerceAtLeast(1)
                     val maxLines = 7
                     val lineHeight = 20.dp
                     val targetHeight = (lineCount.coerceAtMost(maxLines) * lineHeight.value).dp + 16.dp // 16dp for vertical padding
-                    val textFieldHeight = targetHeight.coerceIn(40.dp, 156.dp)
+                    val textFieldHeight = targetHeight.coerceIn(56.dp, 156.dp)
 
-                    BasicTextField(
-                        state = textState,
+                    Box(
                         modifier = Modifier
-                            .weight(1f)
+                            .fillMaxWidth()
                             .height(textFieldHeight)
-                            .focusRequester(focusRequester)
-                            .onPreviewKeyEvent { event ->
-                                if (event.type == KeyEventType.KeyDown) {
-                                    when {
-                                        // Enter with slash palette: execute first matching command
-                                        event.key == Key.Enter && !event.isShiftPressed && showSlashPalette -> {
-                                            val match = commands.filter { it.name.startsWith(slashQuery, ignoreCase = true) }
-                                            if (match.isNotEmpty()) {
-                                                showSlashPalette = false
-                                                textState.edit { replace(0, length, "") }
-                                                onSlashCommand(match.first())
-                                            }
-                                            true
-                                        }
-                                        event.key == Key.Enter && !event.isShiftPressed -> {
-                                            val text = textState.text.toString().trim()
-                                            if (text.isNotEmpty()) {
-                                                onSend(text)
-                                                textState.edit { replace(0, length, "") }
-                                            }
-                                            showSlashPalette = false
-                                            true
-                                        }
-                                        event.key == Key.Enter && event.isShiftPressed -> {
-                                            // Explicitly insert newline — CMP BasicTextField
-                                            // doesn't always handle this via pass-through
-                                            val pos = textState.selection.start
-                                            textState.edit { replace(pos, pos, "\n") }
-                                            showSlashPalette = false
-                                            true
-                                        }
-                                        event.key == Key.Escape -> {
-                                            if (showSlashPalette) {
-                                                showSlashPalette = false
-                                                true
-                                            } else if (showAttachMenu) {
-                                                showAttachMenu = false
-                                                true
-                                            } else {
-                                                onCancel()
-                                                true
-                                            }
-                                        }
-                                        else -> false
-                                    }
-                                } else false
-                            },
-                        enabled = enabled,
-                        cursorBrush = SolidColor(Color.White),
-                        textStyle = TextStyle(
-                            color = Color(0xFFCCCCCC),
-                            fontSize = 13.sp,
-                        ),
-                        decorator = { innerTextField ->
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .verticalScroll(scrollState),
-                                contentAlignment = Alignment.CenterStart,
-                            ) {
-                                if (textState.text.isEmpty()) {
-                                    Text(
-                                        text = "Type a message...",
-                                        color = mutedText,
-                                        fontSize = 13.sp,
-                                    )
-                                }
-                                innerTextField()
-                            }
-                        },
-                    )
-
-                    // Send / Stop button
-                    if (isStreaming) {
-                        // Streaming: red outlined square with small filled square inside
-                        Box(
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                    ) {
+                        BasicTextField(
+                            state = textState,
                             modifier = Modifier
-                                .size(28.dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .border(2.dp, stopRed, RoundedCornerShape(6.dp))
-                                .clickable(enabled = enabled) { onCancel() },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .background(stopRed),
-                            )
-                        }
-                    } else {
-                        // Idle: bordered rounded rect with play triangle
-                        Box(
-                            modifier = Modifier
-                                .size(28.dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .border(1.dp, Color(0xFF555555), RoundedCornerShape(6.dp))
-                                .clickable(enabled = enabled) {
-                                    val text = textState.text.toString().trim()
-                                    if (text.isNotEmpty()) {
-                                        onSend(text)
-                                        textState.edit { replace(0, length, "") }
-                                    }
+                                .fillMaxSize()
+                                .focusRequester(focusRequester)
+                                .onPreviewKeyEvent { event ->
+                                    if (event.type == KeyEventType.KeyDown) {
+                                        when {
+                                            // Up arrow — navigate command history (older)
+                                            event.key == Key.DirectionUp && !event.isShiftPressed && !showSlashPalette && commandHistory.isNotEmpty() -> {
+                                                saveDraftIfNeeded(attachedFiles)
+                                                val newIndex = if (historyIndex < 0) 0 else (historyIndex + 1).coerceAtMost(commandHistory.size - 1)
+                                                if (newIndex != historyIndex || historyIndex < 0) {
+                                                    loadHistoryEntry(newIndex)
+                                                }
+                                                true
+                                            }
+                                            // Down arrow — navigate command history (newer) or restore draft
+                                            event.key == Key.DirectionDown && !event.isShiftPressed && !showSlashPalette && inHistoryMode -> {
+                                                val newIndex = historyIndex - 1
+                                                if (newIndex < 0) {
+                                                    // Restore draft
+                                                    textState.edit { replace(0, length, draftText) }
+                                                    historyIndex = -1
+                                                    inHistoryMode = false
+                                                    onLoadHistoryEntry(CommandHistoryEntry(draftText, draftFiles))
+                                                } else {
+                                                    loadHistoryEntry(newIndex)
+                                                }
+                                                true
+                                            }
+                                            // Enter with slash palette: execute first matching command
+                                            event.key == Key.Enter && !event.isShiftPressed && showSlashPalette -> {
+                                                val match = commands.filter { it.name.startsWith(slashQuery, ignoreCase = true) }
+                                                if (match.isNotEmpty()) {
+                                                    showSlashPalette = false
+                                                    textState.edit { replace(0, length, "") }
+                                                    onSlashCommand(match.first())
+                                                }
+                                                true
+                                            }
+                                            event.key == Key.Enter && !event.isShiftPressed -> {
+                                                val text = textState.text.toString().trim()
+                                                if (text.isNotEmpty()) {
+                                                    onSend(text, attachedFiles)
+                                                    textState.edit { replace(0, length, "") }
+                                                }
+                                                showSlashPalette = false
+                                                inHistoryMode = false
+                                                historyIndex = -1
+                                                true
+                                            }
+                                            event.key == Key.Enter && event.isShiftPressed -> {
+                                                // Explicitly insert newline — CMP BasicTextField
+                                                // doesn't always handle this via pass-through
+                                                val pos = textState.selection.start
+                                                textState.edit { replace(pos, pos, "\n") }
+                                                showSlashPalette = false
+                                                true
+                                            }
+                                            event.key == Key.Escape -> {
+                                                if (showSlashPalette) {
+                                                    showSlashPalette = false
+                                                    true
+                                                } else if (showAttachMenu) {
+                                                    showAttachMenu = false
+                                                    true
+                                                } else if (inHistoryMode) {
+                                                    // Cancel history navigation and restore draft
+                                                    textState.edit { replace(0, length, draftText) }
+                                                    onLoadHistoryEntry(CommandHistoryEntry(draftText, draftFiles))
+                                                    inHistoryMode = false
+                                                    historyIndex = -1
+                                                    true
+                                                } else {
+                                                    onCancel()
+                                                    true
+                                                }
+                                            }
+                                            else -> false
+                                        }
+                                    } else false
                                 },
+                            enabled = enabled,
+                            cursorBrush = SolidColor(Color.White),
+                            textStyle = TextStyle(
+                                color = Color(0xFFCCCCCC),
+                                fontSize = 13.sp,
+                            ),
+                            decorator = { innerTextField ->
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .verticalScroll(scrollState),
+                                    contentAlignment = Alignment.CenterStart,
+                                ) {
+                                    if (textState.text.isEmpty()) {
+                                        Text(
+                                            text = "Type a message...",
+                                            color = mutedText,
+                                            fontSize = 13.sp,
+                                        )
+                                    }
+                                    innerTextField()
+                                }
+                            },
+                        )
+                    }
+
+                    // Buttons row: + button | spacer | Send/Stop button
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // Attach button — opens the attach menu popup
+                        Box(
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(CircleShape)
+                                .clickable(enabled = enabled) {
+                                    showAttachMenu = !showAttachMenu
+                                    println("[InputArea] Attach button clicked, showAttachMenu=$showAttachMenu, recentFiles=${recentFiles.size}")
+                                }
+                                .padding(8.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
-                                key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute),
-                                contentDescription = "Send",
+                                key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add),
+                                contentDescription = "Attach",
                                 modifier = Modifier.size(16.dp),
-                                tint = Color(0xFFCCCCCC),
+                                tint = mutedText,
                             )
+
+                            // Attach menu popup anchored to the + button
+                            if (showAttachMenu) {
+                                println("[InputArea] Showing AttachMenu popup with ${recentFiles.size} recentFiles")
+                                Popup(
+                                    alignment = Alignment.BottomStart,
+                                    offset = IntOffset(0, 4),
+                                    properties = PopupProperties(
+                                        focusable = true,
+                                        dismissOnBackPress = true,
+                                        dismissOnClickOutside = true,
+                                    ),
+                                    onDismissRequest = { showAttachMenu = false },
+                                ) {
+                                    AttachMenu(
+                                        recentFiles = recentFiles,
+                                        searchResults = searchResults,
+                                        onFilesAndFolders = {
+                                            onFilesAndFolders()
+                                        },
+                                        onImage = {
+                                            onImage()
+                                        },
+                                        onRecentFileClick = { file ->
+                                            onRecentFileClick(file)
+                                        },
+                                        onDismiss = { showAttachMenu = false },
+                                        onSearch = onSearch,
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.weight(1f))
+
+                        // Send / Stop button
+                        if (isStreaming) {
+                            // Streaming: red square
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable(enabled = enabled) { onCancel() },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .background(stopRed),
+                                )
+                            }
+                        } else {
+                            // Idle: green run triangle
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable(enabled = enabled) {
+                                        val text = textState.text.toString().trim()
+                                        if (text.isNotEmpty()) {
+                                            onSend(text, attachedFiles)
+                                            textState.edit { replace(0, length, "") }
+                                            inHistoryMode = false
+                                            historyIndex = -1
+                                        }
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute),
+                                    contentDescription = "Send",
+                                    modifier = Modifier.size(16.dp),
+                                    tint = Color(0xFF4EAF4E),
+                                )
+                            }
                         }
                     }
                 }
             }
+        }
         }
 
         Spacer(modifier = Modifier.height(6.dp))

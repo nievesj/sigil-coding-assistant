@@ -37,6 +37,9 @@ class OpenCodeSettingsPanel {
 
     val timeoutField: JBTextField = JBTextField("60", 5)
 
+    /** Command history size — how many past messages to remember. */
+    val commandHistorySizeField: JBTextField = JBTextField("15", 5)
+
     /** Inline code text color — hex string like "#6BBE50" */
     val inlineCodeColorField: JBTextField = JBTextField("#6BBE50", 8)
 
@@ -87,6 +90,7 @@ class OpenCodeSettingsPanel {
         .addLabeledComponent("OpenCode binary:", binaryPathField, 5)
         .addComponentToRightColumn(discoverButton)
         .addLabeledComponent("Permission timeout (seconds):", timeoutField, 5)
+        .addLabeledComponent("Command history size:", commandHistorySizeField, 5)
         .addSeparator(5)
         .addLabeledComponent("Inline code color:", inlineCodeColorField, 5)
         .addComponentToRightColumn(inlineCodeColorButton)
@@ -98,6 +102,7 @@ class OpenCodeSettingsPanel {
     fun setState(settings: OpenCodeSettingsState) {
         binaryPathField.text = settings.binaryPath
         timeoutField.text = settings.permissionTimeoutSeconds.toString()
+        commandHistorySizeField.text = settings.commandHistorySize.toString()
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
     }
@@ -105,6 +110,7 @@ class OpenCodeSettingsPanel {
     fun applyTo(settings: OpenCodeSettingsState) {
         settings.binaryPath = binaryPathField.text.trim()
         settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60
+        settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
         settings.inlineCodeColor = inlineCodeColorField.text.trim()
         settings.listNumberColor = listNumberColorField.text.trim()
     }
@@ -112,6 +118,7 @@ class OpenCodeSettingsPanel {
     fun isModified(settings: OpenCodeSettingsState): Boolean {
         return binaryPathField.text.trim() != settings.binaryPath ||
                 (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
+                (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
                 listNumberColorField.text.trim() != settings.listNumberColor
     }
