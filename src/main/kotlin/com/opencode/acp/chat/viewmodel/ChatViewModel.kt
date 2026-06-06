@@ -1,13 +1,14 @@
 package com.opencode.acp.chat.viewmodel
 
 import com.agentclientprotocol.model.ToolCallStatus
-import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.adapter.OpenCodePart
 import com.opencode.acp.adapter.toSessionItem
 import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.chat.model.*
+import com.opencode.acp.chat.processor.MessageProcessorManager
+import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.config.AcpDefaults
@@ -21,7 +22,6 @@ import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -35,7 +35,6 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import java.io.Closeable
 
@@ -45,17 +44,9 @@ class ChatViewModel(
 
     private val logger = KotlinLogging.logger {}
 
-    /** Write debug log to a file we can read from outside the IDE sandbox. */
-    private val debugLogFile = System.getProperty("java.io.tmpdir") + "/opencode-sse-debug.log"
-    private fun debugLog(msg: String) {
-        try {
-            java.io.File(debugLogFile).appendText("${System.currentTimeMillis()} $msg\n")
-        } catch (_: Exception) {}
-    }
-
     // --- State ---
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
-    val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+    private val processor = MessageProcessorManager(scope)
+    val messages: StateFlow<List<ChatMessage>> = processor.messages
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -79,6 +70,71 @@ class ChatViewModel(
     /** Signal emitted when Ctrl+V finds text on the clipboard. Carries the text to insert. */
     private val _pasteTextSignal = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val pasteTextSignal = _pasteTextSignal.asSharedFlow()
+
+    init {
+        // Collect processor signals and update UI state accordingly
+        scope.launch {
+            processor.signals.collect { signal ->
+                when (signal) {
+                    is UiSignal.StreamingStarted -> {
+                        _isStreaming.value = true
+                    }
+                    is UiSignal.StreamingCompleted -> {
+                        _isStreaming.value = false
+                        responseDeferred?.complete(Unit)
+                        responseDeferred = null
+                        // Refresh context after each response completes.
+                        // Todos arrive via SSE (UiSignal.TodoUpdated) — no REST poll needed here.
+                        scope.launch {
+                            computeSessionContext()
+                        }
+                        // Refresh session list to pick up any new child sessions (subagents)
+                        scope.launch {
+                            try {
+                                loadSessions()
+                                val children = _childSessionMap.value[sessionId] ?: emptyList()
+                                if (children.isNotEmpty()) {
+                                    processor.injectSubagentRefs(signal.messageId, children.map { child ->
+                                        SubagentRef(
+                                            sessionId = child.id,
+                                            agentName = child.title.replaceFirstChar { it.uppercase() },
+                                            taskDescription = child.title,
+                                            status = if (child.outputTokens > 0) SubagentStatus.COMPLETED else SubagentStatus.RUNNING,
+                                        )
+                                    })
+                                }
+                            } catch (_: Exception) { /* best-effort refresh */ }
+                        }
+                    }
+                    is UiSignal.PermissionRequested -> {
+                        _permissionPrompt.value = signal.prompt
+                        startPermissionTimeout()
+                    }
+                    is UiSignal.SelectionRequested -> {
+                        _selectionPrompt.value = signal.prompt
+                    }
+                    is UiSignal.FileChanged -> {
+                        _fileChangeSignal.tryEmit(Unit)
+                    }
+                    is UiSignal.TodoUpdated -> {
+                        _todoItems.value = signal.todos
+                    }
+                    is UiSignal.SessionCreated -> {
+                        scope.launch {
+                            try {
+                                loadSessions()
+                            } catch (_: Exception) { /* best-effort refresh */ }
+                        }
+                    }
+                    is UiSignal.Error -> {
+                        _isStreaming.value = false
+                        responseDeferred?.complete(Unit)
+                        responseDeferred = null
+                    }
+                }
+            }
+        }
+    }
 
     /** Session list state for the sidebar. */
     private val _sessionListState = MutableStateFlow<SessionListState>(SessionListState.Loading)
@@ -112,9 +168,6 @@ class ChatViewModel(
 
     /** Mutex to prevent concurrent session switches. NOT reentrant. */
     private val switchMutex = Mutex()
-
-    /** Pending file changes collected from tool calls, keyed by message ID. */
-    private val pendingFileChanges = mutableMapOf<String, MutableList<ChatFileChange>>()
 
     /** Signal emitted whenever a tool call modifies a file, so the review panel can refresh immediately. */
     private val _fileChangeSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
@@ -160,21 +213,14 @@ class ChatViewModel(
     }
 
     private fun resetSessionState() {
-        _messages.value = emptyList()
-        messageIndex.clear()
-        toolCallIndex.clear()
-        pendingFileChanges.clear()
+        processor.resetSessionState()
         _isStreaming.value = false
-        activeAssistantMessageId = null
-        firstTextChunkReceived = false
-        userEchoStripped = false
         responseDeferred?.complete(Unit)
         responseDeferred = null
         _permissionPrompt.value = null
         _selectionPrompt.value = null
         permissionTimeoutJob?.cancel()
         permissionTimeoutJob = null
-        lastUserText = null
         _sessionContextState.value = SessionContextState.Loading
         _todoItems.value = emptyList()
     }
@@ -190,18 +236,8 @@ class ChatViewModel(
     private var reconnectJob: Job? = null
     private var reconnectAttempt: Int = 0
 
-    /** Tracks the assistant message currently being streamed. */
-    private var activeAssistantMessageId: String? = null
-
-    /** Text of the last user message — used to strip echo from assistant response. */
-    private var lastUserText: String? = null
-
     /** Deferred completed when the current response finishes (Stop event). */
     private var responseDeferred: CompletableDeferred<Unit>? = null
-
-    // --- Index maps for O(1) message/tool lookups ---
-    private val toolCallIndex = mutableMapOf<String, String>()  // toolCallId → messageId
-    private val messageIndex = mutableMapOf<String, Int>()       // messageId → position
 
     // --- Configuration ---
     private var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
@@ -540,8 +576,6 @@ class ChatViewModel(
                 responseDeferred?.complete(Unit)
                 responseDeferred = null
                 _isStreaming.value = false
-                firstTextChunkReceived = false
-                userEchoStripped = false
                 resetSessionState()
 
                 val messages = client.listMessages(targetSessionId, limit = null)
@@ -554,11 +588,7 @@ class ChatViewModel(
                 } else {
                     messages.map { it.toChatMessage() }
                 }
-                _messages.value = chatMessages
-                chatMessages.forEachIndexed { i, msg -> messageIndex[msg.id] = i }
-                chatMessages.forEach { msg ->
-                    msg.toolCalls.forEach { pill -> toolCallIndex[pill.toolCallId] = msg.id }
-                }
+                chatMessages.forEach { processor.addMessage(it) }
 
                 sseJob = startSseSubscription(client, targetSessionId)
                 updateSessionSelection(targetSessionId)
@@ -577,11 +607,7 @@ class ChatViewModel(
                     try {
                         val msgs = client.listMessages(previousSessionId, limit = null)
                         val chatMsgs = msgs.map { it.toChatMessage() }
-                        _messages.value = chatMsgs
-                        chatMsgs.forEachIndexed { i, msg -> messageIndex[msg.id] = i }
-                        chatMsgs.forEach { msg ->
-                            msg.toolCalls.forEach { pill -> toolCallIndex[pill.toolCallId] = msg.id }
-                        }
+                        chatMsgs.forEach { processor.addMessage(it) }
                         sseJob = startSseSubscription(client, previousSessionId)
                     } catch (_: Exception) {
                         // Revert failed too — leave empty state
@@ -672,25 +698,21 @@ class ChatViewModel(
         val userMsg = ChatMessage(
             id = generateId(),
             role = MessageRole.USER,
-            content = text,
+            parts = listOf(MessagePart.Text(text)),
             timestamp = System.currentTimeMillis(),
             attachedFiles = files
         )
-        addMessage(userMsg)
-        lastUserText = text
+        processor.addMessage(userMsg)
 
-        // Create streaming assistant message (initially empty)
-        val assistantMsg = ChatMessage(
-            id = generateId(),
-            role = MessageRole.ASSISTANT,
-            content = "",
-            isStreaming = true,
-            timestamp = System.currentTimeMillis()
+        // Set echo stripping text before creating assistant message
+        processor.setLastUserText(text)
+
+        // Create streaming assistant message via processor
+        val state = _controlState.value
+        val assistantMsgId = processor.createAssistantMessage(
+            modelID = state.selectedModel?.modelID,
+            providerID = state.selectedModel?.providerID
         )
-        addMessage(assistantMsg)
-        activeAssistantMessageId = assistantMsg.id
-        firstTextChunkReceived = false
-        userEchoStripped = false
 
         _isStreaming.value = true
         val deferred = CompletableDeferred<Unit>()
@@ -704,7 +726,6 @@ class ChatViewModel(
             }
 
             // Derive optional request fields from control bar state
-            val state = _controlState.value
             val variant = state.thinkingEffort.variant // null for DEFAULT
             val agent = state.selectedAgent?.id
             val model = state.selectedModel?.let {
@@ -717,7 +738,7 @@ class ChatViewModel(
             // Suspend until the SSE subscription delivers a Stop event
             deferred.await()
         } catch (e: CancellationException) {
-            markStreamingComplete(assistantMsg.id)
+            processor.completeStreaming(assistantMsgId)
         } catch (e: Exception) {
             // Route error to chat as a descriptive assistant message
             val errorMsg = when {
@@ -733,14 +754,10 @@ class ChatViewModel(
                 else ->
                     "An error occurred while sending the message: ${e.message ?: e.javaClass.simpleName}"
             }
-            appendTextToMessage(assistantMsg.id, "\n\n**Error:** $errorMsg")
-            markStreamingComplete(assistantMsg.id)
+            processor.abortStreaming(errorMsg)
         } finally {
             _isStreaming.value = false
             responseDeferred = null
-            activeAssistantMessageId = null
-            firstTextChunkReceived = false
-            userEchoStripped = false
         }
     }
 
@@ -755,8 +772,6 @@ class ChatViewModel(
         responseDeferred?.complete(Unit)
         responseDeferred = null
         _isStreaming.value = false
-        firstTextChunkReceived = false
-        userEchoStripped = false
     }
 
     /** Respond to a permission prompt from the OpenCode engine. */
@@ -771,10 +786,10 @@ class ChatViewModel(
                 )
                 when (response) {
                     PermissionResponse.REJECT_ONCE ->
-                        updateToolCallStatus(prompt.toolCallId, ToolCallStatus.FAILED)
+                        processor.updateToolCallStatus(prompt.toolCallId, ToolCallStatus.FAILED)
                     PermissionResponse.ALLOW_ONCE,
                     PermissionResponse.ALLOW_ALWAYS ->
-                        updateToolCallStatus(prompt.toolCallId, ToolCallStatus.IN_PROGRESS)
+                        processor.updateToolCallStatus(prompt.toolCallId, ToolCallStatus.IN_PROGRESS)
                 }
                 _permissionPrompt.value = null
             } catch (_: Exception) {
@@ -825,7 +840,7 @@ class ChatViewModel(
         permissionTimeoutJob = null
         responseDeferred?.complete(Unit)
         responseDeferred = null
-        activeAssistantMessageId = null
+        processor.close()
         openCodeClient?.close()
         openCodeClient = null
         httpClient?.close()
@@ -854,7 +869,10 @@ class ChatViewModel(
         reconnectAttempt = 0
 
         // Abort any in-flight streaming response — the SSE stream is gone
-        abortInFlightResponse("Connection lost — reconnecting")
+        processor.abortStreaming("Connection lost — reconnecting")
+        responseDeferred?.complete(Unit)
+        responseDeferred = null
+        _isStreaming.value = false
 
         reconnectJob = scope.launch {
             _connectionState.value = ConnectionState.RECONNECTING
@@ -941,7 +959,7 @@ class ChatViewModel(
     private suspend fun computeSessionContext() {
         val currentSessionId = sessionId ?: return
         val client = openCodeClient ?: return
-        val messages = _messages.value
+        val messages = processor.messages.value
 
         // Fetch session details for summary (additions/deletions/filesModified) and timestamps
         val session = try {
@@ -1174,343 +1192,10 @@ class ChatViewModel(
     // --- SSE Event Handling ---
 
     private fun handleSseEvent(event: SseEvent) {
-        // Events that don't require an active streaming message
-        when (event) {
-            is SseEvent.TodoUpdated -> {
-                if (event.sessionId == sessionId) {
-                    _todoItems.value = event.todos.map { todo ->
-                        TodoItem(content = todo.content, status = todo.status, priority = todo.priority)
-                    }
-                }
-                return
-            }
-            is SseEvent.QuestionAsked -> {
-                if (event.sessionId == sessionId && event.questions.isNotEmpty()) {
-                    val q = event.questions.first()
-                    _selectionPrompt.value = SelectionPrompt(
-                        promptId = event.requestId,
-                        question = q.question,
-                        subtitle = q.header.ifBlank { null },
-                        options = q.options.map { opt ->
-                            SelectionOption(title = opt.label, description = opt.description, label = opt.label)
-                        },
-                        allowCustomInput = q.custom,
-                        multiSelect = q.multiple
-                    )
-                }
-                return
-            }
-            is SseEvent.SessionCreated -> {
-                // A child session was created (e.g., subagent spawned).
-                scope.launch {
-                    try {
-                        loadSessions()
-                        val currentMsgId = activeAssistantMessageId
-                        if (currentMsgId != null) {
-                            val children = _childSessionMap.value[sessionId] ?: emptyList()
-                            if (children.isNotEmpty()) {
-                                injectSubagentRefsIntoMessage(currentMsgId, children)
-                            }
-                        }
-                    } catch (_: Exception) { /* best-effort refresh */ }
-                }
-                return
-            }
-            is SseEvent.UserMessage -> {
-                if (event.sessionId == sessionId) {
-                    logger.debug { "User message received from server: ${event.text.take(100)}" }
-                }
-                return
-            }
-            else -> { /* handled below */ }
-        }
-
-        val msgId = activeAssistantMessageId
-        if (msgId == null) {
-            debugLog("VM DROP: ${event::class.simpleName} — activeAssistantMessageId is null")
-            return
-        }
-        debugLog("VM HANDLE: ${event::class.simpleName}, msgId=$msgId")
-
-        when (event) {
-            is SseEvent.TextChunk -> {
-                appendTextToMessage(msgId, event.text)
-            }
-
-            is SseEvent.TextReplace -> {
-                replaceTextInMessage(msgId, event.text)
-            }
-
-            is SseEvent.ThinkingChunk -> {
-                appendThinkingContent(msgId, event.text)
-            }
-
-            is SseEvent.ThinkingReplace -> {
-                replaceThinkingInMessage(msgId, event.text)
-            }
-
-            is SseEvent.ToolUse -> {
-                val toolKind = com.opencode.acp.adapter.ToolMapper.toAcpKind(event.toolName)
-                val pill = ToolCallPill(
-                    toolCallId = event.toolCallId,
-                    toolName = event.toolName,
-                    title = event.title ?: event.toolName,
-                    kind = toolKind,
-                    status = ToolCallStatus.IN_PROGRESS,
-                    input = event.input,
-                )
-                toolCallIndex[event.toolCallId] = msgId
-
-                // Extract file path from tool input for edit/write tools
-                if (toolKind == ToolKind.EDIT && event.input != null) {
-                    val filePath = extractFilePath(event.input)
-                    if (filePath != null) {
-                        val fileName = filePath.substringAfterLast('/')
-                        val change = ChatFileChange(
-                            filePath = filePath,
-                            fileName = fileName,
-                        )
-                        pendingFileChanges.getOrPut(msgId) { mutableListOf() }.add(change)
-                        debugLog("VM FILE_CHANGE: tracked $filePath for tool ${event.toolName}")
-                        // Signal the review panel to refresh immediately
-                        _fileChangeSignal.tryEmit(Unit)
-                    }
-                }
-
-                addToolCallPill(msgId, pill)
-            }
-
-            is SseEvent.ToolResult -> {
-                val targetMessageId = toolCallIndex[event.toolCallId] ?: msgId
-                val resolvedStatus = if (event.isError) ToolCallStatus.FAILED else ToolCallStatus.COMPLETED
-                updateToolCallStatus(targetMessageId, event.toolCallId, resolvedStatus, event.content)
-            }
-
-            is SseEvent.Stop -> {
-                markStreamingComplete(msgId)
-                // Attach any pending file changes collected from tool calls
-                val changes = pendingFileChanges.remove(msgId)
-                if (changes != null && changes.isNotEmpty()) {
-                    val msgs = _messages.value.toMutableList()
-                    val idx = messageIndex[msgId]
-                    if (idx != null) {
-                        msgs[idx] = msgs[idx].copy(fileChanges = changes)
-                        _messages.value = msgs
-                    }
-                }
-                responseDeferred?.complete(Unit)
-                // Refresh context and todos after each response completes
-                scope.launch {
-                    computeSessionContext()
-                    fetchTodos()
-                }
-                // Refresh session list to pick up any new child sessions (subagents)
-                // spawned during this turn and inject their refs into the message
-                scope.launch {
-                    try {
-                        loadSessions()
-                        val children = _childSessionMap.value[sessionId] ?: emptyList()
-                        if (children.isNotEmpty()) {
-                            injectSubagentRefsIntoMessage(msgId, children)
-                        }
-                    } catch (_: Exception) { /* best-effort refresh */ }
-                }
-            }
-
-            is SseEvent.Permission -> {
-                updateToolCallStatus(event.toolCallId, ToolCallStatus.PENDING)
-                val prompt = PermissionPrompt(
-                    permissionId = event.permissionId,
-                    toolCallId = event.toolCallId,
-                    toolName = event.action,
-                    description = event.description,
-                    patterns = event.patterns
-                )
-                _permissionPrompt.value = prompt
-                startPermissionTimeout()
-            }
-
-            is SseEvent.Error -> {
-                appendTextToMessage(msgId, "\n\n**Error:** ${event.message}")
-                markStreamingComplete(msgId)
-                responseDeferred?.complete(Unit)
-            }
-
-            is SseEvent.Plan -> {
-                // Plan events are informational; could be surfaced in UI later
-            }
-
-            is SseEvent.MessageComplete -> {
-                // Message fully persisted on the server side
-            }
-        }
+        processor.process(event)
     }
 
     // --- State Mutations ---
-
-    /**
-     * Aborts any in-flight streaming response, appending an error message.
-     * Called when the SSE stream drops to unblock [sendMessage] and mark the
-     * partial response as complete.
-     */
-    private fun abortInFlightResponse(reason: String) {
-        val msgId = activeAssistantMessageId
-        if (msgId != null && _isStreaming.value) {
-            appendTextToMessage(msgId, "\n\n**Error:** $reason")
-            markStreamingComplete(msgId)
-        }
-        responseDeferred?.complete(Unit)
-        responseDeferred = null
-        _isStreaming.value = false
-        activeAssistantMessageId = null
-        firstTextChunkReceived = false
-        userEchoStripped = false
-    }
-
-    private fun addMessage(message: ChatMessage) {
-        _messages.value = _messages.value + message
-        messageIndex[message.id] = _messages.value.size - 1
-        message.toolCalls.forEach { pill -> toolCallIndex[pill.toolCallId] = message.id }
-        // FIFO eviction
-        if (_messages.value.size > ChatConstants.MAX_MESSAGE_HISTORY) {
-            val evictCount = _messages.value.size - ChatConstants.MAX_MESSAGE_HISTORY
-            val evicted = _messages.value.take(evictCount)
-            val remaining = _messages.value.drop(evictCount)
-            evicted.forEach { msg ->
-                messageIndex.remove(msg.id)
-                msg.toolCalls.forEach { pill -> toolCallIndex.remove(pill.toolCallId) }
-            }
-            _messages.value = remaining
-            messageIndex.clear()
-            toolCallIndex.clear()
-            _messages.value.forEachIndexed { i, msg ->
-                messageIndex[msg.id] = i
-                msg.toolCalls.forEach { pill -> toolCallIndex[pill.toolCallId] = msg.id }
-            }
-        }
-    }
-
-    /** Whether the first non-empty text chunk for the current assistant response has been received. */
-    private var firstTextChunkReceived = false
-
-    /** Whether user echo text has been stripped from the assistant response. */
-    private var userEchoStripped = false
-
-    private fun appendTextToMessage(messageId: String, text: String) {
-        val toAppend = if (!firstTextChunkReceived && text.isNotBlank()) {
-            firstTextChunkReceived = true
-            // Strip user's text from the beginning of the assistant's response
-            // This is needed because the server sometimes returns the user's text as part of the assistant's response
-            val userText = lastUserText
-            if (userText != null && text.startsWith(userText, ignoreCase = true)) {
-                userEchoStripped = true
-                text.substring(userText.length)
-            } else {
-                text
-            }
-        } else {
-            text
-        }
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        messages[index] = msg.copy(content = msg.content + toAppend)
-        _messages.value = messages
-    }
-
-    private fun appendThinkingContent(messageId: String, text: String) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        messages[index] = msg.copy(thinkingContent = msg.thinkingContent + text)
-        _messages.value = messages
-    }
-
-    /**
-     * Replaces the entire text content of a message.
-     * Used for "message.part.updated" events which carry full accumulated text,
-     * NOT incremental deltas. This prevents duplication from appending
-     * full-state snapshots on top of already-accumulated deltas.
-     */
-    private fun replaceTextInMessage(messageId: String, text: String) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        // Strip user echo text from server's full-state snapshot.
-        // The server includes the user's prompt in the assistant's text part.
-        // We only strip once — after that, the content no longer starts with the echo.
-        val stripped = if (!userEchoStripped && lastUserText != null && text.startsWith(lastUserText!!, ignoreCase = true)) {
-            userEchoStripped = true
-            text.substring(lastUserText!!.length)
-        } else {
-            text
-        }
-        messages[index] = msg.copy(content = stripped)
-        _messages.value = messages
-    }
-
-    /**
-     * Replaces the entire thinking content of a message.
-     * Used for "message.part.updated" events which carry full accumulated thinking text.
-     */
-    private fun replaceThinkingInMessage(messageId: String, text: String) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        messages[index] = msg.copy(thinkingContent = text)
-        _messages.value = messages
-    }
-
-    private fun markStreamingComplete(messageId: String) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        messages[index] = msg.copy(isStreaming = false)
-        _messages.value = messages
-    }
-
-    private fun addToolCallPill(messageId: String, pill: ToolCallPill) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        // Deduplicate: if a pill with this toolCallId already exists (e.g. from
-        // session.next.tool.input.started), update it instead of appending a duplicate
-        val existing = msg.toolCalls.indexOfFirst { it.toolCallId == pill.toolCallId }
-        val updatedToolCalls = if (existing >= 0) {
-            msg.toolCalls.toMutableList().apply { set(existing, pill) }
-        } else {
-            msg.toolCalls + pill
-        }
-        messages[index] = msg.copy(toolCalls = updatedToolCalls)
-        _messages.value = messages
-    }
-
-    private fun updateToolCallStatus(messageId: String, toolCallId: String, status: ToolCallStatus?, output: List<kotlinx.serialization.json.JsonObject>? = null) {
-        if (status == null) return
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        val updatedPills = msg.toolCalls.map { pill ->
-            if (pill.toolCallId == toolCallId) pill.copy(status = status, output = output ?: pill.output) else pill
-        }
-        messages[index] = msg.copy(toolCalls = updatedPills)
-        _messages.value = messages
-    }
-
-    private fun updateToolCallStatus(toolCallId: String, status: ToolCallStatus, output: List<kotlinx.serialization.json.JsonObject>? = null) {
-        val messageId = toolCallIndex[toolCallId] ?: return
-        updateToolCallStatus(messageId, toolCallId, status, output)
-    }
-
-    private fun startPermissionTimeout() {
-        permissionTimeoutJob?.cancel()
-        val timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds
-        if (timeoutSeconds <= 0) return
-        permissionTimeoutJob = scope.launch {
-            delay(timeoutSeconds * 1000L)
-            _permissionPrompt.value = null
-        }
-    }
 
     /**
      * Injects [SubagentRef] objects into the most recent assistant message
@@ -1529,58 +1214,24 @@ class ChatViewModel(
                 sessionId = child.id,
                 agentName = child.title.replaceFirstChar { it.uppercase() },
                 taskDescription = child.title,
-                status = inferSubagentStatus(child),
+                status = if (child.outputTokens > 0) SubagentStatus.COMPLETED else SubagentStatus.RUNNING,
             )
         }
         val updated = messages.toMutableList()
         val msg = updated[lastAssistantIdx]
-        updated[lastAssistantIdx] = msg.copy(subagentRefs = refs)
+        val nonSubagentParts = msg.parts.filter { it !is MessagePart.Subagent }
+        val subagentParts = refs.map { MessagePart.Subagent(it) }
+        updated[lastAssistantIdx] = msg.copy(parts = nonSubagentParts + subagentParts)
         return updated
     }
 
-    /**
-     * Injects [SubagentRef] objects into a specific message by ID (for live streaming).
-     * Used when a child session is created while the assistant is still streaming.
-     */
-    private fun injectSubagentRefsIntoMessage(messageId: String, children: List<SessionItem>) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        val refs = children.map { child ->
-            SubagentRef(
-                sessionId = child.id,
-                agentName = child.title.replaceFirstChar { it.uppercase() },
-                taskDescription = child.title,
-                status = inferSubagentStatus(child),
-            )
+    private fun startPermissionTimeout() {
+        permissionTimeoutJob?.cancel()
+        val timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds
+        if (timeoutSeconds <= 0) return
+        permissionTimeoutJob = scope.launch {
+            delay(timeoutSeconds * 1000L)
+            _permissionPrompt.value = null
         }
-        messages[index] = msg.copy(subagentRefs = refs)
-        _messages.value = messages
-        debugLog("VM SUBAGENT: injected ${refs.size} refs into msg $messageId")
-    }
-
-    /**
-     * Infers [SubagentStatus] from a child session's token usage.
-     * If the session has output tokens > 0, it has completed at least one turn → COMPLETED.
-     * Otherwise → RUNNING (still active or just created).
-     */
-    private fun inferSubagentStatus(child: SessionItem): SubagentStatus {
-        return if (child.outputTokens > 0) SubagentStatus.COMPLETED else SubagentStatus.RUNNING
-    }
-
-    /**
-     * Extracts a file path from tool input JSON, trying multiple common key names.
-     * Returns null if no path found.
-     */
-    private fun extractFilePath(input: kotlinx.serialization.json.JsonObject): String? {
-        // Try common file path key names used by OpenCode tools
-        for (key in listOf("file_path", "filePath", "path")) {
-            val element = input[key] ?: continue
-            val path = try {
-                (element as? kotlinx.serialization.json.JsonPrimitive)?.content
-            } catch (_: Exception) { null }
-            if (!path.isNullOrEmpty()) return path
-        }
-        return null
     }
 }

@@ -37,6 +37,9 @@ import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
     var expanded by remember { mutableStateOf(false) }
 
+    // Completed pills render in compact mode (single line, no border/background)
+    val isCompact = pill.status == ToolCallStatus.COMPLETED || pill.status == ToolCallStatus.FAILED
+
     val iconKey = when (pill.status) {
         ToolCallStatus.PENDING -> IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute)
         ToolCallStatus.IN_PROGRESS -> IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute)
@@ -47,39 +50,27 @@ fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
     val statusLabel = ToolStatusDisplay.label(pill.kind)
     val hasDetails = pill.input != null || pill.output != null
 
-    Column(
-        modifier = modifier
-            .padding(horizontal = 12.dp, vertical = 4.dp)
-            .border(
-                width = 1.dp,
-                color = Color(0x40808080),
-                shape = RoundedCornerShape(4.dp)
-            )
-            .background(
-                color = Color(0x10808080),
-                shape = RoundedCornerShape(4.dp)
-            )
-    ) {
-        // Header row — always visible, clickable to toggle details
+    if (isCompact) {
+        // Compact row: no border, no background, single line
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
+            modifier = modifier
+                .padding(horizontal = 12.dp, vertical = 1.dp)
                 .then(
                     if (hasDetails) Modifier.clickable { expanded = !expanded } else Modifier
                 )
-                .padding(horizontal = 8.dp, vertical = 4.dp),
+                .padding(horizontal = 4.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Icon(
                 key = iconKey,
                 contentDescription = pill.status.name,
-                modifier = Modifier.size(16.dp)
+                modifier = Modifier.size(12.dp)
             )
             Text(
                 text = "$statusLabel: ${pill.title}",
-                color = Color.Gray,
-                fontSize = 12.sp
+                color = Color(0xFF666666),
+                fontSize = 11.sp
             )
             if (hasDetails) {
                 Icon(
@@ -87,27 +78,75 @@ fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
                         if (expanded) AllIcons.General.ChevronDown else AllIcons.General.ChevronRight
                     ),
                     contentDescription = if (expanded) "Collapse" else "Expand",
-                    modifier = Modifier.size(12.dp),
-                    tint = Color(0xFF808080),
+                    modifier = Modifier.size(10.dp),
+                    tint = Color(0xFF666666),
                 )
             }
         }
-
-        // Detail section — input and output JSON
-        if (expanded && hasDetails) {
-            Column(
+    } else {
+        // Full row: bordered, with background (for running/pending pills)
+        Column(
+            modifier = modifier
+                .padding(horizontal = 12.dp, vertical = 4.dp)
+                .border(
+                    width = 1.dp,
+                    color = Color(0x40808080),
+                    shape = RoundedCornerShape(4.dp)
+                )
+                .background(
+                    color = Color(0x10808080),
+                    shape = RoundedCornerShape(4.dp)
+                )
+        ) {
+            // Header row — always visible, clickable to toggle details
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 2.dp)
+                    .then(
+                        if (hasDetails) Modifier.clickable { expanded = !expanded } else Modifier
+                    )
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                pill.input?.let { input ->
-                    DetailSection(label = "Input", json = inputToString(input))
+                Icon(
+                    key = iconKey,
+                    contentDescription = pill.status.name,
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = "$statusLabel: ${pill.title}",
+                    color = Color.Gray,
+                    fontSize = 12.sp
+                )
+                if (hasDetails) {
+                    Icon(
+                        key = IntelliJIconKey.fromPlatformIcon(
+                            if (expanded) AllIcons.General.ChevronDown else AllIcons.General.ChevronRight
+                        ),
+                        contentDescription = if (expanded) "Collapse" else "Expand",
+                        modifier = Modifier.size(12.dp),
+                        tint = Color(0xFF808080),
+                    )
                 }
-                pill.output?.let { output ->
-                    val text = output.joinToString("\n") { obj -> objToString(obj) }
-                    if (text.isNotBlank()) {
-                        DetailSection(label = "Output", json = text)
-                    }
+            }
+        }
+    }
+
+    // Detail section — input and output JSON (shared between compact and full)
+    if (expanded && hasDetails) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = if (isCompact) 28.dp else 8.dp, vertical = 2.dp)
+        ) {
+            pill.input?.let { input ->
+                DetailSection(label = "Input", json = inputToString(input))
+            }
+            pill.output?.let { output ->
+                val text = output.joinToString("\n") { obj -> objToString(obj) }
+                if (text.isNotBlank()) {
+                    DetailSection(label = "Output", json = text)
                 }
             }
         }

@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -39,10 +40,12 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intellij.icons.AllIcons
@@ -54,9 +57,11 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.opencode.acp.chat.model.ChatFileChange
 import com.opencode.acp.chat.model.ChatMessage
+import com.opencode.acp.chat.model.MessagePart
 import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.SubagentRef
 import com.opencode.acp.chat.model.SubagentStatus
+import com.opencode.acp.chat.processor.MessageProcessorManager
 import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
@@ -155,7 +160,8 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
         }
         
         // Display text content if any
-        if (message.content.isNotBlank()) {
+        val textContent = message.parts.filterIsInstance<MessagePart.Text>().joinToString("") { it.content }
+        if (textContent.isNotBlank()) {
             Box(
                 modifier = Modifier
                     .background(
@@ -164,7 +170,7 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
                     )
                     .padding(horizontal = 12.dp, vertical = 6.dp)
             ) {
-                org.jetbrains.jewel.ui.component.Text(message.content)
+                org.jetbrains.jewel.ui.component.Text(textContent)
             }
         }
     }
@@ -179,177 +185,211 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
         label = "streamingAlpha",
     )
 
+    // Extract parts by type for rendering in fixed order
+    val thinkingParts = message.parts.filterIsInstance<MessagePart.Thinking>()
+    val toolCallParts = message.parts.filterIsInstance<MessagePart.ToolCall>()
+    val textParts = message.parts.filter { it is MessagePart.Text || it is MessagePart.Code || it is MessagePart.Table }
+    val fileChangeParts = message.parts.filterIsInstance<MessagePart.FileChange>()
+    val subagentParts = message.parts.filterIsInstance<MessagePart.Subagent>()
+    val errorParts = message.parts.filterIsInstance<MessagePart.Error>()
+
     Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
-        message.toolCalls.forEach { pill ->
-            ToolPill(pill)
+        if (MessageProcessorManager.useNewRenderingOrder) {
+            // New order (default): Thinking → ToolCall → Text → FileChange → Subagent → Error
+            thinkingParts.forEach { ThinkingPill(it.content) }
+            toolCallParts.forEach { key(it.pill.toolCallId) { ToolPill(it.pill) } }
+            RenderTextContent(textParts, project)
+            // Show thinking indicator when streaming with no content yet
+            if (message.isStreaming && textParts.isEmpty() && thinkingParts.isEmpty() && toolCallParts.isEmpty()) {
+                ThinkingIndicator()
+            }
+            RenderFileChanges(fileChangeParts, project)
+            RenderSubagentSessions(subagentParts, onSubagentClick)
+            RenderErrorParts(errorParts)
+        } else {
+            // Legacy order: ToolCall → Thinking → FileChange → Subagent → Text → Error
+            toolCallParts.forEach { key(it.pill.toolCallId) { ToolPill(it.pill) } }
+            thinkingParts.forEach { ThinkingPill(it.content) }
+            RenderFileChanges(fileChangeParts, project)
+            RenderSubagentSessions(subagentParts, onSubagentClick)
+            RenderTextContent(textParts, project)
+            // Show thinking indicator when streaming with no content yet
+            if (message.isStreaming && textParts.isEmpty() && thinkingParts.isEmpty() && toolCallParts.isEmpty()) {
+                ThinkingIndicator()
+            }
+            RenderErrorParts(errorParts)
         }
+    }
+}
 
-        if (message.thinkingContent.isNotEmpty()) {
-            ThinkingPill(message.thinkingContent)
+// ── Helper Composables for AssistantMessage ──────────────────────────────────
+
+/**
+ * Renders Text, Code, and Table message parts with Jewel's Markdown composable.
+ * Extracted to avoid duplication between the two rendering order branches.
+ */
+@Composable
+private fun RenderTextContent(textParts: List<MessagePart>, project: Project?) {
+    if (textParts.isEmpty()) return
+
+    val currentProject = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+
+    val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
+    val defaultGreen = Color(0xFF6BBE50)
+    val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
+    val listNumberColor = parseColorOrDefault(settings.listNumberColor, defaultGreen)
+
+    val customInlinesStyling = remember(inlineCodeColor) {
+        val linkColor = Color(0xFF3574F0)
+        InlinesStyling.create(
+            inlineCode = SpanStyle(
+                color = inlineCodeColor,
+                background = Color.Transparent,
+                fontFamily = FontFamily.Monospace,
+            ),
+            link = SpanStyle(
+                color = linkColor,
+                textDecoration = TextDecoration.Underline,
+            ),
+            linkHovered = SpanStyle(
+                color = linkColor,
+                textDecoration = TextDecoration.Underline,
+            ),
+        )
+    }
+
+    val markdownStyling = remember(customInlinesStyling, listNumberColor) {
+        val baseTextStyle = org.jetbrains.jewel.bridge.theme.retrieveDefaultTextStyle()
+        MarkdownStyling.create(
+            inlinesStyling = customInlinesStyling,
+            heading = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.create(
+                h1 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H1.create(
+                    inlinesStyling = customInlinesStyling,
+                ),
+                h2 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H2.create(
+                    inlinesStyling = customInlinesStyling,
+                ),
+                h3 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H3.create(
+                    inlinesStyling = customInlinesStyling,
+                ),
+                h4 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H4.create(
+                    inlinesStyling = customInlinesStyling,
+                ),
+                h5 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H5.create(
+                    inlinesStyling = customInlinesStyling,
+                ),
+                h6 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H6.create(
+                    inlinesStyling = customInlinesStyling,
+                ),
+            ),
+            list = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.create(
+                ordered = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.create(
+                    numberStyle = TextStyle(color = listNumberColor, fontSize = 14.sp),
+                    numberFormatStyles = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles(
+                        firstLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                        secondLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                        thirdLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                    ),
+                ),
+            ),
+            blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
+                padding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                lineWidth = 3.dp,
+                lineColor = Color(0xFF3E3E3E),
+                textColor = Color(0xFF9E9E9E),
+            ),
+        )
+    }
+    val markdownProcessor = remember { MarkdownProcessor() }
+    val codeHighlighter = remember(currentProject) {
+        currentProject?.let {
+            try {
+                org.jetbrains.jewel.bridge.code.highlighting.CodeHighlighterFactory.getInstance(it).createHighlighter()
+            } catch (_: Exception) { NoOpCodeHighlighter }
+        } ?: NoOpCodeHighlighter
+    }
+
+    ProvideMarkdownStyling(
+        markdownStyling = markdownStyling,
+        markdownProcessor = markdownProcessor,
+        codeHighlighter = codeHighlighter,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            textParts.forEach { part ->
+                when (part) {
+                    is MessagePart.Text -> {
+                        val parsedBlocks = remember(part.content) {
+                            val raw = markdownProcessor.processMarkdownDocument(part.content)
+                            clampOrderedLists(raw)
+                        }
+                        Markdown(
+                            markdownBlocks = parsedBlocks,
+                            markdown = part.content,
+                            modifier = Modifier.fillMaxWidth(),
+                            selectable = true,
+                            onUrlClick = { url -> BrowserUtil.open(url) },
+                        )
+                    }
+                    is MessagePart.Code -> {
+                        ChatFencedCodeBlock(
+                            content = part.content,
+                            language = part.language,
+                        )
+                    }
+                    is MessagePart.Table -> {
+                        ChatTable(
+                            rawMarkdown = part.rawMarkdown,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    else -> {} // Should not happen given the filter
+                }
+            }
         }
+    }
+}
 
-        // File changes collected from tool calls
-        if (message.fileChanges.isNotEmpty()) {
-            FileChangesList(
-                changes = message.fileChanges,
-                project = project,
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+@Composable
+private fun RenderFileChanges(fileChangeParts: List<MessagePart.FileChange>, project: Project?) {
+    if (fileChangeParts.isEmpty()) return
+    FileChangesList(
+        changes = fileChangeParts.map { it.change },
+        project = project,
+        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+    )
+}
+
+@Composable
+private fun RenderSubagentSessions(subagentParts: List<MessagePart.Subagent>, onSubagentClick: ((String) -> Unit)?) {
+    if (subagentParts.isEmpty()) return
+    Column(
+        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        subagentParts.forEach { part ->
+            SubagentSessionBar(
+                ref = part.ref,
+                onClick = { onSubagentClick?.invoke(it) },
             )
         }
+    }
+}
 
-        // Subagent sessions spawned by this message
-        if (message.subagentRefs.isNotEmpty()) {
-            Column(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                message.subagentRefs.forEach { ref ->
-                    SubagentSessionBar(
-                        ref = ref,
-                        onClick = { onSubagentClick?.invoke(it) },
-                    )
-                }
-            }
+@Composable
+private fun RenderErrorParts(errorParts: List<MessagePart.Error>) {
+    errorParts.forEach { part ->
+        val errorText = buildAnnotatedString {
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("Error: ") }
+            append(part.message)
         }
-
-        if (message.isStreaming && message.content.isBlank() && message.thinkingContent.isEmpty()) {
-            ThinkingIndicator()
-        } else if (message.isStreaming && message.thinkingContent.isNotEmpty() && message.content.isBlank()) {
-            // Show thinking indicator when thinking is happening but no text yet
-            ThinkingIndicator()
-        } else if (message.content.isNotBlank()) {
-            val currentProject = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-
-            val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
-            val defaultGreen = Color(0xFF6BBE50)
-            val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
-            val listNumberColor = parseColorOrDefault(settings.listNumberColor, defaultGreen)
-
-            val customInlinesStyling = remember(inlineCodeColor) {
-                val linkColor = Color(0xFF3574F0)
-                InlinesStyling.create(
-                    inlineCode = SpanStyle(
-                        color = inlineCodeColor,
-                        background = Color.Transparent,
-                        fontFamily = FontFamily.Monospace,
-                    ),
-                    link = SpanStyle(
-                        color = linkColor,
-                        textDecoration = TextDecoration.Underline,
-                    ),
-                    linkHovered = SpanStyle(
-                        color = linkColor,
-                        textDecoration = TextDecoration.Underline,
-                    ),
-                )
-            }
-
-            val markdownStyling = remember(customInlinesStyling, listNumberColor) {
-                val baseTextStyle = org.jetbrains.jewel.bridge.theme.retrieveDefaultTextStyle()
-                MarkdownStyling.create(
-                    inlinesStyling = customInlinesStyling,
-                    heading = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.create(
-                        h1 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H1.create(
-                            inlinesStyling = customInlinesStyling,
-                        ),
-                        h2 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H2.create(
-                            inlinesStyling = customInlinesStyling,
-                        ),
-                        h3 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H3.create(
-                            inlinesStyling = customInlinesStyling,
-                        ),
-                        h4 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H4.create(
-                            inlinesStyling = customInlinesStyling,
-                        ),
-                        h5 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H5.create(
-                            inlinesStyling = customInlinesStyling,
-                        ),
-                        h6 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H6.create(
-                            inlinesStyling = customInlinesStyling,
-                        ),
-                    ),
-                    list = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.create(
-                        ordered = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.create(
-                            numberStyle = TextStyle(color = listNumberColor, fontSize = 14.sp),
-                            numberFormatStyles = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles(
-                                firstLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
-                                secondLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
-                                thirdLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
-                            ),
-                        ),
-                    ),
-                    blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
-                        padding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                        lineWidth = 3.dp,
-                        lineColor = Color(0xFF3E3E3E),
-                        textColor = Color(0xFF9E9E9E),
-                    ),
-                )
-            }
-            val markdownProcessor = remember { MarkdownProcessor() }
-            val codeHighlighter = remember(currentProject) {
-                currentProject?.let {
-                    try {
-                        org.jetbrains.jewel.bridge.code.highlighting.CodeHighlighterFactory.getInstance(it).createHighlighter()
-                    } catch (_: Exception) { NoOpCodeHighlighter }
-                } ?: NoOpCodeHighlighter
-            }
-
-            // Use healed segmentation for streaming messages to prevent
-            // raw markdown syntax (unclosed backticks, bold, links) from flashing.
-            val segments = remember(message.content, message.isStreaming) {
-                if (message.isStreaming) {
-                    MarkdownSegmenter.segmentHealed(message.content)
-                } else {
-                    MarkdownSegmenter.segment(message.content)
-                }
-            }
-
-            ProvideMarkdownStyling(
-                markdownStyling = markdownStyling,
-                markdownProcessor = markdownProcessor,
-                codeHighlighter = codeHighlighter,
-            ) {
-                Column(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    segments.forEach { segment ->
-                        when (segment.type) {
-                            MarkdownSegment.Type.TEXT -> {
-                                // Pre-parse and clamp ordered list startFrom values.
-                                // All NumberFormatStyle implementations (Decimal, Roman,
-                                // Alphabetical) throw on number <= 0, so we fix the AST
-                                // before it reaches Jewel's DefaultMarkdownBlockRenderer.
-                                val parsedBlocks = remember(segment.content) {
-                                    val raw = markdownProcessor.processMarkdownDocument(segment.content)
-                                    clampOrderedLists(raw)
-                                }
-                                Markdown(
-                                    markdownBlocks = parsedBlocks,
-                                    markdown = segment.content,
-                                    modifier = Modifier.fillMaxWidth(),
-                                    selectable = true,
-                                    onUrlClick = { url -> BrowserUtil.open(url) },
-                                )
-                            }
-                            MarkdownSegment.Type.CODE -> {
-                                ChatFencedCodeBlock(
-                                    content = segment.content,
-                                    language = segment.language,
-                                )
-                            }
-                            MarkdownSegment.Type.TABLE -> {
-                                ChatTable(
-                                    rawMarkdown = segment.content,
-                                    modifier = Modifier.fillMaxWidth(),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Text(
+            text = errorText,
+            color = Color(0xFFFF7B72),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+        )
     }
 }
 

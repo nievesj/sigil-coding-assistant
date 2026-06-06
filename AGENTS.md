@@ -490,6 +490,13 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 - **Action:** No action needed — `PermissionBridge` serves the ACP SDK integration, not the chat UI.
 - **File:** `PermissionBridge.kt`
 
+### CommandInfo Deserialization — Missing `id` Field
+
+- **Status:** `GET /command` returns `CommandInfo` objects without an `id` field. The `CommandInfo` data class (`OpenCodeModels.kt:261`) requires `id` as a non-optional field, causing `MissingFieldException` on deserialization. The slash command palette fails to populate with server commands.
+- **Action:** Make `id` optional in `CommandInfo` (e.g., `val id: String? = null`) or add `@JsonIgnoreUnknownKeys` / fallback. The server response only has `name` and `description`.
+- **File:** `OpenCodeModels.kt:261` (`CommandInfo` data class), `OpenCodeClient.kt:1365` (`listCommands()`)
+- **Impact:** Non-critical — local commands (`/clear`, `/cancel`) still work. Server commands (`/init`, `/review`, `/simplify`, etc.) are unavailable in the palette.
+
 ---
 
 ## Completed (for reference)

@@ -3,9 +3,11 @@ package com.opencode.acp.adapter
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ChatMessage
+import com.opencode.acp.chat.model.MessagePart
 import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.SessionItem
 import com.opencode.acp.chat.model.ToolCallPill
+import com.opencode.acp.chat.ui.compose.MarkdownSegmenter
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -17,6 +19,7 @@ import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -293,33 +296,28 @@ fun OpenCodeMessage.toChatMessage(): ChatMessage {
         else -> MessageRole.ASSISTANT
     }
 
-    // Check for errors — surface failed messages (skip blank error info)
-    val errorSuffix = info.error?.let { err ->
-        val description = err.message?.ifBlank { null } ?: err.name.ifBlank { null }
-        description?.let { d ->
-            val retries = err.retries?.let { " ($it retries)" } ?: ""
-            "\n\n**Error${retries}:** $d"
-        }
-    } ?: ""
+    // Build parts list from OpenCodeParts
+    val parts = mutableListOf<MessagePart>()
 
-    // Concatenate all Text parts into a single content string.
-    // File parts are noted as attachments (images/files cannot be rehydrated from history).
-    val textParts = parts.filterIsInstance<OpenCodePart.Text>()
-    val fileParts = parts.filterIsInstance<OpenCodePart.File>()
-    val textContent = textParts.joinToString("") { it.text }
-    val fileNote = if (fileParts.isNotEmpty()) {
-        val names = fileParts.mapNotNull { it.filename }.ifEmpty { listOf("${fileParts.size} file(s)") }
-        "\n\n📎 ${names.joinToString(", ")}"
-    } else ""
-    val content = textContent + fileNote + errorSuffix
-
-    // Build ToolCallPill list from ToolUse parts, matching with ToolResult parts.
-    // Use groupBy (not associateBy) to handle multiple ToolResults per toolUseId.
-    val toolUseParts = parts.filterIsInstance<OpenCodePart.ToolUse>()
-    val toolResultsByUseId = parts.filterIsInstance<OpenCodePart.ToolResult>()
+    // Tool call pills from ToolUse parts, matching with ToolResult parts
+    val toolUseParts = this.parts.filterIsInstance<OpenCodePart.ToolUse>()
+    val toolResultsByUseId = this.parts.filterIsInstance<OpenCodePart.ToolResult>()
         .groupBy { it.toolUseId }
 
-    val toolCalls = toolUseParts.map { toolUse ->
+    // Thinking content
+    val thinkingContent = this.parts
+        .filterIsInstance<OpenCodePart.Thinking>()
+        .joinToString("") { it.text }
+    val reasoningContent = this.parts
+        .filterIsInstance<OpenCodePart.Reasoning>()
+        .joinToString("") { it.text }
+    val allThinking = thinkingContent + reasoningContent
+    if (allThinking.isNotBlank()) {
+        parts.add(MessagePart.Thinking(allThinking))
+    }
+
+    // Tool calls
+    toolUseParts.forEach { toolUse ->
         val results = toolResultsByUseId[toolUse.id]
         val hasResult = results != null && results.isNotEmpty()
         val anyError = results?.any { it.isError } == true
@@ -328,13 +326,75 @@ fun OpenCodeMessage.toChatMessage(): ChatMessage {
             anyError -> ToolCallStatus.FAILED
             else -> ToolCallStatus.COMPLETED
         }
-        ToolCallPill(
+        // Extract output text from tool results for display in expanded pills
+        val output = results?.flatMap { result ->
+            result.content.mapNotNull { part ->
+                when (part) {
+                    is OpenCodePart.Text -> buildJsonObject { put("text", JsonPrimitive(part.text)) }
+                    else -> null
+                }
+            }
+        }?.ifEmpty { null }
+        parts.add(MessagePart.ToolCall(ToolCallPill(
             toolCallId = toolUse.id,
             toolName = toolUse.name,
             title = toolUse.name,
-            kind = com.opencode.acp.adapter.ToolMapper.toAcpKind(toolUse.name),
-            status = status
-        )
+            kind = ToolMapper.toAcpKind(toolUse.name),
+            status = status,
+            output = output
+        )))
+    }
+
+    // Text content — segment into Text/Code/Table parts
+    val textParts = this.parts.filterIsInstance<OpenCodePart.Text>()
+    val textContent = textParts.joinToString("") { it.text }
+
+    // File note
+    val fileParts = this.parts.filterIsInstance<OpenCodePart.File>()
+    val fileNote = if (fileParts.isNotEmpty()) {
+        val names = fileParts.mapNotNull { it.filename }.ifEmpty { listOf("${fileParts.size} file(s)") }
+        "\n\n📎 ${names.joinToString(", ")}"
+    } else ""
+
+    // Segment text content (without error) into MessageParts
+    val fullText = textContent + fileNote
+    if (fullText.isNotBlank()) {
+        val segments = MarkdownSegmenter.segment(fullText)
+        segments.forEach { segment ->
+            when (segment.type) {
+                com.opencode.acp.chat.ui.compose.MarkdownSegment.Type.TEXT -> {
+                    if (segment.content.isNotBlank()) parts.add(MessagePart.Text(segment.content))
+                }
+                com.opencode.acp.chat.ui.compose.MarkdownSegment.Type.CODE -> {
+                    if (segment.content.isNotBlank()) parts.add(MessagePart.Code(segment.language ?: "", segment.content))
+                }
+                com.opencode.acp.chat.ui.compose.MarkdownSegment.Type.TABLE -> {
+                    val parsed = MarkdownSegmenter.parseTable(segment.content.lines())
+                    if (parsed != null) {
+                        parts.add(MessagePart.Table(
+                            rawMarkdown = segment.content,
+                            headers = parsed.header,
+                            rows = parsed.rows,
+                            alignments = parsed.alignments
+                        ))
+                    } else {
+                        parts.add(MessagePart.Text(segment.content))
+                    }
+                }
+            }
+        }
+    }
+
+    // Error part (separate from text-derived parts — renders with red styling, not markdown)
+    val errorPart = info.error?.let { err ->
+        val description = err.message?.ifBlank { null } ?: err.name.ifBlank { null }
+        description?.let { d ->
+            val retries = err.retries?.let { " (${it} retries)" } ?: ""
+            MessagePart.Error("$d$retries")
+        }
+    }
+    if (errorPart != null) {
+        parts.add(errorPart)
     }
 
     // Parse createdAt timestamp — try ISO-8601 first, fall back to epoch millis
@@ -349,10 +409,8 @@ fun OpenCodeMessage.toChatMessage(): ChatMessage {
     return ChatMessage(
         id = info.id,
         role = role,
-        content = content,
+        parts = parts,
         timestamp = timestamp,
-        toolCalls = toolCalls,
-        thinkingContent = "",
         isStreaming = false,
         modelID = info.modelID,
         providerID = info.providerID,

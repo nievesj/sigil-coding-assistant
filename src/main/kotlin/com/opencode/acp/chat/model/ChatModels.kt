@@ -59,11 +59,8 @@ class CommandHistoryEntry {
 data class ChatMessage(
     val id: String,
     val role: MessageRole,
-    val content: String,
+    val parts: List<MessagePart>,
     val timestamp: Long,
-    val toolCalls: List<ToolCallPill> = emptyList(),
-    val fileChanges: List<ChatFileChange> = emptyList(),
-    val thinkingContent: String = "",
     val isStreaming: Boolean = false,
     // Attached images/files from user message
     val attachedFiles: List<AttachedFile> = emptyList(),
@@ -77,8 +74,6 @@ data class ChatMessage(
     val cacheReadTokens: Long = 0,
     val cacheWriteTokens: Long = 0,
     val cost: Double = 0.0,
-    // Subagent sessions spawned by this assistant message
-    val subagentRefs: List<SubagentRef> = emptyList(),
 )
 
 /** Reference to a subagent/child session spawned from an assistant message. */
@@ -281,6 +276,37 @@ data class TodoItem(
     val status: String,    // "pending", "in_progress", "completed"
     val priority: String   // "high", "medium", "low"
 )
+
+/**
+ * Returns the full markdown representation of a ChatMessage, suitable for
+ * clipboard copy, context display, or debugging.
+ * Concatenates all [MessagePart] variants into a single markdown string:
+ * - Text parts are included as-is
+ * - Code parts are wrapped in ``` fences
+ * - Table parts use their raw markdown representation
+ * - Thinking parts are prefixed with `> ` (blockquote style)
+ * - Error parts are prefixed with "Error: "
+ * - ToolCall, FileChange, and Subagent parts are skipped (not markdown-renderable)
+ */
+val ChatMessage.fullMarkdownContent: String
+    get() = buildString {
+        parts.forEach { part ->
+            when (part) {
+                is MessagePart.Text -> append(part.content).append('\n')
+                is MessagePart.Code -> append("```${part.language}\n${part.content}\n```\n")
+                is MessagePart.Table -> append(part.rawMarkdown).append('\n')
+                is MessagePart.Thinking -> {
+                    part.content.lines().forEach { line ->
+                        append("> ").append(line).append('\n')
+                    }
+                }
+                is MessagePart.Error -> append("Error: ${part.message}\n")
+                is MessagePart.ToolCall -> { /* skip — binary/structured, not markdown */ }
+                is MessagePart.FileChange -> { /* skip — not markdown content */ }
+                is MessagePart.Subagent -> { /* skip — not markdown content */ }
+            }
+        }
+    }
 
 /** Sidebar tab identifiers. */
 enum class SidebarTab { SESSIONS, CONTEXT, REVIEW }
