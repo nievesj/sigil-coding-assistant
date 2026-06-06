@@ -2,11 +2,13 @@ package com.opencode.acp.chat
 
 import com.intellij.openapi.actionSystem.CustomShortcutSet
 import com.intellij.openapi.actionSystem.KeyboardShortcut
+import com.intellij.openapi.components.service
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
+import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.chat.ui.compose.ChatScreen
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.util.edtScope
@@ -18,8 +20,9 @@ import org.jetbrains.jewel.bridge.addComposeTab
 
 class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
+        val service = project.service<OpenCodeService>()
         val scope = edtScope()
-        val viewModel = ChatViewModel(scope)
+        val viewModel = ChatViewModel(scope, service)
 
         // addComposeTab() automatically handles SwingBridgeTheme, enableNewSwingCompositing(),
         // and JewelComposePanel creation — no explicit SwingBridgeTheme {} wrapper needed.
@@ -43,7 +46,8 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
             pasteAction.registerCustomShortcutSet(pasteShortcut, component, project)
         }
 
-        // Register disposable for ViewModel cleanup
+        // Register disposable for ViewModel cleanup on tool window close.
+        // The service (OpenCodeService) is NOT disposed here — it lives as long as the project.
         com.intellij.openapi.util.Disposer.register(toolWindow.contentManager, object : com.intellij.openapi.Disposable {
             override fun dispose() {
                 scope.cancel()

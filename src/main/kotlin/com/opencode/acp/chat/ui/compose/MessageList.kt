@@ -160,7 +160,7 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
         }
         
         // Display text content if any
-        val textContent = message.parts.filterIsInstance<MessagePart.Text>().joinToString("") { it.content }
+        val textContent = message.parts.values.filterIsInstance<MessagePart.Text>().joinToString("") { it.content }
         if (textContent.isNotBlank()) {
             Box(
                 modifier = Modifier
@@ -186,39 +186,39 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
     )
 
     // Extract parts by type for rendering in fixed order
-    val thinkingParts = message.parts.filterIsInstance<MessagePart.Thinking>()
-    val toolCallParts = message.parts.filterIsInstance<MessagePart.ToolCall>()
-    val textParts = message.parts.filter { it is MessagePart.Text || it is MessagePart.Code || it is MessagePart.Table }
-    val fileChangeParts = message.parts.filterIsInstance<MessagePart.FileChange>()
-    val subagentParts = message.parts.filterIsInstance<MessagePart.Subagent>()
-    val errorParts = message.parts.filterIsInstance<MessagePart.Error>()
+    val thinkingParts = message.parts.values.filterIsInstance<MessagePart.Thinking>()
+    val toolCallParts = message.parts.values.filterIsInstance<MessagePart.ToolCall>()
+    val textParts = message.parts.values.filter { it is MessagePart.Text || it is MessagePart.Code || it is MessagePart.Table }
+    val fileChangeParts = message.parts.values.filterIsInstance<MessagePart.FileChange>()
+    val subagentParts = message.parts.values.filterIsInstance<MessagePart.Subagent>()
+    val errorParts = message.parts.values.filterIsInstance<MessagePart.Error>()
+    val patchParts = message.parts.values.filterIsInstance<MessagePart.Patch>()
+    val agentParts = message.parts.values.filterIsInstance<MessagePart.Agent>()
+    val stepFinishParts = message.parts.values.filterIsInstance<MessagePart.StepFinish>()
+    val retryParts = message.parts.values.filterIsInstance<MessagePart.Retry>()
+    val compactionParts = message.parts.values.filterIsInstance<MessagePart.Compaction>()
+    val assistantFileParts = message.parts.values.filterIsInstance<MessagePart.AssistantFile>()
+    val assistantImageParts = message.parts.values.filterIsInstance<MessagePart.Image>()
 
     Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
-        if (MessageProcessorManager.useNewRenderingOrder) {
-            // New order (default): Thinking → ToolCall → Text → FileChange → Subagent → Error
-            thinkingParts.forEach { ThinkingPill(it.content) }
-            toolCallParts.forEach { key(it.pill.toolCallId) { ToolPill(it.pill) } }
-            RenderTextContent(textParts, project)
-            // Show thinking indicator when streaming with no content yet
-            if (message.isStreaming && textParts.isEmpty() && thinkingParts.isEmpty() && toolCallParts.isEmpty()) {
-                ThinkingIndicator()
-            }
-            RenderFileChanges(fileChangeParts, project)
-            RenderSubagentSessions(subagentParts, onSubagentClick)
-            RenderErrorParts(errorParts)
-        } else {
-            // Legacy order: ToolCall → Thinking → FileChange → Subagent → Text → Error
-            toolCallParts.forEach { key(it.pill.toolCallId) { ToolPill(it.pill) } }
-            thinkingParts.forEach { ThinkingPill(it.content) }
-            RenderFileChanges(fileChangeParts, project)
-            RenderSubagentSessions(subagentParts, onSubagentClick)
-            RenderTextContent(textParts, project)
-            // Show thinking indicator when streaming with no content yet
-            if (message.isStreaming && textParts.isEmpty() && thinkingParts.isEmpty() && toolCallParts.isEmpty()) {
-                ThinkingIndicator()
-            }
-            RenderErrorParts(errorParts)
+        // Rendering order: Thinking → ToolCall → Agent → Text → Patch → File/Image → FileChange → Subagent → StepFinish → Retry → Compaction → Error
+        thinkingParts.forEach { ThinkingPill(it.content) }
+        toolCallParts.forEach { key(it.pill.toolCallId) { ToolPill(it.pill) } }
+        agentParts.forEach { AgentBadge(it.name) }
+        RenderTextContent(textParts, project)
+        // Show thinking indicator when streaming with no content yet
+        if (message.isStreaming && textParts.isEmpty() && thinkingParts.isEmpty() && toolCallParts.isEmpty()) {
+            ThinkingIndicator()
         }
+        RenderPatchCards(patchParts)
+        RenderAssistantFileCards(assistantFileParts)
+        RenderAssistantImageCards(assistantImageParts)
+        RenderFileChanges(fileChangeParts, project)
+        RenderSubagentSessions(subagentParts, onSubagentClick)
+        stepFinishParts.forEach { StepFinishPill(it) }
+        retryParts.forEach { RetryPill(it.attempt, it.maxAttempts, it.error) }
+        compactionParts.forEach { CompactionPill(it.summary) }
+        RenderErrorParts(errorParts)
     }
 }
 
@@ -226,7 +226,6 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
 
 /**
  * Renders Text, Code, and Table message parts with Jewel's Markdown composable.
- * Extracted to avoid duplication between the two rendering order branches.
  */
 @Composable
 private fun RenderTextContent(textParts: List<MessagePart>, project: Project?) {
@@ -389,6 +388,240 @@ private fun RenderErrorParts(errorParts: List<MessagePart.Error>) {
             text = errorText,
             color = Color(0xFFFF7B72),
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+        )
+    }
+}
+
+@Composable
+private fun AgentBadge(name: String) {
+    Row(
+        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = name,
+            style = TextStyle(
+                fontSize = 11.sp,
+                color = Color(0xFF9E9E9E),
+                fontWeight = FontWeight.Medium,
+            ),
+            modifier = Modifier
+                .background(
+                    color = Color(0xFF3E3E3E),
+                    shape = RoundedCornerShape(4.dp)
+                )
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+        )
+    }
+}
+
+@Composable
+private fun RenderPatchCards(patchParts: List<MessagePart.Patch>) {
+    if (patchParts.isEmpty()) return
+    patchParts.forEach { patch ->
+        Column(
+            modifier = Modifier
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+                .fillMaxWidth()
+                .background(
+                    color = Color(0xFF2D2D2D),
+                    shape = RoundedCornerShape(8.dp)
+                )
+                .padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = "📄 ${patch.files.size} changed file${if (patch.files.size != 1) "s" else ""}",
+                style = TextStyle(
+                    fontSize = 12.sp,
+                    color = Color(0xFF9E9E9E),
+                    fontWeight = FontWeight.Medium,
+                ),
+            )
+            patch.files.forEach { filePath ->
+                val fileName = filePath.substringAfterLast('/')
+                Text(
+                    text = "  $fileName",
+                    style = TextStyle(
+                        fontSize = 11.sp,
+                        color = Color(0xFFBBBBBB),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StepFinishPill(stepFinish: MessagePart.StepFinish) {
+    Row(
+        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        val tokenParts = buildList {
+            stepFinish.inputTokens?.let { add("${formatTokenCount(it)} in") }
+            stepFinish.outputTokens?.let { add("${formatTokenCount(it)} out") }
+            stepFinish.reasoningTokens?.let { add("${formatTokenCount(it)} reasoning") }
+            stepFinish.totalCost?.let { add("$${"%.4f".format(it)}") }
+        }
+        val label = if (tokenParts.isNotEmpty()) {
+            "Step — ${tokenParts.joinToString(" / ")}"
+        } else if (stepFinish.snapshot != null) {
+            "Step completed"
+        } else {
+            return
+        }
+        Text(
+            text = label,
+            style = TextStyle(
+                fontSize = 11.sp,
+                color = Color(0xFF7E7E7E),
+            ),
+        )
+    }
+}
+
+private fun formatTokenCount(count: Long): String = when {
+    count >= 1_000_000 -> "${"%.1f".format(count / 1_000_000.0)}M"
+    count >= 1_000 -> "${"%.1f".format(count / 1_000.0)}k"
+    else -> count.toString()
+}
+
+@Composable
+private fun RetryPill(attempt: Int, maxAttempts: Int, error: String?) {
+    Row(
+        modifier = Modifier
+            .padding(horizontal = 8.dp, vertical = 2.dp)
+            .background(
+                color = Color(0xFF5C4A00),
+                shape = RoundedCornerShape(4.dp)
+            )
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = "↻ Retry $attempt/$maxAttempts",
+            style = TextStyle(
+                fontSize = 11.sp,
+                color = Color(0xFFFFD666),
+                fontWeight = FontWeight.Medium,
+            ),
+        )
+        if (error != null) {
+            Text(
+                text = "— $error",
+                style = TextStyle(
+                    fontSize = 10.sp,
+                    color = Color(0xFFCCAA44),
+                ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun RenderAssistantFileCards(parts: List<MessagePart.AssistantFile>) {
+    if (parts.isEmpty()) return
+    parts.forEach { file ->
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 8.dp, vertical = 2.dp)
+                .fillMaxWidth()
+                .background(
+                    color = Color(0xFF2D2D2D),
+                    shape = RoundedCornerShape(6.dp)
+                )
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "📎",
+                style = TextStyle(fontSize = 12.sp),
+            )
+            Column {
+                Text(
+                    text = file.filename ?: "file",
+                    style = TextStyle(
+                        fontSize = 12.sp,
+                        color = Color(0xFFBBBBBB),
+                        fontWeight = FontWeight.Medium,
+                    ),
+                )
+                Text(
+                    text = file.mime,
+                    style = TextStyle(
+                        fontSize = 10.sp,
+                        color = Color(0xFF7E7E7E),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RenderAssistantImageCards(parts: List<MessagePart.Image>) {
+    if (parts.isEmpty()) return
+    parts.forEach { image ->
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 8.dp, vertical = 2.dp)
+                .fillMaxWidth()
+                .background(
+                    color = Color(0xFF2D2D2D),
+                    shape = RoundedCornerShape(6.dp)
+                )
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "🖼️",
+                style = TextStyle(fontSize = 12.sp),
+            )
+            Column {
+                Text(
+                    text = image.filename ?: "image",
+                    style = TextStyle(
+                        fontSize = 12.sp,
+                        color = Color(0xFFBBBBBB),
+                        fontWeight = FontWeight.Medium,
+                    ),
+                )
+                Text(
+                    text = image.mime,
+                    style = TextStyle(
+                        fontSize = 10.sp,
+                        color = Color(0xFF7E7E7E),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompactionPill(summary: String?) {
+    Row(
+        modifier = Modifier
+            .padding(horizontal = 8.dp, vertical = 2.dp)
+            .background(
+                color = Color(0xFF1A2A1A),
+                shape = RoundedCornerShape(4.dp)
+            )
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "📎 Context compacted${if (summary != null) " — $summary" else ""}",
+            style = TextStyle(
+                fontSize = 11.sp,
+                color = Color(0xFF7EBF7E),
+            ),
         )
     }
 }

@@ -23,12 +23,9 @@ import java.io.InputStreamReader
 
 private val logger = KotlinLogging.logger {}
 
-/** Write debug log to a file we can read from outside the IDE sandbox. */
-private val debugLogFile = System.getProperty("java.io.tmpdir") + "/opencode-sse-debug.log"
+/** Debug log helper — uses logger so output goes to idea.log, not a temp file. */
 private fun debugLog(msg: String) {
-    try {
-        java.io.File(debugLogFile).appendText("${System.currentTimeMillis()} $msg\n")
-    } catch (_: Exception) {}
+    logger.info { "[ACP-SSE] $msg" }
 }
 
 /**
@@ -53,6 +50,11 @@ class OpenCodeClient(
         classDiscriminator = "type"
         encodeDefaults = true
     }
+
+    /** Set of part IDs that belong to reasoning/thinking content on the V1 bus.
+     *  Populated when message.part.updated arrives with part.type == "reasoning"/"thinking".
+     *  Used in message.part.delta to disambiguate reasoning from text (both use field: "text"). */
+    private val reasoningPartIds: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     // -------------------------------------------------------------------------
     // Request / Response DTOs (private)
@@ -140,7 +142,12 @@ class OpenCodeClient(
             logger.error { "GET $path returned ${response.status}: ${body.take(500)}" }
             error("GET $path failed with ${response.status}: ${body.take(200)}")
         }
-        return json.decodeFromString<T>(body)
+        return try {
+            json.decodeFromString<T>(body)
+        } catch (e: Exception) {
+            logger.error(e) { "GET $path deserialization failed. Body preview: ${body.take(1000)}" }
+            throw e
+        }
     }
 
     /**
@@ -358,19 +365,30 @@ class OpenCodeClient(
             SendMessageRequest(parts = parts, variant = variant, agent = agent, model = model)
         )
         logger.info { "Sending message: ${requestBody.take(200)}" }
-        val response = httpClient.post("$baseUrl/session/$sessionId/message") {
-            applyAuth()
-            contentType(ContentType.Application.Json)
-            setBody(requestBody)
+        val startTime = System.currentTimeMillis()
+        try {
+            val response = httpClient.post("$baseUrl/session/$sessionId/message") {
+                applyAuth()
+                contentType(ContentType.Application.Json)
+                setBody(requestBody)
+            }
+            val elapsed = System.currentTimeMillis() - startTime
+            logger.info { "POST /session/$sessionId/message got response: ${response.status} in ${elapsed}ms" }
+            val body = response.bodyAsText()
+            logger.debug { "POST /session/$sessionId/message body: ${body.take(500)}" }
+            if (!response.status.isSuccess()) {
+                logger.error { "POST /session/$sessionId/message returned ${response.status}: ${body.take(500)}" }
+                error("POST /session/$sessionId/message failed with ${response.status}: ${body.take(200)}")
+            }
+            val responseBody: SendMessageResponse = json.decodeFromString(body)
+            logger.info { "POST /session/$sessionId/message OK — msgId=${responseBody.info?.id}" }
+            return responseBody.info?.id
+                ?: error("No message ID in response")
+        } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - startTime
+            logger.error(e) { "[ACP] sendMessageAsync FAILED after ${elapsed}ms: ${e::class.simpleName}: ${e.message}" }
+            throw e
         }
-        val body = response.bodyAsText()
-        if (!response.status.isSuccess()) {
-            logger.error { "POST /session/$sessionId/message returned ${response.status}: ${body.take(500)}" }
-            error("POST /session/$sessionId/message failed with ${response.status}: ${body.take(200)}")
-        }
-        val responseBody: SendMessageResponse = json.decodeFromString(body)
-        return responseBody.info?.id
-            ?: error("No message ID in response")
     }
 
     /**
@@ -552,12 +570,12 @@ class OpenCodeClient(
                         debugLog("SSE IN: rawType=$rawEventType → eventType=$eventType, v2=${v2Data != null}, sid=$sessionId, pKeys=${props.keys}")
 
                         val parsed = parseSseEvent(eventType, props, sessionId)
-                        if (parsed != null) {
+                    if (parsed is SseEvent.Ignored) {
+                        logger.debug { "[ACP-SSE] IGNORED: type=$eventType, reason=${parsed.reason}" }
+                    } else {
                             debugLog("SSE OK: ${parsed::class.simpleName}")
-                            send(parsed)
-                        } else {
-                            debugLog("SSE SKIP: type=$eventType")
                         }
+                        send(parsed)
                     }
                     logger.info { "SSE stream ended" }
                 }
@@ -571,44 +589,60 @@ class OpenCodeClient(
         }
     }
 
+    // V1 carries messageID at the top level of props
+    private fun extractMessageId(props: JsonObject): String? =
+        props["messageID"]?.jsonPrimitive?.contentOrNull
+
+    // V1 carries partID at the top level of props (for message.part.delta)
+    private fun extractPartId(props: JsonObject): String? =
+        props["partID"]?.jsonPrimitive?.contentOrNull
+
+    // V1 carries part.id inside the part object (for message.part.updated)
+    private fun extractPartIdFromPart(part: JsonObject): String? =
+        part["id"]?.jsonPrimitive?.contentOrNull
+
     /**
      * Parses SSE event data into our internal [SseEvent] hierarchy.
      * Handles both old format (flat JSON) and new format (properties wrapper).
      * Now handles v2 events from OpenCode server.
      */
-    private fun parseSseEvent(eventType: String, props: JsonObject, sessionId: String): SseEvent? {
+    private fun parseSseEvent(eventType: String, props: JsonObject, sessionId: String): SseEvent {
         return try {
             logger.debug { "Parsing SSE event: type=$eventType, sessionId=$sessionId" }
             when (eventType) {
                 // V2 Text events
                 "session.next.text.started" -> {
                     // Text generation started - no action needed yet
-                    null
+                    SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "intentional no-op")
                 }
 
                 "session.next.text.delta" -> {
-                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing delta")
                     SseEvent.TextChunk(sessionId = sessionId, text = delta)
                 }
 
                 "session.next.text.ended" -> {
-                    val text = props["text"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val text = props["text"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing text")
                     SseEvent.TextReplace(sessionId = sessionId, text = text)
                 }
 
                 // V2 Reasoning events
                 "session.next.reasoning.started" -> {
                     // Reasoning started - no action needed yet
-                    null
+                    SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "intentional no-op")
                 }
 
                 "session.next.reasoning.delta" -> {
-                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing delta")
                     SseEvent.ThinkingChunk(sessionId = sessionId, text = delta)
                 }
 
                 "session.next.reasoning.ended" -> {
-                    val text = props["text"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val text = props["text"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing text")
                     SseEvent.ThinkingReplace(sessionId = sessionId, text = text)
                 }
 
@@ -616,11 +650,12 @@ class OpenCodeClient(
                 "session.next.tool.input.started" -> {
                     // Skip: pill is created from "called" event which has full data (tool name + input).
                     // Creating from "input.started" would produce incomplete pills without input data.
-                    null
+                    SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "intentional no-op")
                 }
 
                 "session.next.tool.called" -> {
-                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID")
                     val tool = props["tool"]?.jsonPrimitive?.contentOrNull ?: "tool"
                     val input = props["input"]?.jsonObject
                     SseEvent.ToolUse(
@@ -633,7 +668,8 @@ class OpenCodeClient(
                 }
 
                 "session.next.tool.success" -> {
-                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID")
                     val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject) }
                     SseEvent.ToolResult(
@@ -645,7 +681,8 @@ class OpenCodeClient(
                 }
 
                 "session.next.tool.failed" -> {
-                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID")
                     val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject) }
                     SseEvent.ToolResult(
@@ -659,17 +696,17 @@ class OpenCodeClient(
                 // V2 Step events (for status indication)
                 "session.next.step.started" -> {
                     // Step started - could be used for status indication
-                    null
+                    SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "intentional no-op")
                 }
 
                 "session.next.step.ended" -> {
                     // Step ended - could be used for status indication
-                    null
+                    SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "intentional no-op")
                 }
 
                 "session.next.step.failed" -> {
                     // Step failed - could be used for error indication
-                    null
+                    SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "intentional no-op")
                 }
 
                 // V2 Prompted event (user message from server)
@@ -685,180 +722,36 @@ class OpenCodeClient(
                             text = text,
                             files = files
                         )
-                    } else null
+                    } else SseEvent.Ignored(sessionId, eventType, "parse error: missing prompt")
                 }
 
-                // Legacy events (kept for backward compatibility)
-                "message.part.delta" -> {
-                    val field = props["field"]?.jsonPrimitive?.contentOrNull
-                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull ?: return null
-                    when (field) {
-                        "text" -> SseEvent.TextChunk(sessionId = sessionId, text = delta)
-                        "thinking", "reasoning" -> SseEvent.ThinkingChunk(sessionId = sessionId, text = delta)
-                        else -> null
-                    }
-                }
-
-                "message.part.updated" -> {
-                    val part = props["part"]?.jsonObject
-                    if (part != null) {
-                        val partType = part["type"]?.jsonPrimitive?.contentOrNull
-                        when (partType) {
-                            "text" -> {
-                                val text = part["text"]?.jsonPrimitive?.contentOrNull
-                                if (text != null) {
-                                    SseEvent.TextReplace(sessionId = sessionId, text = text)
-                                } else null
-                            }
-                            "reasoning", "thinking" -> {
-                                val text = part["text"]?.jsonPrimitive?.contentOrNull
-                                if (text != null) {
-                                    SseEvent.ThinkingReplace(sessionId = sessionId, text = text)
-                                } else null
-                            }
-                            "tool_use", "tool" -> {
-                                // OpenCode server uses "tool" for V1, "tool_use" is the alternate name
-                                // part.id is the part ID (prt_xxx), part.callID is the tool call ID
-                                val toolCallId = part["callID"]?.jsonPrimitive?.contentOrNull
-                                    ?: part["id"]?.jsonPrimitive?.contentOrNull
-                                    ?: return null
-                                val toolName = part["tool"]?.jsonPrimitive?.contentOrNull
-                                    ?: part["name"]?.jsonPrimitive?.contentOrNull
-                                    ?: "tool"
-                                // state is a nested object: { status: "running"|"completed"|"error"|..., input, output, ... }
-                                val stateObj = part["state"]?.jsonObject
-                                val status = stateObj?.get("status")?.jsonPrimitive?.contentOrNull
-                                debugLog("SSE TOOL: callID=$toolCallId, tool=$toolName, status=$status, stateKeys=${stateObj?.keys}")
-                                when (status) {
-                                    "completed" -> {
-                                        val output = (stateObj?.get("output") as? kotlinx.serialization.json.JsonArray)
-                                            ?.mapNotNull { (it as? JsonObject) }
-                                            ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
-                                                ?.mapNotNull { (it as? JsonObject) }
-                                        SseEvent.ToolResult(
-                                            sessionId = sessionId,
-                                            toolCallId = toolCallId,
-                                            isError = false,
-                                            content = output
-                                        )
-                                    }
-                                    "error" -> {
-                                        val output = (stateObj?.get("output") as? kotlinx.serialization.json.JsonArray)
-                                            ?.mapNotNull { (it as? JsonObject) }
-                                            ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
-                                                ?.mapNotNull { (it as? JsonObject) }
-                                        SseEvent.ToolResult(
-                                            sessionId = sessionId,
-                                            toolCallId = toolCallId,
-                                            isError = true,
-                                            content = output
-                                        )
-                                    }
-                                    else -> {
-                                        // "running", "pending", or null — emit as ToolUse
-                                        val input = stateObj?.get("input")?.jsonObject ?: part["input"]?.jsonObject
-                                        SseEvent.ToolUse(
-                                            sessionId = sessionId,
-                                            toolCallId = toolCallId,
-                                            toolName = toolName,
-                                            title = stateObj?.get("title")?.jsonPrimitive?.contentOrNull ?: toolName,
-                                            input = input
-                                        )
-                                    }
-                                }
-                            }
-                            "tool_result" -> {
-                                val toolCallId = part["id"]?.jsonPrimitive?.contentOrNull ?: return null
-                                val output = (part["output"] as? kotlinx.serialization.json.JsonArray)
-                                    ?.mapNotNull { (it as? JsonObject) }
-                                SseEvent.ToolResult(
-                                    sessionId = sessionId,
-                                    toolCallId = toolCallId,
-                                    isError = part["isError"]?.jsonPrimitive?.contentOrNull == "true",
-                                    content = output
-                                )
-                            }
-                            else -> {
-                                debugLog("SSE SKIP part.updated: partType=$partType, partKeys=${part.keys}")
-                                null
-                            }
-                        }
-                    } else null
-                }
-
-                "message.updated" -> {
-                    val info = props["info"]?.jsonObject
-                    if (info != null) {
-                        val finish = info["finish"]?.jsonPrimitive?.contentOrNull
-                        if (finish == "stop" || finish == "end") {
-                            SseEvent.Stop(sessionId = sessionId, stopReason = finish)
-                        } else if (finish != null) {
-                            SseEvent.Stop(sessionId = sessionId, stopReason = finish)
-                        } else null
-                    } else null
-                }
-
-                "session.created" -> {
-                    SseEvent.SessionCreated(sessionId = sessionId)
-                }
-
-                "stop" -> {
-                    val stopReason = props["stopReason"]?.jsonPrimitive?.contentOrNull ?: "stop"
-                    SseEvent.Stop(sessionId = sessionId, stopReason = stopReason)
-                }
-
-                "text_chunk" -> {
-                    val text = props["text"]?.jsonPrimitive?.contentOrNull ?: return null
-                    SseEvent.TextChunk(sessionId = sessionId, text = text)
-                }
-
-                "tool_use" -> {
-                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val toolName = props["toolName"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val title = props["title"]?.jsonPrimitive?.contentOrNull
-                    SseEvent.ToolUse(
-                        sessionId = sessionId,
-                        toolCallId = toolCallId,
-                        toolName = toolName,
-                        title = title,
-                        input = props["input"]?.jsonObject
-                    )
-                }
-
-                "tool_result" -> {
-                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val isError = props["isError"]?.jsonPrimitive?.let {
-                        if (it.isString) it.content.lowercase() == "true" else it.toString().lowercase() == "true"
-                    } ?: false
-                    val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
-                        ?.mapNotNull { (it as? JsonObject) }
-                    SseEvent.ToolResult(
-                        sessionId = sessionId,
-                        toolCallId = toolCallId,
-                        isError = isError,
-                        content = output
-                    )
-                }
-
-                "permission.asked" -> {
-                    val permissionId = props["id"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val permission = props["permission"]?.jsonPrimitive?.contentOrNull ?: return null
+                // V2 Permission event
+                "session.next.permission" -> {
+                    val permissionId = props["id"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing id")
+                    val permission = props["permission"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing permission")
                     val toolObj = props["tool"]?.jsonObject
                     val toolCallId = toolObj?.get("callID")?.jsonPrimitive?.contentOrNull ?: ""
                     val patterns = props["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
-                    val description = if (patterns.isNullOrEmpty()) permission else "$permission: ${patterns.joinToString(", ")}"
+                    val description = props["description"]?.jsonPrimitive?.contentOrNull
+                        ?: if (patterns.isNullOrEmpty()) permission else "$permission: ${patterns.joinToString(", ")}"
                     SseEvent.Permission(
                         sessionId = sessionId,
                         permissionId = permissionId,
                         toolCallId = toolCallId,
                         action = permission,
-                        description = description
+                        description = description,
+                        patterns = patterns ?: emptyList()
                     )
                 }
 
-                "question.asked" -> {
-                    val requestId = props["id"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val questionsArray = props["questions"]?.jsonArray ?: return null
+                // V2 Question event
+                "session.next.question" -> {
+                    val requestId = props["id"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing id")
+                    val questionsArray = props["questions"]?.jsonArray
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing questions")
                     val questions = questionsArray.mapNotNull { element ->
                         val obj = element.jsonObject
                         val question = obj["question"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
@@ -887,12 +780,8 @@ class OpenCodeClient(
                     )
                 }
 
-                "error" -> {
-                    val message = props["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown error"
-                    SseEvent.Error(sessionId = sessionId, message = message)
-                }
-
-                "todo.updated" -> {
+                // V2 Todo event
+                "session.next.todo.updated" -> {
                     val todosArray = props["todos"]?.jsonArray
                     if (todosArray != null) {
                         val todos = todosArray.mapNotNull { element ->
@@ -903,17 +792,384 @@ class OpenCodeClient(
                             SseTodoItem(content = content, status = status, priority = priority)
                         }
                         SseEvent.TodoUpdated(sessionId = sessionId, todos = todos)
-                    } else null
+                    } else SseEvent.Ignored(sessionId, eventType, "parse error: missing todos")
+                }
+
+                // V2 Stop event
+                "session.next.stopped" -> {
+                    val stopReason = props["stopReason"]?.jsonPrimitive?.contentOrNull ?: "stop"
+                    SseEvent.Stop(sessionId = sessionId, stopReason = stopReason)
+                }
+
+                // V2 Session created
+                "session.next.created" -> {
+                    SseEvent.SessionCreated(sessionId = sessionId)
+                }
+
+                // Legacy events (kept for backward compatibility)
+                "message.part.delta" -> {
+                    val field = props["field"]?.jsonPrimitive?.contentOrNull
+                    val delta = props["delta"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing delta")
+                    val messageId = extractMessageId(props)
+                    val partId = extractPartId(props)
+                    when (field) {
+                        "text" -> {
+                            // Server sends field: "text" for BOTH text and reasoning deltas on V1 bus.
+                            // Disambiguate by checking if the partID is in the reasoning set.
+                            if (partId != null && partId in reasoningPartIds) {
+                                SseEvent.ThinkingChunk(sessionId = sessionId, text = delta, messageId = messageId, partId = partId)
+                            } else {
+                                SseEvent.TextChunk(sessionId = sessionId, text = delta, messageId = messageId, partId = partId)
+                            }
+                        }
+                        "thinking", "reasoning" -> SseEvent.ThinkingChunk(sessionId = sessionId, text = delta, messageId = messageId, partId = partId)
+                        else -> SseEvent.Ignored(sessionId, eventType, "parse error: unknown field=$field")
+                    }
+                }
+
+                "message.part.updated" -> {
+                    val part = props["part"]?.jsonObject
+                    if (part != null) {
+                        val partType = part["type"]?.jsonPrimitive?.contentOrNull
+                        val partId = extractPartIdFromPart(part)
+                        val messageId = extractMessageId(props)
+                        when (partType) {
+                            "text" -> {
+                                // A text part appearing means any prior reasoning part is done.
+                                // Clear the reasoning tracking set to prevent stale entries leaking
+                                // across turns within the same session.
+                                reasoningPartIds.clear()
+                                val text = part["text"]?.jsonPrimitive?.contentOrNull
+                                if (text != null) {
+                                    SseEvent.TextReplace(sessionId = sessionId, text = text, messageId = messageId, partId = partId)
+                                } else SseEvent.Ignored(sessionId, eventType, "parse error: missing text in text part", messageId = messageId, partId = partId)
+                            }
+                            "reasoning", "thinking" -> {
+                                // Track this partID so message.part.delta can disambiguate reasoning from text
+                                if (partId != null) reasoningPartIds.add(partId)
+                                val text = part["text"]?.jsonPrimitive?.contentOrNull
+                                if (text != null) {
+                                    SseEvent.ThinkingReplace(sessionId = sessionId, text = text, messageId = messageId, partId = partId)
+                                } else SseEvent.Ignored(sessionId, eventType, "parse error: missing text in reasoning part", messageId = messageId, partId = partId)
+                            }
+                            "tool_use", "tool" -> {
+                                // OpenCode server uses "tool" for V1, "tool_use" is the alternate name
+                                // part.id is the part ID (prt_xxx), part.callID is the tool call ID
+                                val toolCallId = part["callID"]?.jsonPrimitive?.contentOrNull
+                                    ?: part["id"]?.jsonPrimitive?.contentOrNull
+                                    ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID in tool part")
+                                val toolName = part["tool"]?.jsonPrimitive?.contentOrNull
+                                    ?: part["name"]?.jsonPrimitive?.contentOrNull
+                                    ?: "tool"
+                                // state is a nested object: { status: "running"|"completed"|"error"|..., input, output, ... }
+                                val stateObj = part["state"]?.jsonObject
+                                val status = stateObj?.get("status")?.jsonPrimitive?.contentOrNull
+                                debugLog("SSE TOOL: callID=$toolCallId, tool=$toolName, status=$status, stateKeys=${stateObj?.keys}")
+                                when (status) {
+                                    "completed" -> {
+                                        val output = (stateObj.get("output") as? kotlinx.serialization.json.JsonArray)
+                                            ?.mapNotNull { (it as? JsonObject) }
+                                            ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
+                                                ?.mapNotNull { (it as? JsonObject) }
+                                        SseEvent.ToolResult(
+                                            sessionId = sessionId,
+                                            toolCallId = toolCallId,
+                                            isError = false,
+                                            content = output,
+                                            messageId = messageId,
+                                            partId = partId
+                                        )
+                                    }
+                                    "error" -> {
+                                        val output = (stateObj.get("output") as? kotlinx.serialization.json.JsonArray)
+                                            ?.mapNotNull { (it as? JsonObject) }
+                                            ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
+                                                ?.mapNotNull { (it as? JsonObject) }
+                                        SseEvent.ToolResult(
+                                            sessionId = sessionId,
+                                            toolCallId = toolCallId,
+                                            isError = true,
+                                            content = output,
+                                            messageId = messageId,
+                                            partId = partId
+                                        )
+                                    }
+                                    else -> {
+                                        // "running", "pending", or null — emit as ToolUse
+                                        val input = stateObj?.get("input")?.jsonObject ?: part["input"]?.jsonObject
+                                        SseEvent.ToolUse(
+                                            sessionId = sessionId,
+                                            toolCallId = toolCallId,
+                                            toolName = toolName,
+                                            title = stateObj?.get("title")?.jsonPrimitive?.contentOrNull ?: toolName,
+                                            input = input,
+                                            messageId = messageId,
+                                            partId = partId
+                                        )
+                                    }
+                                }
+                            }
+                            "tool_result" -> {
+                                val toolCallId = part["id"]?.jsonPrimitive?.contentOrNull
+                                    ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing id in tool_result part")
+                                val output = (part["output"] as? kotlinx.serialization.json.JsonArray)
+                                    ?.mapNotNull { (it as? JsonObject) }
+                                SseEvent.ToolResult(
+                                    sessionId = sessionId,
+                                    toolCallId = toolCallId,
+                                    isError = part["isError"]?.jsonPrimitive?.contentOrNull == "true",
+                                    content = output,
+                                    messageId = messageId,
+                                    partId = partId
+                                )
+                            }
+                            "patch" -> {
+                                val hash = part["hash"]?.jsonPrimitive?.contentOrNull
+                                    ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing hash in patch part")
+                                val files = part["files"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+                                SseEvent.Patch(sessionId = sessionId, hash = hash, files = files, messageId = messageId, partId = partId)
+                            }
+                            "file" -> {
+                                val mime = part["mime"]?.jsonPrimitive?.contentOrNull
+                                    ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing mime in file part")
+                                val url = part["url"]?.jsonPrimitive?.contentOrNull
+                                    ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing url in file part")
+                                val filename = part["filename"]?.jsonPrimitive?.contentOrNull
+                                SseEvent.AssistantFile(sessionId = sessionId, mime = mime, url = url, filename = filename, messageId = messageId, partId = partId)
+                            }
+                            "image" -> {
+                                val mime = part["mime"]?.jsonPrimitive?.contentOrNull
+                                    ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing mime in image part")
+                                val url = part["url"]?.jsonPrimitive?.contentOrNull
+                                    ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing url in image part")
+                                val filename = part["filename"]?.jsonPrimitive?.contentOrNull
+                                SseEvent.AssistantImage(sessionId = sessionId, mime = mime, url = url, filename = filename, messageId = messageId, partId = partId)
+                            }
+                            "agent" -> {
+                                val name = part["name"]?.jsonPrimitive?.contentOrNull
+                                    ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing name in agent part")
+                                SseEvent.Agent(sessionId = sessionId, agentName = name, messageId = messageId, partId = partId)
+                            }
+                            "retry" -> {
+                                val attempt = part["attempt"]?.jsonPrimitive?.intOrNull ?: 1
+                                val maxAttempts = part["maxAttempts"]?.jsonPrimitive?.intOrNull ?: 3
+                                val error = part["error"]?.jsonPrimitive?.contentOrNull
+                                SseEvent.Retry(sessionId = sessionId, attempt = attempt, maxAttempts = maxAttempts, error = error, messageId = messageId, partId = partId)
+                            }
+                            "compaction" -> {
+                                val summary = part["summary"]?.jsonPrimitive?.contentOrNull
+                                SseEvent.Compaction(sessionId = sessionId, summary = summary, messageId = messageId, partId = partId)
+                            }
+                            "snapshot" -> {
+                                val id = part["id"]?.jsonPrimitive?.contentOrNull
+                                SseEvent.Snapshot(sessionId = sessionId, id = id, messageId = messageId, partId = partId)
+                            }
+                            "step-start" -> SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "intentional no-op", messageId = messageId, partId = partId) // No action needed
+                            "step-finish" -> {
+                                // Log raw part keys on first encounter to verify field names against actual server payload.
+                                // The field names below (inputTokens, outputTokens, etc.) are assumptions —
+                                // server may use different names (e.g. snake_case). Check debug logs.
+                                logger.debug { "[ACP] step-finish raw part keys: ${part.keys}" }
+                                val snapshot = part["snapshot"]?.jsonPrimitive?.contentOrNull
+                                val inputTokens = part["inputTokens"]?.jsonPrimitive?.longOrNull
+                                    ?: part["input_tokens"]?.jsonPrimitive?.longOrNull
+                                val outputTokens = part["outputTokens"]?.jsonPrimitive?.longOrNull
+                                    ?: part["output_tokens"]?.jsonPrimitive?.longOrNull
+                                val reasoningTokens = part["reasoningTokens"]?.jsonPrimitive?.longOrNull
+                                    ?: part["reasoning_tokens"]?.jsonPrimitive?.longOrNull
+                                val totalCost = part["totalCost"]?.jsonPrimitive?.doubleOrNull
+                                    ?: part["total_cost"]?.jsonPrimitive?.doubleOrNull
+                                SseEvent.StepFinish(sessionId = sessionId, snapshot = snapshot, inputTokens = inputTokens, outputTokens = outputTokens, reasoningTokens = reasoningTokens, totalCost = totalCost, messageId = messageId, partId = partId)
+                            }
+                            "subtask" -> {
+                                val prompt = part["prompt"]?.jsonPrimitive?.contentOrNull
+                                val description = part["description"]?.jsonPrimitive?.contentOrNull
+                                val agent = part["agent"]?.jsonPrimitive?.contentOrNull
+                                val model = part["model"]?.jsonPrimitive?.contentOrNull
+                                SseEvent.Subtask(sessionId = sessionId, prompt = prompt, description = description, agent = agent, model = model, messageId = messageId, partId = partId)
+                            }
+                            else -> {
+                                debugLog("SSE SKIP part.updated: partType=$partType, partKeys=${part.keys}")
+                                SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "unknown part type: $partType", messageId = messageId, partId = partId)
+                            }
+                        }
+                    } else SseEvent.Ignored(sessionId, eventType, "parse error: missing part in message.part.updated")
+                }
+
+                "message.updated" -> {
+                    val info = props["info"]?.jsonObject
+                    val messageId = extractMessageId(props)
+                    if (info != null) {
+                        val finish = info["finish"]?.jsonPrimitive?.contentOrNull
+                        if (finish == "stop" || finish == "end") {
+                            SseEvent.Stop(sessionId = sessionId, stopReason = finish, messageId = messageId)
+                        } else if (finish != null) {
+                            SseEvent.Stop(sessionId = sessionId, stopReason = finish, messageId = messageId)
+                        } else SseEvent.Ignored(sessionId, eventType, "parse error: missing finish in message.updated", messageId = messageId)
+                    } else SseEvent.Ignored(sessionId, eventType, "parse error: missing info in message.updated", messageId = messageId)
+                }
+
+                "session.created" -> {
+                    SseEvent.SessionCreated(sessionId = sessionId)
+                }
+
+                "stop" -> {
+                    val stopReason = props["stopReason"]?.jsonPrimitive?.contentOrNull ?: "stop"
+                    val messageId = extractMessageId(props)
+                    SseEvent.Stop(sessionId = sessionId, stopReason = stopReason, messageId = messageId)
+                }
+
+                "text_chunk" -> {
+                    val text = props["text"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing text")
+                    val messageId = extractMessageId(props)
+                    val partId = extractPartId(props)
+                    SseEvent.TextChunk(sessionId = sessionId, text = text, messageId = messageId, partId = partId)
+                }
+
+                "tool_use" -> {
+                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing toolCallId")
+                    val toolName = props["toolName"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing toolName")
+                    val title = props["title"]?.jsonPrimitive?.contentOrNull
+                    val messageId = extractMessageId(props)
+                    val partId = extractPartId(props)
+                    SseEvent.ToolUse(
+                        sessionId = sessionId,
+                        toolCallId = toolCallId,
+                        toolName = toolName,
+                        title = title,
+                        input = props["input"]?.jsonObject,
+                        messageId = messageId,
+                        partId = partId
+                    )
+                }
+
+                "tool_result" -> {
+                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing toolCallId")
+                    val isError = props["isError"]?.jsonPrimitive?.let {
+                        if (it.isString) it.content.lowercase() == "true" else it.toString().lowercase() == "true"
+                    } ?: false
+                    val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? JsonObject) }
+                    val messageId = extractMessageId(props)
+                    val partId = extractPartId(props)
+                    SseEvent.ToolResult(
+                        sessionId = sessionId,
+                        toolCallId = toolCallId,
+                        isError = isError,
+                        content = output,
+                        messageId = messageId,
+                        partId = partId
+                    )
+                }
+
+                "permission.asked" -> {
+                    val permissionId = props["id"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing id")
+                    val permission = props["permission"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing permission")
+                    val toolObj = props["tool"]?.jsonObject
+                    val toolCallId = toolObj?.get("callID")?.jsonPrimitive?.contentOrNull ?: ""
+                    val patterns = props["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                    val description = if (patterns.isNullOrEmpty()) permission else "$permission: ${patterns.joinToString(", ")}"
+                    val messageId = extractMessageId(props)
+                    SseEvent.Permission(
+                        sessionId = sessionId,
+                        permissionId = permissionId,
+                        toolCallId = toolCallId,
+                        action = permission,
+                        description = description,
+                        messageId = messageId
+                    )
+                }
+
+                "question.asked" -> {
+                    val requestId = props["id"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing id")
+                    val questionsArray = props["questions"]?.jsonArray
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing questions")
+                    val messageId = extractMessageId(props)
+                    val questions = questionsArray.mapNotNull { element ->
+                        val obj = element.jsonObject
+                        val question = obj["question"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                        val header = obj["header"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val multiple = obj["multiple"]?.jsonPrimitive?.booleanOrNull ?: false
+                        val custom = obj["custom"]?.jsonPrimitive?.booleanOrNull ?: true
+                        val optionsArray = obj["options"]?.jsonArray ?: emptyList()
+                        val options = optionsArray.mapNotNull { optElement ->
+                            val optObj = optElement.jsonObject
+                            val label = optObj["label"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                            val desc = optObj["description"]?.jsonPrimitive?.contentOrNull ?: ""
+                            com.opencode.acp.SseQuestionOption(label = label, description = desc)
+                        }
+                        com.opencode.acp.SseQuestionInfo(
+                            question = question,
+                            header = header,
+                            options = options,
+                            multiple = multiple,
+                            custom = custom
+                        )
+                    }
+                    SseEvent.QuestionAsked(
+                        sessionId = sessionId,
+                        requestId = requestId,
+                        questions = questions,
+                        messageId = messageId
+                    )
+                }
+
+                "error" -> {
+                    val message = props["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown error"
+                    val messageId = extractMessageId(props)
+                    SseEvent.Error(sessionId = sessionId, message = message, messageId = messageId)
+                }
+
+                "todo.updated" -> {
+                    val todosArray = props["todos"]?.jsonArray
+                    val messageId = extractMessageId(props)
+                    if (todosArray != null) {
+                        val todos = todosArray.mapNotNull { element ->
+                            val obj = element.jsonObject
+                            val content = obj["content"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                            val status = obj["status"]?.jsonPrimitive?.contentOrNull ?: "pending"
+                            val priority = obj["priority"]?.jsonPrimitive?.contentOrNull ?: "medium"
+                            SseTodoItem(content = content, status = status, priority = priority)
+                        }
+                        SseEvent.TodoUpdated(sessionId = sessionId, todos = todos, messageId = messageId)
+                    } else SseEvent.Ignored(sessionId, eventType, "parse error: missing todos", messageId = messageId)
+                }
+
+                "plan" -> {
+                    val entriesArray = props["entries"]?.jsonArray
+                    val entries = entriesArray?.mapNotNull { element ->
+                        val obj = element.jsonObject
+                        PlanEntry(
+                            description = obj["description"]?.jsonPrimitive?.contentOrNull ?: "",
+                            priority = obj["priority"]?.jsonPrimitive?.contentOrNull ?: "medium",
+                            status = obj["status"]?.jsonPrimitive?.contentOrNull ?: "pending"
+                        )
+                    } ?: emptyList()
+                    val messageId = extractMessageId(props)
+                    SseEvent.Plan(sessionId = sessionId, entries = entries, messageId = messageId)
+                }
+
+                "message_complete" -> {
+                    val messageId = extractMessageId(props) ?: ""
+                    SseEvent.MessageComplete(sessionId = sessionId, messageId = messageId)
                 }
 
                 else -> {
                     debugLog("SSE UNKNOWN: type=$eventType, pKeys=${props.keys}")
-                    null
+                    SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "unknown type")
                 }
             }
         } catch (e: Exception) {
-            logger.warn(e) { "Failed to parse SSE event: $eventType" }
-            null
+            logger.error(e) { "[ACP] SSE parse FAILED: type=$eventType, sid=$sessionId" }
+            SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "parse error: ${e.message}")
         }
     }
 
@@ -927,6 +1183,11 @@ class OpenCodeClient(
      */
     override fun close() {
         // No-op: SSE now uses the shared httpClient owned by the caller
+    }
+
+    /** Clear reasoning part ID tracking. Call on session switch. */
+    fun resetReasoningTracking() {
+        reasoningPartIds.clear()
     }
 }
 

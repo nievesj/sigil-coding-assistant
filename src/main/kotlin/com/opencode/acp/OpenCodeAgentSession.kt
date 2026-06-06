@@ -1,3 +1,8 @@
+@file:OptIn(
+    com.agentclientprotocol.annotations.UnstableApi::class,
+    kotlinx.coroutines.ExperimentalCoroutinesApi::class
+)
+
 package com.opencode.acp
 
 import com.agentclientprotocol.agent.AgentSession
@@ -203,6 +208,55 @@ class OpenCodeAgentSession(
                     is SseEvent.QuestionAsked -> {
                         // Question prompts are handled by ChatViewModel for the chat UI.
                         logger.debug { "Question asked: ${sseEvent.requestId}" }
+                    }
+
+                    is SseEvent.Patch -> {
+                        // TODO: Implement when ACP SDK needs patch handling — emit appropriate event
+                        logger.debug { "Patch: ${sseEvent.hash} — ${sseEvent.files.size} file(s)" }
+                    }
+
+                    is SseEvent.Agent -> {
+                        // TODO: Implement when ACP SDK needs agent identification — emit appropriate event
+                        logger.debug { "Agent: ${sseEvent.agentName}" }
+                    }
+
+                    is SseEvent.Retry -> {
+                        // TODO: Implement when ACP SDK needs retry status — emit appropriate event
+                        logger.debug { "Retry: ${sseEvent.attempt}/${sseEvent.maxAttempts}" }
+                    }
+
+                    is SseEvent.Compaction -> {
+                        // TODO: Implement when ACP SDK needs compaction notification — emit appropriate event
+                        logger.debug { "Compaction: ${sseEvent.summary}" }
+                    }
+
+                    is SseEvent.Snapshot -> {
+                        // TODO: Implement when ACP SDK needs snapshot markers — emit appropriate event
+                        logger.debug { "Snapshot: ${sseEvent.id}" }
+                    }
+
+                    is SseEvent.StepFinish -> {
+                        // TODO: Implement when ACP SDK needs step finish with token data — emit appropriate event
+                        logger.debug { "Step finish: ${sseEvent.snapshot}" }
+                    }
+
+                    is SseEvent.Subtask -> {
+                        // TODO: Implement when ACP SDK needs subtask creation — emit appropriate event
+                        logger.debug { "Subtask: ${sseEvent.description ?: sseEvent.prompt}" }
+                    }
+
+                    is SseEvent.AssistantFile -> {
+                        // TODO: Implement when ACP SDK needs assistant file handling — emit appropriate event
+                        logger.debug { "Assistant file: ${sseEvent.filename ?: sseEvent.url}" }
+                    }
+
+                    is SseEvent.AssistantImage -> {
+                        // TODO: Implement when ACP SDK needs assistant image handling — emit appropriate event
+                        logger.debug { "Assistant image: ${sseEvent.filename ?: sseEvent.url}" }
+                    }
+
+                    is SseEvent.Ignored -> {
+                        logger.debug { "Ignored: ${sseEvent.eventType} — ${sseEvent.reason}" }
                     }
                 }
             }

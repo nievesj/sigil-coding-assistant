@@ -35,16 +35,48 @@ They are in the sandbox directory:
 .intellijPlatform/sandbox/intellij-opencode-plugin/IU-2026.1/log/idea.log
 ```
 
-To see logs in the Run tool window:
-1. Edit run configuration → add log file from sandbox path above
-2. Or use `Help → Debug Log Settings` in the running sandbox IDE and add:
-   ```
-   #com.opencode.acp.chat.viewmodel.ChatViewModel
-   #com.opencode.acp.adapter.OpenCodeClient
-   ```
+### Installed Plugin Log Location
 
-To see stdout from the plugin, use `println()` — it appears in the Run tool
-window console (not in idea.log).
+When the plugin is installed from a zip (not runIde), logs go to the main
+IDEA installation log:
+
+```
+C:\Users\<username>\AppData\Local\JetBrains\IntelliJIdea<version>\log\idea.log
+```
+
+For this project's developer machine: `C:\Users\josen\AppData\Local\JetBrains\IntelliJIdea2026.1\log\idea.log`
+
+To search for plugin-specific log lines, grep for `[ACP]`:
+```bash
+Select-String -Path "C:\Users\josen\AppData\Local\JetBrains\IntelliJIdea2026.1\log\idea.log" -Pattern "\[ACP\]"
+```
+
+To enable verbose SSE debugging in the installed plugin, add to
+`Help → Debug Log Settings`:
+```
+#com.opencode.acp.adapter.OpenCodeClient=debug
+```
+
+### Plugin Logging Convention
+
+All plugin logging must use `logger.info {}` / `logger.error {}` / `logger.debug {}`
+(from `io.github.oshai.kotlinlogging.KotlinLogging`). This writes to IntelliJ's
+`idea.log` (Help → Show Log in Finder/Explorer), which is visible regardless of
+how the plugin is launched (runIde or installed zip).
+
+- **Do NOT use `println()`** — only visible in Run console when launched via `runIde`.
+  When installed from a zip, println output goes nowhere useful.
+- **Do NOT use `java.io.File.appendText()`** — temp files are ephemeral and hard to
+  discover.
+- **Do NOT use `System.err.println()`** — same problem as println.
+- **DO use `logger.info { "[ACP] ..." }`** — prefix with `[ACP]` for grep-friendly
+  filtering in idea.log.
+- **For SSE debug logging**, use `logger.debug {}` (not a temp file).
+
+To enable verbose SSE logging in idea.log, add to Help → Debug Log Settings:
+```
+#com.opencode.acp.adapter.OpenCodeClient=debug
+```
 
 ### Jewel Markdown: Cannot Override DefaultMarkdownBlockRenderer for Code Blocks
 

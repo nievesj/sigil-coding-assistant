@@ -76,11 +76,10 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
     val seen = mutableSetOf<String>()
 
     // Exact filename match first
-    com.intellij.psi.search.FilenameIndex.getFilesByName(project, query, com.intellij.psi.search.GlobalSearchScope.projectScope(project))
+    com.intellij.psi.search.FilenameIndex.getVirtualFilesByName(project, query, com.intellij.psi.search.GlobalSearchScope.projectScope(project))
         .filter { it.isValid && !it.isDirectory }
         .take(maxResults)
-        .forEach {
-            val vf = it.virtualFile ?: return@forEach
+        .forEach { vf ->
             if (vf.path !in seen) {
                 seen.add(vf.path)
                 results.add(RecentFile(name = vf.name, path = vf.path))
@@ -90,11 +89,11 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
     // If we have enough results, return early
     if (results.size >= maxResults) return results.take(maxResults)
 
-    // Partial match: iterate all files in project sources and content roots
-    val projectScope = com.intellij.psi.search.GlobalSearchScope.projectScope(project)
-    com.intellij.psi.search.FilenameIndex.getFilesByName(project, query, projectScope)
-    // For partial matches, use VFS refresh + iterate project files
-    val baseDir = project.baseDir ?: return results
+    // Local file system for VFS operations
+    val localFileSystem = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+    // Fall back to project base path for partial match traversal
+    val basePath = project.basePath ?: return results
+    val baseDir = localFileSystem.findFileByPath(basePath) ?: return results
 
     fun searchDir(dir: VirtualFile) {
         if (results.size >= maxResults) return
@@ -316,7 +315,7 @@ fun ChatScreen(
 
                     // Message list (fills remaining space)
                     MessageList(
-                        messages = messages,
+                        messages = messages.values.toList(),
                         modifier = Modifier.weight(1f).fillMaxWidth(),
                         project = project,
                         onSubagentClick = { subagentId ->

@@ -1,6 +1,6 @@
 package com.opencode.acp.config.settings
 
-import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
+import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.ui.TextBrowseFolderListener
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.ui.components.JBLabel
@@ -16,7 +16,7 @@ class OpenCodeSettingsPanel {
     val binaryPathField: TextFieldWithBrowseButton = TextFieldWithBrowseButton().apply {
         addBrowseFolderListener(
             TextBrowseFolderListener(
-                FileChooserDescriptorFactory.createSingleFileDescriptor()
+                FileChooserDescriptor(true, false, false, false, false, false)
                     .withTitle("Select OpenCode Binary")
                     .withDescription("Choose the opencode executable")
             )
@@ -39,6 +39,9 @@ class OpenCodeSettingsPanel {
 
     /** Command history size — how many past messages to remember. */
     val commandHistorySizeField: JBTextField = JBTextField("15", 5)
+
+    /** SSE socket timeout — seconds between SSE events before reconnecting. */
+    val sseSocketTimeoutField: JBTextField = JBTextField("60", 5)
 
     /** Inline code text color — hex string like "#6BBE50" */
     val inlineCodeColorField: JBTextField = JBTextField("#6BBE50", 8)
@@ -91,6 +94,7 @@ class OpenCodeSettingsPanel {
         .addComponentToRightColumn(discoverButton)
         .addLabeledComponent("Permission timeout (seconds):", timeoutField, 5)
         .addLabeledComponent("Command history size:", commandHistorySizeField, 5)
+        .addLabeledComponent("SSE socket timeout (seconds):", sseSocketTimeoutField, 5)
         .addSeparator(5)
         .addLabeledComponent("Inline code color:", inlineCodeColorField, 5)
         .addComponentToRightColumn(inlineCodeColorButton)
@@ -103,6 +107,7 @@ class OpenCodeSettingsPanel {
         binaryPathField.text = settings.binaryPath
         timeoutField.text = settings.permissionTimeoutSeconds.toString()
         commandHistorySizeField.text = settings.commandHistorySize.toString()
+        sseSocketTimeoutField.text = settings.sseSocketTimeoutSeconds.toString()
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
     }
@@ -111,6 +116,7 @@ class OpenCodeSettingsPanel {
         settings.binaryPath = binaryPathField.text.trim()
         settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60
         settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
+        settings.sseSocketTimeoutSeconds = sseSocketTimeoutField.text.trim().toIntOrNull()?.coerceIn(30, 3600) ?: 60
         settings.inlineCodeColor = inlineCodeColorField.text.trim()
         settings.listNumberColor = listNumberColorField.text.trim()
     }
@@ -119,6 +125,7 @@ class OpenCodeSettingsPanel {
         return binaryPathField.text.trim() != settings.binaryPath ||
                 (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
                 (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
+                (sseSocketTimeoutField.text.trim().toIntOrNull() ?: 60) != settings.sseSocketTimeoutSeconds ||
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
                 listNumberColorField.text.trim() != settings.listNumberColor
     }

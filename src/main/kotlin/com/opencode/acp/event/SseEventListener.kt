@@ -70,7 +70,7 @@ class SseEventListener(
 
             return when (normalizedType) {
                 // V2 Text events
-                "session.next.text.started" -> null
+                "session.next.text.started" -> SseEvent.Ignored(sessionId, "session.next.text.started", "intentional no-op")
                 "session.next.text.delta" -> SseEvent.TextChunk(
                     sessionId = sessionId,
                     text = obj["delta"]?.jsonPrimitive?.contentOrNull ?: ""
@@ -81,7 +81,7 @@ class SseEventListener(
                 )
 
                 // V2 Reasoning events
-                "session.next.reasoning.started" -> null
+                "session.next.reasoning.started" -> SseEvent.Ignored(sessionId, "session.next.reasoning.started", "intentional no-op")
                 "session.next.reasoning.delta" -> SseEvent.ThinkingChunk(
                     sessionId = sessionId,
                     text = obj["delta"]?.jsonPrimitive?.contentOrNull ?: ""
@@ -112,9 +112,9 @@ class SseEventListener(
                 )
 
                 // V2 Step events
-                "session.next.step.started" -> null
-                "session.next.step.ended" -> null
-                "session.next.step.failed" -> null
+                "session.next.step.started" -> SseEvent.Ignored(sessionId, "session.next.step.started", "intentional no-op")
+                "session.next.step.ended" -> SseEvent.Ignored(sessionId, "session.next.step.ended", "intentional no-op")
+                "session.next.step.failed" -> SseEvent.Ignored(sessionId, "session.next.step.failed", "intentional no-op")
 
                 // V2 Prompted event
                 "session.next.prompted" -> {
@@ -192,6 +192,34 @@ class SseEventListener(
 
                 // V2 Session created
                 "session.next.created" -> SseEvent.SessionCreated(sessionId = sessionId)
+
+                // V2 new part type events
+                "session.next.patch" -> {
+                    val hash = obj["hash"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val files = obj["files"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+                    SseEvent.Patch(sessionId = sessionId, hash = hash, files = files)
+                }
+                "session.next.agent" -> {
+                    val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: return null
+                    SseEvent.Agent(sessionId = sessionId, agentName = name)
+                }
+                "session.next.retry" -> {
+                    val attempt = obj["attempt"]?.jsonPrimitive?.intOrNull ?: 1
+                    val maxAttempts = obj["maxAttempts"]?.jsonPrimitive?.intOrNull ?: 3
+                    val error = obj["error"]?.jsonPrimitive?.contentOrNull
+                    SseEvent.Retry(sessionId = sessionId, attempt = attempt, maxAttempts = maxAttempts, error = error)
+                }
+                "session.next.compaction" -> {
+                    val summary = obj["summary"]?.jsonPrimitive?.contentOrNull
+                    SseEvent.Compaction(sessionId = sessionId, summary = summary)
+                }
+                "session.next.subtask" -> {
+                    val prompt = obj["prompt"]?.jsonPrimitive?.contentOrNull
+                    val description = obj["description"]?.jsonPrimitive?.contentOrNull
+                    val agent = obj["agent"]?.jsonPrimitive?.contentOrNull
+                    val model = obj["model"]?.jsonPrimitive?.contentOrNull
+                    SseEvent.Subtask(sessionId = sessionId, prompt = prompt, description = description, agent = agent, model = model)
+                }
 
                 // Legacy events
                 "text_chunk" -> SseEvent.TextChunk(

@@ -2,6 +2,7 @@ package com.opencode.acp.chat.model
 
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
+import java.util.LinkedHashMap
 
 /** Attached file/image in a user message. */
 data class AttachedFile(
@@ -59,9 +60,11 @@ class CommandHistoryEntry {
 data class ChatMessage(
     val id: String,
     val role: MessageRole,
-    val parts: List<MessagePart>,
+    val parts: Map<String, MessagePart>,
     val timestamp: Long,
     val isStreaming: Boolean = false,
+    /** Explicit message state — tracks lifecycle transitions. */
+    val state: MessageState = MessageState.Created,
     // Attached images/files from user message
     val attachedFiles: List<AttachedFile> = emptyList(),
     // Model info from AssistantMessage — present only for assistant messages
@@ -74,6 +77,14 @@ data class ChatMessage(
     val cacheReadTokens: Long = 0,
     val cacheWriteTokens: Long = 0,
     val cost: Double = 0.0,
+    /**
+     * Server's message ID — matches V1 `messageID` in SSE events.
+     * Null for user messages (user messages have no server ID).
+     * Used to deterministically route SSE events to the correct message
+     * instead of relying on `ctx.activeMessageId`.
+     * Stored explicitly rather than derived from [id] to avoid format assumptions.
+     */
+    val serverMessageId: String? = null,
 )
 
 /** Reference to a subagent/child session spawned from an assistant message. */
@@ -290,7 +301,7 @@ data class TodoItem(
  */
 val ChatMessage.fullMarkdownContent: String
     get() = buildString {
-        parts.forEach { part ->
+        parts.values.forEach { part ->
             when (part) {
                 is MessagePart.Text -> append(part.content).append('\n')
                 is MessagePart.Code -> append("```${part.language}\n${part.content}\n```\n")
@@ -304,6 +315,13 @@ val ChatMessage.fullMarkdownContent: String
                 is MessagePart.ToolCall -> { /* skip — binary/structured, not markdown */ }
                 is MessagePart.FileChange -> { /* skip — not markdown content */ }
                 is MessagePart.Subagent -> { /* skip — not markdown content */ }
+                is MessagePart.Patch -> append("Patch: ${part.hash} — ${part.files.size} file(s)\n")
+                is MessagePart.Agent -> append("Agent: ${part.name}\n")
+                is MessagePart.Retry -> append("Retry: ${part.attempt}/${part.maxAttempts}${part.error?.let { " — $it" } ?: ""}\n")
+                is MessagePart.Compaction -> append("Context compacted${part.summary?.let { ": $it" } ?: ""}\n")
+                is MessagePart.AssistantFile -> append("📎 ${part.filename ?: part.url}\n")
+                is MessagePart.Image -> append("🖼️ ${part.filename ?: part.url}\n")
+                is MessagePart.StepFinish -> { /* skip — informational */ }
             }
         }
     }

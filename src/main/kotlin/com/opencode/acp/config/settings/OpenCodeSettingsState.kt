@@ -35,6 +35,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var sidebarVisible: Boolean = true
     /** Maximum number of entries kept in the input command history. */
     var commandHistorySize: Int = 15
+    /** SSE socket timeout in seconds (how long to wait between SSE events before reconnecting). */
+    var sseSocketTimeoutSeconds: Int = 60
     /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save. */
     var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
 
@@ -51,6 +53,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         lastSelectedModelKey = state.lastSelectedModelKey
         sidebarVisible = state.sidebarVisible
         commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
+        sseSocketTimeoutSeconds = if (state.sseSocketTimeoutSeconds > 0) state.sseSocketTimeoutSeconds else 60
         commandHistory = state.commandHistory
     }
 

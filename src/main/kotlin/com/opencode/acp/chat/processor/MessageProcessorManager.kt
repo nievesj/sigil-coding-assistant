@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import java.util.LinkedHashMap
 
 /**
  * Owns all mutable streaming state (text accumulation, tool call tracking,
@@ -37,29 +38,15 @@ import kotlinx.serialization.json.JsonPrimitive
  */
 class MessageProcessorManager(private val scope: CoroutineScope) {
 
-    companion object {
-        /**
-         * Feature flag controlling the rendering order of parts in AssistantMessage.
-         * When true (default): Thinking → ToolCall → Text/Code/Table → FileChange → Subagent → Error
-         * When false: ToolCall → Thinking → FileChange → Subagent → Text/Code/Table (legacy order)
-         *
-         * This allows toggling back to the old order if user testing reveals regressions.
-         * See TDD §4.6.3 for details.
-         */
-        var useNewRenderingOrder: Boolean = true
-    }
-
-
     private val logger = KotlinLogging.logger {}
 
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
-    val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+    private val _messages = MutableStateFlow<LinkedHashMap<String, ChatMessage>>(LinkedHashMap())
+    val messages: StateFlow<Map<String, ChatMessage>> = _messages.asStateFlow()
 
     private val _signals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 16)
     val signals: SharedFlow<UiSignal> = _signals.asSharedFlow()
 
     private val ctx = ProcessorContext()
-    private val messageIndex = mutableMapOf<String, Int>()  // messageId → index in _messages
 
     // Thread-safe event queue: SSE coroutine sends events here (any thread),
     // the event processing coroutine consumes them on EDT.
@@ -81,6 +68,7 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
     private fun startCoroutines() {
         eventProcessingJob = scope.launch(Dispatchers.EDT) {
             for (event in eventChannel) {
+                logger.info { "[ACP] processEvent DEQUEUE: ${event::class.simpleName} sid=${event.sessionId}" }
                 processEvent(event)
             }
         }
@@ -93,36 +81,56 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
 
     // ── Public API ──────────────────────────────────────────────────────────
 
-    /** Enqueue an SSE event for processing. Thread-safe — called from SSE coroutine (any thread). */
+    /** Enqueue an SSE event for processing. Thread-safe — called from SSE coroutine (any thread).
+     *  Filters out SseEvent.Ignored to avoid consuming channel buffer space with events
+     *  that the processor will immediately log and discard. */
     fun process(event: SseEvent) {
-        eventChannel.trySend(event)
+        if (event is SseEvent.Ignored) {
+            logger.debug { "Ignored: ${event.eventType} — ${event.reason}" }
+            return
+        }
+        val result = eventChannel.trySend(event)
+        if (result.isFailure) {
+            val isClosed = eventChannel.isClosedForSend
+            logger.error { "[ACP] processEvent ENQUEUE FAILED: ${event::class.simpleName} — isClosed=$isClosed, reason=${result.exceptionOrNull()?.message}" }
+        }
     }
 
     /** Create a placeholder assistant message for a new turn.
      *  Adds the message to _messages, sets ctx.activeMessageId, stores modelID/providerID.
      *  MUST be called before the first SSE event arrives (i.e., before process() is called).
      *  Returns the message ID. */
-    fun createAssistantMessage(modelID: String?, providerID: String?): String {
+    fun createAssistantMessage(
+        modelID: String?,
+        providerID: String?,
+        serverMessageId: String? = null
+    ): String {
         // Reset turn-specific state to prevent stale data from the previous turn
         // leaking into the new message. Preserves toolCallIndex (cross-message routing)
         // and lastUserText (set separately via setLastUserText).
         ctx.resetTurnState()
 
-        val id = generateId()
+        // Use server's messageID if provided, otherwise generate a local UUID
+        // Using serverMessageId allows deterministic SSE event routing via messageID match
+        val id = serverMessageId ?: generateId()
         ctx.activeMessageId = id
+        ctx.activeServerMessageId = serverMessageId
         ctx.modelID = modelID
         ctx.providerID = providerID
         ctx.isStreaming = true
+        logger.info { "[ACP] createAssistantMessage: id=$id, serverMessageId=$serverMessageId" }
         firstChunkFlushed = false
 
         val message = ChatMessage(
             id = id,
             role = MessageRole.ASSISTANT,
-            parts = emptyList(),
+            parts = linkedMapOf(),
             isStreaming = true,
+            state = MessageState.Created,
             timestamp = System.currentTimeMillis(),
             modelID = modelID,
             providerID = providerID,
+            serverMessageId = serverMessageId,
         )
         addMessage(message)
         // StreamingStarted is NOT emitted here — it fires when the first content
@@ -135,10 +143,11 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
      *  Verifies messageId == ctx.activeMessageId; no-op if mismatch. */
     fun completeStreaming(messageId: String) {
         if (messageId != ctx.activeMessageId) return
+        ctx.activeThinkingCompleted = true
         flushToMessages()
         ctx.isStreaming = false
-        // Update the message's isStreaming flag
-        updateMessage(messageId) { it.copy(isStreaming = false) }
+        // Transition message state: Streaming → Completed
+        updateMessage(messageId) { it.copy(isStreaming = false, state = MessageState.Completed) }
         emitStreamingCompleted(messageId)
     }
 
@@ -146,10 +155,13 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
      *  Appends MessagePart.Error, marks streaming complete. */
     fun abortStreaming(reason: String) {
         val msgId = ctx.activeMessageId ?: return
+        // Mark thinking as completed so its state transitions Streaming → Completed (or Failed if error in thinking)
+        ctx.activeThinkingCompleted = true
         ctx.errorMessage = reason
         ctx.isStreaming = false
         flushToMessages()
-        updateMessage(msgId) { it.copy(isStreaming = false) }
+        // Transition message state: Streaming → Aborted
+        updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Aborted) }
         emitStreamingCompleted(msgId)
         _signals.tryEmit(UiSignal.Error(msgId, reason))
     }
@@ -161,8 +173,7 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         while (eventChannel.tryReceive().isSuccess) { /* drain */ }
         while (flushChannel.tryReceive().isSuccess) { /* drain */ }
         ctx.reset()
-        _messages.value = emptyList()
-        messageIndex.clear()
+        _messages.value = LinkedHashMap()
         firstChunkFlushed = false
         // Restart coroutines for the new session
         eventProcessingJob?.cancel()
@@ -172,44 +183,86 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
 
     /** Add a message directly (for loading history from REST API). */
     fun addMessage(message: ChatMessage) {
-        val current = _messages.value.toMutableList()
-        current.add(message)
-        messageIndex[message.id] = current.size - 1
-        // Update toolCallIndex for history messages
-        message.parts.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
+        val current = LinkedHashMap(_messages.value)
+        current[message.id] = message
+        message.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
             ctx.toolCallIndex[part.pill.toolCallId] = message.id
         }
-        // FIFO eviction
+        // FIFO eviction — use iterator for O(1) per removal (avoids rehash per remove())
         if (current.size > ChatConstants.MAX_MESSAGE_HISTORY) {
-            val evictCount = current.size - ChatConstants.MAX_MESSAGE_HISTORY
-            val evicted = current.take(evictCount)
-            val remaining = current.drop(evictCount)
-            evicted.forEach { msg ->
-                messageIndex.remove(msg.id)
-                msg.parts.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
+            val excess = current.size - ChatConstants.MAX_MESSAGE_HISTORY
+            val iter = current.entries.iterator()
+            var toRemove = excess
+            while (iter.hasNext() && toRemove > 0) {
+                val entry = iter.next()
+                entry.value.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
                     ctx.toolCallIndex.remove(part.pill.toolCallId)
                 }
+                iter.remove()
+                toRemove--
             }
-            remaining.forEachIndexed { i, msg -> messageIndex[msg.id] = i }
-            _messages.value = remaining
-        } else {
-            _messages.value = current
         }
+        _messages.value = current
     }
 
     /** Inject subagent references into an existing message.
      *  Removes existing Subagent parts, adds new ones, emits StateFlow. */
     fun injectSubagentRefs(messageId: String, refs: List<SubagentRef>) {
         updateMessage(messageId) { msg ->
-            val nonSubagentParts = msg.parts.filter { it !is MessagePart.Subagent }
-            val subagentParts = refs.map { MessagePart.Subagent(it) }
-            msg.copy(parts = nonSubagentParts + subagentParts)
+            val partsWithoutSubagents = LinkedHashMap(msg.parts.filterValues { it !is MessagePart.Subagent })
+            refs.forEach { ref ->
+                partsWithoutSubagents[ref.sessionId] = MessagePart.Subagent(ref)
+            }
+            msg.copy(parts = partsWithoutSubagents)
         }
     }
 
     /** Update tool call status (for permission responses that change pill state). */
+    @Suppress("REDUNDANT_ELSE_IN_WHEN")
     fun updateToolCallStatus(toolCallId: String, status: ToolCallStatus, output: List<JsonObject>? = null) {
-        // Update in context if it's the active message
+        // Track part state transition
+        val newPartState = when (status) {
+            ToolCallStatus.COMPLETED -> PartState.Completed
+            ToolCallStatus.FAILED -> PartState.Failed(output?.toString() ?: "Tool error")
+            ToolCallStatus.PENDING -> PartState.Pending
+            ToolCallStatus.IN_PROGRESS -> PartState.InProgress
+            else -> PartState.InProgress
+        }
+        ctx.toolPartStates[toolCallId] = newPartState
+
+        updateToolCallStatusInternal(toolCallId, status, output, newPartState)
+    }
+
+    /** Set tool part state directly (e.g. Rejected on permission reject). */
+    fun setToolPartState(toolCallId: String, state: PartState) {
+        ctx.toolPartStates[toolCallId] = state
+        // Also update pill status for visual consistency
+        val pill = ctx.toolCallPills[toolCallId]
+        if (pill != null) {
+            val pillStatus = when (state) {
+                PartState.Completed -> ToolCallStatus.COMPLETED
+                is PartState.Failed -> ToolCallStatus.FAILED
+                PartState.Pending -> ToolCallStatus.PENDING
+                PartState.InProgress -> ToolCallStatus.IN_PROGRESS
+                else -> pill.status
+            }
+            ctx.toolCallPills[toolCallId] = pill.copy(status = pillStatus)
+            flushToMessages()
+        } else {
+            val messageId = ctx.toolCallIndex[toolCallId] ?: return
+            updateMessage(messageId) { msg ->
+                val updatedParts = LinkedHashMap(msg.parts)
+                updatedParts.replaceAll { _, part ->
+                    if (part is MessagePart.ToolCall && part.pill.toolCallId == toolCallId) {
+                        part.copy(state = state)
+                    } else part
+                }
+                msg.copy(parts = updatedParts)
+            }
+        }
+    }
+
+    private fun updateToolCallStatusInternal(toolCallId: String, status: ToolCallStatus, output: List<JsonObject>?, newPartState: PartState) {
         val pill = ctx.toolCallPills[toolCallId]
         if (pill != null) {
             ctx.toolCallPills[toolCallId] = pill.copy(status = status, output = output ?: pill.output)
@@ -219,13 +272,24 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         // Otherwise, find the message containing this tool call and update it
         val messageId = ctx.toolCallIndex[toolCallId] ?: return
         updateMessage(messageId) { msg ->
-            val updatedParts = msg.parts.map { part ->
+            val updatedParts = LinkedHashMap(msg.parts)
+            updatedParts.replaceAll { _, part ->
                 if (part is MessagePart.ToolCall && part.pill.toolCallId == toolCallId) {
-                    MessagePart.ToolCall(part.pill.copy(status = status, output = output ?: part.pill.output))
+                    MessagePart.ToolCall(part.pill.copy(status = status, output = output ?: part.pill.output), state = newPartState)
                 } else part
             }
             msg.copy(parts = updatedParts)
         }
+    }
+
+    /** Update the server's message ID on an already-created assistant message.
+     *  Called after sendMessageAsync() returns the server-assigned ID.
+     *  Also updates ctx.activeServerMessageId for SSE event routing. */
+    fun updateServerMessageId(messageId: String, serverMessageId: String) {
+        if (messageId != ctx.activeMessageId) return
+        ctx.activeServerMessageId = serverMessageId
+        updateMessage(messageId) { it.copy(serverMessageId = serverMessageId) }
+        logger.info { "[ACP] updateServerMessageId: msg=$messageId → serverId=$serverMessageId" }
     }
 
     /** Set the last user message text for echo stripping.
@@ -236,6 +300,7 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
 
     /** Cancel all coroutines. Call on plugin disposal to prevent leaks. */
     fun close() {
+        logger.info { "[ACP] processor.close() called" }
         eventProcessingJob?.cancel()
         flushJob?.cancel()
         eventChannel.close()
@@ -288,12 +353,30 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                 // The Stop event handles streaming completion
                 return
             }
+            is SseEvent.Ignored -> {
+                // Never reached — filtered in process() before enqueue. Handled here for
+                // compiler exhaustiveness (Ignored is a member of the SseEvent sealed interface).
+                return
+            }
             else -> { /* handled below */ }
         }
 
         val msgId = ctx.activeMessageId
         if (msgId == null) {
-            logger.debug { "Processor DROP: ${event::class.simpleName} — activeMessageId is null" }
+            logger.info { "[ACP] processEvent DROP: ${event::class.simpleName} — activeMessageId is null (sid=${event.sessionId})" }
+            return
+        }
+
+        // Verify the event's messageId matches our active turn's serverMessageId.
+        // If we have a serverMessageId and the event carries one, they must match.
+        // Cross-message events (ToolResult, Permission) are allowed through — they reference
+        // toolCallId, not messageId, and are routed via toolCallIndex separately.
+        val activeServerId = ctx.activeServerMessageId
+        val eventServerId = event.messageId
+        val isCrossMessageEvent = event is SseEvent.ToolResult || event is SseEvent.Permission
+        logger.info { "[ACP] processEvent ROUTE: ${event::class.simpleName} activeMsgId=$msgId activeServerId=$activeServerId eventServerId=$eventServerId isCross=$isCrossMessageEvent" }
+        if (!isCrossMessageEvent && activeServerId != null && eventServerId != null && eventServerId != activeServerId) {
+            logger.info { "[ACP] processEvent SKIP: event messageId=$eventServerId != active=$activeServerId (${event::class.simpleName})" }
             return
         }
 
@@ -346,6 +429,9 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                 // Dedup: skip if callId already seen (input.started + called pair)
                 if (event.toolCallId in ctx.toolCallPills) return
 
+                // Track part state: this tool call is now InProgress
+                ctx.toolPartStates[event.toolCallId] = PartState.InProgress
+
                 val toolKind = ToolMapper.toAcpKind(event.toolName)
                 val pill = ToolCallPill(
                     toolCallId = event.toolCallId,
@@ -373,6 +459,9 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
             }
 
             is SseEvent.ToolResult -> {
+                // Track part state: tool call completed or failed
+                ctx.toolPartStates[event.toolCallId] = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed
+
                 val existingPill = ctx.toolCallPills[event.toolCallId]
                 if (existingPill != null) {
                     val resolvedStatus = if (event.isError) ToolCallStatus.FAILED else ToolCallStatus.COMPLETED
@@ -392,6 +481,9 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
             }
 
             is SseEvent.Permission -> {
+                // Track part state: tool call is now Pending (waiting for user permission)
+                ctx.toolPartStates[event.toolCallId] = PartState.Pending
+
                 // Update pill status to PENDING
                 val existingPill = ctx.toolCallPills[event.toolCallId]
                 if (existingPill != null) {
@@ -415,10 +507,13 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
             }
 
             is SseEvent.Stop -> {
+                // Mark thinking as completed so its state transitions Streaming → Completed
+                ctx.activeThinkingCompleted = true
                 // Flush remaining buffer (isStreaming still true → StreamHealer runs)
                 flushToMessages()
                 ctx.isStreaming = false
-                updateMessage(msgId) { it.copy(isStreaming = false) }
+                // Transition message state: Streaming → Completed
+                updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
                 emitStreamingCompleted(msgId)
             }
 
@@ -426,9 +521,58 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                 ctx.errorMessage = event.message
                 ctx.isStreaming = false
                 flushToMessages()
-                updateMessage(msgId) { it.copy(isStreaming = false) }
+                // Transition message state: Streaming → Failed
+                updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Failed(event.message)) }
                 _signals.tryEmit(UiSignal.Error(msgId, event.message))
             }
+
+            is SseEvent.Patch -> {
+                ctx.activePatches.add(event)
+                scheduleFlush()
+            }
+            is SseEvent.Agent -> {
+                ctx.activeAgentName = event.agentName
+                scheduleFlush()
+            }
+            is SseEvent.Retry -> {
+                ctx.activeRetry = event
+                scheduleFlush()
+            }
+            is SseEvent.Compaction -> {
+                ctx.activeCompaction = event
+                scheduleFlush()
+            }
+            is SseEvent.Snapshot -> {
+                // Internal state marker — no visual needed
+            }
+            is SseEvent.StepFinish -> {
+                ctx.activeStepFinish = event
+                scheduleFlush()
+            }
+            is SseEvent.Subtask -> {
+                // Subtask creation — currently informational until split view is implemented
+            }
+
+            is SseEvent.AssistantFile -> {
+                // Track as proper MessagePart type (rendered as inline card), NOT dumped into text buffer.
+                // Key by partId for correct update semantics; fall back to url if partId is null.
+                ctx.activeAssistantFiles[event.partId ?: event.url] = event
+                scheduleFlush()
+            }
+            is SseEvent.AssistantImage -> {
+                // Track as proper MessagePart type, NOT dumped into text buffer.
+                // Key by partId for correct update semantics; fall back to url if partId is null.
+                ctx.activeAssistantImages[event.partId ?: event.url] = event
+                scheduleFlush()
+            }
+            // Events handled in the first when block (early return) — unreachable here.
+            is SseEvent.Ignored,
+            is SseEvent.MessageComplete,
+            is SseEvent.Plan,
+            is SseEvent.QuestionAsked,
+            is SseEvent.SessionCreated,
+            is SseEvent.TodoUpdated,
+            is SseEvent.UserMessage -> { /* already returned above */ }
         }
     }
 
@@ -461,46 +605,105 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
             emptyList()
         }
 
-        // 2. Build thinking part
+        // 2. Build thinking part with state transition
         val thinkingPart: MessagePart.Thinking? = if (ctx.thinkingBuffer.isNotEmpty()) {
-            MessagePart.Thinking(ctx.thinkingBuffer.toString())
+            val thinkingState = if (ctx.activeThinkingCompleted) PartState.Completed else PartState.Streaming
+            MessagePart.Thinking(ctx.thinkingBuffer.toString(), state = thinkingState)
         } else {
             null
         }
 
-        // 3. Assemble complete parts list in fixed rendering order
-        val parts = mutableListOf<MessagePart>()
+        // 3. Assemble complete parts map.
+        //    Insertion order here does NOT determine rendering order — the UI
+        //    (AssistantMessage composable) re-sorts by type. The map just needs
+        //    all parts present with unique keys.
+        //    All non-text-derived parts use generatePartId() as key to avoid collisions
+        //    (never use business data like patch.hash or agentName as map keys).
+        val parts = linkedMapOf<String, MessagePart>()
 
         // Thinking first
-        if (thinkingPart != null) parts.add(thinkingPart)
+        if (thinkingPart != null) parts[MessagePart.generatePartId()] = thinkingPart
 
         // Tool calls (insertion order via LinkedHashMap)
         ctx.toolCallPills.values.forEach { pill ->
-            parts.add(MessagePart.ToolCall(pill))
+            val partState = ctx.toolPartStates[pill.toolCallId] ?: PartState.Created
+            parts[pill.toolCallId] = MessagePart.ToolCall(pill = pill, state = partState)
         }
 
         // Text-derived parts (Text, Code, Table in segment order)
-        parts.addAll(textDerivedParts)
+        textDerivedParts.forEach { part ->
+            parts[MessagePart.generatePartId()] = part
+        }
 
         // File changes
         ctx.pendingFileChanges.forEach { change ->
-            parts.add(MessagePart.FileChange(change))
+            parts[MessagePart.generatePartId()] = MessagePart.FileChange(change)
+        }
+
+        // Patch parts (authoritative file change summary from server)
+        ctx.activePatches.forEach { patch ->
+            parts[MessagePart.generatePartId()] = MessagePart.Patch(hash = patch.hash, files = patch.files)
+        }
+
+        // Assistant-generated files
+        ctx.activeAssistantFiles.values.forEach { file ->
+            parts[MessagePart.generatePartId()] = MessagePart.AssistantFile(
+                mime = file.mime, url = file.url, filename = file.filename
+            )
+        }
+
+        // Assistant-generated images
+        ctx.activeAssistantImages.values.forEach { image ->
+            parts[MessagePart.generatePartId()] = MessagePart.Image(
+                mime = image.mime, url = image.url, filename = image.filename
+            )
+        }
+
+        // Agent badge
+        val agentName = ctx.activeAgentName
+        if (agentName != null) {
+            parts[MessagePart.generatePartId()] = MessagePart.Agent(name = agentName)
+        }
+
+        // Step finish
+        val stepFinish = ctx.activeStepFinish
+        if (stepFinish != null) {
+            parts[MessagePart.generatePartId()] = MessagePart.StepFinish(
+                snapshot = stepFinish.snapshot,
+                inputTokens = stepFinish.inputTokens,
+                outputTokens = stepFinish.outputTokens,
+                reasoningTokens = stepFinish.reasoningTokens,
+                totalCost = stepFinish.totalCost,
+            )
+        }
+
+        // Retry
+        val retry = ctx.activeRetry
+        if (retry != null) {
+            parts[MessagePart.generatePartId()] = MessagePart.Retry(attempt = retry.attempt, maxAttempts = retry.maxAttempts, error = retry.error)
+        }
+
+        // Compaction
+        val compaction = ctx.activeCompaction
+        if (compaction != null) {
+            parts[MessagePart.generatePartId()] = MessagePart.Compaction(summary = compaction.summary)
         }
 
         // Error
         if (ctx.errorMessage != null) {
-            parts.add(MessagePart.Error(ctx.errorMessage!!))
+            parts[MessagePart.generatePartId()] = MessagePart.Error(ctx.errorMessage!!)
         }
 
         // 4. Build updated ChatMessage preserving metadata from existing message
-        val existingIdx = messageIndex[msgId]
-        val existing = if (existingIdx != null) _messages.value.getOrNull(existingIdx) else null
+        val existing = _messages.value[msgId]
         val updatedMessage = ChatMessage(
             id = msgId,
             role = MessageRole.ASSISTANT,
             parts = parts,
             timestamp = existing?.timestamp ?: System.currentTimeMillis(),
             isStreaming = ctx.isStreaming,
+            // Preserve existing state — transitions are set explicitly by event handlers
+            state = existing?.state ?: MessageState.Streaming,
             attachedFiles = existing?.attachedFiles ?: emptyList(),
             modelID = existing?.modelID ?: ctx.modelID,
             providerID = existing?.providerID ?: ctx.providerID,
@@ -510,15 +713,13 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
             cacheReadTokens = existing?.cacheReadTokens ?: 0L,
             cacheWriteTokens = existing?.cacheWriteTokens ?: 0L,
             cost = existing?.cost ?: 0.0,
+            serverMessageId = existing?.serverMessageId,
         )
 
         // 5. Update _messages
-        val idx = messageIndex[msgId]
-        if (idx != null) {
-            val list = _messages.value.toMutableList()
-            list[idx] = updatedMessage
-            _messages.value = list
-        }
+        val updated = LinkedHashMap(_messages.value)
+        updated[msgId] = updatedMessage
+        _messages.value = updated
     }
 
     /** Convert a MarkdownSegment to a MessagePart. Returns null for blank segments. */
@@ -551,16 +752,19 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
 
     /** Update a message in _messages by ID. No-op if not found. */
     private fun updateMessage(messageId: String, transform: (ChatMessage) -> ChatMessage) {
-        val idx = messageIndex[messageId] ?: return
-        val list = _messages.value.toMutableList()
-        list[idx] = transform(list[idx])
-        _messages.value = list
+        val map = _messages.value
+        val existing = map[messageId] ?: return
+        val updated = LinkedHashMap(map)
+        updated[messageId] = transform(existing)
+        _messages.value = updated
     }
 
     /** Emit StreamingStarted signal exactly once per turn, on first content chunk arrival. */
     private fun emitStreamingStartedIfNeeded(msgId: String) {
         if (!ctx.streamingStartedEmitted) {
             ctx.streamingStartedEmitted = true
+            // Transition message state: Created → Streaming
+            updateMessage(msgId) { it.copy(state = MessageState.Streaming) }
             _signals.tryEmit(UiSignal.StreamingStarted(msgId))
         }
     }
