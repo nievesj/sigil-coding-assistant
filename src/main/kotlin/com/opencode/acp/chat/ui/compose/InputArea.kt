@@ -543,30 +543,31 @@ fun InputArea(
                 val cornerRadiusPx = with(density) { 12.dp.toPx() }
                 val glowPath = remember { androidx.compose.ui.graphics.Path() }
 
-                // Shift gradient stops based on rotation to animate the bright spot.
-                // Single bright spot with wide, smooth fade — avoids jumpy corners.
+                // Animated blue glow when LLM is streaming.
+                //
+                // The sweep gradient goes 0°→360° (right → clockwise).  We shift
+                // the color-stop positions each frame to orbit the bright spot.
+                // The peak is centred at 0.50 with wide transparent margins
+                // (0.00–0.35 and 0.65–1.00) so the shifted peak — which is only
+                // 0.30 wide — can never cross the 0/1 seam, no matter the offset.
                 val offset = rotation / 360f
                 val baseStops = floatArrayOf(
-                    0.00f, 0.10f, 0.18f, 0.22f, 0.25f, 0.28f, 0.32f, 0.40f, 1.00f
+                    0.00f, 0.35f, 0.42f, 0.46f, 0.50f, 0.54f, 0.58f, 0.65f, 1.00f
                 )
                 val baseColors = arrayOf(
                     Color.Transparent,                              // 0.00
-                    Color.Transparent,                              // 0.10
-                    Color(0xFF4A9EFF).copy(alpha = 0.15f),          // 0.18
-                    Color(0xFF4A9EFF).copy(alpha = 0.45f),          // 0.22
-                    Color(0xFF00D4FF).copy(alpha = 0.85f),          // 0.25  ← peak
-                    Color(0xFF4A9EFF).copy(alpha = 0.45f),          // 0.28
-                    Color(0xFF4A9EFF).copy(alpha = 0.15f),          // 0.32
-                    Color.Transparent,                              // 0.40
+                    Color.Transparent,                              // 0.35
+                    Color(0xFF4A9EFF).copy(alpha = 0.15f),          // 0.42
+                    Color(0xFF4A9EFF).copy(alpha = 0.45f),          // 0.46
+                    Color(0xFF00D4FF).copy(alpha = 0.85f),          // 0.50  ← peak
+                    Color(0xFF4A9EFF).copy(alpha = 0.45f),          // 0.54
+                    Color(0xFF4A9EFF).copy(alpha = 0.15f),          // 0.58
+                    Color.Transparent,                              // 0.65
                     Color.Transparent,                              // 1.00
                 )
                 val shiftedStops = FloatArray(baseStops.size) { i ->
-                    ((baseStops[i] + offset) % 1f)
+                    (baseStops[i] + offset) % 1f
                 }
-                val shiftedColors = Array(baseColors.size) { i ->
-                    baseColors[(i - 0 + baseColors.size) % baseColors.size]
-                }
-                // Re-sort by stop position to keep sweepGradient happy
                 val paired = shiftedStops.indices.map { shiftedStops[it] to baseColors[it] }
                 val sorted = paired.sortedBy { it.first }
 

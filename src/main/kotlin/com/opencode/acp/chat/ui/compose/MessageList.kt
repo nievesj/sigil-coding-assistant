@@ -64,6 +64,7 @@ import org.jetbrains.jewel.foundation.code.highlighting.NoOpCodeHighlighter
 import org.jetbrains.jewel.intui.markdown.bridge.ProvideMarkdownStyling
 import org.jetbrains.jewel.intui.markdown.bridge.styling.create
 import org.jetbrains.jewel.markdown.Markdown
+import org.jetbrains.jewel.markdown.MarkdownBlock
 import org.jetbrains.jewel.markdown.rendering.InlinesStyling
 import org.jetbrains.jewel.markdown.rendering.MarkdownStyling
 import org.jetbrains.jewel.markdown.processing.MarkdownProcessor
@@ -270,6 +271,11 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
                     list = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.create(
                         ordered = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.create(
                             numberStyle = TextStyle(color = listNumberColor, fontSize = 14.sp),
+                            numberFormatStyles = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles(
+                                firstLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                                secondLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                                thirdLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                            ),
                         ),
                     ),
                     blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
@@ -311,7 +317,16 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
                     segments.forEach { segment ->
                         when (segment.type) {
                             MarkdownSegment.Type.TEXT -> {
+                                // Pre-parse and clamp ordered list startFrom values.
+                                // All NumberFormatStyle implementations (Decimal, Roman,
+                                // Alphabetical) throw on number <= 0, so we fix the AST
+                                // before it reaches Jewel's DefaultMarkdownBlockRenderer.
+                                val parsedBlocks = remember(segment.content) {
+                                    val raw = markdownProcessor.processMarkdownDocument(segment.content)
+                                    clampOrderedLists(raw)
+                                }
                                 Markdown(
+                                    markdownBlocks = parsedBlocks,
                                     markdown = segment.content,
                                     modifier = Modifier.fillMaxWidth(),
                                     selectable = true,
@@ -577,6 +592,42 @@ private fun SubagentSessionBar(
             modifier = Modifier.weight(1f),
         )
     }
+}
+
+/**
+ * Clamp non-positive [MarkdownBlock.ListBlock.OrderedList.startFrom] values in a parsed
+ * markdown block tree.
+ *
+ * All of Jewel's [NumberFormatStyle] implementations (Decimal, Roman, Alphabetical)
+ * throw [IllegalArgumentException] for `number <= 0`. CommonMark allows `startFrom = 0`
+ * (e.g. `0. item`), and nested lists can produce surprising `startFrom` values.
+ * This function walks the block tree and replaces any [OrderedList] with
+ * `startFrom <= 0` with a fresh instance using `startFrom = 1`.
+ */
+private fun clampOrderedLists(blocks: List<MarkdownBlock>): List<MarkdownBlock> =
+    blocks.map { block -> clampBlock(block) }
+
+private fun clampBlock(block: MarkdownBlock): MarkdownBlock = when (block) {
+    is MarkdownBlock.ListBlock.OrderedList -> {
+        val fixedChildren = block.children.map { clampListItem(it) }
+        if (block.startFrom <= 0) {
+            MarkdownBlock.ListBlock.OrderedList(fixedChildren, block.isTight, 1, block.delimiter)
+        } else {
+            MarkdownBlock.ListBlock.OrderedList(fixedChildren, block.isTight, block.startFrom, block.delimiter)
+        }
+    }
+    is MarkdownBlock.ListBlock.UnorderedList -> {
+        val fixedChildren = block.children.map { clampListItem(it) }
+        MarkdownBlock.ListBlock.UnorderedList(fixedChildren, block.isTight, block.marker)
+    }
+    is MarkdownBlock.ListItem -> clampListItem(block)
+    is MarkdownBlock.BlockQuote -> MarkdownBlock.BlockQuote(block.children.map { clampBlock(it) })
+    else -> block
+}
+
+private fun clampListItem(item: MarkdownBlock.ListItem): MarkdownBlock.ListItem {
+    val fixedChildren = item.children.map { clampBlock(it) }
+    return MarkdownBlock.ListItem(fixedChildren, item.level)
 }
 
 private fun parseColorOrDefault(hex: String, defaultColor: Color): Color {
