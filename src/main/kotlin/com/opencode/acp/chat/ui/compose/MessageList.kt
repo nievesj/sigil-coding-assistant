@@ -9,6 +9,7 @@ import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
+
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -36,6 +38,8 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.snapshotFlow
+
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -56,6 +60,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.application.ApplicationManager
@@ -85,6 +90,7 @@ import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.VerticalScrollbar
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
+import io.github.oshai.kotlinlogging.KotlinLogging
 
 @Composable
 fun MessageList(
@@ -96,66 +102,119 @@ fun MessageList(
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val logger = KotlinLogging.logger {}
 
-    // isDragged is ONLY true during an active user drag — NOT during flings or programmatic scrolls
+    // Scroll to the very bottom of the list.
+    // scrollToItem(index) puts the item at the TOP of the viewport.
+    // scrollToItem(index, scrollOffset) puts it at top + offset pixels down.
+    // Using a large scrollOffset pushes the item UP so its BOTTOM edge is visible.
+    suspend fun scrollToEnd() {
+        if (messages.isEmpty()) return
+        logger.info { "[ACP] scrollToEnd: messages.size=${messages.size}, firstVisibleItemIndex=${listState.firstVisibleItemIndex}, canScrollForward=${listState.canScrollForward}" }
+        // Scroll to last item with max offset — this puts the end of the content at the bottom of viewport
+        listState.scrollToItem(messages.size - 1, Int.MAX_VALUE)
+        logger.info { "[ACP] scrollToEnd: DONE — canScrollForward=${listState.canScrollForward}, firstVisibleItemIndex=${listState.firstVisibleItemIndex}" }
+    }
+
+    // Auto-scroll state: starts ON, stays ON until user manually scrolls up.
+    // Only re-enabled by clicking the jump-to-bottom button.
+    var autoScrollEnabled by remember { mutableStateOf(true) }
+
+    // Detect user drag — disable auto-scroll
     val isDragged by listState.interactionSource.collectIsDraggedAsState()
 
-    // Is the list at the bottom? With reverseLayout=true, index 0 + offset 0 = absolute bottom
-    val isAtBottom by remember {
+    // Track previous firstVisibleItemIndex to detect wheel/scrollbar scroll direction
+    var prevFirstVisibleIndex by remember { mutableStateOf(0) }
+
+    // Detect any user scroll that moves toward older messages (up):
+    // - Drag: isDragged && canScrollBackward means user dragged up
+    // - Wheel/scrollbar: firstVisibleItemIndex decreased
+    LaunchedEffect(Unit) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .collect { currentIndex ->
+                if (currentIndex < prevFirstVisibleIndex && !isDragged) {
+                    // Index decreased = user scrolled toward older messages via wheel/scrollbar
+                    if (autoScrollEnabled) {
+                        autoScrollEnabled = false
+                        logger.info { "[ACP] User scrolled up (wheel/scrollbar) — autoScrollEnabled=false, index $prevFirstVisibleIndex -> $currentIndex" }
+                    }
+                }
+                prevFirstVisibleIndex = currentIndex
+            }
+    }
+
+    LaunchedEffect(isDragged) {
+        if (isDragged && listState.canScrollBackward && autoScrollEnabled) {
+            autoScrollEnabled = false
+            logger.info { "[ACP] User dragged up — autoScrollEnabled=false" }
+        }
+    }
+
+    // Auto-scroll: when enabled, scroll to bottom whenever content extends below viewport.
+    // This handles both new messages AND streaming content growth.
+    LaunchedEffect(autoScrollEnabled) {
+        if (!autoScrollEnabled) return@LaunchedEffect
+        snapshotFlow { listState.canScrollForward }
+            .collect { canForward ->
+                if (canForward && autoScrollEnabled) {
+                    scrollToEnd()
+                }
+            }
+    }
+
+    // Also scroll on new messages when auto-scroll is enabled
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty() && autoScrollEnabled) {
+            scrollToEnd()
+        }
+    }
+
+    // On initial load, always scroll to bottom
+    LaunchedEffect(Unit) {
+        if (messages.isNotEmpty()) {
+            snapshotFlow { listState.layoutInfo.totalItemsCount }
+                .first { it > 0 }
+            scrollToEnd()
+        }
+    }
+
+    // Show jump button when auto-scroll is disabled and there's content below
+    val showJumpButton by remember {
         derivedStateOf {
-            listState.firstVisibleItemIndex == 0 &&
-                listState.firstVisibleItemScrollOffset < 5
+            !autoScrollEnabled && listState.canScrollForward
         }
     }
 
-    // Auto-scroll state: true by default, disabled when user drags up, re-enabled when user returns to bottom
-    var autoScroll by remember { mutableStateOf(true) }
-
-    // Detect user scroll intent: drag away from bottom → disable; return to bottom → re-enable
-    LaunchedEffect(isDragged, isAtBottom) {
-        when {
-            isAtBottom && !isDragged -> autoScroll = true
-            isDragged && !isAtBottom -> autoScroll = false
-        }
-    }
-
-    // Auto-scroll on new messages (instant, no animation — avoids feedback loop)
-    LaunchedEffect(autoScroll, messages.size) {
-        if (messages.isNotEmpty() && autoScroll) {
-            listState.scrollToItem(0)
-        }
-    }
-
-    // Jump button alpha
     val jumpButtonAlpha by animateFloatAsState(
-        targetValue = if (!autoScroll && !isAtBottom) 1f else 0f,
+        targetValue = if (showJumpButton) 1f else 0f,
         label = "jumpButtonAlpha"
     )
 
     Box(modifier = modifier) {
         SelectionContainer {
-            Box(Modifier.fillMaxSize()) {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.padding(end = 12.dp, start = 8.dp, top = 8.dp, bottom = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                    reverseLayout = true,
-                ) {
-                    items(
-                        count = messages.size,
-                        key = { index -> messages[messages.size - 1 - index].id }
-                    ) { index ->
-                        MessageItem(messages[messages.size - 1 - index], project, onSubagentClick, onImagePreview)
-                    }
+            // Arrangement.Bottom anchors items to the BOTTOM of the viewport.
+            // fillMaxSize() is CRITICAL — without it, the LazyColumn wraps content
+            // height and Arrangement.Bottom has no effect.
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(end = 12.dp, start = 8.dp, top = 8.dp, bottom = 8.dp),
+                verticalArrangement = Arrangement.Bottom,
+            ) {
+                items(
+                    count = messages.size,
+                    key = { index -> messages[index].id }
+                ) { index ->
+                    MessageItem(messages[index], project, onSubagentClick, onImagePreview)
                 }
-
-                // Scrollbar INSIDE SelectionContainer so it receives pointer events
-                VerticalScrollbar(
-                    modifier = Modifier.align(Alignment.TopEnd).fillMaxHeight(),
-                    scrollState = listState,
-                )
             }
         }
+
+        // Scrollbar OUTSIDE SelectionContainer — SelectionContainer consumes pointer events,
+        // so the scrollbar must be a sibling, not a child.
+        VerticalScrollbar(
+            modifier = Modifier.align(Alignment.TopEnd).fillMaxHeight(),
+            scrollState = listState,
+        )
 
         // Jump to bottom button
         if (jumpButtonAlpha > 0f) {
@@ -175,9 +234,9 @@ fun MessageList(
                         shape = CircleShape
                     )
                     .clickable {
-                        autoScroll = true
+                        autoScrollEnabled = true
                         scope.launch {
-                            listState.animateScrollToItem(0)
+                            scrollToEnd()
                         }
                     },
                 contentAlignment = Alignment.Center
