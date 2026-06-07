@@ -130,9 +130,9 @@ class OpenCodeService(private val project: Project) : Disposable {
      * Initialize the connection and load sessions.
      * Called once when the service is first accessed.
      */
-    suspend fun initialize(): Boolean {
-        logger.info { "[ACP] OpenCodeService.initialize: START" }
-        val connected = connectionManager.initialize()
+    suspend fun initialize(projectBasePath: String = "."): Boolean {
+        logger.info { "[ACP] OpenCodeService.initialize: START (projectBasePath=$projectBasePath)" }
+        val connected = connectionManager.initialize(projectBasePath)
         if (!connected) {
             logger.warn { "[ACP] OpenCodeService.initialize: connectionManager.initialize() returned false" }
             return false

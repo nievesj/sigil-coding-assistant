@@ -133,7 +133,7 @@ class ChatViewModel(
     // --- Initialization ---
 
     suspend fun initialize(projectBasePath: String) {
-        val success = service.initialize()
+        val success = service.initialize(projectBasePath)
         if (!success) {
             logger.warn { "Service initialization failed" }
             return

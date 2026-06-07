@@ -16,6 +16,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -337,6 +338,10 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
             else -> { /* handled below */ }
         }
 
+        // Cancel any pending debounced Stop — a new event means streaming continues
+        ctx.pendingStopJob?.cancel()
+        ctx.pendingStopJob = null
+
         val msgId = ctx.activeMessageId
         if (msgId == null) {
             logger.info { "[ACP] processEvent DROP: ${event::class.simpleName} — activeMessageId is null" }
@@ -561,9 +566,23 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                     logger.info { "[ACP] processEvent Stop (tool-calls): intermediate — continuing stream" }
                     // Don't stop streaming — more events will follow
                 } else {
-                    ctx.isStreaming = false
-                    updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
-                    emitStreamingCompleted(msgId)
+                    // Debounce: delay finalization to allow intermediate stops.
+                    // The server sends Stop(reason=stop) between agent steps (e.g., after
+                    // text response, before tool call, before next text response).
+                    // If a new event arrives during the delay, cancel the finalization.
+                    val capturedMsgId = msgId
+                    ctx.pendingStopJob?.cancel()
+                    ctx.pendingStopJob = scope.launch {
+                        delay(300)
+                        // No new events arrived — this is the final stop
+                        stateLock.withLock {
+                            if (!ctx.isStreaming) return@withLock
+                            ctx.isStreaming = false
+                            updateMessage(capturedMsgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
+                            emitStreamingCompleted(capturedMsgId)
+                        }
+                    }
+                    logger.info { "[ACP] processEvent Stop (reason=${event.stopReason}): debounced finalization (300ms)" }
                 }
             }
 

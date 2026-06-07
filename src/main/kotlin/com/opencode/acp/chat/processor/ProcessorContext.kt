@@ -4,6 +4,7 @@ import com.opencode.acp.SseEvent
 import com.opencode.acp.chat.model.ChatFileChange
 import com.opencode.acp.chat.model.PartState
 import com.opencode.acp.chat.model.ToolCallPill
+import kotlinx.coroutines.Job
 
 /**
  * Mutable accumulation state for a single streaming turn.
@@ -57,6 +58,8 @@ class ProcessorContext {
     var isStreaming: Boolean = false
     var modelID: String? = null
     var providerID: String? = null
+    /** Pending job for debounced Stop finalization. Cancelled if a new event arrives. */
+    var pendingStopJob: Job? = null
 
     // ── Per-event state (added directly to parts map via updateMessage) ────
     val activePatches: MutableList<SseEvent.Patch> = mutableListOf()
@@ -87,6 +90,8 @@ class ProcessorContext {
         isStreaming = false
         modelID = null
         providerID = null
+        pendingStopJob?.cancel()
+        pendingStopJob = null
         activePatches.clear()
         activeAgentName = null
         activeRetry = null

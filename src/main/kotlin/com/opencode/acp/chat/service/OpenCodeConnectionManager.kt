@@ -24,6 +24,8 @@ import kotlinx.serialization.json.Json
  */
 class OpenCodeConnectionManager(private val scope: CoroutineScope) {
 
+    private var projectBasePath: String = "."
+
     private val logger = KotlinLogging.logger {}
 
     // --- Connection state ---
@@ -85,7 +87,8 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
      *
      * @return true if connection succeeded, false on fatal error (binary not found, timeout)
      */
-    suspend fun initialize(): Boolean {
+    suspend fun initialize(projectBasePath: String = "."): Boolean {
+        this.projectBasePath = projectBasePath
         if (initialized) {
             logger.info { "Already initialized — skipping" }
             return true
@@ -320,8 +323,9 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         }
 
         try {
-            logger.info { "Launching: $binaryPath serve --hostname $host --port $port" }
+            logger.info { "Launching: $binaryPath serve --hostname $host --port $port (cwd=$projectBasePath)" }
             val pb = ProcessBuilder(binaryPath, "serve", "--hostname", host, "--port", port.toString())
+                .directory(java.io.File(projectBasePath))
                 .redirectErrorStream(true)
                 .apply {
                     environment().putIfAbsent("OPENCODE_CLIENT", "cli")

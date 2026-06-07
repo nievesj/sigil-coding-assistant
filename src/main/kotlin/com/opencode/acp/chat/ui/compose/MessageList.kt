@@ -90,7 +90,6 @@ import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.VerticalScrollbar
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
-import io.github.oshai.kotlinlogging.KotlinLogging
 
 @Composable
 fun MessageList(
@@ -102,18 +101,10 @@ fun MessageList(
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    val logger = KotlinLogging.logger {}
 
-    // Scroll to the very bottom of the list.
-    // scrollToItem(index) puts the item at the TOP of the viewport.
-    // scrollToItem(index, scrollOffset) puts it at top + offset pixels down.
-    // Using a large scrollOffset pushes the item UP so its BOTTOM edge is visible.
     suspend fun scrollToEnd() {
         if (messages.isEmpty()) return
-        logger.info { "[ACP] scrollToEnd: messages.size=${messages.size}, firstVisibleItemIndex=${listState.firstVisibleItemIndex}, canScrollForward=${listState.canScrollForward}" }
-        // Scroll to last item with max offset — this puts the end of the content at the bottom of viewport
         listState.scrollToItem(messages.size - 1, Int.MAX_VALUE)
-        logger.info { "[ACP] scrollToEnd: DONE — canScrollForward=${listState.canScrollForward}, firstVisibleItemIndex=${listState.firstVisibleItemIndex}" }
     }
 
     // Auto-scroll state: starts ON, stays ON until user manually scrolls up.
@@ -133,10 +124,8 @@ fun MessageList(
         snapshotFlow { listState.firstVisibleItemIndex }
             .collect { currentIndex ->
                 if (currentIndex < prevFirstVisibleIndex && !isDragged) {
-                    // Index decreased = user scrolled toward older messages via wheel/scrollbar
                     if (autoScrollEnabled) {
                         autoScrollEnabled = false
-                        logger.info { "[ACP] User scrolled up (wheel/scrollbar) — autoScrollEnabled=false, index $prevFirstVisibleIndex -> $currentIndex" }
                     }
                 }
                 prevFirstVisibleIndex = currentIndex
@@ -146,7 +135,6 @@ fun MessageList(
     LaunchedEffect(isDragged) {
         if (isDragged && listState.canScrollBackward && autoScrollEnabled) {
             autoScrollEnabled = false
-            logger.info { "[ACP] User dragged up — autoScrollEnabled=false" }
         }
     }
 
