@@ -2,14 +2,13 @@
 
 package com.opencode.acp.chat.ui.compose
 
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,14 +20,23 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.foundation.layout.PaddingValues
@@ -48,7 +56,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.intellij.icons.AllIcons
+import kotlinx.coroutines.launch
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -62,7 +70,6 @@ import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.SubagentRef
 import com.opencode.acp.chat.model.SubagentStatus
 import com.opencode.acp.chat.processor.MessageProcessorManager
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.foundation.code.highlighting.NoOpCodeHighlighter
@@ -75,7 +82,8 @@ import org.jetbrains.jewel.markdown.rendering.MarkdownStyling
 import org.jetbrains.jewel.markdown.processing.MarkdownProcessor
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.component.VerticalScrollbar
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 
 @Composable
@@ -87,25 +95,100 @@ fun MessageList(
     onImagePreview: ((String) -> Unit)? = null,
 ) {
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
 
-    // Auto-scroll to bottom when new messages arrive
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(0)
+    // isDragged is ONLY true during an active user drag — NOT during flings or programmatic scrolls
+    val isDragged by listState.interactionSource.collectIsDraggedAsState()
+
+    // Is the list at the bottom? With reverseLayout=true, index 0 + offset 0 = absolute bottom
+    val isAtBottom by remember {
+        derivedStateOf {
+            listState.firstVisibleItemIndex == 0 &&
+                listState.firstVisibleItemScrollOffset < 5
         }
     }
 
-    LazyColumn(
-        state = listState,
-        modifier = modifier.padding(8.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-        reverseLayout = true,
-    ) {
-        items(
-            count = messages.size,
-            key = { index -> messages[messages.size - 1 - index].id }
-        ) { index ->
-            MessageItem(messages[messages.size - 1 - index], project, onSubagentClick, onImagePreview)
+    // Auto-scroll state: true by default, disabled when user drags up, re-enabled when user returns to bottom
+    var autoScroll by remember { mutableStateOf(true) }
+
+    // Detect user scroll intent: drag away from bottom → disable; return to bottom → re-enable
+    LaunchedEffect(isDragged, isAtBottom) {
+        when {
+            isAtBottom && !isDragged -> autoScroll = true
+            isDragged && !isAtBottom -> autoScroll = false
+        }
+    }
+
+    // Auto-scroll on new messages (instant, no animation — avoids feedback loop)
+    LaunchedEffect(autoScroll, messages.size) {
+        if (messages.isNotEmpty() && autoScroll) {
+            listState.scrollToItem(0)
+        }
+    }
+
+    // Jump button alpha
+    val jumpButtonAlpha by animateFloatAsState(
+        targetValue = if (!autoScroll && !isAtBottom) 1f else 0f,
+        label = "jumpButtonAlpha"
+    )
+
+    Box(modifier = modifier) {
+        SelectionContainer {
+            Box(Modifier.fillMaxSize()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.padding(end = 12.dp, start = 8.dp, top = 8.dp, bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    reverseLayout = true,
+                ) {
+                    items(
+                        count = messages.size,
+                        key = { index -> messages[messages.size - 1 - index].id }
+                    ) { index ->
+                        MessageItem(messages[messages.size - 1 - index], project, onSubagentClick, onImagePreview)
+                    }
+                }
+
+                // Scrollbar INSIDE SelectionContainer so it receives pointer events
+                VerticalScrollbar(
+                    modifier = Modifier.align(Alignment.TopEnd).fillMaxHeight(),
+                    scrollState = listState,
+                )
+            }
+        }
+
+        // Jump to bottom button
+        if (jumpButtonAlpha > 0f) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 16.dp, bottom = 16.dp)
+                    .graphicsLayer { alpha = jumpButtonAlpha }
+                    .size(36.dp)
+                    .background(
+                        color = Color(0xFF3E3E3E).copy(alpha = 0.9f),
+                        shape = CircleShape
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = Color(0xFF5E5E5E),
+                        shape = CircleShape
+                    )
+                    .clickable {
+                        autoScroll = true
+                        scope.launch {
+                            listState.animateScrollToItem(0)
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    key = AllIconsKeys.General.ChevronDown,
+                    contentDescription = "Jump to bottom",
+                    modifier = Modifier.size(16.dp),
+                    tint = Color(0xFFCCCCCC)
+                )
+            }
         }
     }
 }
@@ -178,48 +261,203 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
 
 @Composable
 fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentClick: ((String) -> Unit)? = null) {
-    // Streaming fade-in: text starts at reduced alpha and smoothly transitions to full when complete
-    val streamingAlpha by animateFloatAsState(
-        targetValue = if (message.isStreaming) 0.6f else 1f,
-        animationSpec = tween(durationMillis = 300),
-        label = "streamingAlpha",
-    )
+     val streamingAlpha = if (message.isStreaming) 0.85f else 1f
 
-    // Extract parts by type for rendering in fixed order
-    val thinkingParts = message.parts.values.filterIsInstance<MessagePart.Thinking>()
-    val toolCallParts = message.parts.values.filterIsInstance<MessagePart.ToolCall>()
-    val textParts = message.parts.values.filter { it is MessagePart.Text || it is MessagePart.Code || it is MessagePart.Table }
-    val fileChangeParts = message.parts.values.filterIsInstance<MessagePart.FileChange>()
-    val subagentParts = message.parts.values.filterIsInstance<MessagePart.Subagent>()
-    val errorParts = message.parts.values.filterIsInstance<MessagePart.Error>()
-    val patchParts = message.parts.values.filterIsInstance<MessagePart.Patch>()
-    val agentParts = message.parts.values.filterIsInstance<MessagePart.Agent>()
-    val stepFinishParts = message.parts.values.filterIsInstance<MessagePart.StepFinish>()
-    val retryParts = message.parts.values.filterIsInstance<MessagePart.Retry>()
-    val compactionParts = message.parts.values.filterIsInstance<MessagePart.Compaction>()
-    val assistantFileParts = message.parts.values.filterIsInstance<MessagePart.AssistantFile>()
-    val assistantImageParts = message.parts.values.filterIsInstance<MessagePart.Image>()
+     // Set up markdown styling once for the entire message (needed by Text and Code parts)
+     val currentProject = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+     val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
+     val defaultGreen = Color(0xFF6BBE50)
+     val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
+     val listNumberColor = parseColorOrDefault(settings.listNumberColor, defaultGreen)
+     val customInlinesStyling = remember(inlineCodeColor) {
+         val linkColor = Color(0xFF3574F0)
+         InlinesStyling.create(
+             inlineCode = SpanStyle(color = inlineCodeColor, background = Color.Transparent, fontFamily = FontFamily.Monospace),
+             link = SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline),
+             linkHovered = SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline),
+         )
+     }
+     val markdownStyling = remember(customInlinesStyling, listNumberColor) {
+         val baseTextStyle = org.jetbrains.jewel.bridge.theme.retrieveDefaultTextStyle()
+         MarkdownStyling.create(
+             inlinesStyling = customInlinesStyling,
+             heading = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.create(
+                 h1 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H1.create(inlinesStyling = customInlinesStyling),
+                 h2 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H2.create(inlinesStyling = customInlinesStyling),
+                 h3 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H3.create(inlinesStyling = customInlinesStyling),
+                 h4 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H4.create(inlinesStyling = customInlinesStyling),
+                 h5 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H5.create(inlinesStyling = customInlinesStyling),
+                 h6 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H6.create(inlinesStyling = customInlinesStyling),
+             ),
+             list = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.create(
+                 ordered = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.create(
+                     numberStyle = TextStyle(color = listNumberColor, fontSize = 14.sp),
+                     numberFormatStyles = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles(
+                         firstLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                         secondLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                         thirdLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
+                     ),
+                 ),
+             ),
+             blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
+                 padding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                 lineWidth = 3.dp,
+                 lineColor = Color(0xFF3E3E3E),
+                 textColor = Color(0xFF9E9E9E),
+             ),
+         )
+     }
+     val markdownProcessor = remember { MarkdownProcessor() }
+     val codeHighlighter = remember(currentProject) {
+         currentProject?.let {
+             try { org.jetbrains.jewel.bridge.code.highlighting.CodeHighlighterFactory.getInstance(it).createHighlighter() }
+             catch (_: Exception) { NoOpCodeHighlighter }
+         } ?: NoOpCodeHighlighter
+     }
 
-    Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
-        // Rendering order: Thinking → ToolCall → Agent → Text → Patch → File/Image → FileChange → Subagent → StepFinish → Retry → Compaction → Error
-        thinkingParts.forEach { ThinkingPill(it.content) }
-        toolCallParts.forEach { key(it.pill.toolCallId) { ToolPill(it.pill) } }
-        agentParts.forEach { AgentBadge(it.name) }
-        RenderTextContent(textParts, project)
-        // Show thinking indicator when streaming with no content yet
-        if (message.isStreaming && textParts.isEmpty() && thinkingParts.isEmpty() && toolCallParts.isEmpty()) {
-            ThinkingIndicator()
-        }
-        RenderPatchCards(patchParts)
-        RenderAssistantFileCards(assistantFileParts)
-        RenderAssistantImageCards(assistantImageParts)
-        RenderFileChanges(fileChangeParts, project)
-        RenderSubagentSessions(subagentParts, onSubagentClick)
-        stepFinishParts.forEach { StepFinishPill(it) }
-        retryParts.forEach { RetryPill(it.attempt, it.maxAttempts, it.error) }
-        compactionParts.forEach { CompactionPill(it.summary) }
-        RenderErrorParts(errorParts)
-    }
+     ProvideMarkdownStyling(
+         markdownStyling = markdownStyling,
+         markdownProcessor = markdownProcessor,
+         codeHighlighter = codeHighlighter,
+     ) {
+         Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
+             // Render parts in LinkedHashMap insertion order — the order events arrived.
+             var hasThinking = false
+             var hasToolCall = false
+             for ((key, part) in message.parts) {
+                 when (part) {
+                       is MessagePart.Thinking -> {
+                          hasThinking = true
+                          key(key) {
+                              val segments = remember(part.content) {
+                                  MarkdownSegmenter.segmentHealed(part.content)
+                              }
+                              Column(
+                                  modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
+                                      .graphicsLayer { alpha = 0.55f }
+                              ) {
+                                  segments.forEach { segment ->
+                                      when (segment.type) {
+                                          MarkdownSegment.Type.TEXT -> {
+                                              if (segment.content.isNotBlank()) {
+                                                  val parsedBlocks = remember(segment.content) {
+                                                      val raw = markdownProcessor.processMarkdownDocument(segment.content)
+                                                      clampOrderedLists(raw)
+                                                  }
+                                                  Markdown(
+                                                      markdownBlocks = parsedBlocks,
+                                                      markdown = segment.content,
+                                                      modifier = Modifier.fillMaxWidth(),
+                                                      selectable = true,
+                                                      onUrlClick = { url -> BrowserUtil.open(url) },
+                                                  )
+                                              }
+                                          }
+                                          MarkdownSegment.Type.CODE -> {
+                                              if (segment.content.isNotBlank()) {
+                                                  ChatFencedCodeBlock(
+                                                      content = segment.content,
+                                                      language = segment.language ?: "",
+                                                  )
+                                              }
+                                          }
+                                          MarkdownSegment.Type.TABLE -> {
+                                              val parsed = MarkdownSegmenter.parseTable(segment.content.lines())
+                                              if (parsed != null) {
+                                                  ChatTable(
+                                                      rawMarkdown = segment.content,
+                                                      modifier = Modifier.fillMaxWidth(),
+                                                  )
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                     is MessagePart.ToolCall -> {
+                         hasToolCall = true
+                         key(key) { ToolPill(part.pill) }
+                     }
+                     is MessagePart.Text -> {
+                         key(key) {
+                             val parsedBlocks = remember(part.content) {
+                                 val raw = markdownProcessor.processMarkdownDocument(part.content)
+                                 clampOrderedLists(raw)
+                             }
+                             Markdown(
+                                 markdownBlocks = parsedBlocks,
+                                 markdown = part.content,
+                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                                 selectable = true,
+                                 onUrlClick = { url -> BrowserUtil.open(url) },
+                             )
+                         }
+                     }
+                     is MessagePart.Code -> key(key) { ChatFencedCodeBlock(content = part.content, language = part.language) }
+                     is MessagePart.Table -> key(key) { ChatTable(rawMarkdown = part.rawMarkdown, modifier = Modifier.fillMaxWidth()) }
+                     is MessagePart.Patch -> key(key) {
+                         Column(
+                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp).fillMaxWidth()
+                                 .background(color = Color(0xFF2D2D2D), shape = RoundedCornerShape(8.dp)).padding(8.dp),
+                             verticalArrangement = Arrangement.spacedBy(4.dp),
+                              ) {
+                              Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                  Icon(key = AllIconsKeys.Nodes.Folder, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFF9E9E9E))
+                                  Text(text = "${part.files.size} changed file${if (part.files.size != 1) "s" else ""}", style = TextStyle(fontSize = 12.sp, color = Color(0xFF9E9E9E), fontWeight = FontWeight.Medium))
+                              }
+                             part.files.forEach { filePath ->
+                                 Text(text = "  ${filePath.substringAfterLast('/')}", style = TextStyle(fontSize = 11.sp, color = Color(0xFFBBBBBB)))
+                             }
+                         }
+                     }
+                     is MessagePart.Agent -> key(key) { AgentBadge(part.name) }
+                     is MessagePart.StepFinish -> key(key) { StepFinishPill(part) }
+                     is MessagePart.Retry -> key(key) { RetryPill(part.attempt, part.maxAttempts, part.error) }
+                     is MessagePart.Compaction -> key(key) { CompactionPill(part.summary) }
+                     is MessagePart.FileChange -> key(key) { FileChangeCard(change = part.change, project = project, addedColor = Color(0xFF7EE787), deletedColor = Color(0xFFFF7B72), pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)) }
+                     is MessagePart.Subagent -> key(key) { SubagentSessionBar(ref = part.ref, onClick = { onSubagentClick?.invoke(it) }) }
+                     is MessagePart.AssistantFile -> key(key) {
+                         Row(
+                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp).fillMaxWidth()
+                                 .background(color = Color(0xFF2D2D2D), shape = RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 6.dp),
+                             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
+                          ) {
+                              Icon(key = AllIconsKeys.FileTypes.Text, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFBBBBBB))
+                              Column {
+                                 Text(text = part.filename ?: "file", style = TextStyle(fontSize = 12.sp, color = Color(0xFFBBBBBB), fontWeight = FontWeight.Medium))
+                                 Text(text = part.mime, style = TextStyle(fontSize = 10.sp, color = Color(0xFF7E7E7E)))
+                             }
+                         }
+                     }
+                     is MessagePart.Image -> key(key) {
+                         Row(
+                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp).fillMaxWidth()
+                                 .background(color = Color(0xFF2D2D2D), shape = RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 6.dp),
+                             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
+                          ) {
+                              Icon(key = AllIconsKeys.FileTypes.Image, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFBBBBBB))
+                              Column {
+                                 Text(text = part.filename ?: "image", style = TextStyle(fontSize = 12.sp, color = Color(0xFFBBBBBB), fontWeight = FontWeight.Medium))
+                                 Text(text = part.mime, style = TextStyle(fontSize = 10.sp, color = Color(0xFF7E7E7E)))
+                             }
+                         }
+                     }
+                     is MessagePart.Error -> key(key) {
+                         val errorText = buildAnnotatedString {
+                             withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("Error: ") }
+                             append(part.message)
+                         }
+                         Text(text = errorText, color = Color(0xFFFF7B72), modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
+                     }
+                 }
+             }
+             // Show thinking indicator when streaming with no content yet
+             if (message.isStreaming && !hasThinking && !hasToolCall && message.parts.values.none { it is MessagePart.Text || it is MessagePart.Code || it is MessagePart.Table }) {
+                 ThinkingIndicator()
+             }
+         }
+     }
 }
 
 // ── Helper Composables for AssistantMessage ──────────────────────────────────
@@ -430,15 +668,18 @@ private fun RenderPatchCards(patchParts: List<MessagePart.Patch>) {
                 )
                 .padding(8.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            Text(
-                text = "📄 ${patch.files.size} changed file${if (patch.files.size != 1) "s" else ""}",
-                style = TextStyle(
-                    fontSize = 12.sp,
-                    color = Color(0xFF9E9E9E),
-                    fontWeight = FontWeight.Medium,
-                ),
-            )
+            ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Icon(key = AllIconsKeys.Nodes.Folder, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFF9E9E9E))
+                Text(
+                    text = "${patch.files.size} changed file${if (patch.files.size != 1) "s" else ""}",
+                    style = TextStyle(
+                        fontSize = 12.sp,
+                        color = Color(0xFF9E9E9E),
+                        fontWeight = FontWeight.Medium,
+                    ),
+                )
+            }
             patch.files.forEach { filePath ->
                 val fileName = filePath.substringAfterLast('/')
                 Text(
@@ -538,10 +779,7 @@ private fun RenderAssistantFileCards(parts: List<MessagePart.AssistantFile>) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text(
-                text = "📎",
-                style = TextStyle(fontSize = 12.sp),
-            )
+            Icon(key = AllIconsKeys.FileTypes.Text, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFBBBBBB))
             Column {
                 Text(
                     text = file.filename ?: "file",
@@ -579,10 +817,7 @@ private fun RenderAssistantImageCards(parts: List<MessagePart.Image>) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text(
-                text = "🖼️",
-                style = TextStyle(fontSize = 12.sp),
-            )
+            Icon(key = AllIconsKeys.FileTypes.Image, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFBBBBBB))
             Column {
                 Text(
                     text = image.filename ?: "image",
@@ -616,13 +851,16 @@ private fun CompactionPill(summary: String?) {
             .padding(horizontal = 6.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = "📎 Context compacted${if (summary != null) " — $summary" else ""}",
-            style = TextStyle(
-                fontSize = 11.sp,
-                color = Color(0xFF7EBF7E),
-            ),
-        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Icon(key = AllIconsKeys.General.BalloonInformation, contentDescription = null, modifier = Modifier.size(12.dp), tint = Color(0xFF7EBF7E))
+            Text(
+                text = "Context compacted${if (summary != null) " — $summary" else ""}",
+                style = TextStyle(
+                    fontSize = 11.sp,
+                    color = Color(0xFF7EBF7E),
+                ),
+            )
+        }
     }
 }
 
@@ -684,28 +922,7 @@ private fun FileChangeCard(
 
     // Resolve file type icon
     val fileIconKey = remember(change.fileName) {
-        val ext = change.fileName.substringAfterLast('.', "").lowercase()
-        val icon = when (ext) {
-            "kt", "kts" -> AllIcons.Language.Kotlin
-            "java" -> AllIcons.FileTypes.Java
-            "xml" -> AllIcons.FileTypes.Xml
-            "json" -> AllIcons.FileTypes.Json
-            "yaml", "yml" -> AllIcons.FileTypes.Yaml
-            "md", "txt", "properties", "gitignore" -> AllIcons.FileTypes.Text
-            "js", "jsx", "ts", "tsx" -> AllIcons.FileTypes.JavaScript
-            "css" -> AllIcons.FileTypes.Css
-            "html", "htm" -> AllIcons.FileTypes.Html
-            "py" -> AllIcons.Language.Python
-            "rb" -> AllIcons.Language.Ruby
-            "rs" -> AllIcons.Language.Rust
-            "go" -> AllIcons.Language.GO
-            "scala" -> AllIcons.Language.Scala
-            "php" -> AllIcons.Language.Php
-            "gradle", "gradle.kts" -> AllIcons.Nodes.Folder
-            "svg", "png", "jpg", "jpeg", "gif", "bmp", "webp" -> AllIcons.FileTypes.Image
-            else -> AllIcons.FileTypes.Text
-        }
-        IntelliJIconKey.fromPlatformIcon(icon)
+        getFileTypeIcon(change.fileName)
     }
 
     // Resolve virtual file for diff/open actions
@@ -784,7 +1001,7 @@ private fun FileChangeCard(
         if (virtualFile != null) {
             Spacer(Modifier.width(8.dp))
             Icon(
-                key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Locate),
+                key = AllIconsKeys.General.Locate,
                 contentDescription = "Open file",
                 modifier = Modifier
                     .size(18.dp)

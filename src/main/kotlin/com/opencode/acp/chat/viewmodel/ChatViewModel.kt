@@ -73,6 +73,19 @@ class ChatViewModel(
     // --- Init ---
 
     init {
+        // Log message count changes for diagnostics
+        scope.launch {
+            service.messages.collect { msgMap ->
+                if (msgMap.isNotEmpty()) {
+                    val userCount = msgMap.values.count { it.role == MessageRole.USER }
+                    val assistantCount = msgMap.values.count { it.role == MessageRole.ASSISTANT }
+                    logger.info { "[ACP] VM messages snapshot: ${msgMap.size} total (${userCount} user, $assistantCount assistant), ids=${msgMap.keys.toList().takeLast(3).joinToString(",")}" }
+                } else {
+                    logger.info { "[ACP] VM messages snapshot: EMPTY map" }
+                }
+            }
+        }
+
         // Collect processor signals and update UI state
         scope.launch {
             service.signals.collect { signal ->
@@ -274,18 +287,13 @@ class ChatViewModel(
         val prompt = _permissionPrompt.value ?: return
         service.respondPermission(prompt.permissionId, prompt.toolCallId, response)
         _permissionPrompt.value = null
-        permissionTimeoutJob?.cancel()
-        permissionTimeoutJob = null
+        service.permissionManager.cancelPermissionTimeout()
     }
 
-    private var permissionTimeoutJob: Job? = null
-
     private fun startPermissionTimeout() {
-        permissionTimeoutJob?.cancel()
-        val timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds
-        if (timeoutSeconds <= 0) return
-        permissionTimeoutJob = scope.launch {
-            delay(timeoutSeconds * 1000L)
+        service.permissionManager.startPermissionTimeout(
+            timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds
+        ) {
             _permissionPrompt.value = null
         }
     }
@@ -387,9 +395,7 @@ class ChatViewModel(
     // --- Cleanup ---
 
     override fun close() {
-        // Cancel UI-specific jobs only — service persists
-        permissionTimeoutJob?.cancel()
-        permissionTimeoutJob = null
+        service.permissionManager.cancelPermissionTimeout()
     }
 
     // --- Helpers ---

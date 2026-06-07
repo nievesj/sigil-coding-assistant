@@ -648,8 +648,11 @@ class OpenCodeClient(
 
                 // V2 Tool events
                 "session.next.tool.input.started" -> {
-                    // Skip: pill is created from "called" event which has full data (tool name + input).
-                    // Creating from "input.started" would produce incomplete pills without input data.
+                    // Log the input data for debugging
+                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull
+                    val tool = props["tool"]?.jsonPrimitive?.contentOrNull
+                    val input = props["input"]?.jsonObject
+                    logger.info { "[ACP] V2 tool.input.started: callID=$callID, tool=$tool, hasInput=${input != null}, inputKeys=${input?.keys}" }
                     SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "intentional no-op")
                 }
 
@@ -658,6 +661,7 @@ class OpenCodeClient(
                         ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID")
                     val tool = props["tool"]?.jsonPrimitive?.contentOrNull ?: "tool"
                     val input = props["input"]?.jsonObject
+                    logger.info { "[ACP] V2 tool.called: callID=$callID, tool=$tool, hasInput=${input != null}, inputKeys=${input?.keys}" }
                     SseEvent.ToolUse(
                         sessionId = sessionId,
                         toolCallId = callID,
@@ -872,11 +876,17 @@ class OpenCodeClient(
                                             ?.mapNotNull { (it as? JsonObject) }
                                             ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
                                                 ?.mapNotNull { (it as? JsonObject) }
+                                        // Also try to extract input from completed state — may update existing pill
+                                        val completedInput = stateObj.get("input")?.jsonObject ?: part["input"]?.jsonObject
+                                        if (completedInput != null) {
+                                            logger.info { "[ACP] V1 tool completed with input: callID=$toolCallId, tool=$toolName, inputKeys=${completedInput.keys}" }
+                                        }
                                         SseEvent.ToolResult(
                                             sessionId = sessionId,
                                             toolCallId = toolCallId,
                                             isError = false,
                                             content = output,
+                                            input = completedInput,
                                             messageId = messageId,
                                             partId = partId
                                         )
@@ -886,11 +896,13 @@ class OpenCodeClient(
                                             ?.mapNotNull { (it as? JsonObject) }
                                             ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
                                                 ?.mapNotNull { (it as? JsonObject) }
+                                        val errorInput = stateObj.get("input")?.jsonObject ?: part["input"]?.jsonObject
                                         SseEvent.ToolResult(
                                             sessionId = sessionId,
                                             toolCallId = toolCallId,
                                             isError = true,
                                             content = output,
+                                            input = errorInput,
                                             messageId = messageId,
                                             partId = partId
                                         )
@@ -898,6 +910,7 @@ class OpenCodeClient(
                                     else -> {
                                         // "running", "pending", or null — emit as ToolUse
                                         val input = stateObj?.get("input")?.jsonObject ?: part["input"]?.jsonObject
+                                        logger.info { "[ACP] V1 tool part: callID=$toolCallId, tool=$toolName, status=$status, hasState=${stateObj != null}, stateInput=${stateObj?.get("input") != null}, partInput=${part["input"] != null}, resolvedInput=${input != null}" }
                                         SseEvent.ToolUse(
                                             sessionId = sessionId,
                                             toolCallId = toolCallId,
@@ -1055,6 +1068,7 @@ class OpenCodeClient(
                     } ?: false
                     val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject) }
+                    val input = props["input"]?.jsonObject
                     val messageId = extractMessageId(props)
                     val partId = extractPartId(props)
                     SseEvent.ToolResult(
@@ -1062,6 +1076,7 @@ class OpenCodeClient(
                         toolCallId = toolCallId,
                         isError = isError,
                         content = output,
+                        input = input,
                         messageId = messageId,
                         partId = partId
                     )

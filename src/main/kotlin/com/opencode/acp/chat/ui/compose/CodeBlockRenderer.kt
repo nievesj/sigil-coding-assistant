@@ -35,7 +35,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.intellij.icons.AllIcons
 import com.intellij.openapi.editor.colors.EditorColors
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.colors.EditorFontType
@@ -45,8 +44,7 @@ import java.awt.datatransfer.StringSelection
 import org.jetbrains.jewel.foundation.code.highlighting.LocalCodeHighlighter
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.Icon
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 /**
  * Language name mapping: markdown code fence language → language
@@ -86,25 +84,25 @@ private fun mapLanguageId(lang: String): String {
 /**
  * Map language name to IntelliJ platform icon for the code block header.
  */
-private fun languageIcon(lang: String): javax.swing.Icon = when (lang.lowercase()) {
-    "javascript", "js", "jsx"     -> AllIcons.FileTypes.JavaScript
-    "typescript", "ts", "tsx"     -> AllIcons.FileTypes.JavaScript
-    "css", "scss", "less"         -> AllIcons.FileTypes.Css
-    "java"                        -> AllIcons.FileTypes.Java
-    "kotlin", "kt", "kts"         -> AllIcons.Language.Kotlin
-    "python", "py"                -> AllIcons.Language.Python
-    "ruby", "rb"                  -> AllIcons.Language.Ruby
-    "rust", "rs"                  -> AllIcons.Language.Rust
-    "go"                          -> AllIcons.Language.GO
-    "scala"                       -> AllIcons.Language.Scala
-    "php"                         -> AllIcons.Language.Php
-    "html", "htm"                 -> AllIcons.FileTypes.Html
-    "xml"                         -> AllIcons.FileTypes.Xml
-    "json"                        -> AllIcons.FileTypes.Json
-    "yaml", "yml"                 -> AllIcons.FileTypes.Yaml
-    "shell", "bash", "zsh", "sh"  -> AllIcons.Nodes.Console
-    "sql"                         -> AllIcons.FileTypes.Text
-    else                          -> AllIcons.FileTypes.Text
+private fun languageIcon(lang: String): org.jetbrains.jewel.ui.icon.IconKey = when (lang.lowercase()) {
+    "javascript", "js", "jsx"     -> AllIconsKeys.FileTypes.JavaScript
+    "typescript", "ts", "tsx"     -> AllIconsKeys.FileTypes.JavaScript
+    "css", "scss", "less"         -> AllIconsKeys.FileTypes.Css
+    "java"                        -> AllIconsKeys.FileTypes.Java
+    "kotlin", "kt", "kts"         -> AllIconsKeys.Language.Kotlin
+    "python", "py"                -> AllIconsKeys.Language.Python
+    "ruby", "rb"                  -> AllIconsKeys.Language.Ruby
+    "rust", "rs"                  -> AllIconsKeys.Language.Rust
+    "go"                          -> AllIconsKeys.Language.GO
+    "scala"                       -> AllIconsKeys.Language.Scala
+    "php"                         -> AllIconsKeys.Language.Php
+    "html", "htm"                 -> AllIconsKeys.FileTypes.Html
+    "xml"                         -> AllIconsKeys.FileTypes.Xml
+    "json"                        -> AllIconsKeys.FileTypes.Json
+    "yaml", "yml"                 -> AllIconsKeys.FileTypes.Yaml
+    "shell", "bash", "zsh", "sh"  -> AllIconsKeys.Nodes.Console
+    "sql"                         -> AllIconsKeys.FileTypes.Text
+    else                          -> AllIconsKeys.FileTypes.Text
 }
 
 @Composable
@@ -184,7 +182,7 @@ fun ChatFencedCodeBlock(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(languageIcon(language.orEmpty())),
+                        key = languageIcon(language.orEmpty()),
                         contentDescription = displayName,
                         modifier = Modifier.size(14.dp),
                         tint = Color(0xFF6BBE50),
@@ -197,7 +195,7 @@ fun ChatFencedCodeBlock(
                 }
 
                 Icon(
-                    key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Copy),
+                    key = AllIconsKeys.Actions.Copy,
                     contentDescription = "Copy code",
                     modifier = Modifier
                         .size(16.dp)

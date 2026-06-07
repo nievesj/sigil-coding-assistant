@@ -72,7 +72,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
-import com.intellij.icons.AllIcons
 import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.model.CommandHistoryEntry
 import com.opencode.acp.chat.model.ControlBarState
@@ -81,11 +80,10 @@ import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.ThinkingEffort
 import com.opencode.acp.chat.model.TodoItem
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
 import java.awt.image.BufferedImage
@@ -173,33 +171,9 @@ private fun readClipboardOnEdt(): Any? {
 
         val flavors = transferable.transferDataFlavors
 
-        // 1. Try imageFlavor (screenshot, copied image from image editor)
-        if (transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
-            val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
-            if (image != null) {
-
-                return image
-            }
-        }
-
-        // 2. Try javaFileListFlavor (copied image file from OS file manager)
-        if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
-            @Suppress("UNCHECKED_CAST")
-            val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
-            if (files != null && files.isNotEmpty()) {
-                // Check if any file is an image
-                val imageExts = setOf("png", "jpg", "jpeg", "gif", "bmp", "svg", "webp")
-                val imageFiles = files.filter { f ->
-                    f.extension.lowercase() in imageExts
-                }
-                if (imageFiles.isNotEmpty()) {
-
-                    return imageFiles
-                }
-            }
-        }
-
-        // 3. Try stringFlavor / plain text (text paste from editors, browsers, etc.)
+        // 1. Try stringFlavor / plain text FIRST — if the clipboard has text
+        //    content, it should be treated as text even if it also has an image
+        //    representation (many apps put both on the clipboard).
         for (flavor in flavors) {
             if (flavor.mimeType.startsWith("text/plain") && flavor.isRepresentationClassReader) {
                 try {
@@ -207,21 +181,47 @@ private fun readClipboardOnEdt(): Any? {
                     if (reader != null) {
                         val text = reader.readText()
                         if (text.isNotBlank()) {
-
                             return text
                         }
                     }
                 } catch (_: Exception) { }
             }
         }
+        // Also try stringFlavor directly (common for macOS)
         if (transferable.isDataFlavorSupported(DataFlavor.stringFlavor)) {
-            val text = transferable.getTransferData(DataFlavor.stringFlavor) as? String
-            if (!text.isNullOrBlank()) {
+            try {
+                val text = transferable.getTransferData(DataFlavor.stringFlavor) as? String
+                if (text != null && text.isNotBlank()) {
+                    return text
+                }
+            } catch (_: Exception) { }
+        }
 
-                return text
+        // 2. Try javaFileListFlavor (files from OS file manager) — only return
+        //    actual image files here; non-image files are ignored (the user
+        //    should use the "Attach" button for those).
+        if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+            @Suppress("UNCHECKED_CAST")
+            val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
+            if (files != null && files.isNotEmpty()) {
+                val imageExts = setOf("png", "jpg", "jpeg", "gif", "bmp", "svg", "webp")
+                val imageFiles = files.filter { f ->
+                    f.extension.lowercase() in imageExts
+                }
+                if (imageFiles.isNotEmpty()) {
+                    return imageFiles
+                }
             }
         }
 
+        // 3. Try imageFlavor (screenshot, copied image from image editor) —
+        //    last priority since screenshots typically don't also have text.
+        if (transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
+            val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
+            if (image != null) {
+                return image
+            }
+        }
 
     } catch (e: Exception) {
 
@@ -650,7 +650,7 @@ fun InputArea(
                                         )
                                     } else {
                                         Icon(
-                                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.FileTypes.Image),
+                                            key = AllIconsKeys.FileTypes.Image,
                                             contentDescription = file.name,
                                             modifier = Modifier.size(20.dp),
                                             tint = Color(0xFFBBBBBB),
@@ -667,7 +667,7 @@ fun InputArea(
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(
-                                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
+                                            key = AllIconsKeys.Actions.Close,
                                             contentDescription = "Remove",
                                             modifier = Modifier.size(10.dp),
                                             tint = Color(0xFFCCCCCC),
@@ -684,7 +684,7 @@ fun InputArea(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Icon(
-                                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.FileTypes.Text),
+                                        key = AllIconsKeys.FileTypes.Text,
                                         contentDescription = null,
                                         modifier = Modifier.size(14.dp),
                                         tint = Color(0xFFBBBBBB),
@@ -706,7 +706,7 @@ fun InputArea(
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(
-                                            key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
+                                            key = AllIconsKeys.Actions.Close,
                                             contentDescription = "Remove",
                                             modifier = Modifier.size(10.dp),
                                             tint = Color(0xFF808080),
@@ -863,7 +863,7 @@ fun InputArea(
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
-                                key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add),
+                                key = AllIconsKeys.General.Add,
                                 contentDescription = "Attach",
                                 modifier = Modifier.size(16.dp),
                                 tint = mutedText,
@@ -913,10 +913,11 @@ fun InputArea(
                                     .clickable(enabled = enabled) { onCancel() },
                                 contentAlignment = Alignment.Center,
                             ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(8.dp)
-                                        .background(stopRed),
+                                Icon(
+                                    key = AllIconsKeys.Actions.Suspend,
+                                    contentDescription = "Stop",
+                                    modifier = Modifier.size(12.dp),
+                                    tint = stopRed,
                                 )
                             }
                         } else {
@@ -937,7 +938,7 @@ fun InputArea(
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Icon(
-                                    key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute),
+                                    key = AllIconsKeys.Actions.Execute,
                                     contentDescription = "Send",
                                     modifier = Modifier.size(16.dp),
                                     tint = Color(0xFF4EAF4E),

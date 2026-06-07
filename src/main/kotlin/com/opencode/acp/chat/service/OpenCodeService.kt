@@ -6,8 +6,6 @@ import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
 import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
-import com.opencode.acp.adapter.toChatMessage
-import com.opencode.acp.adapter.toSessionItem
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.processor.MessageProcessorManager
 import com.opencode.acp.chat.processor.UiSignal
@@ -17,20 +15,18 @@ import com.opencode.acp.chat.model.ConnectionState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.serialization.json.JsonObject
 
 /**
- * Project-level service that owns the OpenCode connection and message processor.
- * Survives tool window disposal/recreation. Only disposed when the project closes.
+ * Project-level service that owns the OpenCode connection, session management,
+ * and message processor. Survives tool window disposal/recreation.
  *
  * Architecture:
- * - [OpenCodeConnectionManager] handles SSE/HTTP connection lifecycle
- * - [MessageProcessorManager] handles message processing and the event channel
+ * - [OpenCodeConnectionManager] — HTTP/SSE connection lifecycle
+ * - [SessionManager] — session CRUD, switching, context
+ * - [MessageProcessorManager] — event processing, message accumulation
  * - This service coordinates between them and exposes the public API
  *
- * The [ChatViewModel] is a thin UI wrapper that delegates to this service.
+ * The [ChatViewModel] is a thin UI wrapper that delegates here.
  */
 @Service(Service.Level.PROJECT)
 class OpenCodeService(private val project: Project) : Disposable {
@@ -38,36 +34,80 @@ class OpenCodeService(private val project: Project) : Disposable {
     private val logger = KotlinLogging.logger {}
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    // --- Sub-components ---
+    // ── Sub-components ─────────────────────────────────────────────────────
+
     val connectionManager = OpenCodeConnectionManager(scope)
     val processor = MessageProcessorManager(scope)
+    val sessionManager: SessionManager = createSessionManager()
+    val commandManager = CommandManager(
+        clientProvider = { connectionManager.client },
+        sessionIdProvider = { sessionManager.sessionId }
+    )
+    val permissionManager = PermissionManager(
+        scope = scope,
+        clientProvider = { connectionManager.client },
+        processor = processor
+    )
 
-    // --- Session state ---
-    private var sessionId: String? = null
-    private val switchMutex = Mutex()
-    private var responseDeferred: CompletableDeferred<Unit>? = null
-    private var permissionTimeoutJob: Job? = null
+    // ── State flows ────────────────────────────────────────────────────────
 
-    // --- State flows (forwarded from sub-components) ---
     val messages: StateFlow<Map<String, ChatMessage>> = processor.messages
     val signals: SharedFlow<UiSignal> = processor.signals
     val connectionState: StateFlow<ConnectionState> = connectionManager.connectionState
+    val sessionListState: StateFlow<SessionListState> = sessionManager.sessionListState
+    val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = sessionManager.childSessionMap
+    val todoItems: StateFlow<List<TodoItem>> = sessionManager.todoItems
+    val sessionContextState: StateFlow<SessionContextState> = sessionManager.sessionContextState
 
-    // --- Session management state ---
-    private val _sessionListState = MutableStateFlow<SessionListState>(SessionListState.Loading)
-    val sessionListState: StateFlow<SessionListState> = _sessionListState.asStateFlow()
+    // ── Internal state ─────────────────────────────────────────────────────
 
-    private val _childSessionMap = MutableStateFlow<Map<String, List<SessionItem>>>(emptyMap())
-    val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = _childSessionMap.asStateFlow()
-
-    private val _todoItems = MutableStateFlow<List<TodoItem>>(emptyList())
-    val todoItems: StateFlow<List<TodoItem>> = _todoItems.asStateFlow()
-
-    private val _sessionContextState = MutableStateFlow<SessionContextState>(SessionContextState.Loading)
-    val sessionContextState: StateFlow<SessionContextState> = _sessionContextState.asStateFlow()
-
-    // --- Signal collection (completes responseDeferred on Stop) ---
+    private var responseDeferred: CompletableDeferred<Unit>? = null
     private var signalCollectionJob: Job? = null
+
+    /**
+     * Serializes sendMessage() calls. Without this, a rapid double-send (e.g. user
+     * double-clicks send, or sends a message before the first response completes)
+     * would cause the second call to overwrite [responseDeferred], orphaning the
+     * first call's deferred which then hangs in `deferred.await()` until the
+     * 5-minute timeout.
+     */
+    private val sendMutex = kotlinx.coroutines.sync.Mutex()
+
+    // ── Wires ──────────────────────────────────────────────────────────────
+
+    /** Build the SessionManager with callbacks into this service. */
+    private fun createSessionManager(): SessionManager {
+        return SessionManager(
+            scope = scope,
+            clientProvider = { connectionManager.client },
+            processor = processor,
+            onBeforeReset = { targetId ->
+                connectionManager.resetReconnectState()
+                connectionManager.cancelSseSubscription()
+                // Clear the active session marker before resetting processor state.
+                // This ensures any in-flight reconnect check for the old session
+                // sees it as inactive and bails out. The new session ID is set
+                // in onAfterSseSetup just before the new subscription starts.
+                connectionManager.setActiveSseSession(null)
+                responseDeferred?.complete(Unit)
+                responseDeferred = null
+            },
+            onAfterSseSetup = { targetId ->
+                connectionManager.cancelSseSubscription()
+                // Mark the new active session before starting the new subscription
+                // so isActiveSession() returns true for the new session during the
+                // connection setup, and false for the old session (if any) during
+                // its pending teardown.
+                connectionManager.setActiveSseSession(targetId)
+                startSseSubscription(targetId)
+            }
+        )
+    }
+
+    /** Session ID convenience accessor. */
+    val sessionId: String? get() = sessionManager.sessionId
+
+    // ── Signal collection (completes responseDeferred on Stop) ──────────
 
     private fun startSignalCollection() {
         signalCollectionJob?.cancel()
@@ -75,7 +115,6 @@ class OpenCodeService(private val project: Project) : Disposable {
             processor.signals.collect { signal ->
                 when (signal) {
                     is UiSignal.StreamingCompleted -> {
-                        // Complete the pending responseDeferred so sendMessage() unblocks
                         responseDeferred?.complete(Unit)
                         responseDeferred = null
                     }
@@ -85,12 +124,11 @@ class OpenCodeService(private val project: Project) : Disposable {
         }
     }
 
-    // --- Initialization ---
+    // ── Initialization ─────────────────────────────────────────────────────
 
     /**
      * Initialize the connection and load sessions.
      * Called once when the service is first accessed.
-     * Returns true if connection succeeded.
      */
     suspend fun initialize(): Boolean {
         logger.info { "[ACP] OpenCodeService.initialize: START" }
@@ -101,203 +139,47 @@ class OpenCodeService(private val project: Project) : Disposable {
         }
         logger.info { "[ACP] OpenCodeService.initialize: connection established" }
 
-        // Start collecting processor signals to complete responseDeferred
         startSignalCollection()
 
-        // Load sessions
         logger.info { "[ACP] OpenCodeService.initialize: loading sessions..." }
-        loadSessions()
-        logger.info { "[ACP] OpenCodeService.initialize: sessions state = ${_sessionListState.value::class.simpleName}" }
+        sessionManager.loadSessions()
+        logger.info { "[ACP] OpenCodeService.initialize: sessions state = ${sessionListState.value::class.simpleName}" }
 
-        // Switch to most recent session if available
-        when (val state = _sessionListState.value) {
+        when (val state = sessionListState.value) {
             is SessionListState.Loaded -> {
                 if (state.sessions.isNotEmpty()) {
-                    switchSession(state.sessions.first().id)
+                    sessionManager.switchSession(state.sessions.first().id)
                 }
             }
             is SessionListState.Error -> {
-                loadSessions()
-                val retry = _sessionListState.value as? SessionListState.Loaded
+                sessionManager.loadSessions()
+                val retry = sessionListState.value as? SessionListState.Loaded
                 if (retry != null && retry.sessions.isNotEmpty()) {
-                    switchSession(retry.sessions.first().id)
+                    sessionManager.switchSession(retry.sessions.first().id)
                 }
             }
-            is SessionListState.Loading -> { /* shouldn't happen */ }
+            is SessionListState.Loading -> { }
         }
 
         return true
     }
 
-    // --- Session management ---
+    // ── Session management (delegated) ─────────────────────────────────────
 
-    suspend fun loadSessions() {
-        val client = connectionManager.client ?: run {
-            logger.warn { "[ACP] loadSessions: client is null" }
-            return
-        }
-        try {
-            logger.info { "[ACP] loadSessions: fetching session list..." }
-            val sessionList = client.listSessions()
-            val currentId = sessionId
-            val items = sessionList
-                .sortedByDescending { it.time?.updated ?: it.time?.created ?: 0L }
-                .map { it.toSessionItem() }
-            _sessionListState.value = SessionListState.Loaded(
-                sessions = items,
-                selectedId = currentId
-            )
-            val children = items.filter { it.parentID != null }
-                .groupBy { it.parentID!! }
-            _childSessionMap.value = children
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to load sessions" }
-            _sessionListState.value = SessionListState.Error(e.message ?: "Failed to load sessions")
-        }
-    }
+    suspend fun loadSessions() = sessionManager.loadSessions()
+    suspend fun switchSession(sessionId: String) = sessionManager.switchSession(sessionId)
+    suspend fun createAndSwitchSession(title: String? = null) = sessionManager.createAndSwitchSession(title)
+    suspend fun archiveSession(sessionId: String) = sessionManager.archiveSession(sessionId)
 
-    suspend fun switchSession(targetSessionId: String) {
-        switchMutex.withLock {
-            val client = connectionManager.client ?: return
-            if (sessionId == targetSessionId) return
-
-            val previousSessionId = sessionId
-            logger.info { "[ACP] switchSession: START target=$targetSessionId, previous=$previousSessionId" }
-
-            try {
-                connectionManager.resetReconnectState()
-                connectionManager.cancelSseSubscription()
-                responseDeferred?.complete(Unit)
-                responseDeferred = null
-                processor.resetSessionState()
-                connectionManager.client?.resetReasoningTracking()
-
-                logger.info { "[ACP] switchSession: fetching messages for $targetSessionId ..." }
-                val messages = client.listMessages(targetSessionId, limit = null)
-                logger.info { "[ACP] switchSession: got ${messages.size} raw messages" }
-                sessionId = targetSessionId
-
-                val children = _childSessionMap.value[targetSessionId] ?: emptyList()
-                logger.info { "[ACP] switchSession: converting ${messages.size} messages to chat, children=${children.size}" }
-                val chatMessages = try {
-                    if (children.isNotEmpty()) {
-                        injectSubagentRefs(messages.map { it.toChatMessage() }, children)
-                    } else {
-                        messages.map { it.toChatMessage() }
-                    }
-                } catch (e: Exception) {
-                    logger.error(e) { "[ACP] switchSession: ERROR in toChatMessage: ${e.message}" }
-                    throw e
-                }
-                logger.info { "[ACP] switchSession: ${chatMessages.size} chat messages ready, adding to processor" }
-                chatMessages.forEach { processor.addMessage(it) }
-
-                startSseSubscription(targetSessionId)
-                updateSessionSelection(targetSessionId)
-                computeSessionContext()
-                fetchTodos()
-
-                logger.info { "[ACP] switchSession: DONE — ${chatMessages.size} messages loaded" }
-            } catch (e: CancellationException) {
-                logger.info { "[ACP] switchSession: CANCELLED" }
-                throw e
-            } catch (e: Exception) {
-                logger.error(e) { "[ACP] switchSession: FAILED — ${e::class.simpleName}: ${e.message}" }
-                sessionId = previousSessionId
-                updateSessionSelection(previousSessionId)
-                if (previousSessionId != null) {
-                    try {
-                        val msgs = client.listMessages(previousSessionId, limit = null)
-                        val chatMsgs = msgs.map { it.toChatMessage() }
-                        chatMsgs.forEach { processor.addMessage(it) }
-                        startSseSubscription(previousSessionId)
-                    } catch (e2: Exception) {
-                        logger.error(e2) { "[ACP] switchSession: revert also FAILED" }
-                    }
-                }
-            }
-        }
-    }
-
-    suspend fun createAndSwitchSession(title: String? = null) {
-        val client = connectionManager.client ?: return
-
-        val session = try {
-            client.createSession(title)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.error(e) { "Failed to create session" }
-            return
-        }
-
-        switchMutex.withLock {
-            connectionManager.resetReconnectState()
-            try { cancel() } catch (_: Exception) { /* best-effort */ }
-            connectionManager.cancelSseSubscription()
-            processor.resetSessionState()
-            sessionId = session.id
-            startSseSubscription(session.id)
-        }
-
-        loadSessions()
-        updateSessionSelection(session.id)
-        computeSessionContext()
-        fetchTodos()
-        logger.info { "Created and switched to new session: ${session.id}" }
-    }
-
-    suspend fun archiveSession(targetSessionId: String) {
-        val client = connectionManager.client ?: return
-        try {
-            val success = client.deleteSession(targetSessionId)
-            if (!success) {
-                logger.warn { "Server returned false for deleteSession($targetSessionId)" }
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.error(e) { "Failed to archive session $targetSessionId" }
-            try { loadSessions() } catch (e2: Exception) { logger.warn(e2) { "Also failed to refresh sessions" } }
-            return
-        }
-
-        if (targetSessionId == sessionId) {
-            val previousSessionId = sessionId
-            createAndSwitchSession()
-            if (sessionId == previousSessionId) {
-                logger.error { "Failed to create replacement session after archiving active session" }
-                sessionId = null
-                processor.resetSessionState()
-                updateSessionSelection(null)
-            }
-        } else {
-            loadSessions()
-        }
-        logger.info { "Archived session $targetSessionId" }
-    }
-
-    private fun updateSessionSelection(selectedId: String?) {
-        val current = _sessionListState.value
-        if (current is SessionListState.Loaded) {
-            _sessionListState.value = current.copy(selectedId = selectedId)
-        }
-    }
-
-    // --- SSE subscription ---
+    // ── SSE subscription ──────────────────────────────────────────────────
 
     private fun startSseSubscription(targetSessionId: String) {
-        connectionManager.cancelSseSubscription()
-        val job = connectionManager.startSseSubscription(targetSessionId) { event ->
+        connectionManager.startSseSubscription(targetSessionId) { event ->
             handleSseEvent(event)
         }
-        // Store the job reference in the connection manager for cancellation
-        // (it's already stored internally by startSseSubscription)
     }
 
-    private fun handleSseEvent(event: SseEvent) {
+    private suspend fun handleSseEvent(event: SseEvent) {
         val summary = when (event) {
             is SseEvent.TextChunk -> "TextChunk(sid=${event.sessionId}, mid=${event.messageId}, text=${event.text.take(30)})"
             is SseEvent.ThinkingChunk -> "ThinkingChunk(sid=${event.sessionId}, mid=${event.messageId}, text=${event.text.take(30)})"
@@ -313,7 +195,7 @@ class OpenCodeService(private val project: Project) : Disposable {
         processor.process(event)
     }
 
-    // --- Message sending ---
+    // ── Message sending ────────────────────────────────────────────────────
 
     suspend fun sendMessage(
         text: String,
@@ -324,11 +206,34 @@ class OpenCodeService(private val project: Project) : Disposable {
         agent: String? = null,
         model: OpenCodeClient.MessageModel? = null
     ): SendMessageResult {
+        // Serialize concurrent sends. `tryLock` returns false immediately if another
+        // send is in progress, avoiding both:
+        //   1. The double-click race that orphans the first responseDeferred.
+        //   2. A second coroutine blocking on sendMutex while the user is mid-send.
+        if (!sendMutex.tryLock()) {
+            logger.warn { "[ACP] sendMessage: rejected — another send is already in progress" }
+            return SendMessageResult.Error("Another message is already being sent. Please wait for it to complete.")
+        }
+        try {
+            return sendMessageInternal(text, files, modelID, providerID, variant, agent, model)
+        } finally {
+            sendMutex.unlock()
+        }
+    }
+
+    private suspend fun sendMessageInternal(
+        text: String,
+        files: List<AttachedFile>,
+        modelID: String?,
+        providerID: String?,
+        variant: String?,
+        agent: String?,
+        model: OpenCodeClient.MessageModel?
+    ): SendMessageResult {
         val client = connectionManager.client ?: return SendMessageResult.Error("No client")
-        val currentSessionId = sessionId ?: return SendMessageResult.Error("No session")
+        val currentSessionId = sessionManager.sessionId ?: return SendMessageResult.Error("No session")
         logger.info { "[ACP] sendMessage: START session=$currentSessionId text='${text.take(50)}'" }
 
-        // Add user message
         val userMsg = ChatMessage(
             id = generateId(),
             role = MessageRole.USER,
@@ -339,16 +244,11 @@ class OpenCodeService(private val project: Project) : Disposable {
         processor.addMessage(userMsg)
         processor.setLastUserText(text)
 
-        // Create the assistant message BEFORE the HTTP call so that SSE events
-        // arriving while the HTTP request is in-flight can be routed immediately.
-        // The server-assigned messageID is patched in after sendMessageAsync returns.
-        // Also clear stale reasoning tracking from the previous turn to prevent
-        // misrouting text chunks as thinking content.
         connectionManager.client?.resetReasoningTracking()
         val assistantMsgId = processor.createAssistantMessage(
             modelID = modelID,
             providerID = providerID,
-            serverMessageId = null  // will be updated after HTTP call
+            serverMessageId = null
         )
 
         val deferred = CompletableDeferred<Unit>()
@@ -357,13 +257,23 @@ class OpenCodeService(private val project: Project) : Disposable {
         try {
             val parts = mutableListOf<com.opencode.acp.adapter.OpenCodePart>(com.opencode.acp.adapter.OpenCodePart.Text(text = text))
             files.forEach { file ->
-                parts.add(com.opencode.acp.adapter.OpenCodePart.File(mime = file.mime, url = file.dataUri, filename = file.name))
+                // Read file content for source.text so the LLM knows the file content and path
+                val fileText = try {
+                    java.io.File(file.path).readText(Charsets.UTF_8)
+                } catch (_: Exception) { null }
+                val sourceText = fileText?.let { txt ->
+                    com.opencode.acp.adapter.OpenCodePart.FileSourceText(value = txt, start = 0, end = txt.length)
+                }
+                parts.add(com.opencode.acp.adapter.OpenCodePart.File(
+                    mime = file.mime, url = file.dataUri, filename = file.name,
+                    source = com.opencode.acp.adapter.OpenCodePart.FileSource(path = file.path, text = sourceText)
+                ))
             }
+            logger.info { "[ACP] sendMessage: ${parts.size} parts (text + ${files.size} file attachments: ${files.joinToString { it.name }})" }
 
             val serverMessageId = client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
             logger.info { "[ACP] sendMessage: got serverMessageId=$serverMessageId" }
 
-            // Patch the server-assigned messageID into the already-created assistant message
             processor.updateServerMessageId(assistantMsgId, serverMessageId)
 
             withTimeout(300_000L) {
@@ -394,11 +304,11 @@ class OpenCodeService(private val project: Project) : Disposable {
         }
     }
 
-    // --- Actions ---
+    // ── Actions ────────────────────────────────────────────────────────────
 
     suspend fun cancel() {
         val client = connectionManager.client
-        val currentSessionId = sessionId
+        val currentSessionId = sessionManager.sessionId
         if (client != null && currentSessionId != null) {
             client.abortSession(currentSessionId)
         }
@@ -406,150 +316,30 @@ class OpenCodeService(private val project: Project) : Disposable {
         responseDeferred = null
     }
 
-    suspend fun respondPermission(permissionId: String, toolCallId: String, response: com.opencode.acp.chat.model.PermissionResponse) {
-        val client = connectionManager.client ?: return
-        try {
-            client.respondPermission(permissionId = permissionId, response = response.optionId)
-            when (response) {
-                PermissionResponse.REJECT_ONCE ->
-                    processor.setToolPartState(toolCallId, PartState.Rejected)
-                PermissionResponse.ALLOW_ONCE,
-                PermissionResponse.ALLOW_ALWAYS ->
-                    processor.updateToolCallStatus(toolCallId, com.agentclientprotocol.model.ToolCallStatus.IN_PROGRESS)
-            }
-        } catch (_: Exception) {
-            // Network error — keep prompt open for retry
-        }
+    suspend fun respondPermission(permissionId: String, toolCallId: String, response: PermissionResponse) =
+        permissionManager.respondPermission(permissionId, toolCallId, response)
+
+    suspend fun respondQuestion(promptId: String, answers: List<List<String>>) =
+        permissionManager.respondQuestion(promptId, answers)
+
+    suspend fun rejectQuestion(promptId: String) =
+        permissionManager.rejectQuestion(promptId)
+
+    // ── Data fetching ──────────────────────────────────────────────────────
+
+    suspend fun computeSessionContext(controlState: ControlBarState? = null) {
+        sessionManager.computeSessionContext(controlState)
     }
 
-    suspend fun respondQuestion(promptId: String, answers: List<List<String>>) {
-        val client = connectionManager.client ?: return
-        client.respondQuestion(promptId, answers)
-    }
+    suspend fun fetchTodos() = sessionManager.fetchTodos()
 
-    suspend fun rejectQuestion(promptId: String) {
-        val client = connectionManager.client ?: return
-        client.rejectQuestion(promptId)
-    }
+    suspend fun fetchAvailableCommands(): List<SlashCommand> =
+        commandManager.fetchAvailableCommands()
 
-    // --- Data fetching ---
+    suspend fun executeServerCommand(commandName: String, args: String = "") =
+        commandManager.executeServerCommand(commandName, args)
 
-    suspend fun computeSessionContext(controlState: ControlBarState? = null): SessionContextState {
-        val currentSessionId = sessionId ?: return SessionContextState.Loading
-        val client = connectionManager.client ?: return SessionContextState.Loading
-        val messages = processor.messages.value
-
-        val session = try {
-            client.getSession(currentSessionId)
-        } catch (_: Exception) {
-            null
-        }
-
-        val lastAssistant = messages.values.findLast {
-            it.role == MessageRole.ASSISTANT && (it.inputTokens + it.outputTokens + it.reasoningTokens + it.cacheReadTokens + it.cacheWriteTokens) > 0
-        }
-
-        val totalCost = messages.values.filter { it.role == MessageRole.ASSISTANT }.sumOf { it.cost }
-
-        val modelId = lastAssistant?.modelID ?: controlState?.selectedModel?.modelID
-        val providerId = lastAssistant?.providerID ?: controlState?.selectedModel?.providerID
-
-        val (providerName, modelName) = resolveModelNames(controlState?.models ?: emptyList(), modelId, providerId)
-        val contextLimit = resolveContextLimit(controlState?.allModels?.ifEmpty { controlState.models } ?: emptyList(), providerId, modelId)
-
-        val inputTokens = lastAssistant?.inputTokens ?: 0L
-        val outputTokens = lastAssistant?.outputTokens ?: 0L
-        val reasoningTokens = lastAssistant?.reasoningTokens ?: 0L
-        val cacheReadTokens = lastAssistant?.cacheReadTokens ?: 0L
-        val cacheWriteTokens = lastAssistant?.cacheWriteTokens ?: 0L
-        val totalTokens = inputTokens + outputTokens + reasoningTokens + cacheReadTokens + cacheWriteTokens
-
-        val usagePercent = if (contextLimit > 0L) {
-            (totalTokens.toFloat() / contextLimit.toFloat()) * 100f
-        } else 0f
-
-        val sessionTitle = (_sessionListState.value as? SessionListState.Loaded)
-            ?.sessions?.find { it.id == currentSessionId }?.title ?: "Untitled"
-
-        val result = SessionContextState.Loaded(
-            context = SessionContext(
-                sessionId = currentSessionId,
-                title = sessionTitle,
-                providerID = providerId ?: "",
-                modelID = modelId ?: "",
-                providerName = providerName,
-                modelName = modelName,
-                contextLimit = contextLimit,
-                totalTokens = totalTokens,
-                inputTokens = inputTokens,
-                outputTokens = outputTokens,
-                reasoningTokens = reasoningTokens,
-                cacheReadTokens = cacheReadTokens,
-                cacheWriteTokens = cacheWriteTokens,
-                usagePercent = usagePercent,
-                totalCost = totalCost,
-                messageCount = messages.size,
-                userMessageCount = messages.values.count { it.role == MessageRole.USER },
-                assistantMessageCount = messages.values.count { it.role == MessageRole.ASSISTANT },
-                additions = session?.summary?.additions ?: 0,
-                deletions = session?.summary?.deletions ?: 0,
-                filesModified = session?.summary?.files ?: 0,
-                sessionCreated = session?.time?.created ?: 0L,
-                lastUpdated = session?.time?.updated ?: 0L
-            )
-        )
-        _sessionContextState.value = result
-        return result
-    }
-
-    suspend fun fetchTodos() {
-        val currentSessionId = sessionId ?: return
-        val client = connectionManager.client ?: return
-        try {
-            val todos = client.getTodos(currentSessionId)
-            _todoItems.value = todos.map { TodoItem(content = it.content, status = it.status, priority = it.priority) }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            // Silently fail
-        }
-    }
-
-    suspend fun fetchAvailableCommands(): List<SlashCommand> {
-        val client = connectionManager.client ?: return emptyList()
-        return try {
-            val commands = client.listCommands()
-            commands.map { cmd ->
-                SlashCommand(
-                    name = cmd.id ?: cmd.name,
-                    description = cmd.description ?: cmd.name,
-                    iconKey = null,
-                    isServerCommand = true
-                )
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to fetch available commands" }
-            emptyList()
-        }
-    }
-
-    suspend fun executeServerCommand(commandName: String, args: String = "") {
-        val currentSessionId = sessionId ?: return
-        val client = connectionManager.client ?: return
-        try {
-            client.executeCommand(currentSessionId, commandName, args)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to execute command: $commandName" }
-        }
-    }
-
-    // --- Data access (delegate methods for ViewModel) ---
-    // Exceptions propagate to ViewModel's existing catch blocks which log warnings.
-    // Do NOT catch silently here — the ViewModel needs visibility into failures.
+    // ── Data access (delegate methods for ViewModel) ───────────────────────
 
     suspend fun listAgents(): List<com.opencode.acp.adapter.AgentInfo> {
         val client = connectionManager.client
@@ -571,83 +361,19 @@ class OpenCodeService(private val project: Project) : Disposable {
         return client.listProviders()
     }
 
-    // --- Helpers ---
+    // ── Cleanup ────────────────────────────────────────────────────────────
 
-    private fun resolveModelNames(models: List<ProviderModel>, modelId: String?, providerId: String?): Pair<String, String> {
-        if (modelId.isNullOrBlank() && providerId.isNullOrBlank()) return Pair("Unknown", "Unknown")
-        if (models.isEmpty()) return Pair(providerId ?: "Unknown", modelId ?: "Unknown")
-
-        val exactMatch = models.find { it.providerID == providerId && it.modelID == modelId }
-        if (exactMatch != null) {
-            val parts = exactMatch.displayName.split(" / ", limit = 2)
-            return Pair(parts.getOrElse(0) { exactMatch.providerID }, parts.getOrElse(1) { exactMatch.modelID })
-        }
-
-        val modelOnlyMatch = models.find { it.modelID == modelId }
-        if (modelOnlyMatch != null) {
-            val parts = modelOnlyMatch.displayName.split(" / ", limit = 2)
-            return Pair(parts.getOrElse(0) { modelOnlyMatch.providerID }, parts.getOrElse(1) { modelOnlyMatch.modelID })
-        }
-
-        return Pair(providerId ?: "Unknown", modelId ?: "Unknown")
-    }
-
-    private fun resolveContextLimit(models: List<ProviderModel>, providerId: String?, modelId: String?): Long {
-        if (modelId.isNullOrBlank()) return 0L
-        if (models.isEmpty()) return 0L
-
-        val exactMatch = models.find { it.providerID == providerId && it.modelID == modelId }
-        if (exactMatch != null && exactMatch.contextWindow > 0) return exactMatch.contextWindow.toLong()
-
-        val modelOnlyMatch = models.find { it.modelID == modelId }
-        if (modelOnlyMatch != null && modelOnlyMatch.contextWindow > 0) return modelOnlyMatch.contextWindow.toLong()
-
-        return 0L
-    }
-
-    private fun injectSubagentRefs(messages: List<ChatMessage>, children: List<SessionItem>): List<ChatMessage> {
-        if (messages.isEmpty()) return messages
-        val lastAssistantIdx = messages.indexOfLast { it.role == MessageRole.ASSISTANT }
-        if (lastAssistantIdx == -1) return messages
-
-        val refs = children.map { child ->
-            SubagentRef(
-                sessionId = child.id,
-                agentName = child.title.replaceFirstChar { it.uppercase() },
-                taskDescription = child.title,
-                status = if (child.outputTokens > 0) SubagentStatus.COMPLETED else SubagentStatus.RUNNING,
-            )
-        }
-
-        val updated = messages.toMutableList()
-        val msg = updated[lastAssistantIdx]
-        val partsWithoutSubagents = LinkedHashMap(msg.parts.filterValues { it !is MessagePart.Subagent })
-        refs.forEach { ref ->
-            partsWithoutSubagents[ref.sessionId] = MessagePart.Subagent(ref)
-        }
-        updated[lastAssistantIdx] = msg.copy(parts = partsWithoutSubagents)
-        return updated
-    }
-
-    // --- Cleanup ---
-
-    /**
-     * Full re-initialization after connection failure.
-     * Does NOT hold switchMutex — initialize() calls switchSession()
-     * which acquires it. Holding it here would deadlock since Kotlin's
-     * Mutex is NOT reentrant.
-     */
     suspend fun retryConnection() {
-        connectionManager.close()
+        connectionManager.disconnect()
         initialize()
     }
 
     override fun dispose() {
         logger.info { "[ACP] OpenCodeService.dispose() called — project closing" }
-        permissionTimeoutJob?.cancel()
+        permissionManager.dispose()
         responseDeferred?.complete(Unit)
         responseDeferred = null
-        connectionManager.close()
+        connectionManager.shutdown()
         processor.close()
         scope.cancel()
     }

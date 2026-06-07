@@ -15,76 +15,67 @@ import com.opencode.acp.chat.model.ToolCallPill
  * directly — it sends events to eventChannel, which is consumed on EDT.
  */
 class ProcessorContext {
-    /** Accumulates raw text from TextChunk events before segmentation. */
+    // ── Text buffer ────────────────────────────────────────────────────────
+    /** Accumulates raw text from TextChunk events before segmentation into text parts. */
     val textBuffer: StringBuilder = StringBuilder()
-    /** Accumulates thinking/reasoning text. Plain text, NOT markdown — StreamHealer is NOT applied. */
+
+    // ── Thinking phase state ──────────────────────────────────────────────
+    /** Key for the currently active thinking phase in the parts map (e.g., "thinking_0").
+     *  Null when no thinking phase has started yet. Each phase gets a unique key
+     *  so completed phases are frozen and never overwritten. */
+    var activeThinkingKey: String? = null
+    /** Accumulates text for the current streaming thinking phase. */
     val thinkingBuffer: StringBuilder = StringBuilder()
-    /** Whether thinking content has completed (Stop/Error received after thinking chunks).
-     *  Used to transition Thinking part state from Streaming → Completed. */
+    /** Whether the current thinking phase has completed (Stop/tool-calls received).
+     *  When true, the current phase is frozen — any new ThinkingChunk/ThinkingReplace
+     *  starts a new phase with a new key. */
     var activeThinkingCompleted: Boolean = false
-    /** Tool call pills keyed by callId. Updated in-place for status changes. */
+    /** Monotonic counter for generating unique thinking keys. */
+    var thinkingPhaseIndex: Int = 0
+
+    // ── Tool call state ───────────────────────────────────────────────────
+    /** Tool call pills keyed by callId. Secondary index for updates — the primary
+     *  data lives in the message parts map under the toolCallId key. */
     val toolCallPills: LinkedHashMap<String, ToolCallPill> = linkedMapOf()
-    /** Maps toolCallId → messageId for cross-message tool result/permission routing.
-     *  Needed because ToolResult/Permission events reference toolCallId, not messageId. */
+    /** Maps toolCallId → messageId for cross-message tool result/permission routing. */
     val toolCallIndex: MutableMap<String, String> = mutableMapOf()
-    /** File changes collected from tool calls for the current active message.
-     *  Since ProcessorContext tracks only one active message at a time, this is
-     *  a simple list, not a map keyed by message ID. reset() is called at each
-     *  turn boundary, so accumulation across turns is not possible. */
-    val pendingFileChanges: MutableList<ChatFileChange> = mutableListOf()
-    /** Whether the first non-empty text chunk has been received.
-     *  Only flipped when text.isNotBlank() — empty chunks are ignored. */
-    var firstTextChunkReceived: Boolean = false
-    /** Whether user echo text has been stripped from the response. */
-    var userEchoStripped: Boolean = false
-    /** Whether UiSignal.StreamingStarted has been emitted for this turn.
-     *  Prevents double-emission when the first chunks arrive. */
-    var streamingStartedEmitted: Boolean = false
-    /** Whether UiSignal.StreamingCompleted has been emitted for this turn.
-     *  Prevents double-emission when completeStreaming() is called after Stop. */
-    var streamingCompletedEmitted: Boolean = false
-    /** The ID of the currently-streaming assistant message. */
-    var activeMessageId: String? = null
-    /** Server's messageID for the current streaming turn (from sendMessageAsync response).
-     *  Used to deterministically route V1 SSE events to the correct message via messageID match. */
-    var activeServerMessageId: String? = null
-    /** The last user message text, for echo stripping.
-     *  Set by setLastUserText() before process() begins. */
-    var lastUserText: String? = null
-    /** Error message collected during this streaming turn, if any. */
-    var errorMessage: String? = null
-    /** Whether the message is currently streaming. */
-    var isStreaming: Boolean = false
-    /** Model ID for the current streaming turn. */
-    var modelID: String? = null
-    /** Provider ID for the current streaming turn. */
-    var providerID: String? = null
-    /** Active patch parts from the current streaming turn. */
-    val activePatches: MutableList<SseEvent.Patch> = mutableListOf()
-    /** Active agent name from the current streaming turn. */
-    var activeAgentName: String? = null
-    /** Active retry info from the current streaming turn. */
-    var activeRetry: SseEvent.Retry? = null
-    /** Active compaction info from the current streaming turn. */
-    var activeCompaction: SseEvent.Compaction? = null
-    /** Active step finish info from the current streaming turn. */
-    var activeStepFinish: SseEvent.StepFinish? = null
-    /** Lifecycle state of each tool call part, keyed by toolCallId.
-     *  Tracks state transitions: Created → InProgress → Completed/Failed/Pending/Rejected. */
+    /** Lifecycle state of each tool call part, keyed by toolCallId. */
     val toolPartStates: MutableMap<String, PartState> = mutableMapOf()
-    /** Assistant-generated files pending rendering (keyed by partId for correct update semantics, url as fallback). */
+
+    // ── File changes ──────────────────────────────────────────────────────
+    val pendingFileChanges: MutableList<ChatFileChange> = mutableListOf()
+
+    // ── Turn lifecycle ────────────────────────────────────────────────────
+    var firstTextChunkReceived: Boolean = false
+    var userEchoStripped: Boolean = false
+    var streamingStartedEmitted: Boolean = false
+    var streamingCompletedEmitted: Boolean = false
+    var activeMessageId: String? = null
+    var activeServerMessageId: String? = null
+    var lastUserText: String? = null
+    var errorMessage: String? = null
+    var isStreaming: Boolean = false
+    var modelID: String? = null
+    var providerID: String? = null
+
+    // ── Per-event state (added directly to parts map via updateMessage) ────
+    val activePatches: MutableList<SseEvent.Patch> = mutableListOf()
+    var activeAgentName: String? = null
+    var activeRetry: SseEvent.Retry? = null
+    var activeCompaction: SseEvent.Compaction? = null
+    var activeStepFinish: SseEvent.StepFinish? = null
     val activeAssistantFiles: MutableMap<String, SseEvent.AssistantFile> = mutableMapOf()
-    /** Assistant-generated images pending rendering (keyed by partId for correct update semantics, url as fallback). */
     val activeAssistantImages: MutableMap<String, SseEvent.AssistantImage> = mutableMapOf()
 
-    /** Reset turn-specific state for a new streaming turn.
-     *  Preserves [toolCallIndex] (needed for cross-message tool result/permission routing)
-     *  and [lastUserText] (set separately via setLastUserText).
-     *  Called at the start of createAssistantMessage(). */
+    /** Reset turn-specific state for a new streaming turn. */
     fun resetTurnState() {
         textBuffer.clear()
         thinkingBuffer.clear()
+        activeThinkingKey = null
+        activeThinkingCompleted = false
+        thinkingPhaseIndex = 0
         toolCallPills.clear()
+        toolPartStates.clear()
         pendingFileChanges.clear()
         firstTextChunkReceived = false
         userEchoStripped = false
@@ -101,14 +92,11 @@ class ProcessorContext {
         activeRetry = null
         activeCompaction = null
         activeStepFinish = null
-        toolPartStates.clear()
         activeAssistantFiles.clear()
         activeAssistantImages.clear()
-        activeThinkingCompleted = false
     }
 
-    /** Reset ALL state including toolCallIndex and lastUserText.
-     *  Called on session switch (full reset). */
+    /** Reset ALL state including toolCallIndex and lastUserText. */
     fun reset() {
         resetTurnState()
         toolCallIndex.clear()

@@ -51,6 +51,7 @@ sealed interface SseEvent {
         val toolCallId: String,
         val isError: Boolean = false,
         val content: List<JsonObject>? = null,
+        val input: JsonObject? = null,
         override val messageId: String? = null,
         override val partId: String? = null
     ) : SseEvent

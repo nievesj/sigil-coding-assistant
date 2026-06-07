@@ -9,8 +9,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.animation.core.animateDpAsState
@@ -42,9 +40,7 @@ import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.viewmodel.ChatViewModel
-import com.intellij.icons.AllIcons
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
@@ -124,7 +120,8 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
 }
 
 @Composable
-fun ChatScreen(
+fun
+        ChatScreen(
     viewModel: ChatViewModel,
     project: Project
 ) {
@@ -145,8 +142,8 @@ fun ChatScreen(
     // Local (non-server) slash commands — always shown first
     val localCommands = remember {
         listOf(
-            SlashCommand("clear", "Start a new session", IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add)),
-            SlashCommand("cancel", "Cancel current response", IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Suspend)),
+            SlashCommand("clear", "Start a new session", AllIconsKeys.General.Add),
+            SlashCommand("cancel", "Cancel current response", AllIconsKeys.Actions.Suspend),
         )
     }
     // Merged list: local commands first, then server commands
@@ -354,9 +351,13 @@ fun ChatScreen(
                 controlState = controlState,
                 contextState = sessionContextState,
                 onSend = { text, files ->
+                    // Capture a snapshot BEFORE clearing — attachedFiles is a mutable list
+                    // and InputArea passes the same reference. If we clear first, the coroutine
+                    // would find an empty list by the time it runs.
+                    val fileSnapshot = files.toList()
                     attachedFiles.clear()
                     scope.launch {
-                        viewModel.sendMessage(text, files)
+                        viewModel.sendMessage(text, fileSnapshot)
                     }
                 },
                 onCancel = { scope.launch { viewModel.cancel() } },

@@ -34,19 +34,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.intellij.icons.AllIcons
 import com.intellij.openapi.project.Project
 import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.SessionItem
 import com.opencode.acp.chat.model.SessionListState
 import com.opencode.acp.chat.model.SidebarTab
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 import org.jetbrains.jewel.ui.icon.IconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -141,21 +139,21 @@ private fun SidebarTabRow(
     ) {
         SidebarTabButton(
             label = "Sessions",
-            iconKey = IntelliJIconKey.fromPlatformIcon(AllIcons.Nodes.Console),
+            iconKey = AllIconsKeys.Nodes.Console,
             isSelected = selectedTab == SidebarTab.SESSIONS,
             onClick = { onTabSelected(SidebarTab.SESSIONS) },
             modifier = Modifier.weight(1f)
         )
         SidebarTabButton(
             label = "Context",
-            iconKey = IntelliJIconKey.fromPlatformIcon(AllIcons.Nodes.Folder),
+            iconKey = AllIconsKeys.Nodes.Folder,
             isSelected = selectedTab == SidebarTab.CONTEXT,
             onClick = { onTabSelected(SidebarTab.CONTEXT) },
             modifier = Modifier.weight(1f)
         )
         SidebarTabButton(
             label = "Review",
-            iconKey = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Checked),
+            iconKey = AllIconsKeys.Actions.Checked,
             isSelected = selectedTab == SidebarTab.REVIEW,
             onClick = { onTabSelected(SidebarTab.REVIEW) },
             modifier = Modifier.weight(1f)
@@ -209,7 +207,7 @@ private fun SidebarTabButton(
                     color = if (isSelected) selectedColor else unselectedColor,
                 )
                 Icon(
-                    key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.ChevronDown),
+                    key = AllIconsKeys.General.ChevronDown,
                     contentDescription = null,
                     modifier = Modifier.size(8.dp),
                     tint = if (isSelected) selectedColor else unselectedColor.copy(alpha = 0.7f),
@@ -243,7 +241,7 @@ private fun NewSessionButton(onClick: () -> Unit) {
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Icon(
-            key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Add),
+            key = AllIconsKeys.General.Add,
             contentDescription = "New session",
             modifier = Modifier.size(14.dp),
             tint = retrieveColorOrUnspecified("Link.activeForeground"),
@@ -490,9 +488,7 @@ private fun SessionRow(
                     contentAlignment = Alignment.Center,
                 ) {
                 Icon(
-                    key = IntelliJIconKey.fromPlatformIcon(
-                        if (isExpanded) AllIcons.General.ChevronDown else AllIcons.General.ChevronRight
-                    ),
+                    key = if (isExpanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
                     contentDescription = if (isExpanded) "Collapse" else "Expand",
                         modifier = Modifier.size(16.dp),
                         tint = iconTint,
@@ -506,7 +502,7 @@ private fun SessionRow(
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Forward),
+                        key = AllIconsKeys.Actions.Forward,
                         contentDescription = null,
                         modifier = Modifier.size(14.dp),
                         tint = iconTint,
@@ -541,7 +537,7 @@ private fun SessionRow(
                     )
                     // Archive button — always visible, subtle until hover
                     Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Close),
+                        key = AllIconsKeys.Actions.Close,
                         contentDescription = "Archive",
                         modifier = Modifier
                             .size(20.dp)
@@ -658,7 +654,7 @@ private fun ErrorContent(
         verticalArrangement = Arrangement.Center,
     ) {
         Icon(
-            key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.BalloonError),
+            key = AllIconsKeys.General.BalloonError,
             contentDescription = null,
             modifier = Modifier.size(24.dp),
             tint = retrieveColorOrUnspecified("Component.errorFocusColor"),

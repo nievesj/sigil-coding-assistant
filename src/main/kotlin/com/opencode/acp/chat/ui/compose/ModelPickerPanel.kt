@@ -47,15 +47,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.Image as ComposeImage
-import com.intellij.icons.AllIcons
 import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.config.settings.OpenCodeSettingsState
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.TextField
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icon.IconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 // ── Colors ──────────────────────────────────────────────────────────────────
 private val BgColor = Color(0xFF2B2B2B)
@@ -150,7 +149,7 @@ fun ModelPickerPanel(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Search),
+                key = AllIconsKeys.Actions.Search,
                 contentDescription = null,
                 modifier = Modifier.size(14.dp),
                 tint = MutedTextColor,
@@ -183,7 +182,7 @@ fun ModelPickerPanel(
                 item(key = "header_favorites") {
                     SectionHeader(
                         title = "FAVORITES",
-                        iconText = "★",
+                        iconKey = AllIconsKeys.Nodes.Favorite,
                         iconColor = StarGold,
                         expanded = favoritesExpanded,
                         onToggle = { favoritesExpanded = !favoritesExpanded },
@@ -278,6 +277,7 @@ fun ModelPickerPanel(
 internal fun SectionHeader(
     title: String,
     iconText: String? = null,
+    iconKey: org.jetbrains.jewel.ui.icon.IconKey? = null,
     iconColor: Color = MutedTextColor,
     expanded: Boolean,
     onToggle: () -> Unit,
@@ -290,16 +290,24 @@ internal fun SectionHeader(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // Chevron
-        Text(
-            text = if (expanded) "▼" else "▶",
-            fontSize = 8.sp,
-            color = MutedTextColor,
-            modifier = Modifier.width(12.dp),
+        Icon(
+            key = if (expanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
+            contentDescription = if (expanded) "Collapse" else "Expand",
+            modifier = Modifier.size(10.dp),
+            tint = MutedTextColor,
         )
         Spacer(modifier = Modifier.width(6.dp))
 
-        // Section icon (text-based, e.g. star for favorites)
-        if (iconText != null) {
+        // Section icon (platform icon or text fallback)
+        if (iconKey != null) {
+            Icon(
+                key = iconKey,
+                contentDescription = null,
+                modifier = Modifier.size(12.dp),
+                tint = iconColor,
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+        } else if (iconText != null) {
             Text(
                 text = iconText,
                 fontSize = 12.sp,
@@ -369,17 +377,19 @@ private fun ModelRow(
         // Feature indicator icons
         Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
             if (model.reasoning) {
-                Text(
-                    text = "\u26A1",
-                    fontSize = 10.sp,
-                    color = Color(0xFFE5C100),
+                Icon(
+                    key = AllIconsKeys.Actions.Lightning,
+                    contentDescription = "Reasoning",
+                    modifier = Modifier.size(10.dp),
+                    tint = Color(0xFFE5C100),
                 )
             }
             if (hasVisionCapability(model)) {
-                Text(
-                    text = "\u25C9",
-                    fontSize = 10.sp,
-                    color = Color(0xFF4285F4),
+                Icon(
+                    key = AllIconsKeys.Actions.Search,
+                    contentDescription = "Vision",
+                    modifier = Modifier.size(10.dp),
+                    tint = Color(0xFF4285F4),
                 )
             }
         }
@@ -398,14 +408,15 @@ private fun ModelRow(
         }
 
         // Star toggle
-        Text(
-            text = if (isFavorite) "★" else "☆",
-            fontSize = 14.sp,
-            color = if (isFavorite) StarGold else StarMuted,
+        Icon(
+            key = if (isFavorite) AllIconsKeys.Nodes.Favorite else AllIconsKeys.Nodes.Favorite,
+            contentDescription = if (isFavorite) "Remove from favorites" else "Add to favorites",
             modifier = Modifier
+                .size(14.dp)
                 .clip(CircleShape)
                 .clickable(onClick = onToggleFavorite)
                 .padding(horizontal = 2.dp),
+            tint = if (isFavorite) StarGold else StarMuted,
         )
     }
 }

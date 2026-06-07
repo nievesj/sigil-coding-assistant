@@ -23,28 +23,27 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.agentclientprotocol.model.ToolCallStatus
-import com.intellij.icons.AllIcons
+import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ToolCallPill
 import com.opencode.acp.chat.util.ToolStatusDisplay
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 @Composable
 fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(pill.kind == ToolKind.EXECUTE) }
 
-    // Completed pills render in compact mode (single line, no border/background)
-    val isCompact = pill.status == ToolCallStatus.COMPLETED || pill.status == ToolCallStatus.FAILED
+    // All pills render in the same style — no visual jump when status changes.
+    val isCompact = false
 
     val iconKey = when (pill.status) {
-        ToolCallStatus.PENDING -> IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute)
-        ToolCallStatus.IN_PROGRESS -> IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Execute)
-        ToolCallStatus.COMPLETED -> IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Checked)
-        ToolCallStatus.FAILED -> IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Cancel)
+        ToolCallStatus.PENDING -> AllIconsKeys.Actions.Lightning
+        ToolCallStatus.IN_PROGRESS -> AllIconsKeys.Actions.Execute
+        ToolCallStatus.COMPLETED -> AllIconsKeys.Actions.Checked
+        ToolCallStatus.FAILED -> AllIconsKeys.Actions.Cancel
     }
 
     val statusLabel = ToolStatusDisplay.label(pill.kind)
@@ -74,9 +73,7 @@ fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
             )
             if (hasDetails) {
                 Icon(
-                    key = IntelliJIconKey.fromPlatformIcon(
-                        if (expanded) AllIcons.General.ChevronDown else AllIcons.General.ChevronRight
-                    ),
+                    key = if (expanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
                     contentDescription = if (expanded) "Collapse" else "Expand",
                     modifier = Modifier.size(10.dp),
                     tint = Color(0xFF666666),
@@ -121,9 +118,7 @@ fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
                 )
                 if (hasDetails) {
                     Icon(
-                        key = IntelliJIconKey.fromPlatformIcon(
-                            if (expanded) AllIcons.General.ChevronDown else AllIcons.General.ChevronRight
-                        ),
+                        key = if (expanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
                         contentDescription = if (expanded) "Collapse" else "Expand",
                         modifier = Modifier.size(12.dp),
                         tint = Color(0xFF808080),

@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -38,7 +39,9 @@ import androidx.compose.ui.window.PopupProperties
 import com.opencode.acp.chat.model.ControlBarState
 import com.opencode.acp.chat.model.OpenCodeAgentInfo
 import com.opencode.acp.chat.model.ThinkingEffort
+import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 // ── Shared colors ───────────────────────────────────────────────────────────
 private val ChipBg = Color(0xFF2B2B2B)
@@ -210,10 +213,11 @@ internal fun SelectorChip(
             fontSize = 12.sp,
             color = textColor,
         )
-        Text(
-            text = "\u25BE",
-            fontSize = 14.sp,
-            color = textColor.copy(alpha = 0.7f),
+        Icon(
+            key = AllIconsKeys.General.ChevronDown,
+            contentDescription = null,
+            modifier = Modifier.size(10.dp),
+            tint = textColor.copy(alpha = 0.7f),
         )
     }
 }

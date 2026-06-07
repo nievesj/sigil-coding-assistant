@@ -35,7 +35,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.intellij.icons.AllIcons
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.diff.DiffManager
 import com.intellij.diff.DiffContentFactory
@@ -61,12 +60,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 
 // ── Review Panel (sidebar tab content) ───────────────────────────────────────
@@ -253,7 +251,7 @@ private fun ChangedFileRow(
     ) {
         // File type icon
         Icon(
-            key = IntelliJIconKey.fromPlatformIcon(getFileTypeIcon(file.fileName)),
+            key = getFileTypeIcon(file.fileName),
             contentDescription = file.fileName,
             modifier = Modifier.size(16.dp),
             tint = Color.Unspecified
@@ -336,7 +334,7 @@ private fun ChangedFileRow(
         if (file.virtualFile != null) {
             Spacer(Modifier.width(8.dp))
             Icon(
-                key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.Locate),
+                key = AllIconsKeys.General.Locate,
                 contentDescription = "Open file",
                 modifier = Modifier
                     .size(18.dp)
@@ -350,33 +348,33 @@ private fun ChangedFileRow(
 
 // ── File type icons ────────────────────────────────────────────────────────────
 
-private fun getFileTypeIcon(fileName: String): javax.swing.Icon {
+internal fun getFileTypeIcon(fileName: String): org.jetbrains.jewel.ui.icon.IconKey {
     val extension = fileName.substringAfterLast('.', "").lowercase()
     return when (extension) {
-        "kt" -> AllIcons.Language.Kotlin
-        "kts" -> AllIcons.Language.Kotlin
-        "java" -> AllIcons.FileTypes.Java
-        "xml" -> AllIcons.FileTypes.Xml
-        "json" -> AllIcons.FileTypes.Json
-        "yaml", "yml" -> AllIcons.FileTypes.Yaml
-        "md" -> AllIcons.FileTypes.Text
-        "txt" -> AllIcons.FileTypes.Text
-        "js", "jsx" -> AllIcons.FileTypes.JavaScript
-        "ts", "tsx" -> AllIcons.FileTypes.JavaScript
-        "css" -> AllIcons.FileTypes.Css
-        "html", "htm" -> AllIcons.FileTypes.Html
-        "py" -> AllIcons.Language.Python
-        "rb" -> AllIcons.Language.Ruby
-        "rs" -> AllIcons.Language.Rust
-        "go" -> AllIcons.Language.GO
-        "scala" -> AllIcons.Language.Scala
-        "php" -> AllIcons.Language.Php
-        "gradle", "gradle.kts" -> AllIcons.Nodes.Folder  // Fallback for Gradle
-        "properties" -> AllIcons.FileTypes.Text
-        "gitignore" -> AllIcons.FileTypes.Text
-        "svg" -> AllIcons.FileTypes.Image
-        "png", "jpg", "jpeg", "gif", "bmp", "webp" -> AllIcons.FileTypes.Image
-        else -> AllIcons.FileTypes.Text
+        "kt" -> AllIconsKeys.Language.Kotlin
+        "kts" -> AllIconsKeys.Language.Kotlin
+        "java" -> AllIconsKeys.FileTypes.Java
+        "xml" -> AllIconsKeys.FileTypes.Xml
+        "json" -> AllIconsKeys.FileTypes.Json
+        "yaml", "yml" -> AllIconsKeys.FileTypes.Yaml
+        "md" -> AllIconsKeys.FileTypes.Text
+        "txt" -> AllIconsKeys.FileTypes.Text
+        "js", "jsx" -> AllIconsKeys.FileTypes.JavaScript
+        "ts", "tsx" -> AllIconsKeys.FileTypes.JavaScript
+        "css" -> AllIconsKeys.FileTypes.Css
+        "html", "htm" -> AllIconsKeys.FileTypes.Html
+        "py" -> AllIconsKeys.Language.Python
+        "rb" -> AllIconsKeys.Language.Ruby
+        "rs" -> AllIconsKeys.Language.Rust
+        "go" -> AllIconsKeys.Language.GO
+        "scala" -> AllIconsKeys.Language.Scala
+        "php" -> AllIconsKeys.Language.Php
+        "gradle", "gradle.kts" -> AllIconsKeys.Nodes.Folder  // Fallback for Gradle
+        "properties" -> AllIconsKeys.FileTypes.Text
+        "gitignore" -> AllIconsKeys.FileTypes.Text
+        "svg" -> AllIconsKeys.FileTypes.Image
+        "png", "jpg", "jpeg", "gif", "bmp", "webp" -> AllIconsKeys.FileTypes.Image
+        else -> AllIconsKeys.FileTypes.Text
     }
 }
 
@@ -423,7 +421,7 @@ private fun ReviewErrorContent(
         verticalArrangement = Arrangement.Center
     ) {
         Icon(
-            key = IntelliJIconKey.fromPlatformIcon(AllIcons.General.BalloonError),
+            key = AllIconsKeys.General.BalloonError,
             contentDescription = null,
             modifier = Modifier.size(24.dp),
             tint = Color(0xFFDB4437),

@@ -33,6 +33,7 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
     private var openCodeClient: OpenCodeClient? = null
     private var httpClient: HttpClient? = null
     private var openCodeProcess: Process? = null
+    private var processWatcherJob: Job? = null
     private var shutdownHook: Thread? = null
     private var sseJob: Job? = null
     private var reconnectJob: Job? = null
@@ -40,12 +41,27 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
     var initialized: Boolean = false
         private set
 
+    /**
+     * Session ID the active SSE subscription was started for. Used by [isActiveSession]
+     * to compare against incoming session IDs and avoid re-subscribing to a stale session
+     * after the user has switched.
+     *
+     * The previous version of [isActiveSession] always returned `initialized` regardless
+     * of the passed-in sessionId, which caused the reconnection path to leak subscriptions
+     * to old sessions during rapid switching.
+     */
+    @Volatile
+    private var activeSseSessionId: String? = null
+
     var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
         private set
     var port: Int = AcpDefaults.DEFAULT_OPENCODE_PORT
         private set
     var authToken: String? = null
         private set
+
+    /** Path to the binary we launched (if we started the process ourselves). */
+    private var launchedBinaryPath: String? = null
 
     /** The current OpenCode client. Null until [initialize] succeeds. */
     val client: OpenCodeClient? get() = openCodeClient
@@ -108,13 +124,9 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         )
         openCodeClient = opencodeClient
 
-        // Launch the binary if configured and not already running
+        // Always launch our own binary — don't trust isServerReachable()
         if (settings.binaryPath.isNotBlank()) {
-            if (!isServerReachable()) {
-                launchOpenCodeBinary(settings.binaryPath)
-            } else {
-                logger.info { "[ACP] ConnectionManager.initialize: server already running at $host:$port" }
-            }
+            launchOpenCodeBinary(settings.binaryPath)
         } else {
             logger.warn { "[ACP] ConnectionManager.initialize: no binary path configured" }
             _connectionState.value = ConnectionState.ERROR
@@ -136,6 +148,15 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
                 // Connection refused or similar — server not ready yet
             }
             attempt++
+
+            // Check if the launched process died — if so, fail fast instead of polling to timeout
+            val processStatus = checkProcessAlive()
+            if (processStatus != null) {
+                logger.error { "[ACP] ConnectionManager.initialize: $processStatus" }
+                _connectionState.value = ConnectionState.ERROR
+                return false
+            }
+
             if (attempt == 1) {
                 logger.info { "[ACP] ConnectionManager.initialize: server not ready yet, polling..." }
             }
@@ -179,12 +200,14 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
 
     /**
      * Launch an SSE subscription job for the given session.
-     * Events are delivered to [onEvent] callback.
+     * Events are delivered to [onEvent] callback (suspend — may apply backpressure
+     * to the upstream SSE stream via a bounded event channel in the processor).
      * Handles reconnection on stream end.
      */
-    fun startSseSubscription(sessionId: String, onEvent: (SseEvent) -> Unit): Job {
+    fun startSseSubscription(sessionId: String, onEvent: suspend (SseEvent) -> Unit): Job {
         val capturedId = sessionId
-        return scope.launch {
+        activeSseSessionId = capturedId
+        val job = scope.launch {
             try {
                 subscribeSession(capturedId).collect { event ->
                     onEvent(event)
@@ -194,28 +217,38 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
             } catch (_: Exception) {
                 // SSE error — stream ended
             }
-            // Stream ended without cancellation — trigger reconnection
-            if (isActive && initialized && this@OpenCodeConnectionManager.isActiveSession(capturedId)) {
+            // Stream ended without cancellation — trigger reconnection if session
+            // is still the active one (not a stale session from before a switch)
+            if (isActive && initialized && isActiveSession(capturedId)) {
                 logger.info { "SSE stream ended for session $capturedId — triggering reconnection" }
                 triggerReconnect(capturedId, onEvent)
             }
         }
+        sseJob = job  // Store so cancelSseSubscription() can cancel it later
+        return job
     }
 
     fun cancelSseSubscription() {
         sseJob?.cancel()
         sseJob = null
+        // Don't clear activeSseSessionId here — the session may be the same
+        // as the new one we're switching to. Cleared explicitly in setActiveSseSession
+        // or close() when the session truly changes.
     }
 
-    /** Whether the given session is still the active one. */
-    private fun isActiveSession(sessionId: String): Boolean {
-        // This is checked by the service — connection manager doesn't track sessionId
-        return initialized
+    /** Mark the active SSE session. Called when the service switches sessions. */
+    fun setActiveSseSession(sessionId: String?) {
+        activeSseSessionId = sessionId
+    }
+
+    /** Whether the given session is still the active SSE target. */
+    fun isActiveSession(sessionId: String): Boolean {
+        return initialized && activeSseSessionId == sessionId
     }
 
     // --- Reconnection ---
 
-    private fun triggerReconnect(sessionId: String, onEvent: (SseEvent) -> Unit) {
+    private fun triggerReconnect(sessionId: String, onEvent: suspend (SseEvent) -> Unit) {
         reconnectJob?.cancel()
         reconnectAttempt = 0
 
@@ -228,6 +261,13 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
                 if (reconnectAttempt > 0) {
                     logger.info { "Reconnect attempt ${reconnectAttempt + 1}, waiting ${delayMs}ms" }
                     delay(delayMs)
+                }
+
+                // If the process we launched is dead, try to relaunch it before health-checking.
+                val ourProcess = openCodeProcess
+                if (launchedBinaryPath != null && (ourProcess == null || !ourProcess.isAlive)) {
+                    logger.info { "Launched process is dead — attempting relaunch from cached path" }
+                    launchOpenCodeBinary(launchedBinaryPath!!)
                 }
 
                 val client = openCodeClient
@@ -273,26 +313,38 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
     // --- Binary management ---
 
     private fun launchOpenCodeBinary(binaryPath: String) {
-        if (isServerReachable()) {
-            logger.info { "OpenCode server already running at $host:$port — skipping launch" }
-            return
+        // Kill any previously launched process before starting a new one
+        if (openCodeProcess?.isAlive == true) {
+            killProcess(openCodeProcess)
+            openCodeProcess = null
         }
+
         try {
-            logger.info { "Launching: $binaryPath serve --host $host --port $port" }
-            val pb = ProcessBuilder(binaryPath, "serve", "--host", host, "--port", port.toString())
+            logger.info { "Launching: $binaryPath serve --hostname $host --port $port" }
+            val pb = ProcessBuilder(binaryPath, "serve", "--hostname", host, "--port", port.toString())
                 .redirectErrorStream(true)
                 .apply {
                     environment().putIfAbsent("OPENCODE_CLIENT", "cli")
                 }
             openCodeProcess = pb.start()
+            launchedBinaryPath = binaryPath
             logger.info { "OpenCode process started (PID: ${openCodeProcess?.pid()})" }
 
+            // Drain stdout/stderr to a buffer so we can report it if the process dies
+            val outputBuffer = StringBuffer()
             Thread({
-                openCodeProcess?.inputStream?.bufferedReader()?.use { reader ->
-                    reader.lines().forEach { line ->
-                        logger.debug { "[opencode] $line" }
+                try {
+                    openCodeProcess?.inputStream?.bufferedReader()?.use { reader ->
+                        reader.lines().forEach { line ->
+                            logger.debug { "[opencode] $line" }
+                            synchronized(outputBuffer) {
+                                if (outputBuffer.length < 4096) {
+                                    outputBuffer.append(line).append('\n')
+                                }
+                            }
+                        }
                     }
-                }
+                } catch (_: Exception) { }
             }, "opencode-stdout-drain").apply {
                 isDaemon = true
                 start()
@@ -304,9 +356,55 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
                 }, "opencode-shutdown").apply { isDaemon = true }
                 Runtime.getRuntime().addShutdownHook(shutdownHook)
             }
+
+            // Start process watcher to detect unexpected death and auto-restart
+            startProcessWatcher()
         } catch (e: Exception) {
             logger.error(e) { "Failed to launch OpenCode binary at $binaryPath" }
         }
+    }
+
+    /**
+     * Watch the launched process. If it dies while [initialized] is true,
+     * try to restart it immediately and set state to RECONNECTING.
+     * This protects against external killers (e.g. JetBrains ACP ProcessHandler).
+     */
+    private fun startProcessWatcher() {
+        processWatcherJob?.cancel()
+        val proc = openCodeProcess ?: return
+        processWatcherJob = scope.launch {
+            // Wait for the process to exit (non-blocking via onExit)
+            try {
+                proc.onExit().get()
+            } catch (_: InterruptedException) {
+                return@launch
+            } catch (_: java.util.concurrent.ExecutionException) {
+                // Process terminated abnormally
+            }
+
+            val exitCode = proc.exitValue()
+            logger.warn { "[ACP] Process watcher: opencode process exited with code $exitCode" }
+
+            // If we're initialized (connected) or trying to connect, the process died unexpectedly.
+            // Restart it and set state to recovering.
+            if (launchedBinaryPath != null) {
+                logger.info { "[ACP] Process watcher: auto-restarting opencode..." }
+                launchOpenCodeBinary(launchedBinaryPath!!)
+                // Signal to the rest of the system that connection needs recovery
+                if (initialized) {
+                    _connectionState.value = ConnectionState.RECONNECTING
+                    initialized = false
+                }
+            }
+        }
+    }
+
+    /** Check if our launched process is still alive. Returns error text if dead, null if alive. */
+    private fun checkProcessAlive(): String? {
+        val proc = openCodeProcess ?: return "No process was launched"
+        if (proc.isAlive) return null
+        val exitVal = proc.exitValue()
+        return "Process exited with code $exitVal"
     }
 
     private fun isServerReachable(): Boolean {
@@ -340,19 +438,47 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
 
     // --- Cleanup ---
 
-    fun close() {
-        logger.info { "[ACP] ConnectionManager.close() called" }
+    /**
+     * Disconnect from the server but keep the process alive.
+     * Use this for retry/reconnect scenarios where we want to re-establish
+     * the HTTP/SSE connection without restarting the opencode binary.
+     */
+    fun disconnect() {
+        logger.info { "[ACP] ConnectionManager.disconnect() called" }
+        processWatcherJob?.cancel()
+        processWatcherJob = null
         reconnectJob?.cancel()
         reconnectJob = null
         sseJob?.cancel()
         sseJob = null
+        activeSseSessionId = null
         openCodeClient?.close()
         openCodeClient = null
         httpClient?.close()
         httpClient = null
+        initialized = false
+        // Do NOT kill the process — it may still be healthy and we just need
+        // to reconnect our HTTP client. The process will be reused on next
+        // initialize() if it's still reachable.
+    }
+
+    /**
+     * Full shutdown: disconnect AND kill the opencode process.
+     * Use this only for IDE shutdown (dispose) where we own the process
+     * and should clean it up.
+     */
+    fun shutdown() {
+        logger.info { "[ACP] ConnectionManager.shutdown() called" }
+        disconnect()
         killProcess(openCodeProcess)
         openCodeProcess = null
-        initialized = false
+    }
+
+    /** @deprecated Use [disconnect] for retry, or [shutdown] for IDE close. */
+    fun close() {
+        // Default to disconnect — callers that truly want to kill the process
+        // should use shutdown() explicitly.
+        disconnect()
     }
 
     fun resetReconnectState() {

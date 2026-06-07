@@ -16,12 +16,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.opencode.acp.chat.model.ConnectionState
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
-import com.intellij.icons.AllIcons
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 @Composable
 fun ConnectionBanner(
@@ -72,8 +70,8 @@ private fun BannerRow(
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Icon(
-            key = if (isError) IntelliJIconKey.fromPlatformIcon(AllIcons.General.BalloonError)
-                  else IntelliJIconKey.fromPlatformIcon(AllIcons.General.BalloonInformation),
+            key = if (isError) AllIconsKeys.General.BalloonError
+                  else AllIconsKeys.General.BalloonInformation,
             contentDescription = null,
             modifier = Modifier.size(16.dp)
         )

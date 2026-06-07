@@ -16,15 +16,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.intellij.icons.AllIcons
 import com.opencode.acp.chat.model.PermissionPrompt
 import com.opencode.acp.chat.model.PermissionResponse
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.ui.component.DefaultButton
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.OutlinedButton
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 @Composable
 fun PermissionPrompt(
@@ -51,7 +49,7 @@ fun PermissionPrompt(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Lightning),
+                key = AllIconsKeys.Actions.Lightning,
                 contentDescription = null,
                 modifier = Modifier.size(16.dp)
             )

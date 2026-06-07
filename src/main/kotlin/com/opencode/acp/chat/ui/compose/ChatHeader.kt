@@ -10,11 +10,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.intellij.icons.AllIcons
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 @Composable
 fun ChatHeader(
@@ -27,9 +25,7 @@ fun ChatHeader(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
-            key = IntelliJIconKey.fromPlatformIcon(
-                if (isSidebarVisible) AllIcons.General.ChevronLeft else AllIcons.General.ChevronRight
-            ),
+            key = if (isSidebarVisible) AllIconsKeys.General.ChevronLeft else AllIconsKeys.General.ChevronRight,
             contentDescription = if (isSidebarVisible) "Hide sessions" else "Show sessions",
             modifier = Modifier
                 .size(16.dp)

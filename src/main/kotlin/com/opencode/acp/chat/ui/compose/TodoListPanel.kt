@@ -22,7 +22,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.TodoItem
+import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 private val TodoBg = Color(0xFF252525)
 private val TodoHeaderColor = Color(0xFF808080)
@@ -34,10 +36,7 @@ private val TodoAccent = Color(0xFF3574F0)
 
 /**
  * Collapsible todo list panel showing the current session's tasks.
- * Modeled after OpenCode's sidebar todo panel — shows ✓ for completed,
- * • for in_progress, and ○ for pending tasks.
- *
- * Automatically collapses when there are more than 4 incomplete items.
+ * Uses IntelliJ platform icons for status indicators — consistent with the IDE.
  */
 @Composable
 fun TodoListPanel(
@@ -68,10 +67,11 @@ fun TodoListPanel(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = if (incomplete.size > 4 && !expanded) "▶" else "▼",
-                fontSize = 10.sp,
-                color = TodoHeaderColor,
+            Icon(
+                key = if (incomplete.size > 4 && !expanded) AllIconsKeys.General.ChevronRight else AllIconsKeys.General.ChevronDown,
+                contentDescription = if (expanded) "Collapse" else "Expand",
+                modifier = Modifier.size(12.dp),
+                tint = TodoHeaderColor,
             )
             Text(
                 text = "Todo",
@@ -104,11 +104,11 @@ fun TodoListPanel(
 
 @Composable
 private fun TodoRow(todo: TodoItem) {
-    val (icon, color) = when (todo.status) {
-        "completed" -> "✓" to TodoCompletedColor
-        "in_progress" -> "•" to TodoInProgressColor
-        "cancelled" -> "✗" to TodoCancelledColor
-        else -> "○" to TodoPendingColor
+    val (iconKey, color) = when (todo.status) {
+        "completed" -> AllIconsKeys.Actions.Checked to TodoCompletedColor
+        "in_progress" -> AllIconsKeys.Actions.Execute to TodoInProgressColor
+        "cancelled" -> AllIconsKeys.Actions.Cancel to TodoCancelledColor
+        else -> AllIconsKeys.Actions.Lightning to TodoPendingColor
     }
 
     Row(
@@ -116,12 +116,11 @@ private fun TodoRow(todo: TodoItem) {
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.Top
     ) {
-        Text(
-            text = icon,
-            fontSize = 11.sp,
-            color = color,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.size(width = 14.dp, height = 14.dp)
+        Icon(
+            key = iconKey,
+            contentDescription = todo.status,
+            modifier = Modifier.size(12.dp),
+            tint = color,
         )
         Text(
             text = todo.content,

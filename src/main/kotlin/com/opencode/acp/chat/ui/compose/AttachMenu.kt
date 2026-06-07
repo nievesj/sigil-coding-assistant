@@ -36,13 +36,11 @@ import androidx.compose.ui.input.key.type
 
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.intellij.icons.AllIcons
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.TextField
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 /**
  * Recent file entry for the attachment menu.
@@ -120,7 +118,7 @@ fun AttachMenu(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Search),
+                key = AllIconsKeys.Actions.Search,
                 contentDescription = null,
                 modifier = Modifier.size(14.dp),
                 tint = mutedTextColor,
@@ -143,12 +141,12 @@ fun AttachMenu(
 
         // Files and Folders
         AttachMenuItem(
-            icon = AllIcons.Nodes.Folder,
+            icon = AllIconsKeys.Nodes.Folder,
             iconTint = Color(0xFFBBBBBB),
             label = "Files and Folders",
             trailing = {
                 Icon(
-                    key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Forward),
+                    key = AllIconsKeys.Actions.Forward,
                     contentDescription = null,
                     modifier = Modifier.size(12.dp),
                     tint = mutedTextColor,
@@ -165,7 +163,7 @@ fun AttachMenu(
 
         // Image...
         AttachMenuItem(
-            icon = AllIcons.FileTypes.Image,
+            icon = AllIconsKeys.FileTypes.Image,
             iconTint = Color(0xFFBBBBBB),
             label = "Image...",
             hovered = hoveredIndex == 1,
@@ -241,7 +239,7 @@ fun AttachMenu(
 @OptIn(ExperimentalJewelApi::class)
 @Composable
 private fun AttachMenuItem(
-    icon: javax.swing.Icon,
+    icon: org.jetbrains.jewel.ui.icon.IconKey,
     iconTint: Color,
     label: String,
     subtitle: String? = null,
@@ -264,7 +262,7 @@ private fun AttachMenuItem(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
-            key = IntelliJIconKey.fromPlatformIcon(icon),
+            key = icon,
             contentDescription = null,
             modifier = Modifier.size(14.dp),
             tint = iconTint,
@@ -294,25 +292,25 @@ private fun AttachMenuItem(
  * Returns the appropriate IntelliJ icon and tint color for a file based on its extension.
  * Only uses icons known to exist in the IntelliJ platform.
  */
-private fun fileIconForFile(fileName: String): Pair<javax.swing.Icon, Color> {
+private fun fileIconForFile(fileName: String): Pair<org.jetbrains.jewel.ui.icon.IconKey, Color> {
     val ext = fileName.substringAfterLast('.', "").lowercase()
     return when {
-        ext == "kt" || ext == "kts" -> AllIcons.Language.Kotlin to Color(0xFFA97BFF)
-        ext == "java" -> AllIcons.FileTypes.Java to Color(0xFFED8B00)
-        ext == "js" || ext == "jsx" -> AllIcons.FileTypes.JavaScript to Color(0xFFF7DF1E)
-        ext == "ts" || ext == "tsx" -> AllIcons.FileTypes.JavaScript to Color(0xFF3178C6)
-        ext == "py" -> AllIcons.Language.Python to Color(0xFF3776AB)
-        ext == "rb" -> AllIcons.Language.Ruby to Color(0xFFCC342D)
-        ext == "go" -> AllIcons.Language.GO to Color(0xFF00ADD8)
-        ext == "rs" -> AllIcons.Language.Rust to Color(0xFFCE422B)
-        ext == "html" || ext == "htm" -> AllIcons.FileTypes.Html to Color(0xFFE44D26)
-        ext == "css" || ext == "scss" -> AllIcons.FileTypes.Css to Color(0xFF264DE4)
-        ext == "xml" -> AllIcons.FileTypes.Xml to Color(0xFF0060AC)
-        ext == "json" -> AllIcons.FileTypes.Json to Color(0xFFBBBBBB)
-        ext == "yaml" || ext == "yml" -> AllIcons.FileTypes.Yaml to Color(0xFFCB171E)
-        ext == "md" -> AllIcons.FileTypes.Text to Color(0xFF519ABA)
-        ext == "sql" -> AllIcons.FileTypes.Text to Color(0xFFE38C00)
-        ext == "sh" || ext == "bash" -> AllIcons.Nodes.Console to Color(0xFF4EAA25)
-        else -> AllIcons.FileTypes.Text to Color(0xFFBBBBBB)
+        ext == "kt" || ext == "kts" -> AllIconsKeys.Language.Kotlin to Color(0xFFA97BFF)
+        ext == "java" -> AllIconsKeys.FileTypes.Java to Color(0xFFED8B00)
+        ext == "js" || ext == "jsx" -> AllIconsKeys.FileTypes.JavaScript to Color(0xFFF7DF1E)
+        ext == "ts" || ext == "tsx" -> AllIconsKeys.FileTypes.JavaScript to Color(0xFF3178C6)
+        ext == "py" -> AllIconsKeys.Language.Python to Color(0xFF3776AB)
+        ext == "rb" -> AllIconsKeys.Language.Ruby to Color(0xFFCC342D)
+        ext == "go" -> AllIconsKeys.Language.GO to Color(0xFF00ADD8)
+        ext == "rs" -> AllIconsKeys.Language.Rust to Color(0xFFCE422B)
+        ext == "html" || ext == "htm" -> AllIconsKeys.FileTypes.Html to Color(0xFFE44D26)
+        ext == "css" || ext == "scss" -> AllIconsKeys.FileTypes.Css to Color(0xFF264DE4)
+        ext == "xml" -> AllIconsKeys.FileTypes.Xml to Color(0xFF0060AC)
+        ext == "json" -> AllIconsKeys.FileTypes.Json to Color(0xFFBBBBBB)
+        ext == "yaml" || ext == "yml" -> AllIconsKeys.FileTypes.Yaml to Color(0xFFCB171E)
+        ext == "md" -> AllIconsKeys.FileTypes.Text to Color(0xFF519ABA)
+        ext == "sql" -> AllIconsKeys.FileTypes.Text to Color(0xFFE38C00)
+        ext == "sh" || ext == "bash" -> AllIconsKeys.Nodes.Console to Color(0xFF4EAA25)
+        else -> AllIconsKeys.FileTypes.Text to Color(0xFFBBBBBB)
     }
 }
