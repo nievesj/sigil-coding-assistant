@@ -392,6 +392,18 @@ class ChatViewModel(
         service.retryConnection()
     }
 
+    suspend fun connect(projectBasePath: String) {
+        if (connectionState.value == ConnectionState.CONNECTED || 
+            connectionState.value == ConnectionState.CONNECTING) {
+            return
+        }
+        service.initialize(projectBasePath)
+    }
+
+    fun stopConnection() {
+        service.connectionManager.disconnect()
+    }
+
     // --- Cleanup ---
 
     override fun close() {

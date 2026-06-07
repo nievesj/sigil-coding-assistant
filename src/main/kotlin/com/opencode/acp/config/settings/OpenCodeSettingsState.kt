@@ -37,6 +37,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var commandHistorySize: Int = 15
     /** SSE socket timeout in seconds (how long to wait between SSE events before reconnecting). */
     var sseSocketTimeoutSeconds: Int = 60
+    /** Whether to automatically connect when the plugin opens. */
+    var autoConnect: Boolean = true
     /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save. */
     var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
 
@@ -54,6 +56,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         sidebarVisible = state.sidebarVisible
         commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
         sseSocketTimeoutSeconds = if (state.sseSocketTimeoutSeconds > 0) state.sseSocketTimeoutSeconds else 60
+        autoConnect = state.autoConnect
         commandHistory = state.commandHistory
     }
 

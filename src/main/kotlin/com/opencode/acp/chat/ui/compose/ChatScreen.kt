@@ -267,86 +267,106 @@ fun
     }
 
     Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize()) {
-            // Top section: sidebar + chat area
-            Row(modifier = Modifier.weight(1f)) {
-                // Sidebar — animated width for show/hide and tab switching
-                val sidebarTargetWidth = if (isSidebarVisible) {
-                    when (selectedSidebarTab) {
-                        SidebarTab.SESSIONS -> ChatConstants.SIDEBAR_WIDTH_DP
-                        SidebarTab.CONTEXT -> ChatConstants.SIDEBAR_CONTEXT_WIDTH_DP
-                        SidebarTab.REVIEW -> ChatConstants.SIDEBAR_REVIEW_WIDTH_DP
-                    }
-                } else 0
-                val sidebarWidth by animateDpAsState(
-                    targetValue = sidebarTargetWidth.dp,
-                    label = "sidebarWidth"
-                )
-
-                SessionSidebar(
-                    state = sessionListState,
-                    contextState = sessionContextState,
-                    selectedTab = selectedSidebarTab,
-                    onTabSelected = { selectedSidebarTab = it },
-                    onNewSession = { scope.launch { viewModel.createAndSwitchSession() } },
-                    onSessionSelected = { scope.launch { viewModel.switchSession(it) } },
-                    onSessionArchived = { scope.launch { viewModel.archiveSession(it) } },
-                    onRetry = { scope.launch { viewModel.loadSessions() } },
-                    onContextRetry = { viewModel.retryContextFetch() },
-                    onShowDetails = { /* Context tab is already showing */ },
-                    project = project,
-                    modifier = Modifier.width(sidebarWidth),
-                    fileChangeSignal = viewModel.fileChangeSignal,
-                )
-                // Main chat area
-                Column(modifier = Modifier.weight(1f)) {
-                    ChatHeader(
-                        isSidebarVisible = isSidebarVisible,
-                        onToggleSidebar = { viewModel.toggleSidebar() }
-                    )
-                    // Connection banner (shows/hides based on state)
-                    ConnectionBanner(
-                        state = connectionState,
-                        onRetry = { scope.launch { viewModel.retryConnection(project.basePath ?: ".") } }
+        // Show splash screen when not connected
+        if (connectionState != ConnectionState.CONNECTED) {
+            ConnectionSplashScreen(
+                connectionState = connectionState,
+                onConnect = { 
+                    scope.launch { viewModel.connect(project.basePath ?: ".") }
+                },
+                onRetry = { 
+                    scope.launch { viewModel.retryConnection(project.basePath ?: ".") }
+                },
+                onStop = { 
+                    viewModel.stopConnection()
+                },
+                onAutoConnectChanged = { enabled ->
+                    // Auto-connect setting is persisted in the settings
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            // Main chat UI
+            Column(Modifier.fillMaxSize()) {
+                // Top section: sidebar + chat area
+                Row(modifier = Modifier.weight(1f)) {
+                    // Sidebar — animated width for show/hide and tab switching
+                    val sidebarTargetWidth = if (isSidebarVisible) {
+                        when (selectedSidebarTab) {
+                            SidebarTab.SESSIONS -> ChatConstants.SIDEBAR_WIDTH_DP
+                            SidebarTab.CONTEXT -> ChatConstants.SIDEBAR_CONTEXT_WIDTH_DP
+                            SidebarTab.REVIEW -> ChatConstants.SIDEBAR_REVIEW_WIDTH_DP
+                        }
+                    } else 0
+                    val sidebarWidth by animateDpAsState(
+                        targetValue = sidebarTargetWidth.dp,
+                        label = "sidebarWidth"
                     )
 
-                    // Message list (fills remaining space)
-                    MessageList(
-                        messages = messages.values.toList(),
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                    SessionSidebar(
+                        state = sessionListState,
+                        contextState = sessionContextState,
+                        selectedTab = selectedSidebarTab,
+                        onTabSelected = { selectedSidebarTab = it },
+                        onNewSession = { scope.launch { viewModel.createAndSwitchSession() } },
+                        onSessionSelected = { scope.launch { viewModel.switchSession(it) } },
+                        onSessionArchived = { scope.launch { viewModel.archiveSession(it) } },
+                        onRetry = { scope.launch { viewModel.loadSessions() } },
+                        onContextRetry = { viewModel.retryContextFetch() },
+                        onShowDetails = { /* Context tab is already showing */ },
                         project = project,
-                        onSubagentClick = { subagentId ->
-                            scope.launch { viewModel.switchSession(subagentId) }
-                        },
-                        onImagePreview = { uri -> previewImageUri = uri },
+                        modifier = Modifier.width(sidebarWidth),
+                        fileChangeSignal = viewModel.fileChangeSignal,
+                    )
+                    // Main chat area
+                    Column(modifier = Modifier.weight(1f)) {
+                        ChatHeader(
+                            isSidebarVisible = isSidebarVisible,
+                            onToggleSidebar = { viewModel.toggleSidebar() }
+                        )
+                        // Connection banner (shows/hides based on state)
+                        ConnectionBanner(
+                            state = connectionState,
+                            onRetry = { scope.launch { viewModel.retryConnection(project.basePath ?: ".") } }
+                        )
+
+                        // Message list (fills remaining space)
+                        MessageList(
+                            messages = messages.values.toList(),
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                            project = project,
+                            onSubagentClick = { subagentId ->
+                                scope.launch { viewModel.switchSession(subagentId) }
+                            },
+                            onImagePreview = { uri -> previewImageUri = uri },
+                        )
+                    }
+                }
+
+                // Bottom section spans full width (including sidebar)
+                // Permission prompt (shows/hides based on state)
+                permissionPrompt?.let { prompt ->
+                    PermissionPrompt(
+                        prompt = prompt,
+                        onRespond = { response ->
+                            scope.launch { viewModel.respondPermission(response) }
+                        }
                     )
                 }
-            }
 
-            // Bottom section spans full width (including sidebar)
-            // Permission prompt (shows/hides based on state)
-            permissionPrompt?.let { prompt ->
-                PermissionPrompt(
-                    prompt = prompt,
-                    onRespond = { response ->
-                        scope.launch { viewModel.respondPermission(response) }
-                    }
-                )
-            }
+                // Selection prompt (shows/hides based on state)
+                selectionPrompt?.let { prompt ->
+                    SelectionPrompt(
+                        prompt = prompt,
+                        onSubmit = { response -> viewModel.respondSelection(response) },
+                        onDismiss = { viewModel.respondSelection(SelectionResponse(emptySet())) }
+                    )
+                }
 
-            // Selection prompt (shows/hides based on state)
-            selectionPrompt?.let { prompt ->
-                SelectionPrompt(
-                    prompt = prompt,
-                    onSubmit = { response -> viewModel.respondSelection(response) },
-                    onDismiss = { viewModel.respondSelection(SelectionResponse(emptySet())) }
-                )
-            }
-
-            // Input area (always visible at bottom, disabled when disconnected or prompt active)
-            val inputEnabled = connectionState == ConnectionState.CONNECTED && permissionPrompt == null && selectionPrompt == null
-            InputArea(
-                enabled = inputEnabled,
+                // Input area (always visible at bottom, disabled when disconnected or prompt active)
+                val inputEnabled = connectionState == ConnectionState.CONNECTED && permissionPrompt == null && selectionPrompt == null
+                InputArea(
+                    enabled = inputEnabled,
                 isStreaming = isStreaming,
                 controlState = controlState,
                 contextState = sessionContextState,
@@ -399,6 +419,7 @@ fun
                     attachedFiles.addAll(entry.toAttachedFiles())
                 },
             )
+            }
         }
 
         // Image preview overlay — centered in the entire plugin window.

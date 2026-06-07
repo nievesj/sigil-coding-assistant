@@ -55,9 +55,12 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
             }
         })
 
-        // Auto-connect on tool window open
-        scope.launch {
-            viewModel.initialize(project.basePath ?: ".")
+        // Auto-connect on tool window open (if setting enabled)
+        val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance()
+        if (settings.autoConnect) {
+            scope.launch {
+                viewModel.initialize(project.basePath ?: ".")
+            }
         }
     }
 }
