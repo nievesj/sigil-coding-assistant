@@ -52,13 +52,13 @@ import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.Brush
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -503,6 +503,27 @@ private fun SessionRow(
 
     val creatingDim = indicator == SessionIndicator.CREATING
 
+    // Shimmer animation state — sweeps a highlight band across the row
+    // Always create the transition unconditionally to keep composition slot
+    // table stable when the indicator flips between NONE and active states.
+    val transition = rememberInfiniteTransition(label = "shimmer")
+    val rawShimmerProgress by transition.animateFloat(
+        initialValue = -0.4f,
+        targetValue = 1.4f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmerProgress"
+    )
+    val shimmerProgress = if (indicator != SessionIndicator.NONE) rawShimmerProgress else 0f
+
+    val shimmerColor = when (indicator) {
+        SessionIndicator.CREATING -> Color(0xFFFFC107)   // amber
+        SessionIndicator.STREAMING -> Color(0xFF4CAF50)  // green
+        SessionIndicator.NONE -> Color.Transparent
+    }
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -510,6 +531,27 @@ private fun SessionRow(
             .padding(horizontal = 4.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(bgColor)
+            .then(
+                if (indicator != SessionIndicator.NONE) {
+                    Modifier.drawBehind {
+                        val bandWidth = size.width * 0.5f
+                        val startX = shimmerProgress * size.width - bandWidth
+                        drawRect(
+                            brush = Brush.horizontalGradient(
+                                colors = listOf(
+                                    Color.Transparent,
+                                    shimmerColor.copy(alpha = 0.15f),
+                                    shimmerColor.copy(alpha = 0.35f),
+                                    shimmerColor.copy(alpha = 0.15f),
+                                    Color.Transparent
+                                ),
+                                startX = startX,
+                                endX = startX + bandWidth
+                            )
+                        )
+                    }
+                } else Modifier
+            )
             .border(
                 width = if (isSelected) 1.dp else 0.dp,
                 color = if (isSelected) retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.3f) else Color.Transparent,
@@ -568,15 +610,6 @@ private fun SessionRow(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    if (indicator != SessionIndicator.NONE) {
-                        StreamingSpinner(
-                            modifier = Modifier.size(12.dp).padding(end = 4.dp),
-                            color = when (indicator) {
-                                SessionIndicator.CREATING -> Color(0xFFFFC107)
-                                SessionIndicator.STREAMING -> Color(0xFF4CAF50)
-                            }
-                        )
-                    }
                     Text(
                         text = session.title.ifBlank { "Untitled" },
                         fontSize = 12.sp,
@@ -719,39 +752,6 @@ private fun ErrorContent(
         )
         Spacer(Modifier.height(8.dp))
         Link("Retry", onClick = onRetry)
-    }
-}
-
-// ── Streaming Spinner ─────────────────────────────────────────────────────
-
-@Composable
-private fun StreamingSpinner(
-    modifier: Modifier = Modifier,
-    color: Color = Color(0xFF4CAF50),
-) {
-    val infiniteTransition = rememberInfiniteTransition(label = "streaming")
-    val rotation by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000, easing = LinearEasing),
-            repeatMode = androidx.compose.animation.core.RepeatMode.Restart
-        ),
-        label = "rotation"
-    )
-
-    Canvas(modifier = modifier) {
-        val stroke = Stroke(
-            width = 2.dp.toPx(),
-            cap = StrokeCap.Round
-        )
-        drawArc(
-            color = color,
-            startAngle = rotation,
-            sweepAngle = 270f,
-            useCenter = false,
-            style = stroke
-        )
     }
 }
 
