@@ -68,6 +68,10 @@ class SseEventListener(
             // Strip V2 version suffix (e.g. "session.next.text.delta.1" → "session.next.text.delta")
             val normalizedType = type.replace(Regex("\\.\\d+$"), "")
 
+            // V1 bus events nest data under "properties"; V2 events are flat.
+            // Extract properties wrapper for V1 events so field access works correctly.
+            val props = obj["properties"]?.jsonObject ?: obj
+
             return when (normalizedType) {
                 // V2 Text events
                 "session.next.text.started" -> SseEvent.Ignored(sessionId, "session.next.text.started", "intentional no-op")
@@ -192,6 +196,25 @@ class SseEventListener(
 
                 // V2 Session created
                 "session.next.created" -> SseEvent.SessionCreated(sessionId = sessionId)
+
+                // Session-level events (V1 bus) — data is in props (extracted from properties wrapper)
+                "session.idle" -> SseEvent.SessionIdle(sessionId = sessionId)
+                "session.error" -> {
+                    // session.error sends a structured error object: { name: "...", data: { message: "..." } }
+                    val errorObj = props["error"]?.jsonObject
+                    val dataObj = errorObj?.get("data")?.jsonObject
+                    val errorMessage = dataObj?.get("message")?.jsonPrimitive?.contentOrNull
+                        ?: errorObj?.get("name")?.jsonPrimitive?.contentOrNull?.replace("Error", " error")
+                    SseEvent.SessionError(sessionId = sessionId, errorMessage = errorMessage)
+                }
+                "session.created" -> SseEvent.SessionCreated(sessionId = sessionId)
+                "session.deleted" -> SseEvent.Ignored(sessionId, "session.deleted", "intentional no-op")
+                "session.updated" -> SseEvent.Ignored(sessionId, "session.updated", "intentional no-op — handled via REST")
+                "session.compacted" -> SseEvent.SessionCompacted(sessionId = sessionId)
+                "message.removed" -> {
+                    val messageId = props["messageID"]?.jsonPrimitive?.contentOrNull
+                    SseEvent.MessageRemoved(sessionId = sessionId, messageId = messageId)
+                }
 
                 // V2 new part type events
                 "session.next.patch" -> {

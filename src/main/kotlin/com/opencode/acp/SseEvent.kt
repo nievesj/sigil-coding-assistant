@@ -235,6 +235,51 @@ sealed interface SseEvent {
         override val partId: String? = null
     ) : SseEvent
 
+    /** Session idle — server finished processing the current prompt cycle. */
+    data class SessionIdle(
+        override val sessionId: String,
+        override val messageId: String? = null,
+        override val partId: String? = null,
+    ) : SseEvent
+
+    /** Session error — server encountered an error for this session. */
+    data class SessionError(
+        override val sessionId: String,
+        val errorMessage: String? = null,
+        override val messageId: String? = null,
+        override val partId: String? = null,
+    ) : SseEvent
+
+    /** Session compacted — server performed auto-compaction (context window overflow). */
+    data class SessionCompacted(
+        override val sessionId: String,
+        override val messageId: String? = null,
+        override val partId: String? = null,
+    ) : SseEvent
+
+    /** Message finalized with token/cost/model data from message.updated SSE event. */
+    data class MessageFinalized(
+        override val sessionId: String,
+        override val messageId: String?,
+        val inputTokens: Long? = null,
+        val outputTokens: Long? = null,
+        val reasoningTokens: Long? = null,
+        val cacheReadTokens: Long? = null,
+        val cacheWriteTokens: Long? = null,
+        val cost: Double? = null,
+        val modelID: String? = null,
+        val providerID: String? = null,
+        val stopReason: String? = null,
+        override val partId: String? = null,
+    ) : SseEvent
+
+    /** Message removed — server removed a message (e.g., after compaction). */
+    data class MessageRemoved(
+        override val sessionId: String,
+        override val messageId: String?,
+        override val partId: String? = null,
+    ) : SseEvent
+
     /**
      * Event that was received but intentionally not processed.
      * Replaces silent null returns — every SSE event produces a non-null SseEvent.

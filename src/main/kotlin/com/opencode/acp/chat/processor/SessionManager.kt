@@ -48,6 +48,10 @@ class SessionManager(private val scope: CoroutineScope) {
     /** Mutex to serialize session switches. */
     private val switchMutex = Mutex()
 
+    /** Timestamp of the last successful computeSessionContext() call (dedup guard). */
+    @Volatile
+    private var lastContextComputeTime: Long = 0L
+
     /** The currently active session ID. Null if no session is active. */
     private val _activeSessionId = MutableStateFlow<String?>(null)
     val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
@@ -268,6 +272,37 @@ class SessionManager(private val scope: CoroutineScope) {
                 _globalSignals.tryEmit(UiSignal.SessionCreated(event.sessionId))
                 return
             }
+            is SseEvent.SessionIdle -> {
+                if (event.sessionId == _activeSessionId.value) {
+                    _globalSignals.tryEmit(UiSignal.SessionIdle(event.sessionId))
+                }
+                // Also route to SessionState as a backstop — if streaming is still
+                // active when the server says it's idle, finalize it.
+                // Don't return early: fall through to the else -> branch below.
+            }
+            is SseEvent.SessionError -> {
+                logger.warn { "[ACP] Session error: session=${event.sessionId}, error=${event.errorMessage}" }
+                _globalSignals.tryEmit(UiSignal.SessionError(event.sessionId, event.errorMessage))
+                return
+            }
+            is SseEvent.SessionCompacted -> {
+                // Server performed auto-compaction — local message cache is stale.
+                // Emit signal so ViewModel can refresh messages and recompute context.
+                if (event.sessionId == _activeSessionId.value) {
+                    _globalSignals.tryEmit(UiSignal.SessionCompacted(event.sessionId))
+                }
+                return
+            }
+            is SseEvent.MessageRemoved -> {
+                // Route to SessionState for cache removal, then refresh context
+                sessionsLock.withLock { sessions[sessionId] }?.let { state ->
+                    state.processEvent(event)
+                }
+                if (sessionId == _activeSessionId.value) {
+                    scope.launch { computeSessionContext() }
+                }
+                return
+            }
             is SseEvent.Subtask -> {
                 // Subagent spawned — refresh the session list so it appears in the sidebar
                 scope.launch { loadSessions() }
@@ -424,6 +459,30 @@ class SessionManager(private val scope: CoroutineScope) {
         }
     }
 
+    /**
+     * Refresh the message cache for the active session by re-fetching from the server.
+     * Used after auto-compaction (session.compacted) when the local cache is stale —
+     * compacted messages are removed/summarized server-side, so local token
+     * accumulation would produce inflated numbers without a refresh.
+     */
+    internal suspend fun refreshActiveSessionMessages() {
+        val currentSessionId = _activeSessionId.value ?: return
+        val c = client ?: return
+        val state = sessionsLock.withLock { sessions[currentSessionId] } ?: return
+
+        val messages = try {
+            c.listMessages(currentSessionId, limit = null)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error(e) { "[ACP] Failed to refresh messages for $currentSessionId after compaction" }
+            return
+        }
+
+        state.replaceAllMessages(messages.map { it.toChatMessage() })
+        logger.info { "[ACP] Refreshed messages for session $currentSessionId after compaction (${messages.size} messages)" }
+    }
+
     /** Evict the least-recently-used non-active session if cache is full.
      *  Never evict streaming or permission-pending sessions.
      *  Removes sessions from the map under lock, then closes them outside the lock. */
@@ -463,36 +522,77 @@ class SessionManager(private val scope: CoroutineScope) {
     internal suspend fun computeSessionContext(controlState: ControlBarState? = null): SessionContextState {
         val currentSessionId = _activeSessionId.value ?: return SessionContextState.Loading
         val c = client ?: return SessionContextState.Loading
+
+        // Dedup: skip re-computation if last call was < 300ms ago and state is Loaded.
+        // This prevents redundant REST calls when StreamingCompleted and SessionIdle
+        // fire close together for the same response.
+        val now = System.currentTimeMillis()
+        if (now - lastContextComputeTime < 300 && _sessionContextState.value is SessionContextState.Loaded) {
+            return _sessionContextState.value
+        }
+        lastContextComputeTime = now
+
         val messages = getActiveSession()?.messages?.value ?: emptyMap()
 
+        // Best-effort session fetch — used for summary, time, and model metadata.
+        // Token/cost data comes from the local message cache (kept accurate by
+        // MessageFinalized SSE events), NOT from session.tokens/session.cost
+        // (the V1 API returns these as always-zero — see AGENTS.md § API Testing).
+        //
+        // Design deviation from TDD §7.1: On fetch failure, we return Loaded with
+        // defaults (0 for summary/time, controlState fallback for model) instead of
+        // Error. This is intentional because token/cost data (the primary context
+        // data) is still available from the local message cache — only the secondary
+        // metadata (summary, time, model) degrades gracefully. Showing an Error
+        // state for a transient session-fetch failure would be too aggressive since
+        // the core data is still correct.
         val session = try {
             c.getSession(currentSessionId)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            logger.error(e) { "[ACP] Failed to fetch session for context" }
             null
         }
 
+        // ── Token data: use LAST assistant message (matches OpenCode desktop) ──
+        // The desktop app shows the last assistant message's token breakdown,
+        // not cumulative across all messages. Only cost is cumulative.
+        // MessageFinalized SSE events keep per-message fields accurate.
+        val assistantMessages = messages.values.filter { it.role == MessageRole.ASSISTANT }
         val lastAssistant = messages.values.findLast {
-            it.role == MessageRole.ASSISTANT && (it.inputTokens + it.outputTokens + it.reasoningTokens + it.cacheReadTokens + it.cacheWriteTokens) > 0
+            it.role == MessageRole.ASSISTANT &&
+                (it.inputTokens + it.outputTokens + it.reasoningTokens + it.cacheReadTokens + it.cacheWriteTokens) > 0
         }
-
-        val totalCost = messages.values.filter { it.role == MessageRole.ASSISTANT }.sumOf { it.cost }
-
-        val modelId = lastAssistant?.modelID ?: controlState?.selectedModel?.modelID
-        val providerId = lastAssistant?.providerID ?: controlState?.selectedModel?.providerID
-
-        val (providerName, modelName) = resolveModelNames(controlState?.models ?: emptyList(), modelId, providerId)
-        val contextLimit = resolveContextLimit(controlState?.allModels?.ifEmpty { controlState.models } ?: emptyList(), providerId, modelId)
-
         val inputTokens = lastAssistant?.inputTokens ?: 0L
         val outputTokens = lastAssistant?.outputTokens ?: 0L
         val reasoningTokens = lastAssistant?.reasoningTokens ?: 0L
         val cacheReadTokens = lastAssistant?.cacheReadTokens ?: 0L
         val cacheWriteTokens = lastAssistant?.cacheWriteTokens ?: 0L
         val totalTokens = inputTokens + outputTokens + reasoningTokens + cacheReadTokens + cacheWriteTokens
+        val totalCost = assistantMessages.sumOf { it.cost }  // cumulative across all messages
+
+        // ── Model info: from session metadata, fallback to controlState ──
+        // Note: SessionModel.id is String = "" (non-nullable). Must use takeIf
+        // to avoid treating empty string as a valid model ID, which would
+        // suppress the controlState fallback.
+        val modelId = session?.model?.id?.takeIf { it.isNotBlank() } ?: controlState?.selectedModel?.modelID
+        val providerId = session?.model?.providerID?.takeIf { it.isNotBlank() } ?: controlState?.selectedModel?.providerID
+
+        val (providerName, modelName) = resolveModelNames(
+            controlState?.models ?: emptyList(), modelId, providerId
+        )
+        val contextLimit = resolveContextLimit(
+            controlState?.allModels?.ifEmpty { controlState.models } ?: emptyList(),
+            providerId, modelId
+        )
 
         val usagePercent = if (contextLimit > 0L) {
             (totalTokens.toFloat() / contextLimit.toFloat()) * 100f
         } else 0f
+
+        // ── Message counts: from local cache (not in OpenCodeSession) ──
+        val messageCount = messages.size
+        val userMessageCount = messages.values.count { it.role == MessageRole.USER }
+        val assistantMessageCount = assistantMessages.size
 
         val sessionTitle = (_sessionListState.value as? SessionListState.Loaded)
             ?.sessions?.find { it.id == currentSessionId }?.title ?: "Untitled"
@@ -514,16 +614,17 @@ class SessionManager(private val scope: CoroutineScope) {
                 cacheWriteTokens = cacheWriteTokens,
                 usagePercent = usagePercent,
                 totalCost = totalCost,
-                messageCount = messages.size,
-                userMessageCount = messages.values.count { it.role == MessageRole.USER },
-                assistantMessageCount = messages.values.count { it.role == MessageRole.ASSISTANT },
+                messageCount = messageCount,
+                userMessageCount = userMessageCount,
+                assistantMessageCount = assistantMessageCount,
                 additions = session?.summary?.additions ?: 0,
                 deletions = session?.summary?.deletions ?: 0,
                 filesModified = session?.summary?.files ?: 0,
                 sessionCreated = session?.time?.created ?: 0L,
-                lastUpdated = session?.time?.updated ?: 0L
+                lastUpdated = session?.time?.updated ?: 0L,
             )
         )
+        logger.info { "[ACP] computeSessionContext: session=$currentSessionId totalTokens=$totalTokens cost=$totalCost usagePercent=${"%.1f".format(usagePercent)}% model=$modelId provider=$providerId" }
         _sessionContextState.value = result
         return result
     }

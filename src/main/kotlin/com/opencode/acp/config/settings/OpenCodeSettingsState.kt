@@ -39,6 +39,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var sseSocketTimeoutSeconds: Int = 60
     /** Whether to automatically connect when the plugin opens. */
     var autoConnect: Boolean = true
+    /** Port for the OpenCode server (default 4096). */
+    var port: Int = 4096
     /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save. */
     var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
 
@@ -57,6 +59,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
         sseSocketTimeoutSeconds = if (state.sseSocketTimeoutSeconds > 0) state.sseSocketTimeoutSeconds else 60
         autoConnect = state.autoConnect
+        port = if (state.port in 1024..65535) state.port else 4096
         commandHistory = state.commandHistory
     }
 

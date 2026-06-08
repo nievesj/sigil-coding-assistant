@@ -33,4 +33,13 @@ sealed interface UiSignal {
 
     /** Error event processed. */
     data class Error(val messageId: String, val message: String) : UiSignal
+
+    /** Session idle — server finished processing the current prompt cycle. */
+    data class SessionIdle(val sessionId: String) : UiSignal
+
+    /** Session error — server encountered an error for this session. */
+    data class SessionError(val sessionId: String, val errorMessage: String?) : UiSignal
+
+    /** Session compacted — server performed auto-compaction; local message cache may be stale. */
+    data class SessionCompacted(val sessionId: String) : UiSignal
 }

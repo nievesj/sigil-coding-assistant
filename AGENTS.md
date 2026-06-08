@@ -490,6 +490,120 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 | `.svg`, `.png`, `.jpg`, etc. | `AllIcons.FileTypes.Image` |
 | Default | `AllIcons.FileTypes.Text` |
 
+### API Testing (REST Endpoints)
+
+The OpenCode server exposes a REST API at `http://127.0.0.1:4096`. Use PowerShell's
+`Invoke-RestMethod` to test endpoints — `jq` is not available on Windows.
+
+**List sessions:**
+```powershell
+pwsh -Command "(Invoke-RestMethod -Uri 'http://127.0.0.1:4096/session') | ForEach-Object { '{0} - {1}' -f `$_.id, `$_.title }"
+```
+
+**Session detail (tokens, cost, model, summary, time):**
+```powershell
+pwsh -Command "$s = Invoke-RestMethod -Uri 'http://127.0.0.1:4096/session/SESSION_ID'; Write-Output ($s | ConvertTo-Json -Depth 3)"
+```
+
+**List messages with tokens/cost:**
+```powershell
+pwsh -Command "$msgs = Invoke-RestMethod -Uri 'http://127.0.0.1:4096/session/SESSION_ID/message'; foreach ($m in $msgs) { Write-Output ('{0} role={1} cost={2} tokens=[in:{3} out:{4}] model={5}' -f `$m.info.id, `$m.info.role, `$m.info.cost, `$m.info.tokens.input, `$m.info.tokens.output, `$m.info.modelID) }"
+```
+
+**Health check:**
+```powershell
+pwsh -Command "Invoke-RestMethod -Uri 'http://127.0.0.1:4096/global/health' | ConvertTo-Json"
+```
+
+**Verified (2026-06-08):**
+- `GET /session/:id` returns `tokens` and `cost` fields but they are **always zero** — the V1
+  API does NOT populate cumulative session-level token/cost data. Per-message
+  `tokens`/`cost`/`modelID` are populated correctly in `GET /session/:id/message` and
+  `message.updated` SSE events.
+- `GET /session/:id` returns `model` as an **optional** field (`{ id, providerID, variant }`).
+  Per the OpenAPI spec it exists on `Session`, but its population in practice varies.
+  `computeSessionContext()` uses it with `takeIf { isNotBlank() }` and falls back to
+  `controlState.selectedModel` when absent or empty.
+- `GET /session/:id` DOES correctly return `summary` (`additions`, `deletions`, `files`)
+  and `time` (`created`, `updated`).
+- `session.error` SSE events carry a **structured error object** (`{ name, data: { message } }`),
+  not a flat string. Both `OpenCodeClient` and `SseEventListener` parse `data.message` with
+  fallback to `name`.
+
+**Implication:** `computeSessionContext()` must accumulate token/cost data from the
+local message cache (summing across all `ChatMessage` fields populated by
+`MessageFinalized` SSE events and REST-loaded messages), NOT from
+`OpenCodeSession.tokens`/`.cost`. Session `summary` and `time` can be read from
+the REST response.
+
+### Context Manager — Design Deviations from TDD
+
+**Error state on fetch failure (TDD §7.1):** `computeSessionContext()` returns
+`Loaded` with defaults (0 for summary/time, controlState fallback for model)
+instead of `Error` when `GET /session/:id` fails. This is intentional because
+token/cost data (the primary context data) is still available from the local
+message cache — only secondary metadata degrades gracefully. Showing an Error
+state for a transient session-fetch failure would be too aggressive.
+
+**Dedup guard:** `computeSessionContext()` skips re-computation if the last call
+was < 300ms ago and the current state is `Loaded`. This prevents redundant REST
+calls when `StreamingCompleted` and `SessionIdle` fire close together for the
+same response.
+
+### `session.compacted` SSE Event — Auto-Compaction Cache Invalidation
+
+The server sends `session.compacted` when auto-compaction occurs (context window
+overflow). After compaction, the local message cache is stale — compacted messages
+are removed/summarized server-side, so local token accumulation would produce
+inflated numbers.
+
+**Data flow:**
+1. SSE `session.compacted` → `SseEvent.SessionCompacted` → `UiSignal.SessionCompacted`
+2. `ChatViewModel` handles `SessionCompacted` → calls `service.refreshActiveSessionMessages()`
+3. `SessionManager.refreshActiveSessionMessages()` → `GET /session/:id/message` → `SessionState.replaceAllMessages()`
+4. Then `computeSessionContext()` runs on the fresh cache
+
+**Key files:** `SseEvent.kt` (`SessionCompacted`), `OpenCodeClient.kt` (parsing),
+`SseEventListener.kt` (standalone parser), `SessionManager.kt` (routing + refresh),
+`SessionState.kt` (`replaceAllMessages()`), `ChatViewModel.kt` (signal handling)
+
+### `message.removed` SSE Event — Message Deletion
+
+The server sends `message.removed` when a message is deleted (e.g., after
+compaction). The plugin removes the message from the local cache by matching
+`ChatMessage.serverMessageId`, then triggers `computeSessionContext()` to
+refresh token totals.
+
+**Key files:** `SseEvent.kt` (`MessageRemoved`), `OpenCodeClient.kt` (parsing),
+`SseEventListener.kt` (standalone parser), `SessionManager.kt` (routing + context refresh),
+`SessionState.kt` (`removeMessageByServerId()`)
+
+### SseEventListener Standalone Parser — V1 Format Fix
+
+The standalone `parseByType` method now extracts `properties` from V1 bus events
+before accessing event-specific fields. Previously, V1 events like `session.error`
+read from the top-level JSON object (`obj["error"]`), which was `null` because
+V1 nests data under `properties`. The fix: `val props = obj["properties"]?.jsonObject ?: obj`
+— V1 events use `props`, V2 events fall back to `obj` (no `properties` wrapper).
+
+### Configurable Server Port
+
+The plugin now has a configurable port setting in `Settings → Tools → OpenCode`
+(default: 4096). This allows the plugin to coexist with other opencode consumers
+(e.g., a conversation host running on port 4096).
+
+**Connection strategy (`OpenCodeConnectionManager.initialize()`):**
+1. Check if a server is already running on the configured `host:port`
+2. If yes → connect to it (don't launch a new binary)
+3. If no → launch `opencode serve --hostname $host --port $port` and wait for health check
+
+**Shutdown behavior:** The plugin kills its own launched process on IDE dispose
+(`shutdown()` → `killProcess()`). If the plugin connected to an existing server
+(step 1), it does NOT kill that server — it only disconnects the HTTP/SSE client.
+
+**Key files:** `OpenCodeSettingsState.kt` (`port` field), `OpenCodeSettingsPanel.kt`
+(port UI), `OpenCodeConnectionManager.kt` (connection logic)
+
 ---
 
 ## Deferred Features
@@ -570,3 +684,13 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 - [x] `respondPermission`/`respondQuestion`/`rejectQuestion` in `OpenCodeClient` now throw on failure instead of swallowing — ViewModel catch blocks are reachable
 - [x] `SessionItem.createdAt` renamed to `updatedAt` (was actually `time.updated`, not `time.created`)
 - [x] `SessionContext` fields (`additions`/`deletions`/`filesModified`/`sessionCreated`/`lastUpdated`) now populated from `GET /session/:id` summary — were hardcoded to 0
+- [x] `computeSessionContext()` accumulates token/cost from local message cache (all assistant messages) instead of always-zero `session.tokens`/`.cost` or single `lastAssistant` lookup
+- [x] `MessageFinalized` SSE event parses `message.updated` `info.tokens`/`cost`/`modelID`/`providerID` — local message cache stays accurate for accumulation
+- [x] `finalizeStreaming()` extracted as shared logic between `Stop` and `MessageFinalized` handlers — eliminates duplication
+- [x] `session.idle` SSE event triggers `computeSessionContext()` immediately — eliminates 300ms debounce dependency
+- [x] `session.error` SSE event parsed with structured error object (`data.message` with fallback to `name`)
+- [x] `session.compacted` SSE event triggers message cache refresh (`refreshActiveSessionMessages()`) + context recomputation — prevents inflated token counts after auto-compaction
+- [x] `message.removed` SSE event removes message from local cache by `serverMessageId` + triggers context refresh
+- [x] `computeSessionContext()` dedup guard — skips re-computation if < 300ms since last call and state is Loaded (prevents double REST calls when `StreamingCompleted` + `SessionIdle` fire close together)
+- [x] `SseEventListener` standalone parser now extracts `properties` wrapper for V1 bus events — `session.error` parsing was broken (read from top-level `obj` instead of `obj["properties"]`)
+- [x] `SessionState.replaceAllMessages()` and `removeMessageByServerId()` — support cache invalidation after compaction/message deletion

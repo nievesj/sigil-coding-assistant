@@ -453,6 +453,10 @@ class OpenCodeService(private val project: Project) : Disposable {
         sessionManager.computeSessionContext(controlState)
     }
 
+    suspend fun refreshActiveSessionMessages() {
+        sessionManager.refreshActiveSessionMessages()
+    }
+
     suspend fun fetchTodos() = sessionManager.fetchTodos()
 
     suspend fun fetchAvailableCommands(): List<SlashCommand> =

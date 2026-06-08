@@ -110,6 +110,8 @@ class OpenCodeAgentSession(
                         )
                     ))
 
+                    is SseEvent.MessageFinalized -> { /* informational — token/cost data */ }
+
                     is SseEvent.ToolUse -> emit(Event.SessionUpdateEvent(
                         // Initial tool call: use SessionUpdate.ToolCall for the first appearance
                         update = SessionUpdate.ToolCall(
@@ -179,6 +181,22 @@ class OpenCodeAgentSession(
 
                     is SseEvent.SessionCreated -> {
                         logger.debug { "Session created: ${sseEvent.sessionId}" }
+                    }
+
+                    is SseEvent.SessionIdle -> {
+                        logger.debug { "Session idle: ${sseEvent.sessionId}" }
+                    }
+
+                    is SseEvent.SessionError -> {
+                        logger.warn { "Session error: ${sseEvent.sessionId}, error=${sseEvent.errorMessage}" }
+                    }
+
+                    is SseEvent.SessionCompacted -> {
+                        logger.info { "Session compacted: ${sseEvent.sessionId}" }
+                    }
+
+                    is SseEvent.MessageRemoved -> {
+                        logger.debug { "Message removed: ${sseEvent.messageId}" }
                     }
 
                     is SseEvent.MessageComplete -> {

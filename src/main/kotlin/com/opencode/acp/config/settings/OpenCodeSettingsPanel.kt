@@ -37,6 +37,9 @@ class OpenCodeSettingsPanel {
 
     val timeoutField: JBTextField = JBTextField("60", 5)
 
+    /** Server port — which port the opencode server listens on. */
+    val portField: JBTextField = JBTextField("4096", 6)
+
     /** Command history size — how many past messages to remember. */
     val commandHistorySizeField: JBTextField = JBTextField("15", 5)
 
@@ -92,6 +95,7 @@ class OpenCodeSettingsPanel {
     val panel: JPanel = FormBuilder.createFormBuilder()
         .addLabeledComponent("OpenCode binary:", binaryPathField, 5)
         .addComponentToRightColumn(discoverButton)
+        .addLabeledComponent("Server port:", portField, 5)
         .addLabeledComponent("Permission timeout (seconds):", timeoutField, 5)
         .addLabeledComponent("Command history size:", commandHistorySizeField, 5)
         .addLabeledComponent("SSE socket timeout (seconds):", sseSocketTimeoutField, 5)
@@ -105,6 +109,7 @@ class OpenCodeSettingsPanel {
 
     fun setState(settings: OpenCodeSettingsState) {
         binaryPathField.text = settings.binaryPath
+        portField.text = settings.port.toString()
         timeoutField.text = settings.permissionTimeoutSeconds.toString()
         commandHistorySizeField.text = settings.commandHistorySize.toString()
         sseSocketTimeoutField.text = settings.sseSocketTimeoutSeconds.toString()
@@ -114,6 +119,7 @@ class OpenCodeSettingsPanel {
 
     fun applyTo(settings: OpenCodeSettingsState) {
         settings.binaryPath = binaryPathField.text.trim()
+        settings.port = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535) ?: 4096
         settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60
         settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
         settings.sseSocketTimeoutSeconds = sseSocketTimeoutField.text.trim().toIntOrNull()?.coerceIn(30, 3600) ?: 60
@@ -123,6 +129,7 @@ class OpenCodeSettingsPanel {
 
     fun isModified(settings: OpenCodeSettingsState): Boolean {
         return binaryPathField.text.trim() != settings.binaryPath ||
+                (portField.text.trim().toIntOrNull() ?: 4096) != settings.port ||
                 (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
                 (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
                 (sseSocketTimeoutField.text.trim().toIntOrNull() ?: 60) != settings.sseSocketTimeoutSeconds ||

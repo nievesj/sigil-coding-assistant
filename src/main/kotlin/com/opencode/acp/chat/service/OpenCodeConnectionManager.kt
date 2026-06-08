@@ -62,14 +62,18 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
     }
 
     /**
-     * Launch the OpenCode binary (if not already running), then poll the health
-     * endpoint until the server responds. No manual retry needed — this loops
-     * with backoff until the server is ready or [INIT_TIMEOUT_MS] elapses.
+     * Connect to OpenCode server (existing or newly launched), then poll the
+     * health endpoint until the server responds.
      *
-     * Does NOT load sessions or subscribe to SSE — that's done by the service
-     * after the connection is established.
+     * Strategy:
+     * 1. First try to connect to an existing server on the host:port (someone
+     *    else may already have opencode running — e.g., this AI conversation host).
+     *    If reachable, skip launching our own binary and connect directly.
+     * 2. If no existing server, launch our own binary and wait for it to become
+     *    healthy via exponential backoff polling.
+     * 3. Kill any orphan processes from previous sessions to prevent zombie pile-ups.
      *
-     * @return true if connection succeeded, false on fatal error (binary not found, timeout)
+     * @return true if connection succeeded, false on fatal error
      */
     suspend fun initialize(projectBasePath: String = "."): Boolean {
         this.projectBasePath = projectBasePath
@@ -80,7 +84,7 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
 
         val settings = OpenCodeSettingsState.getInstance().state
         host = AcpDefaults.DEFAULT_OPENCODE_HOST
-        port = AcpDefaults.DEFAULT_OPENCODE_PORT
+        port = settings.port
 
         logger.info { "[ACP] ConnectionManager.initialize: connecting to OpenCode at $host:$port" }
         _connectionState.value = ConnectionState.CONNECTING
@@ -111,7 +115,21 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         )
         openCodeClient = opencodeClient
 
-        // Always launch our own binary — don't trust isServerReachable()
+        // Step 1: Try to reach an existing server first
+        val serverAlreadyRunning = try {
+            opencodeClient.healthCheck()
+        } catch (_: Exception) {
+            false
+        }
+
+        if (serverAlreadyRunning) {
+            logger.info { "[ACP] ConnectionManager.initialize: existing server reachable at $host:$port — connecting without launching new binary" }
+            _connectionState.value = ConnectionState.CONNECTED
+            initialized = true
+            return true
+        }
+
+        // Step 2: No existing server — launch our own binary
         if (settings.binaryPath.isNotBlank()) {
             launchOpenCodeBinary(settings.binaryPath)
         } else {
@@ -258,21 +276,6 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         if (proc.isAlive) return null
         val exitVal = proc.exitValue()
         return "Process exited with code $exitVal"
-    }
-
-    private fun isServerReachable(): Boolean {
-        return try {
-            val url = java.net.URI("http://$host:$port/global/health").toURL()
-            val conn = url.openConnection() as java.net.HttpURLConnection
-            conn.connectTimeout = 1000
-            conn.readTimeout = 1000
-            conn.requestMethod = "GET"
-            val reachable = conn.responseCode == 200
-            conn.disconnect()
-            reachable
-        } catch (_: Exception) {
-            false
-        }
     }
 
     private fun killProcess(process: Process?) {

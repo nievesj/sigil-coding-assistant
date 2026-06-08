@@ -246,6 +246,45 @@ class SessionState(
         logger.info { "[ACP] addMessage: id=${message.id}, role=${message.role}, mapSize=${current.size}" }
     }
 
+    /**
+     * Remove a message from the cache by its server message ID.
+     * Used when the server sends message.removed (e.g., after compaction).
+     * The message map is keyed by local ID, so we search by [ChatMessage.serverMessageId].
+     */
+    fun removeMessageByServerId(serverMessageId: String) = stateLock.withLock {
+        val current = LinkedHashMap(_messages.value)
+        val entry = current.entries.find { it.value.serverMessageId == serverMessageId }
+        if (entry != null) {
+            // Clean up tool call index for the removed message
+            entry.value.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
+                ctx.toolCallIndex.remove(part.pill.toolCallId)
+            }
+            current.remove(entry.key)
+            _messages.value = current
+            logger.info { "[ACP] removeMessageByServerId: serverId=$serverMessageId, localId=${entry.key}, mapSize=${current.size}" }
+        } else {
+            logger.debug { "[ACP] removeMessageByServerId: serverId=$serverMessageId not found in cache" }
+        }
+    }
+
+    /**
+     * Replace all messages in the cache with a fresh set from the server.
+     * Used after auto-compaction (session.compacted) when the local cache is stale.
+     * Rebuilds the tool call index from the new message set.
+     */
+    fun replaceAllMessages(newMessages: List<ChatMessage>) = stateLock.withLock {
+        val current = LinkedHashMap<String, ChatMessage>()
+        ctx.toolCallIndex.clear()
+        newMessages.forEach { message ->
+            current[message.id] = message
+            message.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
+                ctx.toolCallIndex[part.pill.toolCallId] = message.id
+            }
+        }
+        _messages.value = current
+        logger.info { "[ACP] replaceAllMessages: ${newMessages.size} messages, mapSize=${current.size}" }
+    }
+
     fun injectSubagentRefs(messageId: String, refs: List<SubagentRef>) = stateLock.withLock {
         updateMessage(messageId) { msg ->
             val partsWithoutSubagents = LinkedHashMap(msg.parts.filterValues { it !is MessagePart.Subagent })
@@ -392,6 +431,25 @@ class SessionState(
             }
             is SseEvent.SessionCreated -> {
                 _signals.tryEmit(UiSignal.SessionCreated(event.sessionId))
+                return
+            }
+            is SseEvent.SessionIdle -> {
+                // Backstop: if the server says it's idle but we're still streaming,
+                // finalize. This handles the case where message.updated didn't have
+                // a finish field or the messageId was missing.
+                if (ctx.isStreaming) {
+                    val msgId = ctx.activeMessageId
+                    if (msgId != null) {
+                        logger.info { "[ACP] SessionIdle backstop: finalizing stuck streaming state" }
+                        finalizeStreaming(msgId, "idle")
+                    }
+                }
+                return
+            }
+            is SseEvent.MessageRemoved -> {
+                // Remove the message from the local cache by server message ID
+                val serverMsgId = event.messageId ?: return
+                removeMessageByServerId(serverMsgId)
                 return
             }
             is SseEvent.UserMessage -> { return }
@@ -603,29 +661,49 @@ class SessionState(
 
             // ── Stop ─────────────────────────────────────────────────────
             is SseEvent.Stop -> {
-                if (!ctx.isStreaming) {
-                    logger.info { "[ACP] processEvent SKIP Stop: not streaming (reason=${event.stopReason})" }
+                finalizeStreaming(msgId, event.stopReason)
+            }
+
+            // ── MessageFinalized ─────────────────────────────────────────
+            // event.messageId is the SERVER message ID (e.g., "msg_xxx").
+            // ctx.activeMessageId is the LOCAL ID (generated if server ID wasn't
+            // available at creation time). ctx.activeServerMessageId is the server ID
+            // set by updateServerMessageId(). We must check against BOTH, and use the
+            // LOCAL ID for updateMessage() since the message map is keyed by local ID.
+            is SseEvent.MessageFinalized -> {
+                val serverMsgId = event.messageId ?: return
+
+                // Guard: only process events for the currently streaming message.
+                // Check against both server ID and local ID — the message may have
+                // been created with a generated ID before the server assigned one.
+                if (serverMsgId != ctx.activeServerMessageId && serverMsgId != ctx.activeMessageId) {
+                    logger.debug { "[ACP] MessageFinalized for non-active message $serverMsgId — skipping (activeLocal=${ctx.activeMessageId}, activeServer=${ctx.activeServerMessageId})" }
                     return
                 }
 
-                freezeCurrentThinking()
-                resegmentTextPartsDirect(msgId)
+                // Use the LOCAL message ID for map lookups — the message cache is
+                // keyed by the ID returned from createAssistantMessage(), which may
+                // differ from the server ID.
+                val localMsgId = ctx.activeMessageId ?: return
 
-                if (event.stopReason == "tool-calls") {
-                    logger.info { "[ACP] processEvent Stop (tool-calls): intermediate — continuing stream" }
-                } else {
-                    val capturedMsgId = msgId
-                    ctx.pendingStopJob?.cancel()
-                    ctx.pendingStopJob = scope.launch {
-                        delay(300)
-                        stateLock.withLock {
-                            if (!ctx.isStreaming) return@withLock
-                            ctx.isStreaming = false
-                            updateMessage(capturedMsgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
-                            emitStreamingCompleted(capturedMsgId)
-                        }
-                    }
-                    logger.info { "[ACP] processEvent Stop (reason=${event.stopReason}): debounced finalization (300ms)" }
+                // Apply token/cost/model updates unconditionally (may arrive without stopReason)
+                updateMessage(localMsgId) { msg ->
+                    msg.copy(
+                        inputTokens = event.inputTokens ?: msg.inputTokens,
+                        outputTokens = event.outputTokens ?: msg.outputTokens,
+                        reasoningTokens = event.reasoningTokens ?: msg.reasoningTokens,
+                        cacheReadTokens = event.cacheReadTokens ?: msg.cacheReadTokens,
+                        cacheWriteTokens = event.cacheWriteTokens ?: msg.cacheWriteTokens,
+                        cost = event.cost ?: msg.cost,
+                        modelID = event.modelID ?: msg.modelID,
+                        providerID = event.providerID ?: msg.providerID,
+                        // isStreaming and state are NOT set here — only in finalizeStreaming()
+                    )
+                }
+
+                // Delegate finalization to shared logic (same as Stop handler)
+                if (event.stopReason != null) {
+                    finalizeStreaming(localMsgId, event.stopReason)
                 }
             }
 
@@ -729,11 +807,48 @@ class SessionState(
             // Unreachable — handled in first when block
             is SseEvent.Ignored,
             is SseEvent.MessageComplete,
+            is SseEvent.MessageRemoved,
             is SseEvent.Plan,
             is SseEvent.QuestionAsked,
+            is SseEvent.SessionCompacted,
             is SseEvent.SessionCreated,
+            is SseEvent.SessionIdle,
+            is SseEvent.SessionError,
             is SseEvent.TodoUpdated,
             is SseEvent.UserMessage -> { /* already returned above */ }
+        }
+    }
+
+    /**
+     * Shared streaming finalization logic — called by both SseEvent.Stop and
+     * SseEvent.MessageFinalized handlers. Handles freeze, resegment, tool-calls
+     * filter, and debounced completion.
+     */
+    private fun finalizeStreaming(msgId: String, stopReason: String) {
+        if (!ctx.isStreaming) {
+            logger.info { "[ACP] finalizeStreaming SKIP: not streaming (reason=$stopReason)" }
+            return
+        }
+
+        freezeCurrentThinking()
+        resegmentTextPartsDirect(msgId)
+
+        if (stopReason == "tool-calls") {
+            // Intermediate stop — tool calls starting; keep message streaming, don't mark completed
+            logger.info { "[ACP] finalizeStreaming (tool-calls): intermediate — continuing stream, token data applied" }
+        } else {
+            val capturedMsgId = msgId
+            ctx.pendingStopJob?.cancel()
+            ctx.pendingStopJob = scope.launch {
+                delay(300)
+                stateLock.withLock {
+                    if (!ctx.isStreaming) return@withLock
+                    ctx.isStreaming = false
+                    updateMessage(capturedMsgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
+                    emitStreamingCompleted(capturedMsgId)
+                }
+            }
+            logger.info { "[ACP] finalizeStreaming (reason=$stopReason): debounced finalization (300ms)" }
         }
     }
 

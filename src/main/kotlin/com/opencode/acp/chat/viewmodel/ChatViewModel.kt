@@ -119,6 +119,15 @@ class ChatViewModel(
                     is UiSignal.SessionCreated -> {
                         // Should not arrive on activeSignals (routed to globalSignals)
                     }
+                    is UiSignal.SessionIdle -> {
+                        // Should not arrive on activeSignals (routed to globalSignals)
+                    }
+                    is UiSignal.SessionError -> {
+                        // Should not arrive on activeSignals (routed to globalSignals)
+                    }
+                    is UiSignal.SessionCompacted -> {
+                        // Should not arrive on activeSignals (routed to globalSignals)
+                    }
                     is UiSignal.FileChanged -> {
                         _fileChangeSignal.tryEmit(Unit)
                     }
@@ -132,6 +141,22 @@ class ChatViewModel(
                 when (signal) {
                     is UiSignal.SessionCreated -> {
                         scope.launch { service.loadSessions() }
+                    }
+                    is UiSignal.SessionIdle -> {
+                        // Server-authoritative idle signal — refresh context immediately
+                        // (eliminates the 300ms debounce dependency from StreamingCompleted)
+                        scope.launch { computeSessionContext() }
+                    }
+                    is UiSignal.SessionError -> {
+                        logger.warn { "[ACP] ViewModel received session error: session=${signal.sessionId}, error=${signal.errorMessage}" }
+                    }
+                    is UiSignal.SessionCompacted -> {
+                        // Server performed auto-compaction — local message cache is stale.
+                        // Refresh messages from server, then recompute context.
+                        scope.launch {
+                            service.refreshActiveSessionMessages()
+                            computeSessionContext()
+                        }
                     }
                     else -> { /* other global signals */ }
                 }

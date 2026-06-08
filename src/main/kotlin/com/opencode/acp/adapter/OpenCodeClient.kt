@@ -602,6 +602,33 @@ class OpenCodeClient(
         part["id"]?.jsonPrimitive?.contentOrNull
 
     /**
+     * Parse info.tokens JSON into nullable per-field values.
+     * Returns null if the "tokens" key is absent entirely.
+     * Individual fields default to null (not 0L) so callers can distinguish
+     * "server sent 0" from "server omitted the field" — the `?:` fallback
+     * in SessionState preserves existing ChatMessage values for omitted fields.
+     */
+    private fun parseInfoTokens(info: JsonObject): ParsedTokens? {
+        val tokensObj = info["tokens"]?.jsonObject ?: return null
+        return ParsedTokens(
+            input = tokensObj["input"]?.jsonPrimitive?.longOrNull,
+            output = tokensObj["output"]?.jsonPrimitive?.longOrNull,
+            reasoning = tokensObj["reasoning"]?.jsonPrimitive?.longOrNull,
+            cacheRead = tokensObj["cache"]?.jsonObject?.get("read")?.jsonPrimitive?.longOrNull,
+            cacheWrite = tokensObj["cache"]?.jsonObject?.get("write")?.jsonPrimitive?.longOrNull,
+        )
+    }
+
+    /** Intermediate token parse result — nullable fields preserve "absent vs zero" semantics. */
+    private data class ParsedTokens(
+        val input: Long?,
+        val output: Long?,
+        val reasoning: Long?,
+        val cacheRead: Long?,
+        val cacheWrite: Long?,
+    )
+
+    /**
      * Parses SSE event data into our internal [SseEvent] hierarchy.
      * Handles both old format (flat JSON) and new format (properties wrapper).
      * Now handles v2 events from OpenCode server.
@@ -1012,19 +1039,78 @@ class OpenCodeClient(
 
                 "message.updated" -> {
                     val info = props["info"]?.jsonObject
-                    val messageId = extractMessageId(props)
+                    // message.updated carries the message ID inside info.id, NOT at the top level.
+                    // extractMessageId(props) looks for props["messageID"] which doesn't exist here.
+                    val messageId = info?.get("id")?.jsonPrimitive?.contentOrNull ?: extractMessageId(props)
                     if (info != null) {
+                        val role = info["role"]?.jsonPrimitive?.contentOrNull
                         val finish = info["finish"]?.jsonPrimitive?.contentOrNull
-                        if (finish == "stop" || finish == "end") {
-                            SseEvent.Stop(sessionId = sessionId, stopReason = finish, messageId = messageId)
-                        } else if (finish != null) {
-                            SseEvent.Stop(sessionId = sessionId, stopReason = finish, messageId = messageId)
-                        } else SseEvent.Ignored(sessionId, eventType, "parse error: missing finish in message.updated", messageId = messageId)
+                        val tokens = parseInfoTokens(info)
+                        val cost = info["cost"]?.jsonPrimitive?.doubleOrNull
+                        val modelID = info["modelID"]?.jsonPrimitive?.contentOrNull
+                        val providerID = info["providerID"]?.jsonPrimitive?.contentOrNull
+
+                        // Only process assistant messages — user messages lack tokens/cost/modelID
+                        if (role != "assistant") {
+                            SseEvent.Ignored(sessionId, eventType, "non-assistant message.updated (role=$role)", messageId = messageId)
+                        }
+                        // Emit MessageFinalized if we have any useful data (finish is optional)
+                        else if (finish != null || tokens != null || cost != null || modelID != null) {
+                            SseEvent.MessageFinalized(
+                                sessionId = sessionId,
+                                messageId = messageId,
+                                inputTokens = tokens?.input,
+                                outputTokens = tokens?.output,
+                                reasoningTokens = tokens?.reasoning,
+                                cacheReadTokens = tokens?.cacheRead,
+                                cacheWriteTokens = tokens?.cacheWrite,
+                                cost = cost,
+                                modelID = modelID,
+                                providerID = providerID,
+                                stopReason = finish,
+                            )
+                        } else SseEvent.Ignored(sessionId, eventType, "no useful data in message.updated", messageId = messageId)
                     } else SseEvent.Ignored(sessionId, eventType, "parse error: missing info in message.updated", messageId = messageId)
                 }
 
                 "session.created" -> {
                     SseEvent.SessionCreated(sessionId = sessionId)
+                }
+
+                "session.idle" -> {
+                    SseEvent.SessionIdle(sessionId = sessionId)
+                }
+
+                "session.error" -> {
+                    // session.error sends a structured error object: { name: "...", data: { message: "..." } }
+                    // Error variants: ProviderAuthError, UnknownError, MessageOutputLengthError,
+                    // MessageAbortedError, APIError (has data.message, data.statusCode, data.isRetryable)
+                    val errorObj = props["error"]?.jsonObject
+                    val dataObj = errorObj?.get("data")?.jsonObject
+                    val errorMessage = dataObj?.get("message")?.jsonPrimitive?.contentOrNull
+                        // Fallback: construct readable message from error name
+                        ?: errorObj?.get("name")?.jsonPrimitive?.contentOrNull?.replace("Error", " error")
+                    SseEvent.SessionError(sessionId = sessionId, errorMessage = errorMessage)
+                }
+
+                "session.updated" -> {
+                    // Full Session object in properties.info — currently informational only.
+                    // Could be used for push-based context updates (tokens/cost) in the future.
+                    SseEvent.Ignored(sessionId, eventType, "session.updated — informational")
+                }
+
+                "session.deleted" -> {
+                    SseEvent.Ignored(sessionId, eventType, "session.deleted — informational")
+                }
+
+                "session.compacted" -> {
+                    // Server performed auto-compaction — local message cache may be stale
+                    SseEvent.SessionCompacted(sessionId = sessionId)
+                }
+
+                "message.removed" -> {
+                    val messageId = props["messageID"]?.jsonPrimitive?.contentOrNull
+                    SseEvent.MessageRemoved(sessionId = sessionId, messageId = messageId)
                 }
 
                 "stop" -> {
