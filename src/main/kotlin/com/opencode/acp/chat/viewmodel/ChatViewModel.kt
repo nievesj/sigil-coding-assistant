@@ -170,7 +170,7 @@ class ChatViewModel(
 
     // --- Initialization ---
 
-    suspend fun initialize(projectBasePath: String) {
+    suspend fun initialize(projectBasePath: String?) {
         val success = service.initialize(projectBasePath)
         if (!success) {
             logger.warn { "Service initialization failed" }
@@ -450,11 +450,11 @@ class ChatViewModel(
 
     // --- Retry ---
 
-    suspend fun retryConnection(projectBasePath: String) {
-        service.retryConnection()
+    suspend fun retryConnection(projectBasePath: String?) {
+        service.initialize(projectBasePath)
     }
 
-    suspend fun connect(projectBasePath: String) {
+    suspend fun connect(projectBasePath: String?) {
         if (connectionState.value == ConnectionState.CONNECTED || 
             connectionState.value == ConnectionState.CONNECTING) {
             return

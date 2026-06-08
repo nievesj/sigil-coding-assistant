@@ -70,9 +70,6 @@ class OpenCodeService(private val project: Project) : Disposable {
      */
     private val sendMutex = kotlinx.coroutines.sync.Mutex()
 
-    /** Stored project base path for retryConnection(). */
-    private var projectBasePath: String = "."
-
     /** Session ID convenience accessor. */
     val sessionId: String? get() = sessionManager.activeSessionId.value
 
@@ -99,11 +96,16 @@ class OpenCodeService(private val project: Project) : Disposable {
     /**
      * Initialize the connection and load sessions.
      * Called once when the service is first accessed.
+     *
+     * @param projectBasePath the IDE project root directory.  Passed as
+     *   `?directory=` to the server for session filtering.  `null` = no
+     *   filter (server returns all sessions).  The connection manager
+     *   receives a non-null CWD for ProcessBuilder (falls back to ".").
      */
-    suspend fun initialize(projectBasePath: String = "."): Boolean {
-        this.projectBasePath = projectBasePath
+    suspend fun initialize(projectBasePath: String? = null): Boolean {
         logger.info { "[ACP] OpenCodeService.initialize: START (projectBasePath=$projectBasePath)" }
-        val connected = connectionManager.initialize(projectBasePath)
+        val connectionPath = projectBasePath ?: "."
+        val connected = connectionManager.initialize(connectionPath)
         if (!connected) {
             logger.warn { "[ACP] OpenCodeService.initialize: connectionManager.initialize() returned false" }
             return false
@@ -111,6 +113,7 @@ class OpenCodeService(private val project: Project) : Disposable {
         logger.info { "[ACP] OpenCodeService.initialize: connection established" }
 
         sessionManager.client = connectionManager.client
+        sessionManager.projectBasePath = projectBasePath
         startGlobalSignalCollection()
 
         // Start global SSE subscription — routes events to correct SessionState by sessionId
@@ -127,7 +130,9 @@ class OpenCodeService(private val project: Project) : Disposable {
                 }
             }
             is SessionListState.Error -> {
-                sessionManager.loadSessions()
+                // Retry without directory filter — the filter may have caused the error
+                // (e.g., server doesn't support ?directory= or path mismatch).
+                sessionManager.loadSessions(directory = null)
                 val retry = sessionListState.value as? SessionListState.Loaded
                 if (retry != null && retry.sessions.isNotEmpty()) {
                     sessionManager.switchSession(retry.sessions.first().id)
@@ -488,11 +493,6 @@ class OpenCodeService(private val project: Project) : Disposable {
     }
 
     // ── Cleanup ────────────────────────────────────────────────────────────
-
-    suspend fun retryConnection() {
-        connectionManager.disconnect()
-        initialize(projectBasePath)
-    }
 
     override fun dispose() {
         logger.info { "[ACP] OpenCodeService.dispose() called — project closing" }

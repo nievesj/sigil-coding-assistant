@@ -3,6 +3,7 @@ package com.opencode.acp.chat.processor
 import com.agentclientprotocol.model.ToolCallStatus
 import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
+import com.opencode.acp.adapter.OpenCodeSession
 import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.adapter.toSessionItem
 import com.opencode.acp.chat.model.*
@@ -97,6 +98,15 @@ class SessionManager(private val scope: CoroutineScope) {
 
     internal var client: OpenCodeClient? = null
 
+    /**
+     * IDE project root directory.  Passed as `?directory=` query param on
+     * session-list and session-create requests so the server resolves the
+     * correct project and returns only that project's sessions.
+     * `null` = no filter (server returns all sessions).
+     * Set by [OpenCodeService.initialize].
+     */
+    internal var projectBasePath: String? = null
+
     // ── Global signal merging ──
 
     private val _allSessionSignals = MutableSharedFlow<Pair<String, UiSignal>>(extraBufferCapacity = 64)
@@ -166,7 +176,7 @@ class SessionManager(private val scope: CoroutineScope) {
     suspend fun createAndSwitchSession(title: String? = null) {
         val c = client ?: return
         val session = try {
-            c.createSession(title)
+            c.createSession(title, projectBasePath)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -202,15 +212,49 @@ class SessionManager(private val scope: CoroutineScope) {
         logger.info { "Created and switched to new session: ${session.id}" }
     }
 
-    /** Load/reload the session list from the server. */
-    suspend fun loadSessions() {
+    /** Load/reload the session list from the server.
+     *  @param directory override the project directory filter.  Defaults to
+     *    [projectBasePath].  Pass `null` to list all sessions (no filter).
+     *    If the filtered list is empty or the request fails, falls back to
+     *    unfiltered listing so the user always sees sessions. */
+    suspend fun loadSessions(directory: String? = projectBasePath) {
         val c = client ?: run {
             logger.warn { "[ACP] SessionManager.loadSessions: client is null" }
             return
         }
         try {
-            logger.info { "[ACP] SessionManager.loadSessions: fetching session list..." }
-            val sessionList = c.listSessions()
+            logger.info { "[ACP] SessionManager.loadSessions: fetching session list... (directory=$directory)" }
+            var sessionList: List<OpenCodeSession>
+
+            try {
+                sessionList = c.listSessions(directory)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Directory filter may not be supported or may have failed.
+                // Fall back to unfiltered listing.
+                if (directory != null) {
+                    logger.warn(e) { "[ACP] SessionManager.loadSessions: directory filter failed, retrying without filter" }
+                    sessionList = c.listSessions(null)
+                } else {
+                    throw e
+                }
+            }
+
+            // Fallback: if directory filter returned empty, retry without filter
+            // so the user always sees sessions (the filter path may not match
+            // the server's project resolution).
+            if (sessionList.isEmpty() && directory != null) {
+                logger.info { "[ACP] SessionManager.loadSessions: directory filter returned 0 sessions, retrying without filter" }
+                try {
+                    sessionList = c.listSessions(null)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // Already have empty list — keep it
+                }
+            }
+
             val currentId = _activeSessionId.value
             val items = sessionList
                 .sortedByDescending { it.time?.updated ?: it.time?.created ?: 0L }

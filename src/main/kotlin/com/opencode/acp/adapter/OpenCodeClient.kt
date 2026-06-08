@@ -221,10 +221,16 @@ class OpenCodeClient(
 
     /**
      * Creates a new OpenCode session.
-     * POST /session
+     * POST /session?directory=<directory>
+     *
+     * @param title optional session title
+     * @param directory optional project directory — the server resolves the
+     *   project ID from this path so the new session is associated with the
+     *   correct project.  Null = no filter (server uses its own CWD).
      */
     suspend fun createSession(
-        title: String? = null
+        title: String? = null,
+        directory: String? = null
     ): OpenCodeSession {
         val requestBody = buildJsonObject {
             if (title != null) put("title", title)
@@ -232,6 +238,7 @@ class OpenCodeClient(
         val response = httpClient.post("$baseUrl/session") {
             applyAuth()
             contentType(ContentType.Application.Json)
+            directory?.let { parameter("directory", normalizeDirectoryPath(it)) }
             setBody(requestBody)
         }
         val body = response.bodyAsText()
@@ -244,10 +251,29 @@ class OpenCodeClient(
 
     /**
      * Lists all active sessions.
-     * GET /session
+     * GET /session?directory=<directory>
+     *
+     * @param directory optional project directory — the server resolves the
+     *   project ID from this path and returns only sessions belonging to that
+     *   project.  Null = no filter (server returns all sessions).
      */
-    suspend fun listSessions(): List<OpenCodeSession> =
-        getJson("/session")
+    suspend fun listSessions(directory: String? = null): List<OpenCodeSession> {
+        val response = httpClient.get("$baseUrl/session") {
+            applyAuth()
+            directory?.let { parameter("directory", normalizeDirectoryPath(it)) }
+        }
+        val body = response.bodyAsText()
+        if (!response.status.isSuccess()) {
+            logger.error { "GET /session returned ${response.status}: ${body.take(500)}" }
+            error("GET /session failed with ${response.status}: ${body.take(200)}")
+        }
+        return try {
+            json.decodeFromString<List<OpenCodeSession>>(body)
+        } catch (e: Exception) {
+            logger.error(e) { "GET /session deserialization failed. Body preview: ${body.take(1000)}" }
+            throw e
+        }
+    }
 
     /**
      * Deletes a session.
@@ -1289,6 +1315,21 @@ class OpenCodeClient(
     /** Clear reasoning part ID tracking. Call on session switch. */
     fun resetReasoningTracking() {
         reasoningPartIds.clear()
+    }
+
+    companion object {
+        /**
+         * Normalize a directory path for the `?directory=` query parameter.
+         * On Windows, the server expects backslash-separated paths (e.g.
+         * `D:\Projects\foo`).  Forward slashes cause the server to return
+         * an empty session list, so we normalize before passing to Ktor's
+         * `parameter()` builder (which handles URL-encoding correctly).
+         */
+        internal fun normalizeDirectoryPath(path: String): String {
+            return if (System.getProperty("os.name").lowercase().contains("windows")) {
+                path.replace('/', '\\')
+            } else path
+        }
     }
 }
 

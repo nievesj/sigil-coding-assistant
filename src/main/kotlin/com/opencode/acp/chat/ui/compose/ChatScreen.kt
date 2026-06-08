@@ -274,10 +274,10 @@ fun
             ConnectionSplashScreen(
                 connectionState = connectionState,
                 onConnect = { 
-                    scope.launch { viewModel.connect(project.basePath ?: ".") }
+                    scope.launch { viewModel.connect(project.basePath) }
                 },
                 onRetry = { 
-                    scope.launch { viewModel.retryConnection(project.basePath ?: ".") }
+                    scope.launch { viewModel.retryConnection(project.basePath) }
                 },
                 onStop = { 
                     viewModel.stopConnection()
@@ -331,7 +331,7 @@ fun
                         // Connection banner (shows/hides based on state)
                         ConnectionBanner(
                             state = connectionState,
-                            onRetry = { scope.launch { viewModel.retryConnection(project.basePath ?: ".") } }
+                            onRetry = { scope.launch { viewModel.retryConnection(project.basePath) } }
                         )
 
                         // Message list (fills remaining space)

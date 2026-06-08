@@ -59,7 +59,7 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance()
         if (settings.autoConnect) {
             scope.launch {
-                viewModel.initialize(project.basePath ?: ".")
+                viewModel.initialize(project.basePath)
             }
         }
     }
