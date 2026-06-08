@@ -38,6 +38,8 @@ class ChatViewModel(
     val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = service.childSessionMap
     val todoItems: StateFlow<List<TodoItem>> = service.todoItems
     val sessionContextState: StateFlow<SessionContextState> = service.sessionContextState
+    val streamingSessionIds: StateFlow<Set<String>> = service.streamingSessionIds
+    val pendingCreationSessionIds: StateFlow<Set<String>> = service.pendingCreationSessionIds
 
     // --- UI-specific state ---
     private val _controlState = MutableStateFlow(ControlBarState())
@@ -86,7 +88,7 @@ class ChatViewModel(
             }
         }
 
-        // Collect processor signals and update UI state
+        // Collect active session signals and update UI state
         scope.launch {
             service.signals.collect { signal ->
                 when (signal) {
@@ -115,12 +117,23 @@ class ChatViewModel(
                         // Todo updates come via SSE, processor handles them
                     }
                     is UiSignal.SessionCreated -> {
-                        // New session detected — refresh session list
-                        scope.launch { service.loadSessions() }
+                        // Should not arrive on activeSignals (routed to globalSignals)
                     }
                     is UiSignal.FileChanged -> {
                         _fileChangeSignal.tryEmit(Unit)
                     }
+                }
+            }
+        }
+
+        // Collect global signals (SessionCreated, etc.)
+        scope.launch {
+            service.globalSignals.collect { signal ->
+                when (signal) {
+                    is UiSignal.SessionCreated -> {
+                        scope.launch { service.loadSessions() }
+                    }
+                    else -> { /* other global signals */ }
                 }
             }
         }
@@ -244,9 +257,30 @@ class ChatViewModel(
 
     suspend fun loadSessions() = service.loadSessions()
 
-    suspend fun switchSession(sessionId: String) = service.switchSession(sessionId)
+    suspend fun switchSession(sessionId: String) {
+        service.switchSession(sessionId)
+        // After switching, sync the streaming indicator to the new session's state
+        val activeSession = service.sessionManager.getActiveSession()
+        _isStreaming.value = activeSession?.isStreaming ?: false
 
-    suspend fun createAndSwitchSession(title: String? = null) = service.createAndSwitchSession(title)
+        // Sync prompt state from the new session's persistent StateFlows
+        _permissionPrompt.value = activeSession?.pendingPermission?.value
+        _selectionPrompt.value = activeSession?.pendingSelection?.value
+
+        // If a permission prompt was restored, restart the timeout
+        if (_permissionPrompt.value != null) {
+            startPermissionTimeout()
+        }
+    }
+
+    suspend fun createAndSwitchSession(title: String? = null) {
+        service.createAndSwitchSession(title)
+        // Sync UI state after creating a new session (same as switchSession)
+        val activeSession = service.sessionManager.getActiveSession()
+        _isStreaming.value = activeSession?.isStreaming ?: false
+        _permissionPrompt.value = activeSession?.pendingPermission?.value
+        _selectionPrompt.value = activeSession?.pendingSelection?.value
+    }
 
     suspend fun archiveSession(sessionId: String) = service.archiveSession(sessionId)
 
@@ -254,6 +288,9 @@ class ChatViewModel(
 
     suspend fun sendMessage(text: String, files: List<AttachedFile> = emptyList()) {
         recordCommand(text, files)
+
+        // Show streaming indicator immediately — don't wait for the first SSE event
+        _isStreaming.value = true
 
         val state = _controlState.value
         val result = service.sendMessage(
@@ -285,7 +322,7 @@ class ChatViewModel(
 
     suspend fun respondPermission(response: PermissionResponse) {
         val prompt = _permissionPrompt.value ?: return
-        service.respondPermission(prompt.permissionId, prompt.toolCallId, response)
+        service.respondPermission(prompt.permissionId, prompt.toolCallId, prompt.sessionId, response)
         _permissionPrompt.value = null
         service.permissionManager.cancelPermissionTimeout()
     }
@@ -311,9 +348,9 @@ class ChatViewModel(
                 }
                 response.customInput?.let { answers.add(listOf(it)) }
                 if (answers.isEmpty()) {
-                    service.rejectQuestion(prompt.promptId)
+                    service.rejectQuestion(prompt.promptId, prompt.sessionId)
                 } else {
-                    service.respondQuestion(prompt.promptId, answers)
+                    service.respondQuestion(prompt.promptId, answers, prompt.sessionId)
                 }
                 _selectionPrompt.value = null
             } catch (e: Exception) {
@@ -401,7 +438,7 @@ class ChatViewModel(
     }
 
     fun stopConnection() {
-        service.connectionManager.disconnect()
+        service.stopConnection()
     }
 
     // --- Cleanup ---

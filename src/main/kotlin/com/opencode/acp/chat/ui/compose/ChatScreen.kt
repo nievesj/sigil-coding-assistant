@@ -135,6 +135,8 @@ fun
     val isSidebarVisible by viewModel.isSidebarVisible.collectAsState()
     val sessionContextState by viewModel.sessionContextState.collectAsState()
     val todoItems by viewModel.todoItems.collectAsState()
+    val streamingSessionIds by viewModel.streamingSessionIds.collectAsState()
+    val pendingCreationSessionIds by viewModel.pendingCreationSessionIds.collectAsState()
     val availableCommands by viewModel.availableCommands.collectAsState()
     val commandHistory by viewModel.commandHistory.collectAsState()
     var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
@@ -317,6 +319,8 @@ fun
                         project = project,
                         modifier = Modifier.width(sidebarWidth),
                         fileChangeSignal = viewModel.fileChangeSignal,
+                        streamingSessionIds = streamingSessionIds,
+                        pendingCreationSessionIds = pendingCreationSessionIds,
                     )
                     // Main chat area
                     Column(modifier = Modifier.weight(1f)) {

@@ -74,7 +74,6 @@ import com.opencode.acp.chat.model.MessagePart
 import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.SubagentRef
 import com.opencode.acp.chat.model.SubagentStatus
-import com.opencode.acp.chat.processor.MessageProcessorManager
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.foundation.code.highlighting.NoOpCodeHighlighter

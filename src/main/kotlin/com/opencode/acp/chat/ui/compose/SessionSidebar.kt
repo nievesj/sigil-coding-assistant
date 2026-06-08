@@ -19,15 +19,19 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -36,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intellij.openapi.project.Project
 import com.opencode.acp.chat.model.SessionContextState
+import com.opencode.acp.chat.model.SessionIndicator
 import com.opencode.acp.chat.model.SessionItem
 import com.opencode.acp.chat.model.SessionListState
 import com.opencode.acp.chat.model.SidebarTab
@@ -46,6 +51,14 @@ import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.StrokeCap
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -68,6 +81,8 @@ fun SessionSidebar(
     project: Project,
     modifier: Modifier = Modifier,
     fileChangeSignal: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
+    streamingSessionIds: Set<String> = emptySet(),
+    pendingCreationSessionIds: Set<String> = emptySet(),
 ) {
     Column(
         modifier = modifier
@@ -85,6 +100,15 @@ fun SessionSidebar(
                 NewSessionButton(onClick = onNewSession)
 
                 // Session list content based on state
+                val listState = rememberLazyListState()
+                // Scroll to top when a new session is created
+                val prevPendingCount = remember { mutableStateOf(pendingCreationSessionIds.size) }
+                LaunchedEffect(pendingCreationSessionIds.size) {
+                    if (pendingCreationSessionIds.size > prevPendingCount.value) {
+                        listState.animateScrollToItem(0)
+                    }
+                    prevPendingCount.value = pendingCreationSessionIds.size
+                }
                 when (state) {
                     is SessionListState.Loading -> LoadingContent()
                     is SessionListState.Error -> ErrorContent(
@@ -100,6 +124,9 @@ fun SessionSidebar(
                                 selectedId = state.selectedId,
                                 onSessionSelected = onSessionSelected,
                                 onSessionArchived = onSessionArchived,
+                                streamingSessionIds = streamingSessionIds,
+                                pendingCreationSessionIds = pendingCreationSessionIds,
+                                listState = listState,
                             )
                         }
                     }
@@ -357,6 +384,9 @@ private fun SessionList(
     selectedId: String?,
     onSessionSelected: (String) -> Unit,
     onSessionArchived: (String) -> Unit,
+    streamingSessionIds: Set<String> = emptySet(),
+    pendingCreationSessionIds: Set<String> = emptySet(),
+    listState: LazyListState = rememberLazyListState(),
 ) {
     val fullTree = remember(sessions) { buildSessionTree(sessions) }
 
@@ -387,6 +417,7 @@ private fun SessionList(
     }
 
     LazyColumn(
+        state = listState,
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 4.dp),
@@ -397,18 +428,25 @@ private fun SessionList(
         ) { index ->
             val item = visibleItems[index]
             val isExpanded = expandedIds[item.session.id] == true
+            val sessionId = item.session.id
+            val indicator = when {
+                sessionId in pendingCreationSessionIds -> SessionIndicator.CREATING
+                sessionId in streamingSessionIds -> SessionIndicator.STREAMING
+                else -> SessionIndicator.NONE
+            }
             SessionRow(
                 session = item.session,
                 depth = item.depth,
                 hasChildren = item.hasChildren,
                 isExpanded = isExpanded,
-                isSelected = item.session.id == selectedId,
-                onClick = { onSessionSelected(item.session.id) },
+                isSelected = sessionId == selectedId,
+                indicator = indicator,
+                onClick = { if (indicator == SessionIndicator.NONE) onSessionSelected(sessionId) },
                 onToggle = {
-                    if (expandedIds[item.session.id] == true) expandedIds[item.session.id] = false
-                    else expandedIds[item.session.id] = true
+                    if (expandedIds[sessionId] == true) expandedIds[sessionId] = false
+                    else expandedIds[sessionId] = true
                 },
-                onArchive = { onSessionArchived(item.session.id) },
+                onArchive = { onSessionArchived(sessionId) },
             )
         }
     }
@@ -423,6 +461,7 @@ private fun SessionRow(
     hasChildren: Boolean = false,
     isExpanded: Boolean = false,
     isSelected: Boolean,
+    indicator: SessionIndicator = SessionIndicator.NONE,
     onClick: () -> Unit,
     onToggle: () -> Unit,
     onArchive: () -> Unit,
@@ -462,9 +501,12 @@ private fun SessionRow(
         retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.55f)
     }
 
+    val creatingDim = indicator == SessionIndicator.CREATING
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
+            .then(if (creatingDim) Modifier.alpha(0.5f) else Modifier)
             .padding(horizontal = 4.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(bgColor)
@@ -526,6 +568,15 @@ private fun SessionRow(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    if (indicator != SessionIndicator.NONE) {
+                        StreamingSpinner(
+                            modifier = Modifier.size(12.dp).padding(end = 4.dp),
+                            color = when (indicator) {
+                                SessionIndicator.CREATING -> Color(0xFFFFC107)
+                                SessionIndicator.STREAMING -> Color(0xFF4CAF50)
+                            }
+                        )
+                    }
                     Text(
                         text = session.title.ifBlank { "Untitled" },
                         fontSize = 12.sp,
@@ -668,6 +719,39 @@ private fun ErrorContent(
         )
         Spacer(Modifier.height(8.dp))
         Link("Retry", onClick = onRetry)
+    }
+}
+
+// ── Streaming Spinner ─────────────────────────────────────────────────────
+
+@Composable
+private fun StreamingSpinner(
+    modifier: Modifier = Modifier,
+    color: Color = Color(0xFF4CAF50),
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "streaming")
+    val rotation by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = LinearEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Restart
+        ),
+        label = "rotation"
+    )
+
+    Canvas(modifier = modifier) {
+        val stroke = Stroke(
+            width = 2.dp.toPx(),
+            cap = StrokeCap.Round
+        )
+        drawArc(
+            color = color,
+            startAngle = rotation,
+            sweepAngle = 270f,
+            useCenter = false,
+            style = stroke
+        )
     }
 }
 

@@ -6,7 +6,7 @@ import com.opencode.acp.chat.model.SelectionPrompt
 import com.opencode.acp.chat.model.TodoItem
 
 /**
- * Signals emitted by MessageProcessorManager for UI coordination.
+ * Signals emitted by [SessionState] for UI coordination.
  * The ViewModel observes these and updates its own StateFlows accordingly.
  */
 sealed interface UiSignal {

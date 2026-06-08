@@ -1,6 +1,5 @@
 package com.opencode.acp.chat.service
 
-import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
@@ -37,23 +36,8 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
     private var openCodeProcess: Process? = null
     private var processWatcherJob: Job? = null
     private var shutdownHook: Thread? = null
-    private var sseJob: Job? = null
-    private var reconnectJob: Job? = null
-    private var reconnectAttempt: Int = 0
     var initialized: Boolean = false
         private set
-
-    /**
-     * Session ID the active SSE subscription was started for. Used by [isActiveSession]
-     * to compare against incoming session IDs and avoid re-subscribing to a stale session
-     * after the user has switched.
-     *
-     * The previous version of [isActiveSession] always returned `initialized` regardless
-     * of the passed-in sessionId, which caused the reconnection path to leak subscriptions
-     * to old sessions during rapid switching.
-     */
-    @Volatile
-    private var activeSseSessionId: String? = null
 
     var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
         private set
@@ -176,141 +160,6 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
     private fun calculateInitBackoff(attempt: Int): Long {
         val exponential = INIT_DELAY_MS * (1L shl attempt.coerceAtMost(4))
         return exponential.coerceAtMost(8_000L)
-    }
-
-    // --- SSE subscription ---
-
-    /**
-     * Start SSE subscription for the given session.
-     * Returns a [Flow] of parsed [SseEvent] objects.
-     * Events are filtered by sessionId before being emitted.
-     *
-     * The caller (service) connects this flow to the processor.
-     */
-    fun subscribeSession(sessionId: String): Flow<SseEvent> {
-        val client = openCodeClient ?: return emptyFlow()
-        val capturedId = sessionId
-        logger.info { "[ACP] startSseSubscription: targetSessionId=$capturedId" }
-        return client.subscribeGlobalEvents()
-            .filter { event ->
-                val match = event.sessionId == capturedId || event is SseEvent.SessionCreated
-                if (!match) {
-                    logger.info { "[ACP] SSE FILTERED OUT: event.sid=${event.sessionId} != captured=$capturedId (${event::class.simpleName})" }
-                }
-                match
-            }
-    }
-
-    /**
-     * Launch an SSE subscription job for the given session.
-     * Events are delivered to [onEvent] callback (suspend — may apply backpressure
-     * to the upstream SSE stream via a bounded event channel in the processor).
-     * Handles reconnection on stream end.
-     */
-    fun startSseSubscription(sessionId: String, onEvent: suspend (SseEvent) -> Unit): Job {
-        val capturedId = sessionId
-        activeSseSessionId = capturedId
-        val job = scope.launch {
-            try {
-                subscribeSession(capturedId).collect { event ->
-                    onEvent(event)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // SSE error — stream ended
-            }
-            // Stream ended without cancellation — trigger reconnection if session
-            // is still the active one (not a stale session from before a switch)
-            if (isActive && initialized && isActiveSession(capturedId)) {
-                logger.info { "SSE stream ended for session $capturedId — triggering reconnection" }
-                triggerReconnect(capturedId, onEvent)
-            }
-        }
-        sseJob = job  // Store so cancelSseSubscription() can cancel it later
-        return job
-    }
-
-    fun cancelSseSubscription() {
-        sseJob?.cancel()
-        sseJob = null
-        // Don't clear activeSseSessionId here — the session may be the same
-        // as the new one we're switching to. Cleared explicitly in setActiveSseSession
-        // or close() when the session truly changes.
-    }
-
-    /** Mark the active SSE session. Called when the service switches sessions. */
-    fun setActiveSseSession(sessionId: String?) {
-        activeSseSessionId = sessionId
-    }
-
-    /** Whether the given session is still the active SSE target. */
-    fun isActiveSession(sessionId: String): Boolean {
-        return initialized && activeSseSessionId == sessionId
-    }
-
-    // --- Reconnection ---
-
-    private fun triggerReconnect(sessionId: String, onEvent: suspend (SseEvent) -> Unit) {
-        reconnectJob?.cancel()
-        reconnectAttempt = 0
-
-        reconnectJob = scope.launch {
-            _connectionState.value = ConnectionState.RECONNECTING
-            logger.info { "Starting reconnection..." }
-
-            while (isActive && initialized) {
-                val delayMs = calculateBackoff(reconnectAttempt)
-                if (reconnectAttempt > 0) {
-                    logger.info { "Reconnect attempt ${reconnectAttempt + 1}, waiting ${delayMs}ms" }
-                    delay(delayMs)
-                }
-
-                // If the process we launched is dead, try to relaunch it before health-checking.
-                val ourProcess = openCodeProcess
-                if (launchedBinaryPath != null && (ourProcess == null || !ourProcess.isAlive)) {
-                    logger.info { "Launched process is dead — attempting relaunch from cached path" }
-                    launchOpenCodeBinary(launchedBinaryPath!!)
-                }
-
-                val client = openCodeClient
-                if (client == null) {
-                    _connectionState.value = ConnectionState.ERROR
-                    initialized = false
-                    return@launch
-                }
-
-                try {
-                    if (!client.healthCheck()) {
-                        reconnectAttempt++
-                        continue
-                    }
-                } catch (_: Exception) {
-                    reconnectAttempt++
-                    continue
-                }
-
-                // Server healthy — re-subscribe
-                sseJob = startSseSubscription(sessionId, onEvent)
-                _connectionState.value = ConnectionState.CONNECTED
-                reconnectAttempt = 0
-                logger.info { "Reconnected successfully" }
-                return@launch
-            }
-
-            if (initialized && _connectionState.value == ConnectionState.RECONNECTING) {
-                _connectionState.value = ConnectionState.ERROR
-                initialized = false
-            }
-        }
-    }
-
-    private fun calculateBackoff(attempt: Int): Long {
-        val base = com.opencode.acp.chat.model.ChatConstants.RECONNECT_DELAY_MS
-        val max = com.opencode.acp.chat.model.ChatConstants.RECONNECT_MAX_DELAY_MS
-        val exponential = (base * (1L shl attempt.coerceAtMost(10))).coerceAtMost(max)
-        val jitter = (exponential * kotlin.random.Random.nextDouble(0.0, 0.2)).toLong()
-        return (exponential + jitter).coerceAtMost(max)
     }
 
     // --- Binary management ---
@@ -451,16 +300,12 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         logger.info { "[ACP] ConnectionManager.disconnect() called" }
         processWatcherJob?.cancel()
         processWatcherJob = null
-        reconnectJob?.cancel()
-        reconnectJob = null
-        sseJob?.cancel()
-        sseJob = null
-        activeSseSessionId = null
         openCodeClient?.close()
         openCodeClient = null
         httpClient?.close()
         httpClient = null
         initialized = false
+        _connectionState.value = ConnectionState.DISCONNECTED
         // Do NOT kill the process — it may still be healthy and we just need
         // to reconnect our HTTP client. The process will be reused on next
         // initialize() if it's still reachable.
@@ -483,11 +328,5 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         // Default to disconnect — callers that truly want to kill the process
         // should use shutdown() explicitly.
         disconnect()
-    }
-
-    fun resetReconnectState() {
-        reconnectJob?.cancel()
-        reconnectJob = null
-        reconnectAttempt = 0
     }
 }

@@ -7,17 +7,18 @@ import com.opencode.acp.adapter.ToolMapper
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.ui.compose.MarkdownSegment
 import com.opencode.acp.chat.ui.compose.MarkdownSegmenter
-import com.opencode.acp.chat.ui.compose.ParsedTable
 import com.opencode.acp.chat.ui.compose.StreamHealer
 import com.opencode.acp.chat.util.EDT
 import com.opencode.acp.chat.util.generateId
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedSendChannelException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -32,68 +33,129 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
- * Owns all mutable streaming state and emits display-ready [List<ChatMessage>].
+ * Per-session state: message map, processor context, streaming lifecycle.
+ * Each session gets its own [SessionState]. Switching sessions is a pointer swap.
  *
- * Architecture: every SSE event handler updates the message parts map DIRECTLY
- * via [updateMessage], touching only its own key. No full rebuild. The parts map
- * is a [LinkedHashMap] so insertion order is preserved — the UI renders in the
- * order events arrive (thinking → tool call → text), not grouped by type.
- *
- * The one exception is text: [TextChunk]/[TextReplace] events accumulate in
- * [ProcessorContext.textBuffer] and are periodically re-segmented into markdown
- * parts ([MessagePart.Text], [MessagePart.Code], [MessagePart.Table]) via
- * [resegmentTextParts]. This replaces only the `text_*`/`code_*`/`table_*`
- * keys in the map — everything else stays untouched.
- *
- * Thread safety: all mutations to [_messages] and [ctx] are protected by [stateLock].
+ * Thread safety: dual protection model —
+ * - Event processing coroutine runs on Dispatchers.EDT (serialization for processEvent)
+ * - External callers (createAssistantMessage, addMessage, etc.) acquire stateLock
+ * - SSE events arrive on any thread and are buffered in eventChannel
+ * - The `closed` flag prevents mutations after close() is called
+ * - ClosedSendChannelException is caught in processEvent() for the race between
+ *   the @Volatile check and channel close
  */
-class MessageProcessorManager(private val scope: CoroutineScope) {
-
+class SessionState(
+    val sessionId: String,
+    private val scope: CoroutineScope,
+    private val sessionManager: SessionManager
+) {
     private val logger = KotlinLogging.logger {}
+    private val stateLock = ReentrantLock()
 
+    /** Whether this SessionState has been closed (evicted or shutdown). */
+    @Volatile private var closed = false
+
+    /** Messages for this session. Keyed by message ID. */
     private val _messages = MutableStateFlow<LinkedHashMap<String, ChatMessage>>(LinkedHashMap())
     val messages: StateFlow<Map<String, ChatMessage>> = _messages.asStateFlow()
 
-    private val _signals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 64)
+    /** UI signals for this session.
+     *  Uses replay = 0 (NOT replay = 1) to avoid stale signal replay on session switch. */
+    private val _signals = MutableSharedFlow<UiSignal>(replay = 0, extraBufferCapacity = 15)
     val signals: SharedFlow<UiSignal> = _signals.asSharedFlow()
 
-    private val ctx = ProcessorContext()
+    /** Persistent permission prompt state for this session.
+     *  Set by event processing when PermissionRequested is emitted.
+     *  Cleared by PermissionManager when the permission is resolved.
+     *  The ViewModel reads this on session switch to restore the prompt UI. */
+    private val _pendingPermission = MutableStateFlow<PermissionPrompt?>(null)
+    val pendingPermission: StateFlow<PermissionPrompt?> = _pendingPermission.asStateFlow()
 
-    private val stateLock = ReentrantLock()
+    /** Persistent selection prompt state for this session.
+     *  Set by event processing when SelectionRequested is emitted.
+     *  Cleared by ChatViewModel when the user responds. */
+    private val _pendingSelection = MutableStateFlow<SelectionPrompt?>(null)
+    val pendingSelection: StateFlow<SelectionPrompt?> = _pendingSelection.asStateFlow()
 
-    private val eventChannel = Channel<SseEvent>(capacity = 1024)
+    /** Processor context for the current streaming turn. */
+    internal val ctx = ProcessorContext()
+
+    /** Whether the first text chunk has been segmented (controls non-debounced
+     *  re-segment for responsiveness on the first chunk). Reset in createAssistantMessage(). */
+    internal var firstTextSegmented = false
+
+    /** Event channel — SSE events buffered for EDT processing. */
+    private val eventChannel = Channel<SseEvent>(1024)
+
+    /** Event processing coroutine (runs on EDT). */
     private var eventProcessingJob: Job? = null
 
-    /** Debounced resegment job for text parts. */
+    /** Debounced text re-segmentation job. */
     private var resegmentJob: Job? = null
 
-    /** Whether the first text chunk has been segmented (for immediate first-segment responsiveness). */
-    private var firstTextSegmented = false
+    /** Response deferred for the current send operation.
+     *  @Volatile because written by OpenCodeService.sendMessage() on Dispatchers.Default
+     *  and read/written by close() under stateLock. */
+    @Volatile
+    var responseDeferred: CompletableDeferred<Unit>? = null
+
+    /** Whether this session has an in-flight streaming message.
+     *  NOTE: This reads [ctx.isStreaming] which is mutated on EDT. For eviction
+     *  checks this is a best-effort read; exact correctness is not required. */
+    val isStreaming: Boolean get() = ctx.isStreaming
+
+    /** Whether this session has a pending permission prompt that hasn't been responded to. */
+    @Volatile var hasPendingPermission: Boolean = false
+        private set
+
+    /** Toggle the pending permission flag. */
+    internal fun setPendingPermission(flag: Boolean) {
+        hasPendingPermission = flag
+        if (!flag) _pendingPermission.value = null
+    }
+
+    /** Set the pending permission prompt. Also sets hasPendingPermission = true. */
+    internal fun setPendingPermissionPrompt(prompt: PermissionPrompt) {
+        hasPendingPermission = true
+        _pendingPermission.value = prompt
+    }
+
+    /** Set the pending selection prompt. */
+    internal fun setPendingSelectionPrompt(prompt: SelectionPrompt) {
+        _pendingSelection.value = prompt
+    }
+
+    /** Clear the pending selection prompt. */
+    internal fun clearPendingSelection() {
+        _pendingSelection.value = null
+    }
+
+    /** Last access time (for LRU cache eviction). */
+    @Volatile
+    var lastAccessTime: Long = System.currentTimeMillis()
+        private set
+
+    /** Signal forwarding job — forwards signals to global merged flow. */
+    private var signalForwardJob: Job? = null
 
     init {
         startCoroutines()
-    }
-
-    private fun startCoroutines() {
-        eventProcessingJob = scope.launch(Dispatchers.EDT) {
-            for (event in eventChannel) {
-                logger.info { "[ACP] processEvent DEQUEUE: ${event::class.simpleName} sid=${event.sessionId}" }
-                processEvent(event)
+        signalForwardJob = scope.launch {
+            _signals.collect { signal ->
+                sessionManager.emitSessionSignal(sessionId, signal)
             }
         }
     }
 
     // ── Public API ──────────────────────────────────────────────────────────
 
-    suspend fun process(event: SseEvent) {
-        if (event is SseEvent.Ignored) {
-            logger.debug { "Ignored: ${event.eventType} — ${event.reason}" }
-            return
-        }
+    suspend fun processEvent(event: SseEvent) {
+        if (closed) return
+        lastAccessTime = System.currentTimeMillis()
         try {
             eventChannel.send(event)
-        } catch (e: Exception) {
-            logger.debug { "[ACP] processEvent send interrupted: ${event::class.simpleName} — ${e.message}" }
+        } catch (_: ClosedSendChannelException) {
+            // Session was closed between the @Volatile check and the send — safe to drop
         }
     }
 
@@ -118,8 +180,9 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         ctx.modelID = modelID
         ctx.providerID = providerID
         ctx.isStreaming = true
-        logger.info { "[ACP] createAssistantMessage: id=$id, serverMessageId=$serverMessageId" }
         firstTextSegmented = false
+        lastAccessTime = System.currentTimeMillis()
+        logger.info { "[ACP] createAssistantMessage: id=$id, serverMessageId=$serverMessageId" }
 
         val message = ChatMessage(
             id = id,
@@ -138,9 +201,7 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
 
     fun completeStreaming(messageId: String) = stateLock.withLock {
         if (messageId != ctx.activeMessageId) return@withLock
-        // Freeze current thinking phase if still streaming
         freezeCurrentThinking()
-        // Re-segment text one final time (without StreamHealer — completed text)
         resegmentTextPartsFinal(messageId)
         ctx.isStreaming = false
         updateMessage(messageId) { it.copy(isStreaming = false, state = MessageState.Completed) }
@@ -152,7 +213,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         freezeCurrentThinking()
         ctx.errorMessage = reason
         ctx.isStreaming = false
-        // Add error part directly
         updateMessage(msgId) { msg ->
             val parts = LinkedHashMap(msg.parts)
             parts["error"] = MessagePart.Error(reason)
@@ -160,21 +220,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         }
         emitStreamingCompleted(msgId)
         _signals.tryEmit(UiSignal.Error(msgId, reason))
-    }
-
-    fun resetSessionState() = stateLock.withLock {
-        val msgCount = _messages.value.size
-        logger.info { "[ACP] resetSessionState: clearing $msgCount messages from _messages" }
-        while (eventChannel.tryReceive().isSuccess) { /* drain */ }
-        resegmentJob?.cancel()
-        resegmentJob = null
-        ctx.reset()
-        _messages.value = LinkedHashMap()
-        firstTextSegmented = false
-        eventProcessingJob?.cancel()
-        eventProcessingJob = null
-        startCoroutines()
-        logger.info { "[ACP] resetSessionState: DONE — _messages cleared" }
     }
 
     fun addMessage(message: ChatMessage) = stateLock.withLock {
@@ -222,7 +267,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         }
         ctx.toolPartStates[toolCallId] = newPartState
 
-        // Find the message containing this tool call
         val targetMsgId = ctx.toolCallIndex[toolCallId] ?: ctx.activeMessageId
         if (targetMsgId != null) {
             updateMessage(targetMsgId) { msg ->
@@ -242,7 +286,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                 msg.copy(parts = parts)
             }
         }
-        // Also update secondary index
         val pill = ctx.toolCallPills[toolCallId]
         if (pill != null) {
             ctx.toolCallPills[toolCallId] = pill.copy(status = status, output = output ?: pill.output)
@@ -289,18 +332,36 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         ctx.lastUserText = text
     }
 
-    fun close() = stateLock.withLock {
-        logger.info { "[ACP] processor.close() called" }
-        eventProcessingJob?.cancel()
-        eventProcessingJob = null
-        resegmentJob?.cancel()
-        resegmentJob = null
-        eventChannel.close()
+    fun close() {
+        stateLock.withLock {
+            if (closed) return
+            closed = true
+            eventProcessingJob?.cancel()
+            resegmentJob?.cancel()
+            signalForwardJob?.cancel()
+            ctx.pendingStopJob?.cancel()
+            eventChannel.close()
+            _pendingPermission.value = null
+            _pendingSelection.value = null
+            responseDeferred?.completeExceptionally(
+                CancellationException("Session $sessionId evicted from cache")
+            )
+            responseDeferred = null
+        }
     }
 
     // ── Internal: Event Processing ──────────────────────────────────────────
 
-    private fun processEvent(event: SseEvent) {
+    private fun startCoroutines() {
+        eventProcessingJob = scope.launch(Dispatchers.EDT) {
+            for (event in eventChannel) {
+                logger.info { "[ACP] processEvent DEQUEUE: ${event::class.simpleName} sid=${event.sessionId}" }
+                processEventInternal(event)
+            }
+        }
+    }
+
+    private fun processEventInternal(event: SseEvent) {
         // Events that don't require an active streaming message
         when (event) {
             is SseEvent.TodoUpdated -> {
@@ -314,6 +375,7 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                 if (event.questions.isNotEmpty()) {
                     val q = event.questions.first()
                     val prompt = SelectionPrompt(
+                        sessionId = sessionId,
                         promptId = event.requestId,
                         question = q.question,
                         subtitle = q.header.ifBlank { null },
@@ -323,6 +385,7 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                         allowCustomInput = q.custom,
                         multiSelect = q.multiple
                     )
+                    setPendingSelectionPrompt(prompt)
                     _signals.tryEmit(UiSignal.SelectionRequested(prompt))
                 }
                 return
@@ -361,11 +424,9 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         when (event) {
             // ── Thinking ──────────────────────────────────────────────────
             is SseEvent.ThinkingChunk -> {
-                // If current thinking phase is completed, start a new one
                 if (ctx.activeThinkingCompleted) {
                     freezeCurrentThinking()
                 }
-                // If no active thinking phase, start one
                 if (ctx.activeThinkingKey == null) {
                     val key = "thinking_${ctx.thinkingPhaseIndex}"
                     ctx.activeThinkingKey = key
@@ -373,7 +434,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                     emitStreamingStartedIfNeeded(msgId)
                 }
                 ctx.thinkingBuffer.append(event.text)
-                // Direct update: only touch this thinking phase's key
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     parts[ctx.activeThinkingKey!!] = MessagePart.Thinking(
@@ -385,18 +445,15 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
             }
 
             is SseEvent.ThinkingReplace -> {
-                // If current thinking phase is completed, start a new one
                 if (ctx.activeThinkingCompleted) {
                     freezeCurrentThinking()
                 }
-                // If no active thinking phase, start one
                 if (ctx.activeThinkingKey == null) {
                     val key = "thinking_${ctx.thinkingPhaseIndex}"
                     ctx.activeThinkingKey = key
                     ctx.thinkingPhaseIndex++
                     emitStreamingStartedIfNeeded(msgId)
                 }
-                // Replace buffer content (full replacement from server)
                 ctx.thinkingBuffer.setLength(0)
                 ctx.thinkingBuffer.append(event.text)
                 updateMessage(msgId) { msg ->
@@ -442,11 +499,8 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
 
             // ── Tool calls ───────────────────────────────────────────────
             is SseEvent.ToolUse -> {
-                // Dedup: skip if callId already seen
                 if (event.toolCallId in ctx.toolCallPills) return
 
-                // If there's an active streaming thinking phase, freeze it now
-                // (tool call means thinking is done for this phase)
                 if (!ctx.activeThinkingCompleted && ctx.thinkingBuffer.isNotEmpty()) {
                     ctx.activeThinkingCompleted = true
                     freezeCurrentThinking()
@@ -466,7 +520,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                 ctx.toolCallPills[event.toolCallId] = pill
                 ctx.toolCallIndex[event.toolCallId] = msgId
 
-                // Extract file path for edit tools
                 if (toolKind == ToolKind.EDIT && event.input != null) {
                     val filePath = extractFilePath(event.input)
                     if (filePath != null) {
@@ -477,11 +530,9 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                     }
                 }
 
-                // Direct update: add tool call part under its own key
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     parts[event.toolCallId] = MessagePart.ToolCall(pill = pill, state = PartState.InProgress)
-                    // Also add file change part if any
                     if (toolKind == ToolKind.EDIT && event.input != null) {
                         extractFilePath(event.input)?.let { path ->
                             val fileName = path.substringAfterLast('/')
@@ -505,7 +556,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                         output = event.content
                     )
                 }
-                // Direct update: update only this tool call's key
                 val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
                 updateMessage(targetMsgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
@@ -527,7 +577,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                 if (existingPill != null) {
                     ctx.toolCallPills[event.toolCallId] = existingPill.copy(status = ToolCallStatus.PENDING)
                 }
-                // Direct update: update only this tool call's key
                 val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
                 updateMessage(targetMsgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
@@ -541,12 +590,14 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
                 val prompt = PermissionPrompt(
+                    sessionId = sessionId,
                     permissionId = event.permissionId,
                     toolCallId = event.toolCallId,
                     toolName = event.action,
                     description = event.description,
                     patterns = event.patterns
                 )
+                setPendingPermissionPrompt(prompt)
                 _signals.tryEmit(UiSignal.PermissionRequested(prompt))
             }
 
@@ -557,24 +608,16 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                     return
                 }
 
-                // Freeze current thinking phase
                 freezeCurrentThinking()
-                // Final text resegment
                 resegmentTextPartsDirect(msgId)
 
                 if (event.stopReason == "tool-calls") {
                     logger.info { "[ACP] processEvent Stop (tool-calls): intermediate — continuing stream" }
-                    // Don't stop streaming — more events will follow
                 } else {
-                    // Debounce: delay finalization to allow intermediate stops.
-                    // The server sends Stop(reason=stop) between agent steps (e.g., after
-                    // text response, before tool call, before next text response).
-                    // If a new event arrives during the delay, cancel the finalization.
                     val capturedMsgId = msgId
                     ctx.pendingStopJob?.cancel()
                     ctx.pendingStopJob = scope.launch {
                         delay(300)
-                        // No new events arrived — this is the final stop
                         stateLock.withLock {
                             if (!ctx.isStreaming) return@withLock
                             ctx.isStreaming = false
@@ -696,20 +739,16 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
 
     // ── Internal: Thinking Phase Management ─────────────────────────────────
 
-    /** Freeze the current thinking phase: mark it Completed in the parts map
-     *  and reset per-phase state so a new phase can start. */
     private fun freezeCurrentThinking() {
         val key = ctx.activeThinkingKey ?: return
         if (ctx.thinkingBuffer.isEmpty()) return
         val content = ctx.thinkingBuffer.toString()
-        // Update the part to Completed
         val msgId = ctx.activeMessageId ?: return
         updateMessage(msgId) { msg ->
             val parts = LinkedHashMap(msg.parts)
             parts[key] = MessagePart.Thinking(content = content, state = PartState.Completed)
             msg.copy(parts = parts)
         }
-        // Reset per-phase state for next phase
         ctx.thinkingBuffer.setLength(0)
         ctx.activeThinkingKey = null
         ctx.activeThinkingCompleted = false
@@ -717,7 +756,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
 
     // ── Internal: Text Re-Segmentation ──────────────────────────────────────
 
-    /** Schedule a debounced resegmentation of text parts. */
     private fun scheduleResegment(msgId: String) {
         if (!firstTextSegmented) {
             firstTextSegmented = true
@@ -727,18 +765,15 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         resegmentJob?.cancel()
         resegmentJob = scope.launch(Dispatchers.EDT) {
             try {
-                kotlinx.coroutines.delay(DEBOUNCE_MS)
+                delay(DEBOUNCE_MS)
                 resegmentTextPartsDirect(msgId)
             } catch (_: CancellationException) { /* newer event arrived */ }
         }
     }
 
-    /** Re-segment the text buffer and replace only text-derived keys in the parts map.
-     *  All other keys (thinking, tool calls, patches, etc.) are left untouched. */
     private fun resegmentTextPartsDirect(msgId: String) {
         stateLock.withLock {
             if (ctx.textBuffer.isEmpty()) {
-                // Remove all text-derived keys
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     parts.keys.removeIf { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") }
@@ -752,7 +787,6 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
             } else {
                 MarkdownSegmenter.segment(raw)
             }
-            // Build new text-derived parts
             val newParts = mutableListOf<Pair<String, MessagePart>>()
             segments.forEachIndexed { i, segment ->
                 when (segment.type) {
@@ -777,13 +811,8 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                     }
                 }
             }
-            // Replace text-derived keys: remove old ones, insert new ones
-            // The position is right after the last non-text part (or at the end).
-            // Since LinkedHashMap preserves insertion order, we re-insert at the
-            // same position by rebuilding the map.
             updateMessage(msgId) { msg ->
                 val oldParts = LinkedHashMap(msg.parts)
-                // Collect non-text entries in order
                 val preserved = mutableListOf<Pair<String, MessagePart>>()
                 var lastNonTextIndex = -1
                 oldParts.entries.forEachIndexed { i, entry ->
@@ -793,17 +822,13 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
                         lastNonTextIndex = preserved.size - 1
                     }
                 }
-                // Build new map: preserved parts with text parts inserted after the last non-text part
                 val newMap = linkedMapOf<String, MessagePart>()
                 preserved.forEachIndexed { i, (key, part) ->
                     newMap[key] = part
-                    // Insert text parts right after this non-text entry if it's the last one
-                    // (or if we haven't placed them yet)
                     if (i == lastNonTextIndex || (lastNonTextIndex == -1 && i == 0)) {
                         newParts.forEach { (tKey, tPart) -> newMap[tKey] = tPart }
                     }
                 }
-                // Edge case: no non-text parts at all
                 if (lastNonTextIndex == -1) {
                     newParts.forEach { (tKey, tPart) -> newMap[tKey] = tPart }
                 }
@@ -812,9 +837,7 @@ class MessageProcessorManager(private val scope: CoroutineScope) {
         }
     }
 
-    /** Final resegment after streaming completes — uses strict (non-healed) segmentation. */
     private fun resegmentTextPartsFinal(msgId: String) = stateLock.withLock {
-        // Temporarily mark as not streaming so segmentation is strict
         val wasStreaming = ctx.isStreaming
         ctx.isStreaming = false
         resegmentTextPartsDirect(msgId)

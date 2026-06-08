@@ -124,6 +124,7 @@ data class ChatFileChange(
 
 /** Display model for a permission prompt inline in chat. */
 data class PermissionPrompt(
+    val sessionId: String,
     val permissionId: String,
     val toolCallId: String,
     val toolName: String,
@@ -141,6 +142,7 @@ data class SelectionOption(
 
 /** Display model for a multi-select prompt inline in chat. */
 data class SelectionPrompt(
+    val sessionId: String,
     val promptId: String,
     val question: String,
     val subtitle: String? = null,
@@ -328,3 +330,10 @@ val ChatMessage.fullMarkdownContent: String
 
 /** Sidebar tab identifiers. */
 enum class SidebarTab { SESSIONS, CONTEXT, REVIEW }
+
+/** Visual indicator state for a session row in the sidebar. */
+enum class SessionIndicator {
+    NONE,
+    CREATING,
+    STREAMING,
+}

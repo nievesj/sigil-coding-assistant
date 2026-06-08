@@ -8,7 +8,7 @@ import kotlinx.coroutines.Job
 
 /**
  * Mutable accumulation state for a single streaming turn.
- * Owned by MessageProcessorManager. NOT a data class — mutable fields must not be
+ * Owned by [SessionState]. NOT a data class — mutable fields must not be
  * shared via copy(). Use reset() to clear between turns.
  *
  * Thread safety: all mutation happens on Dispatchers.EDT via the internal
@@ -51,7 +51,9 @@ class ProcessorContext {
     var userEchoStripped: Boolean = false
     var streamingStartedEmitted: Boolean = false
     var streamingCompletedEmitted: Boolean = false
-    var activeMessageId: String? = null
+    /** @Volatile because read by recoverBackgroundSessions() on Dispatchers.Default
+     *  and written by event processing on Dispatchers.EDT. */
+    @Volatile var activeMessageId: String? = null
     var activeServerMessageId: String? = null
     var lastUserText: String? = null
     var errorMessage: String? = null

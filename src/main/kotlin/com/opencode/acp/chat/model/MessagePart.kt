@@ -4,7 +4,7 @@ import com.opencode.acp.chat.ui.compose.ParsedTable
 
 /**
  * A typed, display-ready segment of message content.
- * The MessageProcessorManager decides what each part is — the UI just renders it.
+ * The session event processing logic determines what each part is — the UI just renders it.
  *
  * Every part carries a `partId` when known — this is the server-side part ID
  * (from V1 `message.part.delta`/`message.part.updated` events, or the server's

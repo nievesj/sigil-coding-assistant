@@ -7,10 +7,11 @@ import com.intellij.openapi.project.Project
 import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.chat.model.*
-import com.opencode.acp.chat.processor.MessageProcessorManager
+import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
+import com.opencode.acp.chat.util.EDT
 import com.opencode.acp.chat.model.ConnectionState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
@@ -22,8 +23,7 @@ import kotlinx.coroutines.flow.*
  *
  * Architecture:
  * - [OpenCodeConnectionManager] — HTTP/SSE connection lifecycle
- * - [SessionManager] — session CRUD, switching, context
- * - [MessageProcessorManager] — event processing, message accumulation
+ * - [SessionManager] — per-session state ownership, SSE routing, session lifecycle
  * - This service coordinates between them and exposes the public API
  *
  * The [ChatViewModel] is a thin UI wrapper that delegates here.
@@ -37,88 +37,58 @@ class OpenCodeService(private val project: Project) : Disposable {
     // ── Sub-components ─────────────────────────────────────────────────────
 
     val connectionManager = OpenCodeConnectionManager(scope)
-    val processor = MessageProcessorManager(scope)
-    val sessionManager: SessionManager = createSessionManager()
+    val sessionManager = SessionManager(scope)
     val commandManager = CommandManager(
         clientProvider = { connectionManager.client },
-        sessionIdProvider = { sessionManager.sessionId }
+        sessionIdProvider = { sessionManager.activeSessionId.value }
     )
     val permissionManager = PermissionManager(
         scope = scope,
         clientProvider = { connectionManager.client },
-        processor = processor
+        sessionManager = sessionManager
     )
 
     // ── State flows ────────────────────────────────────────────────────────
 
-    val messages: StateFlow<Map<String, ChatMessage>> = processor.messages
-    val signals: SharedFlow<UiSignal> = processor.signals
+    val messages: StateFlow<Map<String, ChatMessage>> = sessionManager.activeMessages
+    val signals: SharedFlow<UiSignal> = sessionManager.activeSignals
+    val globalSignals: SharedFlow<UiSignal> = sessionManager.globalSignals
     val connectionState: StateFlow<ConnectionState> = connectionManager.connectionState
     val sessionListState: StateFlow<SessionListState> = sessionManager.sessionListState
     val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = sessionManager.childSessionMap
     val todoItems: StateFlow<List<TodoItem>> = sessionManager.todoItems
     val sessionContextState: StateFlow<SessionContextState> = sessionManager.sessionContextState
+    val streamingSessionIds: StateFlow<Set<String>> = sessionManager.streamingSessionIds
+    val pendingCreationSessionIds: StateFlow<Set<String>> = sessionManager.pendingCreationSessionIds
 
     // ── Internal state ─────────────────────────────────────────────────────
 
-    private var responseDeferred: CompletableDeferred<Unit>? = null
     private var signalCollectionJob: Job? = null
 
     /**
-     * Serializes sendMessage() calls. Without this, a rapid double-send (e.g. user
-     * double-clicks send, or sends a message before the first response completes)
-     * would cause the second call to overwrite [responseDeferred], orphaning the
-     * first call's deferred which then hangs in `deferred.await()` until the
-     * 5-minute timeout.
+     * Serializes sendMessage() calls.
      */
     private val sendMutex = kotlinx.coroutines.sync.Mutex()
 
-    // ── Wires ──────────────────────────────────────────────────────────────
-
-    /** Build the SessionManager with callbacks into this service. */
-    private fun createSessionManager(): SessionManager {
-        return SessionManager(
-            scope = scope,
-            clientProvider = { connectionManager.client },
-            processor = processor,
-            onBeforeReset = { targetId ->
-                connectionManager.resetReconnectState()
-                connectionManager.cancelSseSubscription()
-                // Clear the active session marker before resetting processor state.
-                // This ensures any in-flight reconnect check for the old session
-                // sees it as inactive and bails out. The new session ID is set
-                // in onAfterSseSetup just before the new subscription starts.
-                connectionManager.setActiveSseSession(null)
-                responseDeferred?.complete(Unit)
-                responseDeferred = null
-            },
-            onAfterSseSetup = { targetId ->
-                connectionManager.cancelSseSubscription()
-                // Mark the new active session before starting the new subscription
-                // so isActiveSession() returns true for the new session during the
-                // connection setup, and false for the old session (if any) during
-                // its pending teardown.
-                connectionManager.setActiveSseSession(targetId)
-                startSseSubscription(targetId)
-            }
-        )
-    }
+    /** Stored project base path for retryConnection(). */
+    private var projectBasePath: String = "."
 
     /** Session ID convenience accessor. */
-    val sessionId: String? get() = sessionManager.sessionId
+    val sessionId: String? get() = sessionManager.activeSessionId.value
 
-    // ── Signal collection (completes responseDeferred on Stop) ──────────
+    // ── Global signal collection (completes responseDeferred on background session Stop) ──
 
-    private fun startSignalCollection() {
+    private fun startGlobalSignalCollection() {
         signalCollectionJob?.cancel()
         signalCollectionJob = scope.launch {
-            processor.signals.collect { signal ->
+            sessionManager.allSessionSignals.collect { (sessionId, signal) ->
                 when (signal) {
                     is UiSignal.StreamingCompleted -> {
-                        responseDeferred?.complete(Unit)
-                        responseDeferred = null
+                        val session = sessionManager.getSession(sessionId)
+                        session?.responseDeferred?.complete(Unit)
+                        session?.responseDeferred = null
                     }
-                    else -> { /* other signals handled by ViewModel */ }
+                    else -> { /* other signals handled by ViewModel via activeSignals */ }
                 }
             }
         }
@@ -131,6 +101,7 @@ class OpenCodeService(private val project: Project) : Disposable {
      * Called once when the service is first accessed.
      */
     suspend fun initialize(projectBasePath: String = "."): Boolean {
+        this.projectBasePath = projectBasePath
         logger.info { "[ACP] OpenCodeService.initialize: START (projectBasePath=$projectBasePath)" }
         val connected = connectionManager.initialize(projectBasePath)
         if (!connected) {
@@ -139,7 +110,11 @@ class OpenCodeService(private val project: Project) : Disposable {
         }
         logger.info { "[ACP] OpenCodeService.initialize: connection established" }
 
-        startSignalCollection()
+        sessionManager.client = connectionManager.client
+        startGlobalSignalCollection()
+
+        // Start global SSE subscription — routes events to correct SessionState by sessionId
+        startGlobalSseSubscription()
 
         logger.info { "[ACP] OpenCodeService.initialize: loading sessions..." }
         sessionManager.loadSessions()
@@ -171,11 +146,160 @@ class OpenCodeService(private val project: Project) : Disposable {
     suspend fun createAndSwitchSession(title: String? = null) = sessionManager.createAndSwitchSession(title)
     suspend fun archiveSession(sessionId: String) = sessionManager.archiveSession(sessionId)
 
-    // ── SSE subscription ──────────────────────────────────────────────────
+    // ── Connection stop ─────────────────────────────────────────────────────
 
-    private fun startSseSubscription(targetSessionId: String) {
-        connectionManager.startSseSubscription(targetSessionId) { event ->
-            handleSseEvent(event)
+    /** Stop all connection activity: cancel SSE reconnection loop, cancel SSE
+     *  subscription, and disconnect the HTTP client. Called by the "Stop" button
+     *  on the splash screen when the user wants to abort reconnection. */
+    fun stopConnection() {
+        sseReconnectJob?.cancel()
+        sseReconnectJob = null
+        sseJob?.cancel()
+        sseJob = null
+        connectionManager.disconnect()
+    }
+
+    // ── SSE subscription (single global, routes by sessionId) ───────────────
+
+    private var sseJob: Job? = null
+    private var sseReconnectJob: Job? = null
+    private var sseReconnectAttempt: Int = 0
+
+    /** Single global SSE subscription — all events routed to SessionManager.processEvent().
+     *  Includes automatic reconnection with exponential backoff on stream end. */
+    private fun startGlobalSseSubscription() {
+        sseJob?.cancel()
+        sseReconnectJob?.cancel()
+        val client = connectionManager.client ?: return
+        sseJob = scope.launch {
+            try {
+                client.subscribeGlobalEvents().collect { event ->
+                    handleSseEvent(event)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // SSE error — stream ended
+            }
+            // Stream ended without cancellation — trigger reconnection
+            if (isActive) {
+                logger.info { "[ACP] Global SSE stream ended — triggering reconnection" }
+                triggerGlobalSseReconnect()
+            }
+        }
+    }
+
+    /** Reconnect the global SSE stream with exponential backoff.
+     *  On success, recovers background sessions that may have completed during disconnection. */
+    private fun triggerGlobalSseReconnect() {
+        sseReconnectJob?.cancel()
+        sseReconnectAttempt = 0
+
+        sseReconnectJob = scope.launch {
+            while (isActive) {
+                val base = com.opencode.acp.chat.model.ChatConstants.RECONNECT_DELAY_MS
+                val max = com.opencode.acp.chat.model.ChatConstants.RECONNECT_MAX_DELAY_MS
+                val exponential = (base * (1L shl sseReconnectAttempt.coerceAtMost(10))).coerceAtMost(max)
+                val jitter = (exponential * kotlin.random.Random.nextDouble(0.0, 0.2)).toLong()
+                val delayMs = (exponential + jitter).coerceAtMost(max)
+
+                if (sseReconnectAttempt > 0) {
+                    logger.info { "[ACP] SSE reconnect attempt ${sseReconnectAttempt + 1}, waiting ${delayMs}ms" }
+                    delay(delayMs)
+                }
+
+                val client = connectionManager.client
+                if (client == null) {
+                    logger.warn { "[ACP] SSE reconnect: client is null, giving up" }
+                    return@launch
+                }
+
+                try {
+                    if (!client.healthCheck()) {
+                        sseReconnectAttempt++
+                        continue
+                    }
+                } catch (_: Exception) {
+                    sseReconnectAttempt++
+                    continue
+                }
+
+                // Server healthy — re-subscribe global SSE
+                logger.info { "[ACP] SSE reconnect: server healthy, re-subscribing" }
+                sseJob?.cancel()  // Cancel old job before creating new one to prevent duplicate event processing
+                sseJob = scope.launch {
+                    try {
+                        client.subscribeGlobalEvents().collect { event ->
+                            handleSseEvent(event)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        if (isActive) {
+                            logger.info { "[ACP] Global SSE stream ended again — triggering reconnection" }
+                            triggerGlobalSseReconnect()
+                        }
+                    }
+                }
+
+                // Recover background sessions that may have completed during disconnection
+                recoverBackgroundSessions()
+
+                sseReconnectAttempt = 0
+                logger.info { "[ACP] SSE reconnected successfully" }
+                return@launch
+            }
+        }
+    }
+
+    /** Check all cached sessions that were streaming when SSE dropped.
+     *  Re-fetches recent messages for each streaming session. If the server's
+     *  last message is an assistant message (indicating generation completed),
+     *  finalize it locally. Prevents responseDeferred from hanging until the
+     *  5-minute timeout.
+     *
+     *  ASSUMPTION: The server's REST API (listMessages) only returns completed
+     *  messages — in-progress messages are streamed via SSE, not available via
+     *  REST. If this assumption is wrong, a still-generating session could be
+     *  incorrectly finalized. A per-session status endpoint (GET /session/status)
+     *  would be more reliable if available. */
+    private suspend fun recoverBackgroundSessions() {
+        val client = connectionManager.client ?: return
+        val streamingSessions = sessionManager.getStreamingSessions()
+        if (streamingSessions.isEmpty()) return
+
+        logger.info { "[ACP] recoverBackgroundSessions: checking ${streamingSessions.size} streaming sessions" }
+
+        for (session in streamingSessions) {
+            val sessionId = session.sessionId
+            try {
+                // Re-fetch recent messages to check if the session completed
+                val messages = client.listMessages(sessionId, limit = 5)
+                val lastMessage = messages.lastOrNull()
+                val lastIsAssistant = lastMessage?.info?.role == "assistant"
+
+                if (lastIsAssistant) {
+                    // Server has an assistant message as the last message —
+                    // generation completed while we were disconnected.
+                    val activeMsgId = session.ctx.activeMessageId
+                    if (activeMsgId != null) {
+                        // completeStreaming() acquires stateLock (a JVM ReentrantLock) and
+                        // does CPU-intensive markdown segmentation. Must run on EDT to avoid
+                        // blocking the EDT event processing coroutine that also acquires stateLock.
+                        withContext(Dispatchers.EDT) {
+                            session.completeStreaming(activeMsgId)
+                        }
+                    }
+                    session.responseDeferred?.complete(Unit)
+                    session.responseDeferred = null
+                    logger.info { "[ACP] Recovered background session $sessionId after SSE reconnection" }
+                }
+                // If last message is not assistant, session may still be generating — leave it
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] Failed to recover session $sessionId" }
+            }
         }
     }
 
@@ -192,7 +316,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             else -> "${event::class.simpleName}(sid=${event.sessionId}, mid=${event.messageId})"
         }
         logger.info { "[ACP] handleSseEvent: $summary" }
-        processor.process(event)
+        sessionManager.processEvent(event)
     }
 
     // ── Message sending ────────────────────────────────────────────────────
@@ -206,10 +330,6 @@ class OpenCodeService(private val project: Project) : Disposable {
         agent: String? = null,
         model: OpenCodeClient.MessageModel? = null
     ): SendMessageResult {
-        // Serialize concurrent sends. `tryLock` returns false immediately if another
-        // send is in progress, avoiding both:
-        //   1. The double-click race that orphans the first responseDeferred.
-        //   2. A second coroutine blocking on sendMutex while the user is mid-send.
         if (!sendMutex.tryLock()) {
             logger.warn { "[ACP] sendMessage: rejected — another send is already in progress" }
             return SendMessageResult.Error("Another message is already being sent. Please wait for it to complete.")
@@ -231,7 +351,7 @@ class OpenCodeService(private val project: Project) : Disposable {
         model: OpenCodeClient.MessageModel?
     ): SendMessageResult {
         val client = connectionManager.client ?: return SendMessageResult.Error("No client")
-        val currentSessionId = sessionManager.sessionId ?: return SendMessageResult.Error("No session")
+        val currentSessionId = sessionManager.activeSessionId.value ?: return SendMessageResult.Error("No session")
         logger.info { "[ACP] sendMessage: START session=$currentSessionId text='${text.take(50)}'" }
 
         val userMsg = ChatMessage(
@@ -241,23 +361,23 @@ class OpenCodeService(private val project: Project) : Disposable {
             timestamp = System.currentTimeMillis(),
             attachedFiles = files
         )
-        processor.addMessage(userMsg)
-        processor.setLastUserText(text)
+        sessionManager.addMessage(userMsg)
+        sessionManager.setLastUserText(text)
 
-        connectionManager.client?.resetReasoningTracking()
-        val assistantMsgId = processor.createAssistantMessage(
+        client.resetReasoningTracking()
+        val assistantMsgId = sessionManager.createAssistantMessage(
             modelID = modelID,
             providerID = providerID,
             serverMessageId = null
         )
 
         val deferred = CompletableDeferred<Unit>()
-        responseDeferred = deferred
+        val activeSession = sessionManager.getActiveSession()
+        activeSession?.responseDeferred = deferred
 
         try {
             val parts = mutableListOf<com.opencode.acp.adapter.OpenCodePart>(com.opencode.acp.adapter.OpenCodePart.Text(text = text))
             files.forEach { file ->
-                // Read file content for source.text so the LLM knows the file content and path
                 val fileText = try {
                     java.io.File(file.path).readText(Charsets.UTF_8)
                 } catch (_: Exception) { null }
@@ -274,7 +394,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             val serverMessageId = client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
             logger.info { "[ACP] sendMessage: got serverMessageId=$serverMessageId" }
 
-            processor.updateServerMessageId(assistantMsgId, serverMessageId)
+            sessionManager.updateServerMessageId(assistantMsgId, serverMessageId)
 
             withTimeout(300_000L) {
                 deferred.await()
@@ -282,10 +402,10 @@ class OpenCodeService(private val project: Project) : Disposable {
             return SendMessageResult.Success(assistantMsgId)
         } catch (e: TimeoutCancellationException) {
             logger.error(e) { "[ACP] sendMessage: SSE response timed out after 5 minutes" }
-            processor.abortStreaming("Response timed out after 5 minutes.")
+            sessionManager.abortStreaming("Response timed out after 5 minutes.")
             return SendMessageResult.Error("Response timed out")
         } catch (e: CancellationException) {
-            processor.completeStreaming(assistantMsgId)
+            sessionManager.completeStreaming(assistantMsgId)
             throw e
         } catch (e: Exception) {
             val errorMsg = when {
@@ -297,10 +417,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                     "Connection refused by server."
                 else -> "Error: ${e.message ?: e.javaClass.simpleName}"
             }
-            processor.abortStreaming(errorMsg)
+            sessionManager.abortStreaming(errorMsg)
             return SendMessageResult.Error(errorMsg)
         } finally {
-            responseDeferred = null
+            activeSession?.responseDeferred = null
         }
     }
 
@@ -308,22 +428,24 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     suspend fun cancel() {
         val client = connectionManager.client
-        val currentSessionId = sessionManager.sessionId
+        val currentSessionId = sessionManager.activeSessionId.value
         if (client != null && currentSessionId != null) {
             client.abortSession(currentSessionId)
         }
-        responseDeferred?.complete(Unit)
-        responseDeferred = null
+        sessionManager.getActiveSession()?.let { session ->
+            session.responseDeferred?.complete(Unit)
+            session.responseDeferred = null
+        }
     }
 
-    suspend fun respondPermission(permissionId: String, toolCallId: String, response: PermissionResponse) =
-        permissionManager.respondPermission(permissionId, toolCallId, response)
+    suspend fun respondPermission(permissionId: String, toolCallId: String, sessionId: String, response: PermissionResponse) =
+        permissionManager.respondPermission(permissionId, toolCallId, sessionId, response)
 
-    suspend fun respondQuestion(promptId: String, answers: List<List<String>>) =
-        permissionManager.respondQuestion(promptId, answers)
+    suspend fun respondQuestion(promptId: String, answers: List<List<String>>, sessionId: String) =
+        permissionManager.respondQuestion(promptId, answers, sessionId)
 
-    suspend fun rejectQuestion(promptId: String) =
-        permissionManager.rejectQuestion(promptId)
+    suspend fun rejectQuestion(promptId: String, sessionId: String) =
+        permissionManager.rejectQuestion(promptId, sessionId)
 
     // ── Data fetching ──────────────────────────────────────────────────────
 
@@ -365,16 +487,14 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     suspend fun retryConnection() {
         connectionManager.disconnect()
-        initialize()
+        initialize(projectBasePath)
     }
 
     override fun dispose() {
         logger.info { "[ACP] OpenCodeService.dispose() called — project closing" }
         permissionManager.dispose()
-        responseDeferred?.complete(Unit)
-        responseDeferred = null
+        sessionManager.close()
         connectionManager.shutdown()
-        processor.close()
         scope.cancel()
     }
 
