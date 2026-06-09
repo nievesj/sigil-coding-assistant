@@ -13,6 +13,7 @@ import io.ktor.serialization.kotlinx.json.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.Json
+import java.net.ServerSocket
 
 /**
  * Manages the HTTP client, SSE connection, and connection lifecycle.
@@ -59,18 +60,17 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         private const val INIT_TIMEOUT_MS = 60_000L
         /** Initial health check delay after launch. */
         private const val INIT_DELAY_MS = 500L
+        /** Maximum number of ports to try beyond the configured port. */
+        private const val MAX_PORT_ATTEMPTS = 10
     }
 
     /**
-     * Connect to OpenCode server (existing or newly launched), then poll the
-     * health endpoint until the server responds.
+     * Connect to an OpenCode server by launching our own binary.
      *
      * Strategy:
-     * 1. First try to connect to an existing server on the host:port (someone
-     *    else may already have opencode running — e.g., this AI conversation host).
-     *    If reachable, skip launching our own binary and connect directly.
-     * 2. If no existing server, launch our own binary and wait for it to become
-     *    healthy via exponential backoff polling.
+     * 1. Always launch our own binary. If the configured port is already
+     *    occupied by another process, find the next available port.
+     * 2. Wait for the server to become healthy via exponential backoff polling.
      * 3. Kill any orphan processes from previous sessions to prevent zombie pile-ups.
      *
      * @return true if connection succeeded, false on fatal error
@@ -84,12 +84,19 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
 
         val settings = OpenCodeSettingsState.getInstance().state
         host = AcpDefaults.DEFAULT_OPENCODE_HOST
-        port = settings.port
+        val configuredPort = settings.port
 
-        logger.info { "[ACP] ConnectionManager.initialize: connecting to OpenCode at $host:$port" }
+        // Find an available port — if the configured port is occupied by another
+        // process, try the next ports up to MAX_PORT_ATTEMPTS.
+        port = findAvailablePort(configuredPort)
+        if (port != configuredPort) {
+            logger.info { "[ACP] ConnectionManager.initialize: configured port $configuredPort is in use — using port $port instead" }
+        }
+
+        logger.info { "[ACP] ConnectionManager.initialize: launching opencode at $host:$port" }
         _connectionState.value = ConnectionState.CONNECTING
 
-        // Create HTTP client and OpenCodeClient first
+        // Create HTTP client and OpenCodeClient for the chosen port
         val client = HttpClient(Java) {
             install(ContentNegotiation) {
                 json(Json {
@@ -115,21 +122,7 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         )
         openCodeClient = opencodeClient
 
-        // Step 1: Try to reach an existing server first
-        val serverAlreadyRunning = try {
-            opencodeClient.healthCheck()
-        } catch (_: Exception) {
-            false
-        }
-
-        if (serverAlreadyRunning) {
-            logger.info { "[ACP] ConnectionManager.initialize: existing server reachable at $host:$port — connecting without launching new binary" }
-            _connectionState.value = ConnectionState.CONNECTED
-            initialized = true
-            return true
-        }
-
-        // Step 2: No existing server — launch our own binary
+        // Launch our own binary on the chosen port
         if (settings.binaryPath.isNotBlank()) {
             launchOpenCodeBinary(settings.binaryPath)
         } else {
@@ -270,6 +263,32 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         }
     }
 
+    /**
+     * Find an available port starting from [startPort].
+     * Tests each port by trying to bind a ServerSocket — if binding succeeds,
+     * the port is free and we close the socket immediately. If binding fails,
+     * the port is occupied and we try the next one.
+     *
+     * Returns [startPort] if available, or the next available port up to
+     * [startPort] + [MAX_PORT_ATTEMPTS] - 1. If none are available, returns
+     * [startPort] (will fail later at health-check time with a clear error).
+     */
+    private fun findAvailablePort(startPort: Int): Int {
+        for (candidate in startPort until (startPort + MAX_PORT_ATTEMPTS)) {
+            try {
+                ServerSocket(candidate).use { /* port is available */ }
+                return candidate
+            } catch (_: java.net.BindException) {
+                // Port is occupied — try next
+                logger.info { "[ACP] findAvailablePort: port $candidate is in use, trying next" }
+            }
+        }
+        // All attempts failed — return configured port and let the health-check
+        // timeout produce a meaningful error.
+        logger.warn { "[ACP] findAvailablePort: no available port found in range $startPort..${startPort + MAX_PORT_ATTEMPTS - 1}" }
+        return startPort
+    }
+
     /** Check if our launched process is still alive. Returns error text if dead, null if alive. */
     private fun checkProcessAlive(): String? {
         val proc = openCodeProcess ?: return "No process was launched"
@@ -309,9 +328,8 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         httpClient = null
         initialized = false
         _connectionState.value = ConnectionState.DISCONNECTED
-        // Do NOT kill the process — it may still be healthy and we just need
-        // to reconnect our HTTP client. The process will be reused on next
-        // initialize() if it's still reachable.
+        // Do NOT kill the process — it may still be healthy. initialize() will
+        // find the same port occupied by our own process and launch on the same port.
     }
 
     /**

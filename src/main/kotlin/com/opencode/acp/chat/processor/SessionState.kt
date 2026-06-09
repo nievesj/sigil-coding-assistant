@@ -61,6 +61,9 @@ class SessionState(
     private val _messages = MutableStateFlow<LinkedHashMap<String, ChatMessage>>(LinkedHashMap())
     val messages: StateFlow<Map<String, ChatMessage>> = _messages.asStateFlow()
 
+    /** Real-time streaming text from the current turn's textBuffer. Updated on every TextChunk/TextReplace. */
+    val streamingText: StateFlow<String> get() = ctx.streamingText
+
     /** UI signals for this session.
      *  Uses replay = 0 (NOT replay = 1) to avoid stale signal replay on session switch. */
     private val _signals = MutableSharedFlow<UiSignal>(replay = 0, extraBufferCapacity = 15)
@@ -201,6 +204,22 @@ class SessionState(
         id
     }
 
+    /**
+     * Adopt a streaming assistant message that was loaded from REST (e.g., child session
+     * cached via ensureSessionCached while still streaming). Sets ctx.activeMessageId so
+     * subsequent SSE events (TextChunk, ToolUse, etc.) are routed to this message.
+     * Does NOT create a new message — the message already exists in the map from REST fetch.
+     */
+    fun adoptStreamingContext(messageId: String, modelID: String?, providerID: String?) = stateLock.withLock {
+        ctx.activeMessageId = messageId
+        ctx.modelID = modelID
+        ctx.providerID = providerID
+        ctx.isStreaming = true
+        firstTextSegmented = false
+        lastAccessTime = System.currentTimeMillis()
+        logger.info { "[ACP] adoptStreamingContext: id=$messageId, modelID=$modelID, providerID=$providerID" }
+    }
+
     fun completeStreaming(messageId: String) = stateLock.withLock {
         if (messageId != ctx.activeMessageId) return@withLock
         freezeCurrentThinking()
@@ -285,16 +304,6 @@ class SessionState(
         }
         _messages.value = current
         logger.info { "[ACP] replaceAllMessages: ${newMessages.size} messages, mapSize=${current.size}" }
-    }
-
-    fun injectSubagentRefs(messageId: String, refs: List<SubagentRef>) = stateLock.withLock {
-        updateMessage(messageId) { msg ->
-            val partsWithoutSubagents = LinkedHashMap(msg.parts.filterValues { it !is MessagePart.Subagent })
-            refs.forEach { ref ->
-                partsWithoutSubagents[ref.sessionId] = MessagePart.Subagent(ref)
-            }
-            msg.copy(parts = partsWithoutSubagents)
-        }
     }
 
     @Suppress("REDUNDANT_ELSE_IN_WHEN")
@@ -468,15 +477,50 @@ class SessionState(
         ctx.pendingStopJob?.cancel()
         ctx.pendingStopJob = null
 
+        // Auto-create or rotate assistant message for child/subagent sessions.
+        // Their SSE events arrive while the parent is streaming, but createAssistantMessage
+        // was never called for the child's SessionState. Also handles the case where
+        // adoptStreamingContext adopted a completed message but a new message is streaming.
+        // Only auto-create for content-bearing events — lifecycle events like
+        // MessageFinalized/Stop don't carry content and shouldn't create messages.
+        val eventServerId = event.messageId
+        val isContentEvent = event is SseEvent.TextChunk || event is SseEvent.TextReplace
+            || event is SseEvent.ThinkingChunk || event is SseEvent.ThinkingReplace
+            || event is SseEvent.ToolUse || event is SseEvent.ToolResult
+            || event is SseEvent.Patch || event is SseEvent.Agent
+            || event is SseEvent.StepFinish || event is SseEvent.Compaction
+            || event is SseEvent.Snapshot || event is SseEvent.AssistantFile
+            || event is SseEvent.AssistantImage
+        val needsNewMessage = when {
+            ctx.activeMessageId == null && isContentEvent -> true // No streaming context at all
+            eventServerId != null && eventServerId != ctx.activeMessageId && eventServerId != ctx.activeServerMessageId -> {
+                // A new message is streaming — the event's server messageId differs from
+                // the currently active one. This happens for child/subagent sessions where
+                // adoptStreamingContext adopted a REST-loaded message but the server is now
+                // streaming a different message.
+                logger.info { "[ACP] New message detected for session $sessionId: eventServerId=$eventServerId vs activeMsgId=${ctx.activeMessageId}/activeServerId=${ctx.activeServerMessageId}" }
+                // Finalize the current streaming message before starting a new one
+                val currentId = ctx.activeMessageId
+                if (currentId != null && ctx.isStreaming) {
+                    finalizeStreaming(currentId, "new_message")
+                }
+                true
+            }
+            else -> false
+        }
+        if (needsNewMessage) {
+            logger.info { "[ACP] Auto-creating assistant message for session $sessionId (triggered by ${event::class.simpleName}, serverMsgId=$eventServerId)" }
+            createAssistantMessage(modelID = null, providerID = null, serverMessageId = eventServerId)
+        }
+
         val msgId = ctx.activeMessageId
         if (msgId == null) {
-            logger.info { "[ACP] processEvent DROP: ${event::class.simpleName} — activeMessageId is null" }
+            logger.info { "[ACP] processEvent DROP: ${event::class.simpleName} — activeMessageId is null even after auto-create" }
             return
         }
 
         // Server ID routing check
         val activeServerId = ctx.activeServerMessageId
-        val eventServerId = event.messageId
         val isCrossMessageEvent = event is SseEvent.ToolResult || event is SseEvent.Permission
         logger.info { "[ACP] processEvent ROUTE: ${event::class.simpleName} activeMsgId=$msgId activeServerId=$activeServerId eventServerId=$eventServerId isCross=$isCrossMessageEvent" }
         if (!isCrossMessageEvent && activeServerId != null && eventServerId != null && eventServerId != activeServerId) {
@@ -550,6 +594,7 @@ class SessionState(
                 } else {
                     ctx.textBuffer.append(text)
                 }
+                ctx.streamingText.value = ctx.textBuffer.toString()
                 scheduleResegment(msgId)
             }
 
@@ -567,12 +612,42 @@ class SessionState(
                     ctx.textBuffer.delete(0, userText.length)
                     ctx.userEchoStripped = true
                 }
+                ctx.streamingText.value = ctx.textBuffer.toString()
                 scheduleResegment(msgId)
             }
 
             // ── Tool calls ───────────────────────────────────────────────
             is SseEvent.ToolUse -> {
-                if (event.toolCallId in ctx.toolCallPills) return
+                val existingPill = ctx.toolCallPills[event.toolCallId]
+                if (existingPill != null) {
+                    // Duplicate ToolUse — server updated the part (e.g. task tool called ctx.metadata()).
+                    // Merge metadata, title, and input into the existing pill.
+                    val updatedPill = existingPill.copy(
+                        metadata = event.metadata ?: existingPill.metadata,
+                        title = event.title?.takeIf { it != existingPill.title } ?: existingPill.title,
+                        input = if (event.input != null && event.input.isNotEmpty()) event.input else existingPill.input,
+                    )
+                    ctx.toolCallPills[event.toolCallId] = updatedPill
+                    // Update the message part so Compose recomposes with the new pill
+                    val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: return
+                    updateMessage(targetMsgId) { msg ->
+                        val parts = LinkedHashMap(msg.parts)
+                        val existing = parts[event.toolCallId]
+                        if (existing is MessagePart.ToolCall) {
+                            parts[event.toolCallId] = existing.copy(pill = updatedPill)
+                            msg.copy(parts = parts, isStreaming = ctx.isStreaming)
+                        } else msg
+                    }
+                    // For task tools: proactively cache the child session if we just learned the sessionId
+                    if (existingPill.toolName == "task" && existingPill.metadata?.get("sessionId") == null && event.metadata?.get("sessionId") != null) {
+                        val childId = try { event.metadata["sessionId"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+                        if (childId != null) {
+                            logger.info { "[ACP] Task tool (metadata update): proactively caching child session $childId" }
+                            scope.launch { sessionManager.ensureSessionCached(childId) }
+                        }
+                    }
+                    return
+                }
 
                 if (!ctx.activeThinkingCompleted && ctx.thinkingBuffer.isNotEmpty()) {
                     ctx.activeThinkingCompleted = true
@@ -597,6 +672,7 @@ class SessionState(
                     kind = toolKind,
                     status = ToolCallStatus.IN_PROGRESS,
                     input = event.input,
+                    metadata = event.metadata,
                 )
                 ctx.toolCallPills[event.toolCallId] = pill
                 ctx.toolCallIndex[event.toolCallId] = msgId
@@ -637,6 +713,16 @@ class SessionState(
                     parts[event.toolCallId] = MessagePart.ToolCall(pill = pill, state = PartState.InProgress)
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
+
+                // For task tools: proactively cache the child session so ToolPill can get its messages
+                if (event.toolName == "task") {
+                    logger.info { "[ACP] Task tool ToolUse: callID=${event.toolCallId}, title=${event.title}, inputKeys=${event.input?.keys}, metadata=${event.metadata}" }
+                    val childId = try { event.metadata?.get("sessionId")?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+                    if (childId != null) {
+                        logger.info { "[ACP] Task tool: proactively caching child session $childId" }
+                        scope.launch { sessionManager.ensureSessionCached(childId) }
+                    }
+                }
             }
 
             is SseEvent.ToolResult -> {
@@ -660,8 +746,40 @@ class SessionState(
                         title = resolvedTitle,
                         kind = resolvedKind,
                         input = newInput,
-                        output = event.content
+                        output = event.content,
+                        metadata = event.metadata ?: existingPill.metadata,
                     )
+                } else {
+                    // No prior ToolUse — create pill from scratch (fast sub-agents can complete in one event)
+                    val newInput = event.input
+                    val baseKind = ToolMapper.toAcpKind("tool")
+                    val resolvedKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(newInput) else baseKind
+                    val resolvedTitle = newInput?.let { input ->
+                        try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+                    } ?: "tool"
+                    val newPill = ToolCallPill(
+                        toolCallId = event.toolCallId,
+                        toolName = "tool",
+                        title = resolvedTitle,
+                        kind = resolvedKind,
+                        status = resolvedStatus,
+                        input = newInput,
+                        output = event.content,
+                        metadata = event.metadata,
+                    )
+                    ctx.toolCallPills[event.toolCallId] = newPill
+                    ctx.toolCallIndex[event.toolCallId] = msgId
+                    updateMessage(msgId) { msg ->
+                        val parts = LinkedHashMap(msg.parts)
+                        parts[event.toolCallId] = MessagePart.ToolCall(pill = newPill, state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed)
+                        msg.copy(parts = parts, isStreaming = ctx.isStreaming)
+                    }
+                    // For task tools: proactively cache the child session
+                    val childId = try { event.metadata?.get("sessionId")?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+                    if (childId != null) {
+                        logger.info { "[ACP] Task tool (from ToolResult): proactively caching child session $childId" }
+                        scope.launch { sessionManager.ensureSessionCached(childId) }
+                    }
                 }
                 val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
                 updateMessage(targetMsgId) { msg ->
@@ -681,7 +799,8 @@ class SessionState(
                                 title = resolvedTitle,
                                 kind = resolvedKind,
                                 input = newInput,
-                                output = event.content ?: existing.pill.output
+                                output = event.content ?: existing.pill.output,
+                                metadata = event.metadata ?: existing.pill.metadata,
                             ),
                             state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed
                         )
@@ -985,6 +1104,30 @@ class SessionState(
                             newParts.add("text_$i" to MessagePart.Text(segment.content))
                         }
                     }
+                    MarkdownSegment.Type.TASK -> {
+                        val state = segment.taskAttrs?.get("state") ?: "completed"
+                        val status = when (state) {
+                            "completed" -> ToolCallStatus.COMPLETED
+                            "failed" -> ToolCallStatus.FAILED
+                            else -> ToolCallStatus.IN_PROGRESS
+                        }
+                        val agentId = segment.taskAttrs?.get("id") ?: ""
+                        val output = listOf(kotlinx.serialization.json.JsonObject(
+                            mapOf("text" to kotlinx.serialization.json.JsonPrimitive(segment.content))
+                        ))
+                        val pill = ToolCallPill(
+                            toolCallId = "task_${agentId.hashCode().toString(16).takeLast(8)}",
+                            toolName = "task",
+                            title = "task",
+                            kind = com.agentclientprotocol.model.ToolKind.OTHER,
+                            status = status,
+                            output = output,
+                        )
+                        newParts.add("task_$i" to MessagePart.ToolCall(
+                            pill = pill,
+                            state = if (status == ToolCallStatus.COMPLETED) PartState.Completed else PartState.InProgress
+                        ))
+                    }
                 }
             }
             updateMessage(msgId) { msg ->
@@ -992,7 +1135,7 @@ class SessionState(
                 val preserved = mutableListOf<Pair<String, MessagePart>>()
                 var lastNonTextIndex = -1
                 oldParts.entries.forEachIndexed { i, entry ->
-                    val isTextDerived = entry.key.startsWith("text_") || entry.key.startsWith("code_") || entry.key.startsWith("table_")
+                    val isTextDerived = entry.key.startsWith("text_") || entry.key.startsWith("code_") || entry.key.startsWith("table_") || entry.key.startsWith("task_")
                     if (!isTextDerived) {
                         preserved.add(entry.key to entry.value)
                         lastNonTextIndex = preserved.size - 1

@@ -119,8 +119,10 @@ fun SessionSidebar(
                         if (state.sessions.isEmpty()) {
                             EmptyContent()
                         } else {
+                            // Filter out subtask sessions (they have a parentID) — only show top-level sessions
+                            val topLevelSessions = state.sessions.filter { it.parentID == null }
                             SessionList(
-                                sessions = state.sessions,
+                                sessions = topLevelSessions,
                                 selectedId = state.selectedId,
                                 onSessionSelected = onSessionSelected,
                                 onSessionArchived = onSessionArchived,
@@ -441,7 +443,7 @@ private fun SessionList(
                 isExpanded = isExpanded,
                 isSelected = sessionId == selectedId,
                 indicator = indicator,
-                onClick = { if (indicator == SessionIndicator.NONE) onSessionSelected(sessionId) },
+                onClick = { onSessionSelected(sessionId) },
                 onToggle = {
                     if (expandedIds[sessionId] == true) expandedIds[sessionId] = false
                     else expandedIds[sessionId] = true

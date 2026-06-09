@@ -5,6 +5,7 @@ import com.opencode.acp.chat.model.ChatFileChange
 import com.opencode.acp.chat.model.PartState
 import com.opencode.acp.chat.model.ToolCallPill
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
  * Mutable accumulation state for a single streaming turn.
@@ -19,6 +20,8 @@ class ProcessorContext {
     // ── Text buffer ────────────────────────────────────────────────────────
     /** Accumulates raw text from TextChunk events before segmentation into text parts. */
     val textBuffer: StringBuilder = StringBuilder()
+    /** Mirrors textBuffer content as a StateFlow for real-time observation by UI (e.g. task pill). */
+    val streamingText = MutableStateFlow("")
 
     // ── Thinking phase state ──────────────────────────────────────────────
     /** Key for the currently active thinking phase in the parts map (e.g., "thinking_0").
@@ -75,6 +78,7 @@ class ProcessorContext {
     /** Reset turn-specific state for a new streaming turn. */
     fun resetTurnState() {
         textBuffer.clear()
+        streamingText.value = ""
         thinkingBuffer.clear()
         activeThinkingKey = null
         activeThinkingCompleted = false

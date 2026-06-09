@@ -74,12 +74,6 @@ sealed interface MessagePart {
         override val partId: String? = null
     ) : MessagePart
 
-    /** Reference to a subagent/child session. */
-    data class Subagent(
-        val ref: SubagentRef,
-        override val partId: String? = null
-    ) : MessagePart
-
     /** Authoritative file change summary from the server's patch part.
      *  Contains git hash for diff/revert and list of changed file paths. */
     data class Patch(

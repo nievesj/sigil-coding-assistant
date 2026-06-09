@@ -60,6 +60,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     val sessionContextState: StateFlow<SessionContextState> = sessionManager.sessionContextState
     val streamingSessionIds: StateFlow<Set<String>> = sessionManager.streamingSessionIds
     val pendingCreationSessionIds: StateFlow<Set<String>> = sessionManager.pendingCreationSessionIds
+    val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = sessionManager.sessionCachedFlow
 
     // ── Internal state ─────────────────────────────────────────────────────
 
@@ -477,6 +478,11 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     suspend fun executeServerCommand(commandName: String, args: String = "") =
         commandManager.executeServerCommand(commandName, args)
+
+    /** Get messages StateFlow for a cached session (returns null if not cached). */
+    fun getSessionMessages(sessionId: String) = sessionManager.getSessionMessages(sessionId)
+
+    fun getStreamingText(sessionId: String) = sessionManager.getStreamingText(sessionId)
 
     // ── Data access (delegate methods for ViewModel) ───────────────────────
 

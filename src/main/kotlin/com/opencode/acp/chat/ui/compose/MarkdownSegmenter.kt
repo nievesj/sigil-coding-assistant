@@ -12,8 +12,9 @@ data class MarkdownSegment(
     val type: Type,
     val content: String,
     val language: String? = null,
+    val taskAttrs: Map<String, String>? = null,
 ) {
-    enum class Type { TEXT, CODE, TABLE }
+    enum class Type { TEXT, CODE, TABLE, TASK }
 }
 
 /**
@@ -261,7 +262,64 @@ object MarkdownSegmenter {
             segments.add(MarkdownSegment(MarkdownSegment.Type.TEXT, markdown))
         }
 
-        return segments
+        // Post-process: split <task>...</task> XML from text segments into TASK segments
+        return splitTaskSegments(segments)
+    }
+
+    /**
+     * Split <task>...</task> XML out of text segments into dedicated TASK segments.
+     * The server wraps subagent task results in <task id="..." state="completed">
+     * <task_result>...</task_result></task> XML within the text stream.
+     */
+    private fun splitTaskSegments(segments: List<MarkdownSegment>): List<MarkdownSegment> {
+        val taskRegex = Regex(
+            "<task\\s+([^>]*)>\\s*<task_result>\\s*([\\s\\S]*?)\\s*</task_result>\\s*</task>",
+            RegexOption.MULTILINE
+        )
+        val result = mutableListOf<MarkdownSegment>()
+        for (seg in segments) {
+            if (seg.type != MarkdownSegment.Type.TEXT) {
+                result.add(seg)
+                continue
+            }
+            val matches = taskRegex.findAll(seg.content).toList()
+            if (matches.isEmpty()) {
+                result.add(seg)
+                continue
+            }
+            // Split text around task blocks
+            var lastEnd = 0
+            for (m in matches) {
+                // Text before the task
+                val before = seg.content.substring(lastEnd, m.range.first).trim()
+                if (before.isNotBlank()) {
+                    result.add(MarkdownSegment(MarkdownSegment.Type.TEXT, before))
+                }
+                // Parse attributes from the <task ...> tag
+                val attrs = parseAttributes(m.groupValues[1])
+                val taskContent = m.groupValues[2].trim()
+                if (taskContent.isNotBlank()) {
+                    result.add(MarkdownSegment(MarkdownSegment.Type.TASK, taskContent, taskAttrs = attrs))
+                }
+                lastEnd = m.range.last + 1
+            }
+            // Text after the last task
+            val after = seg.content.substring(lastEnd).trim()
+            if (after.isNotBlank()) {
+                result.add(MarkdownSegment(MarkdownSegment.Type.TEXT, after))
+            }
+        }
+        return result
+    }
+
+    /** Parse key="value" pairs from an XML tag's attribute string. */
+    private fun parseAttributes(attrString: String): Map<String, String> {
+        val result = mutableMapOf<String, String>()
+        val attrRegex = Regex("""(\w+)\s*=\s*"([^"]*)"""")
+        for (m in attrRegex.findAll(attrString)) {
+            result[m.groupValues[1]] = m.groupValues[2]
+        }
+        return result
     }
 
     /**

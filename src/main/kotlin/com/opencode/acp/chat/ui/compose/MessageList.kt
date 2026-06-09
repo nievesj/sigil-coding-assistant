@@ -73,8 +73,6 @@ import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.MessagePart
 import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.MessageState
-import com.opencode.acp.chat.model.SubagentRef
-import com.opencode.acp.chat.model.SubagentStatus
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.foundation.code.highlighting.NoOpCodeHighlighter
@@ -96,8 +94,8 @@ fun MessageList(
     messages: List<ChatMessage>,
     modifier: Modifier = Modifier,
     project: Project? = null,
-    onSubagentClick: ((String) -> Unit)? = null,
     onImagePreview: ((String) -> Unit)? = null,
+    getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -199,7 +197,7 @@ fun MessageList(
                     count = messages.size,
                     key = { index -> messages[index].id }
                 ) { index ->
-                    MessageItem(messages[index], project, onSubagentClick, onImagePreview)
+                    MessageItem(messages[index], project, onImagePreview, getStreamingText = getStreamingText)
                     if (index < messages.size - 1) {
                         Spacer(modifier = Modifier.height(12.dp))
                     }
@@ -251,10 +249,10 @@ fun MessageList(
 }
 
 @Composable
-fun MessageItem(message: ChatMessage, project: Project? = null, onSubagentClick: ((String) -> Unit)? = null, onImagePreview: ((String) -> Unit)? = null) {
+fun MessageItem(message: ChatMessage, project: Project? = null, onImagePreview: ((String) -> Unit)? = null, getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null) {
     when (message.role) {
         MessageRole.USER -> UserMessage(message, onImagePreview)
-        MessageRole.ASSISTANT -> AssistantMessage(message, project, onSubagentClick)
+        MessageRole.ASSISTANT -> AssistantMessage(message, project, getStreamingText = getStreamingText)
     }
 }
 
@@ -317,7 +315,7 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
 }
 
 @Composable
-fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentClick: ((String) -> Unit)? = null) {
+fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null) {
      val streamingAlpha = if (message.isStreaming) 0.85f else 1f
 
      // Set up markdown styling once for the entire message (needed by Text and Code parts)
@@ -404,10 +402,10 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
                                )
                            }
                        }
-                     is MessagePart.ToolCall -> {
-                         hasToolCall = true
-                         key(key) { ToolPill(part.pill) }
-                     }
+                       is MessagePart.ToolCall -> {
+                           hasToolCall = true
+                           key(key) { ToolPill(part.pill, getStreamingText = getStreamingText) }
+                       }
                      is MessagePart.Text -> {
                          key(key) {
                              val parsedBlocks = remember(part.content) {
@@ -444,9 +442,8 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
                      is MessagePart.StepFinish -> key(key) { StepFinishPill(part) }
                      is MessagePart.Retry -> key(key) { RetryPill(part.attempt, part.maxAttempts, part.error) }
                      is MessagePart.Compaction -> key(key) { CompactionPill(part.summary) }
-                     is MessagePart.FileChange -> if (!hasToolCall) key(key) { FileChangeCard(change = part.change, project = project, addedColor = Color(0xFF7EE787), deletedColor = Color(0xFFFF7B72), pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)) }
-                     is MessagePart.Subagent -> if (part.ref.status == SubagentStatus.RUNNING) key(key) { SubagentSessionBar(ref = part.ref, onClick = { onSubagentClick?.invoke(it) }) }
-                     is MessagePart.AssistantFile -> key(key) {
+                      is MessagePart.FileChange -> if (!hasToolCall) key(key) { FileChangeCard(change = part.change, project = project, addedColor = Color(0xFF7EE787), deletedColor = Color(0xFFFF7B72), pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)) }
+                      is MessagePart.AssistantFile -> key(key) {
                          Row(
                              modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp).fillMaxWidth()
                                  .background(color = Color(0xFF2D2D2D), shape = RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 6.dp),
@@ -642,22 +639,6 @@ private fun RenderFileChanges(fileChangeParts: List<MessagePart.FileChange>, pro
         project = project,
         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
     )
-}
-
-@Composable
-private fun RenderSubagentSessions(subagentParts: List<MessagePart.Subagent>, onSubagentClick: ((String) -> Unit)?) {
-    if (subagentParts.isEmpty()) return
-    Column(
-        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        subagentParts.forEach { part ->
-            SubagentSessionBar(
-                ref = part.ref,
-                onClick = { onSubagentClick?.invoke(it) },
-            )
-        }
-    }
 }
 
 @Composable
@@ -1062,72 +1043,6 @@ private fun FileChangeCard(
  * Parse a hex color string ("#RRGGBB" or "RRGGBB") to Compose Color.
  * Falls back to defaultColor if invalid or blank.
  */
-
-// ── Subagent Session Bar ────────────────────────────────────────────────────
-
-@Composable
-private fun SubagentSessionBar(
-    ref: SubagentRef,
-    onClick: (String) -> Unit,
-) {
-    val interactionSource = remember { MutableInteractionSource() }
-    val isHovered by interactionSource.collectIsHoveredAsState()
-    val tintBase = Color(0xFF3574F0)
-
-    val bgColor = when (ref.status) {
-        SubagentStatus.RUNNING -> Color(0xFF1A4D1A)
-        SubagentStatus.COMPLETED -> Color(0xFF2B2B2B)
-        SubagentStatus.FAILED -> Color(0xFF4D1A1A)
-    }
-    val borderColor = if (isHovered) tintBase.copy(alpha = 0.5f) else Color(0xFF3E3E3E)
-    val textColor = when (ref.status) {
-        SubagentStatus.RUNNING -> Color(0xFF7EE787)
-        SubagentStatus.COMPLETED -> Color(0xFFCCCCCC)
-        SubagentStatus.FAILED -> Color(0xFFFF7B72)
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
-            .background(bgColor)
-            .border(1.dp, borderColor, RoundedCornerShape(6.dp))
-            .hoverable(interactionSource)
-            .clickable(interactionSource = interactionSource, indication = null) { onClick(ref.sessionId) }
-            .padding(horizontal = 10.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        // Status dot
-        val dotColor = when (ref.status) {
-            SubagentStatus.RUNNING -> Color(0xFF7EE787)
-            SubagentStatus.COMPLETED -> Color(0xFF808080)
-            SubagentStatus.FAILED -> Color(0xFFFF7B72)
-        }
-        Box(
-            modifier = Modifier
-                .size(8.dp)
-                .clip(RoundedCornerShape(4.dp))
-                .background(dotColor)
-        )
-        // Agent name
-        Text(
-            text = ref.agentName,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = textColor,
-        )
-        // Description
-        Text(
-            text = ref.taskDescription,
-            fontSize = 11.sp,
-            color = textColor.copy(alpha = 0.7f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-    }
-}
 
 /**
  * Clamp non-positive [MarkdownBlock.ListBlock.OrderedList.startFrom] values in a parsed

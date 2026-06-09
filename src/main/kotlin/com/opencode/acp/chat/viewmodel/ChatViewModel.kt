@@ -40,6 +40,7 @@ class ChatViewModel(
     val sessionContextState: StateFlow<SessionContextState> = service.sessionContextState
     val streamingSessionIds: StateFlow<Set<String>> = service.streamingSessionIds
     val pendingCreationSessionIds: StateFlow<Set<String>> = service.pendingCreationSessionIds
+    val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = service.sessionCachedFlow
 
     // --- UI-specific state ---
     private val _controlState = MutableStateFlow(ControlBarState())
@@ -421,6 +422,11 @@ class ChatViewModel(
             service.executeServerCommand(commandName, args)
         }
     }
+
+    /** Get messages StateFlow for a child session (used by ToolPill for task pills). */
+    fun getSessionMessages(sessionId: String) = service.getSessionMessages(sessionId)
+
+    fun getStreamingText(sessionId: String) = service.getStreamingText(sessionId)
 
     // --- Command history ---
 

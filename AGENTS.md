@@ -588,21 +588,25 @@ V1 nests data under `properties`. The fix: `val props = obj["properties"]?.jsonO
 
 ### Configurable Server Port
 
-The plugin now has a configurable port setting in `Settings → Tools → OpenCode`
+The plugin has a configurable port setting in `Settings → Tools → OpenCode`
 (default: 4096). This allows the plugin to coexist with other opencode consumers
-(e.g., a conversation host running on port 4096).
+(e.g., the OpenCode Desktop app) by automatically finding a free port.
 
 **Connection strategy (`OpenCodeConnectionManager.initialize()`):**
-1. Check if a server is already running on the configured `host:port`
-2. If yes → connect to it (don't launch a new binary)
-3. If no → launch `opencode serve --hostname $host --port $port` and wait for health check
+1. Always launch the plugin's own `opencode serve` instance
+2. If the configured port is already occupied, find the next available port
+   (tries up to 10 ports beyond the configured one)
+3. Launch `opencode serve --hostname $host --port $actualPort` and wait for
+   health check with exponential backoff
+4. The plugin never connects to an externally-managed server — it always owns
+   its process to avoid stale state, auth mismatches, or version incompatibilities
 
 **Shutdown behavior:** The plugin kills its own launched process on IDE dispose
-(`shutdown()` → `killProcess()`). If the plugin connected to an existing server
-(step 1), it does NOT kill that server — it only disconnects the HTTP/SSE client.
+(`shutdown()` → `killProcess()`). Other OpenCode instances (e.g., the Desktop
+app) are left untouched since the plugin uses a different port.
 
 **Key files:** `OpenCodeSettingsState.kt` (`port` field), `OpenCodeSettingsPanel.kt`
-(port UI), `OpenCodeConnectionManager.kt` (connection logic)
+(port UI), `OpenCodeConnectionManager.kt` (`findAvailablePort`, connection logic)
 
 ---
 

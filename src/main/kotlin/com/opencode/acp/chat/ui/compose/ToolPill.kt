@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -31,28 +32,51 @@ import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ToolCallPill
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 @Composable
-fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
-    // Edit and Shell pills expanded by default
+fun ToolPill(
+    pill: ToolCallPill,
+    modifier: Modifier = Modifier,
+    getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
+) {
+    // Edit and Shell pills expanded by default; task pills expanded when running
     var expanded by remember {
-        mutableStateOf(pill.kind == ToolKind.EXECUTE || pill.kind == ToolKind.EDIT)
+        mutableStateOf(pill.kind == ToolKind.EXECUTE || pill.kind == ToolKind.EDIT || (pill.toolName == "task" && pill.status == ToolCallStatus.IN_PROGRESS))
     }
 
-    val iconKey = when (pill.status) {
-        ToolCallStatus.PENDING -> AllIconsKeys.Actions.Lightning
-        ToolCallStatus.IN_PROGRESS -> AllIconsKeys.Actions.Execute
-        ToolCallStatus.COMPLETED -> AllIconsKeys.Actions.Checked
-        ToolCallStatus.FAILED -> AllIconsKeys.Actions.Cancel
+    val isTask = pill.toolName == "task"
+    val childSessionId = if (isTask) {
+        try { pill.metadata?.get("sessionId")?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+    } else null
+    val taskAgentName = if (isTask) {
+        pill.input?.getString("subagent_type") ?: pill.input?.getString("description") ?: "subagent"
+    } else null
+
+    // Observe child session streaming text for task pills
+    val childStreamingText = if (isTask && childSessionId != null && getStreamingText != null) {
+        getStreamingText(childSessionId)?.collectAsState()?.value
+    } else null
+
+    val iconKey = when {
+        isTask && pill.status == ToolCallStatus.IN_PROGRESS -> AllIconsKeys.Actions.Execute
+        isTask && pill.status == ToolCallStatus.COMPLETED -> AllIconsKeys.Actions.Checked
+        isTask && pill.status == ToolCallStatus.FAILED -> AllIconsKeys.Actions.Cancel
+        pill.status == ToolCallStatus.PENDING -> AllIconsKeys.Actions.Lightning
+        pill.status == ToolCallStatus.IN_PROGRESS -> AllIconsKeys.Actions.Execute
+        pill.status == ToolCallStatus.COMPLETED -> AllIconsKeys.Actions.Checked
+        pill.status == ToolCallStatus.FAILED -> AllIconsKeys.Actions.Cancel
+        else -> AllIconsKeys.Actions.Execute
     }
 
-    val accentColor = toolKindColor(pill.kind)
-    val kindLabel = toolKindLabel(pill.kind)
-    val hasDetails = pill.input != null || pill.output != null
+    val accentColor = if (isTask) Color(0xFF7EE787) else toolKindColor(pill.kind)
+    val kindLabel = if (isTask) "Task" else toolKindLabel(pill.kind)
+    // Task pills always have an expandable body; other pills only if they have input/output
+    val hasDetails = isTask || pill.input != null || pill.output != null
 
     // Resolve display data
     val fileName = remember(pill.kind, pill.input) { resolveFileName(pill) }
@@ -102,8 +126,8 @@ fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
             )
             Spacer(Modifier.width(6.dp))
 
-            // Filename or description
-            val headerText = fileName ?: description
+            // Filename or description (for task pills, show agent name)
+            val headerText = if (isTask) "@${taskAgentName?.replaceFirstChar { it.uppercase() }}" else (fileName ?: description)
             Text(
                 text = headerText,
                 color = Color(0xFFBBBBBB),
@@ -149,17 +173,83 @@ fun ToolPill(pill: ToolCallPill, modifier: Modifier = Modifier) {
         }
 
         // ── Expanded body (inside the same container) ──
-        if (expanded && hasDetails) {
+                if (expanded && hasDetails) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 12.dp, vertical = 2.dp)
             ) {
-                when (pill.kind) {
-                    ToolKind.EXECUTE -> expandShell(pill)
-                    ToolKind.EDIT -> expandEdit(pill, fileName)
-                    ToolKind.READ -> expandRead(pill, fileName)
-                    else -> expandGeneric(pill)
+                if (isTask) {
+                    // Task pill: status + child session streaming text
+                    when (pill.status) {
+                        ToolCallStatus.IN_PROGRESS -> {
+                            // Show real-time child session text if available, else prompt/description
+                            if (!childStreamingText.isNullOrBlank()) {
+                                ChatFencedCodeBlock(content = childStreamingText, language = "text")
+                            } else {
+                                val desc = pill.input?.getString("description") ?: pill.title.takeIf { it != "task" } ?: ""
+                                val prompt = pill.input?.getString("prompt") ?: ""
+                                if (prompt.isNotBlank()) {
+                                    Text(
+                                        text = prompt.take(500),
+                                        color = Color(0xFFCCCCCC),
+                                        fontSize = 12.sp,
+                                        maxLines = 10,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                    )
+                                } else if (desc.isNotBlank()) {
+                                    Text(
+                                        text = desc,
+                                        color = Color(0xFFCCCCCC),
+                                        fontSize = 12.sp,
+                                        maxLines = 3,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                    )
+                                } else {
+                                    Text("Running task…", color = Color(0xFF808080), fontSize = 11.sp)
+                                }
+                            }
+                        }
+                        ToolCallStatus.COMPLETED -> {
+                            // Show child session text if available, else output, else description
+                            val taskOutput = if (!childStreamingText.isNullOrBlank()) childStreamingText else formatTaskOutput(pill.output)
+                            if (!taskOutput.isNullOrBlank()) {
+                                ChatFencedCodeBlock(content = taskOutput, language = "text")
+                            } else {
+                                val desc = pill.input?.getString("description") ?: pill.title.takeIf { it != "task" } ?: ""
+                                if (desc.isNotBlank()) {
+                                    Text(
+                                        text = desc,
+                                        color = Color(0xFFBBBBBB),
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                    )
+                                } else {
+                                    Text("Task completed", color = Color(0xFF808080), fontSize = 11.sp)
+                                }
+                            }
+                        }
+                        ToolCallStatus.FAILED -> {
+                            val taskOutput = if (!childStreamingText.isNullOrBlank()) childStreamingText else formatTaskOutput(pill.output)
+                            if (!taskOutput.isNullOrBlank()) {
+                                ChatFencedCodeBlock(content = taskOutput, language = "text")
+                            } else {
+                                Text("Task failed", color = Color(0xFFFF7B72), fontSize = 11.sp)
+                            }
+                        }
+                        else -> {
+                            Text("Task pending…", color = Color(0xFF808080), fontSize = 11.sp)
+                        }
+                    }
+                } else {
+                    when (pill.kind) {
+                        ToolKind.EXECUTE -> expandShell(pill)
+                        ToolKind.EDIT -> expandEdit(pill, fileName)
+                        ToolKind.READ -> expandRead(pill, fileName)
+                        else -> expandGeneric(pill)
+                    }
                 }
             }
         }
@@ -330,6 +420,35 @@ private fun toolKindLabel(kind: ToolKind): String = when (kind) {
     ToolKind.THINK -> "Thinking"
     ToolKind.SWITCH_MODE -> "Switch"
     ToolKind.OTHER -> "Tool"
+}
+
+/** Format task tool output by extracting text from the result content.
+ *  The server returns output as a list of JsonObject parts, each with a "text" field.
+ *  We extract and concatenate the text content, stripping XML task wrapper tags.
+ */
+private fun formatTaskOutput(output: List<kotlinx.serialization.json.JsonObject>?): String? {
+    if (output.isNullOrEmpty()) return null
+    val sb = StringBuilder()
+    for (part in output) {
+        val text = part["text"]?.jsonPrimitive?.contentOrNull ?: continue
+        sb.append(text)
+    }
+    var text = sb.toString().trim()
+    if (text.isBlank()) return null
+    // Strip <task ...> and <task_result>...</task_result></task> wrappers
+    val taskMatch = Regex("<task[^>]*>\\s*<task_result>\\s*([\\s\\S]*?)\\s*</task_result>\\s*</task>", RegexOption.MULTILINE)
+        .find(text)
+    if (taskMatch != null) {
+        text = taskMatch.groupValues[1].trim()
+    } else {
+        // Try removing just <task_result>...</task_result>
+        val resultMatch = Regex("<task_result>\\s*([\\s\\S]*?)\\s*</task_result>", RegexOption.MULTILINE)
+            .find(text)
+        if (resultMatch != null) {
+            text = resultMatch.groupValues[1].trim()
+        }
+    }
+    return text.ifBlank { null }
 }
 
 private fun toolKindColor(kind: ToolKind): Color = when (kind) {

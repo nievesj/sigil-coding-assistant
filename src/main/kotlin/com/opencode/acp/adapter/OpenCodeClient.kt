@@ -714,13 +714,15 @@ class OpenCodeClient(
                         ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID")
                     val tool = props["tool"]?.jsonPrimitive?.contentOrNull ?: "tool"
                     val input = props["input"]?.jsonObject
+                    val calledMetadata = props["provider"]?.jsonObject?.get("metadata")?.jsonObject
                     logger.info { "[ACP] V2 tool.called: callID=$callID, tool=$tool, hasInput=${input != null}, inputKeys=${input?.keys}" }
                     SseEvent.ToolUse(
                         sessionId = sessionId,
                         toolCallId = callID,
                         toolName = tool,
                         title = tool,
-                        input = input
+                        input = input,
+                        metadata = calledMetadata
                     )
                 }
 
@@ -731,12 +733,14 @@ class OpenCodeClient(
                         ?.mapNotNull { (it as? JsonObject) }
                     // Pass input so ToolResult handler can re-detect kind if initial ToolUse had generic name
                     val resultInput = props["input"]?.jsonObject
+                    val successMetadata = props["provider"]?.jsonObject?.get("metadata")?.jsonObject
                     SseEvent.ToolResult(
                         sessionId = sessionId,
                         toolCallId = callID,
                         isError = false,
                         content = output,
-                        input = resultInput
+                        input = resultInput,
+                        metadata = successMetadata
                     )
                 }
                 "session.next.tool.failed" -> {
@@ -745,25 +749,14 @@ class OpenCodeClient(
                     val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject) }
                     val resultInput = props["input"]?.jsonObject
+                    val failedMetadata = props["provider"]?.jsonObject?.get("metadata")?.jsonObject
                     SseEvent.ToolResult(
                         sessionId = sessionId,
                         toolCallId = callID,
                         isError = true,
                         content = output,
-                        input = resultInput
-                    )
-                }
-
-                "session.next.tool.failed" -> {
-                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull
-                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID")
-                    val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
-                        ?.mapNotNull { (it as? JsonObject) }
-                    SseEvent.ToolResult(
-                        sessionId = sessionId,
-                        toolCallId = callID,
-                        isError = true,
-                        content = output
+                        input = resultInput,
+                        metadata = failedMetadata
                     )
                 }
 
@@ -936,6 +929,10 @@ class OpenCodeClient(
                                 val toolName = part["tool"]?.jsonPrimitive?.contentOrNull
                                     ?: part["name"]?.jsonPrimitive?.contentOrNull
                                     ?: "tool"
+                                // Always log task tool events for debugging
+                                if (toolName == "task") {
+                                    logger.info { "[ACP] SSE TASK TOOL: callID=$toolCallId, tool=$toolName, partKeys=${part.keys}, rawPart=${part}" }
+                                }
                                 // state is a nested object: { status: "running"|"completed"|"error"|..., input, output, ... }
                                 val stateObj = part["state"]?.jsonObject
                                 val status = stateObj?.get("status")?.jsonPrimitive?.contentOrNull
@@ -943,12 +940,14 @@ class OpenCodeClient(
                                 debugLog("SSE TOOL PART JSON: $part")
                                 when (status) {
                                     "completed" -> {
-                                        val output = (stateObj.get("output") as? kotlinx.serialization.json.JsonArray)
+                                        // Parse output — can be JsonArray (most tools) or string (task tool)
+                                        val rawOutput = stateObj.get("output") ?: part["output"]
+                                        val output = (rawOutput as? kotlinx.serialization.json.JsonArray)
                                             ?.mapNotNull { (it as? JsonObject) }
-                                            ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
-                                                ?.mapNotNull { (it as? JsonObject) }
+                                            ?: rawOutput?.jsonPrimitive?.content?.let { listOf(JsonObject(mapOf("text" to kotlinx.serialization.json.JsonPrimitive(it)))) }
                                         // Also try to extract input from completed state — may update existing pill
                                         val completedInput = stateObj.get("input")?.jsonObject ?: part["input"]?.jsonObject
+                                        val completedMetadata = stateObj.get("metadata")?.jsonObject
                                         if (completedInput != null) {
                                             logger.info { "[ACP] V1 tool completed with input: callID=$toolCallId, tool=$toolName, inputKeys=${completedInput.keys}" }
                                         }
@@ -958,22 +957,25 @@ class OpenCodeClient(
                                             isError = false,
                                             content = output,
                                             input = completedInput,
+                                            metadata = completedMetadata,
                                             messageId = messageId,
                                             partId = partId
                                         )
                                     }
                                     "error" -> {
-                                        val output = (stateObj.get("output") as? kotlinx.serialization.json.JsonArray)
+                                        val rawOutput = stateObj.get("output") ?: part["output"]
+                                        val output = (rawOutput as? kotlinx.serialization.json.JsonArray)
                                             ?.mapNotNull { (it as? JsonObject) }
-                                            ?: (part["output"] as? kotlinx.serialization.json.JsonArray)
-                                                ?.mapNotNull { (it as? JsonObject) }
+                                            ?: rawOutput?.jsonPrimitive?.content?.let { listOf(JsonObject(mapOf("text" to kotlinx.serialization.json.JsonPrimitive(it)))) }
                                         val errorInput = stateObj.get("input")?.jsonObject ?: part["input"]?.jsonObject
+                                        val errorMetadata = stateObj.get("metadata")?.jsonObject
                                         SseEvent.ToolResult(
                                             sessionId = sessionId,
                                             toolCallId = toolCallId,
                                             isError = true,
                                             content = output,
                                             input = errorInput,
+                                            metadata = errorMetadata,
                                             messageId = messageId,
                                             partId = partId
                                         )
@@ -981,6 +983,7 @@ class OpenCodeClient(
                                     else -> {
                                         // "running", "pending", or null — emit as ToolUse
                                         val input = stateObj?.get("input")?.jsonObject ?: part["input"]?.jsonObject
+                                        val runningMetadata = stateObj?.get("metadata")?.jsonObject
                                         logger.info { "[ACP] V1 tool part: callID=$toolCallId, tool=$toolName, status=$status, hasState=${stateObj != null}, stateInput=${stateObj?.get("input") != null}, partInput=${part["input"] != null}, resolvedInput=${input != null}" }
                                         SseEvent.ToolUse(
                                             sessionId = sessionId,
@@ -988,6 +991,7 @@ class OpenCodeClient(
                                             toolName = toolName,
                                             title = stateObj?.get("title")?.jsonPrimitive?.contentOrNull ?: toolName,
                                             input = input,
+                                            metadata = runningMetadata,
                                             messageId = messageId,
                                             partId = partId
                                         )
@@ -1071,6 +1075,7 @@ class OpenCodeClient(
                                 val description = part["description"]?.jsonPrimitive?.contentOrNull
                                 val agent = part["agent"]?.jsonPrimitive?.contentOrNull
                                 val model = part["model"]?.jsonPrimitive?.contentOrNull
+                                logger.info { "[ACP] SSE SUBTASK part: agent=$agent, desc=$description, prompt=${prompt?.take(80)}" }
                                 SseEvent.Subtask(sessionId = sessionId, prompt = prompt, description = description, agent = agent, model = model, messageId = messageId, partId = partId)
                             }
                             else -> {

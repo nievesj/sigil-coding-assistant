@@ -41,6 +41,7 @@ sealed interface SseEvent {
         val toolName: String,
         val title: String? = null,
         val input: JsonObject? = null,
+        val metadata: JsonObject? = null,
         override val messageId: String? = null,
         override val partId: String? = null
     ) : SseEvent
@@ -52,6 +53,7 @@ sealed interface SseEvent {
         val isError: Boolean = false,
         val content: List<JsonObject>? = null,
         val input: JsonObject? = null,
+        val metadata: JsonObject? = null,
         override val messageId: String? = null,
         override val partId: String? = null
     ) : SseEvent

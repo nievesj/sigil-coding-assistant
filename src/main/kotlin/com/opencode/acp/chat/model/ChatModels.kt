@@ -87,20 +87,6 @@ data class ChatMessage(
     val serverMessageId: String? = null,
 )
 
-/** Reference to a subagent/child session spawned from an assistant message. */
-data class SubagentRef(
-    val sessionId: String,
-    val agentName: String,
-    val taskDescription: String,
-    val status: SubagentStatus = SubagentStatus.RUNNING,
-)
-
-enum class SubagentStatus {
-    RUNNING,
-    COMPLETED,
-    FAILED,
-}
-
 enum class MessageRole { USER, ASSISTANT }
 
 /** Display model for a tool call pill. */
@@ -112,6 +98,7 @@ data class ToolCallPill(
     val status: ToolCallStatus,
     val input: kotlinx.serialization.json.JsonObject? = null,
     val output: List<kotlinx.serialization.json.JsonObject>? = null,
+    val metadata: kotlinx.serialization.json.JsonObject? = null,
 )
 
 /** A file modified by a tool call, displayed in the assistant message. */
@@ -316,7 +303,6 @@ val ChatMessage.fullMarkdownContent: String
                 is MessagePart.Error -> append("Error: ${part.message}\n")
                 is MessagePart.ToolCall -> { /* skip — binary/structured, not markdown */ }
                 is MessagePart.FileChange -> { /* skip — not markdown content */ }
-                is MessagePart.Subagent -> { /* skip — not markdown content */ }
                 is MessagePart.Patch -> append("Patch: ${part.hash} — ${part.files.size} file(s)\n")
                 is MessagePart.Agent -> append("Agent: ${part.name}\n")
                 is MessagePart.Retry -> append("Retry: ${part.attempt}/${part.maxAttempts}${part.error?.let { " — $it" } ?: ""}\n")

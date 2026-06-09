@@ -112,6 +112,12 @@ class SessionManager(private val scope: CoroutineScope) {
     private val _allSessionSignals = MutableSharedFlow<Pair<String, UiSignal>>(extraBufferCapacity = 64)
     val allSessionSignals: Flow<Pair<String, UiSignal>> = _allSessionSignals.asSharedFlow()
 
+    /** Emits session IDs when a new SessionState is added to the cache.
+     *  Used by ToolPill to detect when a child session becomes available.
+     *  replay=1 ensures the last cached session ID is available to late subscribers. */
+    private val _sessionCachedFlow = MutableSharedFlow<String>(replay = 1, extraBufferCapacity = 16)
+    val sessionCachedFlow: SharedFlow<String> = _sessionCachedFlow.asSharedFlow()
+
     /** Session IDs that are currently streaming (generation in progress).
      *  Updated reactively from allSessionSignals — StreamingStarted adds, StreamingCompleted removes. */
     private val _streamingSessionIds = MutableStateFlow<Set<String>>(emptySet())
@@ -348,8 +354,8 @@ class SessionManager(private val scope: CoroutineScope) {
                 return
             }
             is SseEvent.Subtask -> {
-                // Subagent spawned — refresh the session list so it appears in the sidebar
-                scope.launch { loadSessions() }
+                // Server doesn't send subtask events via V1 bus — subtasks are regular ToolPart with tool="task"
+                // This handler is a no-op; task tool rendering is handled in ToolPill
                 return
             }
             is SseEvent.TodoUpdated -> {
@@ -362,9 +368,15 @@ class SessionManager(private val scope: CoroutineScope) {
                 return
             }
             else -> {
-                val state = sessionsLock.withLock { sessions[sessionId] }
+                var state = sessionsLock.withLock { sessions[sessionId] }
                 if (state == null) {
-                    logger.debug { "[ACP] Ignoring event for uncached session $sessionId" }
+                    // Auto-cache unknown sessions when SSE events arrive (e.g. subtask streaming)
+                    logger.info { "[ACP] Auto-caching session $sessionId from SSE event" }
+                    ensureSessionCached(sessionId)
+                    state = sessionsLock.withLock { sessions[sessionId] }
+                }
+                if (state == null) {
+                    logger.warn { "[ACP] Failed to cache session $sessionId, ignoring event" }
                     return
                 }
                 state.processEvent(event)
@@ -407,10 +419,6 @@ class SessionManager(private val scope: CoroutineScope) {
         getActiveSession()?.setLastUserText(text)
     }
 
-    fun injectSubagentRefs(messageId: String, refs: List<SubagentRef>) {
-        getActiveSession()?.injectSubagentRefs(messageId, refs)
-    }
-
     // ── Session-specific routing (for PermissionManager) ──
 
     suspend fun setToolPartStateForSession(sessionId: String, toolCallId: String, state: PartState) {
@@ -423,6 +431,21 @@ class SessionManager(private val scope: CoroutineScope) {
 
     suspend fun getSession(sessionId: String): SessionState? {
         return sessionsLock.withLock { sessions[sessionId] }
+    }
+
+    /** Get messages StateFlow for a cached session (returns null if not cached). */
+    fun getSessionMessages(sessionId: String): StateFlow<Map<String, ChatMessage>>? {
+        return sessionsLock.withLock { sessions[sessionId] }?.messages
+    }
+
+    /** Get real-time streaming text for a cached session (returns null if not cached). */
+    fun getStreamingText(sessionId: String): StateFlow<String>? {
+        return sessionsLock.withLock { sessions[sessionId] }?.streamingText
+    }
+
+    /** Check if a session is currently streaming. */
+    fun isSessionStreaming(sessionId: String): Boolean {
+        return sessionsLock.withLock { sessions[sessionId] }?.isStreaming ?: false
     }
 
     /** Get all cached sessions that have isStreaming == true.
@@ -480,25 +503,27 @@ class SessionManager(private val scope: CoroutineScope) {
         val state = SessionState(sessionId, scope, this)
         messages.forEach { state.addMessage(it.toChatMessage()) }
 
-        // Inject subagent refs if this session has children
-        val children = _childSessionMap.value[sessionId]
-        if (children != null) {
-            state.messages.value.values.lastOrNull { it.role == MessageRole.ASSISTANT }?.let { msg ->
-                state.injectSubagentRefs(msg.id, children.map { child ->
-                    SubagentRef(
-                        sessionId = child.id,
-                        agentName = child.title.replaceFirstChar { it.uppercase() },
-                        taskDescription = child.title,
-                        status = if (child.outputTokens > 0) SubagentStatus.COMPLETED else SubagentStatus.RUNNING
-                    )
-                })
-            }
+        // Adopt the last assistant message as the streaming context so subsequent
+        // SSE events (TextChunk, ToolUse, etc.) are routed to it.
+        // This is critical for child sessions: their SSE events arrive while the
+        // parent's prompt loop is still running, but createAssistantMessage was
+        // never called for the child's SessionState.
+        val lastAssistant = messages.findLast { it.info.role == "assistant" }
+        if (lastAssistant != null) {
+            state.adoptStreamingContext(
+                lastAssistant.info.id,
+                lastAssistant.info.modelID,
+                lastAssistant.info.providerID
+            )
+            logger.info { "[ACP] ensureSessionCached: adopted message ${lastAssistant.info.id} for session $sessionId" }
         }
 
         sessionsLock.withLock {
             val existing = sessions.putIfAbsent(sessionId, state)
             if (existing != null) {
                 state.close()
+            } else {
+                _sessionCachedFlow.tryEmit(sessionId)
             }
         }
     }

@@ -539,6 +539,30 @@ private fun OpenCodeMessage.toChatMessageInternal(): ChatMessage {
                         parts[MessagePart.generatePartId()] = MessagePart.Text(segment.content)
                     }
                 }
+                com.opencode.acp.chat.ui.compose.MarkdownSegment.Type.TASK -> {
+                    val state = segment.taskAttrs?.get("state") ?: "completed"
+                    val status = when (state) {
+                        "completed" -> com.agentclientprotocol.model.ToolCallStatus.COMPLETED
+                        "failed" -> com.agentclientprotocol.model.ToolCallStatus.FAILED
+                        else -> com.agentclientprotocol.model.ToolCallStatus.IN_PROGRESS
+                    }
+                    val agentId = segment.taskAttrs?.get("id") ?: ""
+                    val output = listOf(kotlinx.serialization.json.JsonObject(
+                        mapOf("text" to kotlinx.serialization.json.JsonPrimitive(segment.content))
+                    ))
+                    val pill = ToolCallPill(
+                        toolCallId = "task_${agentId.hashCode().toString(16).takeLast(8)}",
+                        toolName = "task",
+                        title = "task",
+                        kind = com.agentclientprotocol.model.ToolKind.OTHER,
+                        status = status,
+                        output = output,
+                    )
+                    parts[MessagePart.generatePartId()] = MessagePart.ToolCall(
+                        pill = pill,
+                        state = if (status == com.agentclientprotocol.model.ToolCallStatus.COMPLETED) com.opencode.acp.chat.model.PartState.Completed else com.opencode.acp.chat.model.PartState.InProgress
+                    )
+                }
             }
         }
     }

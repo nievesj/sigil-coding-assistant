@@ -339,10 +339,8 @@ fun
                             messages = messages.values.toList(),
                             modifier = Modifier.weight(1f).fillMaxWidth(),
                             project = project,
-                            onSubagentClick = { subagentId ->
-                                scope.launch { viewModel.switchSession(subagentId) }
-                            },
                             onImagePreview = { uri -> previewImageUri = uri },
+                            getStreamingText = { sessionId -> viewModel.getStreamingText(sessionId) },
                         )
                     }
                 }
