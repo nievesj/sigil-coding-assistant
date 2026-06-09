@@ -28,6 +28,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import java.util.LinkedHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -317,8 +319,11 @@ class SessionState(
                         state = newPartState
                     )
                 } else {
+                    // Fallback: try to use pill from ctx.toolCallPills (has proper kind/title)
+                    val existingPill = ctx.toolCallPills[toolCallId]
                     parts[toolCallId] = MessagePart.ToolCall(
-                        pill = ToolCallPill(toolCallId = toolCallId, toolName = "tool", title = "tool", kind = ToolKind.OTHER, status = status, output = output),
+                        pill = existingPill?.copy(status = status, output = output ?: existingPill.output)
+                            ?: ToolCallPill(toolCallId = toolCallId, toolName = "tool", title = "tool", kind = ToolKind.OTHER, status = status, output = output),
                         state = newPartState
                     )
                 }
@@ -526,6 +531,11 @@ class SessionState(
 
             // ── Text ──────────────────────────────────────────────────────
             is SseEvent.TextChunk -> {
+                // Thinking ends when text begins — freeze any active thinking
+                if (!ctx.activeThinkingCompleted && ctx.thinkingBuffer.isNotEmpty()) {
+                    ctx.activeThinkingCompleted = true
+                    freezeCurrentThinking()
+                }
                 val text = event.text
                 if (!ctx.firstTextChunkReceived && text.isNotBlank()) {
                     ctx.firstTextChunkReceived = true
@@ -544,6 +554,11 @@ class SessionState(
             }
 
             is SseEvent.TextReplace -> {
+                // Thinking ends when text begins — freeze any active thinking
+                if (!ctx.activeThinkingCompleted && ctx.thinkingBuffer.isNotEmpty()) {
+                    ctx.activeThinkingCompleted = true
+                    freezeCurrentThinking()
+                }
                 ctx.textBuffer.clear()
                 ctx.textBuffer.append(event.text)
                 ctx.userEchoStripped = false
@@ -566,11 +581,19 @@ class SessionState(
                 emitStreamingStartedIfNeeded(msgId)
 
                 ctx.toolPartStates[event.toolCallId] = PartState.InProgress
-                val toolKind = ToolMapper.toAcpKind(event.toolName)
+                val baseKind = ToolMapper.toAcpKind(event.toolName)
+                val toolKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(event.input) else baseKind
+                // Resolve a human-readable title: event.title > input.description > toolName
+                val resolvedTitle = event.title
+                    ?: event.input?.let { input ->
+                        try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+                    }
+                    ?: event.toolName
+                logger.info { "[ACP] ToolUse: callID=${event.toolCallId}, toolName=${event.toolName}, title=${event.title}, kind=$toolKind, hasInput=${event.input != null}, inputKeys=${event.input?.keys}, resolvedTitle=$resolvedTitle" }
                 val pill = ToolCallPill(
                     toolCallId = event.toolCallId,
                     toolName = event.toolName,
-                    title = event.title ?: event.toolName,
+                    title = resolvedTitle,
                     kind = toolKind,
                     status = ToolCallStatus.IN_PROGRESS,
                     input = event.input,
@@ -582,7 +605,28 @@ class SessionState(
                     val filePath = extractFilePath(event.input)
                     if (filePath != null) {
                         val fileName = filePath.substringAfterLast('/')
-                        val change = ChatFileChange(filePath = filePath, fileName = fileName)
+                        val oldString = event.input["oldString"]?.jsonPrimitive?.contentOrNull
+                            ?: event.input["old_string"]?.jsonPrimitive?.contentOrNull
+                            ?: event.input["old"]?.jsonPrimitive?.contentOrNull
+                        val newString = event.input["newString"]?.jsonPrimitive?.contentOrNull
+                            ?: event.input["new_string"]?.jsonPrimitive?.contentOrNull
+                            ?: event.input["new"]?.jsonPrimitive?.contentOrNull
+                        val content = event.input["content"]?.jsonPrimitive?.contentOrNull
+                        val additions = when {
+                            oldString != null && newString != null -> newString.lines().size
+                            content != null -> content.lines().size
+                            else -> 0
+                        }
+                        val deletions = when {
+                            oldString != null && newString != null -> oldString.lines().size
+                            else -> 0
+                        }
+                        val change = ChatFileChange(
+                            filePath = filePath,
+                            fileName = fileName,
+                            additions = additions,
+                            deletions = deletions
+                        )
                         ctx.pendingFileChanges.add(change)
                         _signals.tryEmit(UiSignal.FileChanged(Unit))
                     }
@@ -591,14 +635,6 @@ class SessionState(
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     parts[event.toolCallId] = MessagePart.ToolCall(pill = pill, state = PartState.InProgress)
-                    if (toolKind == ToolKind.EDIT && event.input != null) {
-                        extractFilePath(event.input)?.let { path ->
-                            val fileName = path.substringAfterLast('/')
-                            val change = ChatFileChange(filePath = path, fileName = fileName)
-                            val fcKey = "filechange_${ctx.pendingFileChanges.size - 1}"
-                            parts[fcKey] = MessagePart.FileChange(change)
-                        }
-                    }
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
             }
@@ -607,10 +643,23 @@ class SessionState(
                 ctx.toolPartStates[event.toolCallId] = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed
                 val existingPill = ctx.toolCallPills[event.toolCallId]
                 val resolvedStatus = if (event.isError) ToolCallStatus.FAILED else ToolCallStatus.COMPLETED
+                logger.info { "[ACP] ToolResult: callID=${event.toolCallId}, hasInput=${event.input != null}, inputKeys=${event.input?.keys}, existingKind=${existingPill?.kind}, existingTitle=${existingPill?.title}" }
                 if (existingPill != null) {
+                    val newInput = event.input ?: existingPill.input
+                    // Re-detect kind from input if it was OTHER — the result may have the real data
+                    val resolvedKind = if (existingPill.kind == ToolKind.OTHER) {
+                        ToolMapper.detectKindFromInput(newInput)
+                    } else existingPill.kind
+                    // Recompute title from input
+                    val resolvedTitle = newInput?.let { input ->
+                        try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+                    } ?: existingPill.title
+                    logger.info { "[ACP] ToolResult: callID=${event.toolCallId}, prevKind=${existingPill.kind}, resolvedKind=$resolvedKind, prevTitle=${existingPill.title}, resolvedTitle=$resolvedTitle, hasEventInput=${event.input != null}, eventInputKeys=${event.input?.keys}, hasNewInput=${newInput != null}, newInputKeys=${newInput?.keys}" }
                     ctx.toolCallPills[event.toolCallId] = existingPill.copy(
                         status = resolvedStatus,
-                        input = event.input ?: existingPill.input,
+                        title = resolvedTitle,
+                        kind = resolvedKind,
+                        input = newInput,
                         output = event.content
                     )
                 }
@@ -620,8 +669,20 @@ class SessionState(
                     val existing = parts[event.toolCallId]
                     if (existing is MessagePart.ToolCall) {
                         val newInput = event.input ?: existing.pill.input
+                        val resolvedKind = if (existing.pill.kind == ToolKind.OTHER) {
+                            ToolMapper.detectKindFromInput(newInput)
+                        } else existing.pill.kind
+                        val resolvedTitle = newInput?.let { input ->
+                            try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+                        } ?: existing.pill.title
                         parts[event.toolCallId] = existing.copy(
-                            pill = existing.pill.copy(status = resolvedStatus, input = newInput, output = event.content ?: existing.pill.output),
+                            pill = existing.pill.copy(
+                                status = resolvedStatus,
+                                title = resolvedTitle,
+                                kind = resolvedKind,
+                                input = newInput,
+                                output = event.content ?: existing.pill.output
+                            ),
                             state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed
                         )
                     }

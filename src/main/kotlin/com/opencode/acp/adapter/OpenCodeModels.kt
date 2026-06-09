@@ -5,6 +5,7 @@ import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.MessagePart
 import com.opencode.acp.chat.model.MessageRole
+import com.opencode.acp.chat.model.PartState
 import com.opencode.acp.chat.model.SessionItem
 import com.opencode.acp.chat.model.ToolCallPill
 import com.opencode.acp.chat.ui.compose.MarkdownSegmenter
@@ -21,6 +22,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 private val logger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
@@ -147,8 +149,11 @@ sealed interface OpenCodePart {
     @SerialName("tool_use")
     data class ToolUse(
         val id: String,
+        @SerialName("tool")
         val name: String = "tool",
-        val input: JsonObject = kotlinx.serialization.json.buildJsonObject {}
+        val input: JsonObject = kotlinx.serialization.json.buildJsonObject {},
+        // Title is in state.title on the server, injected by OpenCodePartSerializer
+        val title: String? = null
     ) : OpenCodePart
 
     @Serializable
@@ -303,6 +308,7 @@ object OpenCodePartSerializer : KSerializer<OpenCodePart> {
                 put("type", kotlinx.serialization.json.JsonPrimitive("image"))
                 put("mime", kotlinx.serialization.json.JsonPrimitive(value.mime))
                 put("url", kotlinx.serialization.json.JsonPrimitive(value.url))
+                value.filename?.let { put("filename", kotlinx.serialization.json.JsonPrimitive(it)) }
             }
             else -> {
                 // ToolUse, ToolResult, StepStart, StepFinish, Thinking, Reasoning,
@@ -326,6 +332,32 @@ object OpenCodePartSerializer : KSerializer<OpenCodePart> {
         // Look up the specific serializer for this type
         val serializer = knownTypes[type]
         if (serializer != null) {
+            // Special handling for tool/tool_use: server puts input inside state.input,
+            // but ToolUse expects it at top level. Restructure before deserializing.
+            if ((type == "tool" || type == "tool_use") && element["input"] == null) {
+                val stateObj = element["state"]?.jsonObject
+                val stateInput = stateObj?.get("input")?.jsonObject
+                val stateTitle = stateObj?.get("title")?.jsonPrimitive?.contentOrNull
+                val stateOutput = stateObj?.get("output")?.let { output ->
+                    // Normalize output: if it's a string, wrap in a text JSON array for ToolResult
+                    if (output is JsonPrimitive) {
+                        kotlinx.serialization.json.buildJsonArray {
+                            add(kotlinx.serialization.json.buildJsonObject {
+                                put("text", output)
+                            })
+                        }
+                    } else output
+                }
+                val reconstructed = kotlinx.serialization.json.buildJsonObject {
+                    for ((key, value) in element) put(key, value)
+                    if (stateInput != null) put("input", stateInput!!)
+                    // Inject state.title at top level for ToolUse
+                    if (stateTitle != null) put("title", kotlinx.serialization.json.JsonPrimitive(stateTitle))
+                    // Also inject state.output at top level for ToolResult
+                    if (stateOutput != null && element["output"] == null) put("output", stateOutput!!)
+                }
+                return json.decodeFromJsonElement(serializer, reconstructed)
+            }
             return json.decodeFromJsonElement(serializer, element)
         }
 
@@ -425,7 +457,7 @@ private fun OpenCodeMessage.toChatMessageInternal(): ChatMessage {
         .joinToString("") { it.text }
     val allThinking = thinkingContent + reasoningContent
     if (allThinking.isNotBlank()) {
-        parts[MessagePart.generatePartId()] = MessagePart.Thinking(allThinking)
+        parts[MessagePart.generatePartId()] = MessagePart.Thinking(allThinking, state = PartState.Completed)
     }
 
     // Tool calls
@@ -447,13 +479,23 @@ private fun OpenCodeMessage.toChatMessageInternal(): ChatMessage {
                 }
             }
         }?.ifEmpty { null }
+        val baseKind = ToolMapper.toAcpKind(toolUse.name)
+        val inputObj = toolUse.input.takeIf { it.isNotEmpty() }
+        val resolvedKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(inputObj) else baseKind
+        // Resolve title: prefer input.description, then state.title (from server), then tool name
+        val resolvedTitle = inputObj?.let { input ->
+            try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+        } ?: toolUse.title
+        ?: toolUse.name
+        logger.info { "[ACP] REST ToolUse: id=${toolUse.id}, name=${toolUse.name}, kind=$baseKind->$resolvedKind, title=$resolvedTitle, stateTitle=${toolUse.title}, hasInput=${inputObj != null}, inputKeys=${inputObj?.keys}" }
         parts[toolUse.id] = MessagePart.ToolCall(
             pill = ToolCallPill(
                 toolCallId = toolUse.id,
                 toolName = toolUse.name,
-                title = toolUse.name,
-                kind = ToolMapper.toAcpKind(toolUse.name),
+                title = resolvedTitle,
+                kind = resolvedKind,
                 status = status,
+                input = inputObj,
                 output = output
             ),
             // Loaded from REST — already completed or failed

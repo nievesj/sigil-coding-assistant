@@ -72,6 +72,7 @@ import com.opencode.acp.chat.model.ChatFileChange
 import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.MessagePart
 import com.opencode.acp.chat.model.MessageRole
+import com.opencode.acp.chat.model.MessageState
 import com.opencode.acp.chat.model.SubagentRef
 import com.opencode.acp.chat.model.SubagentStatus
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
@@ -107,7 +108,7 @@ fun MessageList(
     }
 
     // Auto-scroll state: starts ON, stays ON until user manually scrolls up.
-    // Only re-enabled by clicking the jump-to-bottom button.
+    // Re-enabled by clicking jump-to-bottom button OR by sending a new message.
     var autoScrollEnabled by remember { mutableStateOf(true) }
 
     // Detect user drag — disable auto-scroll
@@ -117,15 +118,11 @@ fun MessageList(
     var prevFirstVisibleIndex by remember { mutableStateOf(0) }
 
     // Detect any user scroll that moves toward older messages (up):
-    // - Drag: isDragged && canScrollBackward means user dragged up
-    // - Wheel/scrollbar: firstVisibleItemIndex decreased
     LaunchedEffect(Unit) {
         snapshotFlow { listState.firstVisibleItemIndex }
             .collect { currentIndex ->
                 if (currentIndex < prevFirstVisibleIndex && !isDragged) {
-                    if (autoScrollEnabled) {
-                        autoScrollEnabled = false
-                    }
+                    autoScrollEnabled = false
                 }
                 prevFirstVisibleIndex = currentIndex
             }
@@ -149,9 +146,15 @@ fun MessageList(
             }
     }
 
-    // Also scroll on new messages when auto-scroll is enabled
+    // Scroll on new messages. If the last message is from the user (Enter pressed),
+    // force auto-scroll on even if the user had scrolled up.
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty() && autoScrollEnabled) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        val lastIsUser = messages.lastOrNull()?.role == MessageRole.USER
+        if (lastIsUser) {
+            autoScrollEnabled = true
+        }
+        if (autoScrollEnabled) {
             scrollToEnd()
         }
     }
@@ -165,10 +168,15 @@ fun MessageList(
         }
     }
 
-    // Show jump button when auto-scroll is disabled and there's content below
+    // Show jump button when auto-scroll is disabled and there's content below.
     val showJumpButton by remember {
         derivedStateOf {
-            !autoScrollEnabled && listState.canScrollForward
+            if (autoScrollEnabled) return@derivedStateOf false
+            if (messages.isEmpty()) return@derivedStateOf false
+            val lastItemIndex = messages.size - 1
+            val visibleItems = listState.layoutInfo.visibleItemsInfo
+            val lastItemVisible = visibleItems.any { it.index == lastItemIndex }
+            !lastItemVisible
         }
     }
 
@@ -192,6 +200,9 @@ fun MessageList(
                     key = { index -> messages[index].id }
                 ) { index ->
                     MessageItem(messages[index], project, onSubagentClick, onImagePreview)
+                    if (index < messages.size - 1) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
                 }
             }
         }
@@ -212,12 +223,12 @@ fun MessageList(
                     .graphicsLayer { alpha = jumpButtonAlpha }
                     .size(36.dp)
                     .background(
-                        color = Color(0xFF3E3E3E).copy(alpha = 0.9f),
+                        color = Color(0xFF3574F0),
                         shape = CircleShape
                     )
                     .border(
                         width = 1.dp,
-                        color = Color(0xFF5E5E5E),
+                        color = Color(0xFF5E9AFF),
                         shape = CircleShape
                     )
                     .clickable {
@@ -232,7 +243,7 @@ fun MessageList(
                     key = AllIconsKeys.General.ChevronDown,
                     contentDescription = "Jump to bottom",
                     modifier = Modifier.size(16.dp),
-                    tint = Color(0xFFCCCCCC)
+                    tint = Color.White
                 )
             }
         }
@@ -367,60 +378,32 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
          codeHighlighter = codeHighlighter,
      ) {
          Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
-             // Render parts in LinkedHashMap insertion order — the order events arrived.
-             var hasThinking = false
-             var hasToolCall = false
-             for ((key, part) in message.parts) {
+              // Render parts in LinkedHashMap insertion order — the order events arrived.
+              var hasThinking = false
+              // Pre-compute: if message has any ToolCall parts, suppress Patch/FileChange cards
+              // (ToolPill already shows file info, line counts, and expandable content)
+              val hasToolCallInMessage = message.parts.values.any { it is MessagePart.ToolCall }
+              var hasToolCall = hasToolCallInMessage
+              // Sort parts: text content renders above tool pills (matching desktop app)
+              val sortedParts = message.parts.entries.sortedBy { (_, part) ->
+                  when (part) {
+                      is MessagePart.Text, is MessagePart.Code, is MessagePart.Table -> 0
+                      is MessagePart.Thinking -> 1
+                      is MessagePart.ToolCall -> 2
+                      else -> 3
+                  }
+              }
+             for ((key, part) in sortedParts) {
                  when (part) {
-                       is MessagePart.Thinking -> {
-                          hasThinking = true
-                          key(key) {
-                              val segments = remember(part.content) {
-                                  MarkdownSegmenter.segmentHealed(part.content)
-                              }
-                              Column(
-                                  modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
-                                      .graphicsLayer { alpha = 0.55f }
-                              ) {
-                                  segments.forEach { segment ->
-                                      when (segment.type) {
-                                          MarkdownSegment.Type.TEXT -> {
-                                              if (segment.content.isNotBlank()) {
-                                                  val parsedBlocks = remember(segment.content) {
-                                                      val raw = markdownProcessor.processMarkdownDocument(segment.content)
-                                                      clampOrderedLists(raw)
-                                                  }
-                                                  Markdown(
-                                                      markdownBlocks = parsedBlocks,
-                                                      markdown = segment.content,
-                                                      modifier = Modifier.fillMaxWidth(),
-                                                      selectable = true,
-                                                      onUrlClick = { url -> BrowserUtil.open(url) },
-                                                  )
-                                              }
-                                          }
-                                          MarkdownSegment.Type.CODE -> {
-                                              if (segment.content.isNotBlank()) {
-                                                  ChatFencedCodeBlock(
-                                                      content = segment.content,
-                                                      language = segment.language ?: "",
-                                                  )
-                                              }
-                                          }
-                                          MarkdownSegment.Type.TABLE -> {
-                                              val parsed = MarkdownSegmenter.parseTable(segment.content.lines())
-                                              if (parsed != null) {
-                                                  ChatTable(
-                                                      rawMarkdown = segment.content,
-                                                      modifier = Modifier.fillMaxWidth(),
-                                                  )
-                                              }
-                                          }
-                                      }
-                                  }
-                              }
-                          }
-                      }
+                        is MessagePart.Thinking -> {
+                           hasThinking = true
+                           key(key) {
+                               CollapsibleThinkingPill(
+                                   content = part.content,
+                                   state = part.state,
+                               )
+                           }
+                       }
                      is MessagePart.ToolCall -> {
                          hasToolCall = true
                          key(key) { ToolPill(part.pill) }
@@ -442,7 +425,7 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
                      }
                      is MessagePart.Code -> key(key) { ChatFencedCodeBlock(content = part.content, language = part.language) }
                      is MessagePart.Table -> key(key) { ChatTable(rawMarkdown = part.rawMarkdown, modifier = Modifier.fillMaxWidth()) }
-                     is MessagePart.Patch -> key(key) {
+                     is MessagePart.Patch -> if (!hasToolCall) key(key) {
                          Column(
                              modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp).fillMaxWidth()
                                  .background(color = Color(0xFF2D2D2D), shape = RoundedCornerShape(8.dp)).padding(8.dp),
@@ -461,8 +444,8 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
                      is MessagePart.StepFinish -> key(key) { StepFinishPill(part) }
                      is MessagePart.Retry -> key(key) { RetryPill(part.attempt, part.maxAttempts, part.error) }
                      is MessagePart.Compaction -> key(key) { CompactionPill(part.summary) }
-                     is MessagePart.FileChange -> key(key) { FileChangeCard(change = part.change, project = project, addedColor = Color(0xFF7EE787), deletedColor = Color(0xFFFF7B72), pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)) }
-                     is MessagePart.Subagent -> key(key) { SubagentSessionBar(ref = part.ref, onClick = { onSubagentClick?.invoke(it) }) }
+                     is MessagePart.FileChange -> if (!hasToolCall) key(key) { FileChangeCard(change = part.change, project = project, addedColor = Color(0xFF7EE787), deletedColor = Color(0xFFFF7B72), pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)) }
+                     is MessagePart.Subagent -> if (part.ref.status == SubagentStatus.RUNNING) key(key) { SubagentSessionBar(ref = part.ref, onClick = { onSubagentClick?.invoke(it) }) }
                      is MessagePart.AssistantFile -> key(key) {
                          Row(
                              modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp).fillMaxWidth()
@@ -497,8 +480,24 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, onSubagentC
                          Text(text = errorText, color = Color(0xFFFF7B72), modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                      }
                  }
-             }
-             // Show thinking indicator when streaming with no content yet
+              }
+              // Show "Interrupted" banner when message was aborted by user
+              if (message.state == MessageState.Aborted) {
+                  Row(
+                      modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                      Spacer(Modifier.weight(1f).height(1.dp).background(Color(0xFF444444)))
+                      Text(
+                          text = "Interrupted",
+                          color = Color(0xFF808080),
+                          fontSize = 12.sp,
+                          modifier = Modifier.padding(horizontal = 12.dp),
+                      )
+                      Spacer(Modifier.weight(1f).height(1.dp).background(Color(0xFF444444)))
+                  }
+              }
+              // Show thinking indicator when streaming with no content yet
              if (message.isStreaming && !hasThinking && !hasToolCall && message.parts.values.none { it is MessagePart.Text || it is MessagePart.Code || it is MessagePart.Table }) {
                  ThinkingIndicator()
              }

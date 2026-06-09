@@ -729,11 +729,28 @@ class OpenCodeClient(
                         ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID")
                     val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject) }
+                    // Pass input so ToolResult handler can re-detect kind if initial ToolUse had generic name
+                    val resultInput = props["input"]?.jsonObject
                     SseEvent.ToolResult(
                         sessionId = sessionId,
                         toolCallId = callID,
                         isError = false,
-                        content = output
+                        content = output,
+                        input = resultInput
+                    )
+                }
+                "session.next.tool.failed" -> {
+                    val callID = props["callID"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing callID")
+                    val output = (props["output"] as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? JsonObject) }
+                    val resultInput = props["input"]?.jsonObject
+                    SseEvent.ToolResult(
+                        sessionId = sessionId,
+                        toolCallId = callID,
+                        isError = true,
+                        content = output,
+                        input = resultInput
                     )
                 }
 
@@ -922,7 +939,8 @@ class OpenCodeClient(
                                 // state is a nested object: { status: "running"|"completed"|"error"|..., input, output, ... }
                                 val stateObj = part["state"]?.jsonObject
                                 val status = stateObj?.get("status")?.jsonPrimitive?.contentOrNull
-                                debugLog("SSE TOOL: callID=$toolCallId, tool=$toolName, status=$status, stateKeys=${stateObj?.keys}")
+                                debugLog("SSE TOOL: callID=$toolCallId, tool=$toolName, status=$status, stateKeys=${stateObj?.keys}, partKeys=${part.keys}")
+                                debugLog("SSE TOOL PART JSON: $part")
                                 when (status) {
                                     "completed" -> {
                                         val output = (stateObj.get("output") as? kotlinx.serialization.json.JsonArray)

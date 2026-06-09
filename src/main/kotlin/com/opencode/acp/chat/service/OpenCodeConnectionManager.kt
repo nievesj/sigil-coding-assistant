@@ -324,6 +324,11 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         disconnect()
         killProcess(openCodeProcess)
         openCodeProcess = null
+        // Remove the JVM shutdown hook to prevent stale references during IDE restart
+        shutdownHook?.let {
+            try { Runtime.getRuntime().removeShutdownHook(it) } catch (_: IllegalStateException) { }
+        }
+        shutdownHook = null
     }
 
     /** @deprecated Use [disconnect] for retry, or [shutdown] for IDE close. */
