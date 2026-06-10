@@ -65,6 +65,11 @@ class ProcessorContext {
     var providerID: String? = null
     /** Pending job for debounced Stop finalization. Cancelled if a new event arrives. */
     var pendingStopJob: Job? = null
+    /** Timestamp of the last SSE event received during streaming.
+     *  Used by the activity-aware response timeout in OpenCodeService to avoid
+     *  false timeouts during long-running generations (subtasks, tool chains).
+     *  Updated by SessionState.processEvent(); read by the activity monitor coroutine. */
+    @Volatile var lastActivityTimeMs: Long = System.currentTimeMillis()
 
     // ── Per-event state (added directly to parts map via updateMessage) ────
     val activePatches: MutableList<SseEvent.Patch> = mutableListOf()
@@ -98,6 +103,7 @@ class ProcessorContext {
         providerID = null
         pendingStopJob?.cancel()
         pendingStopJob = null
+        lastActivityTimeMs = System.currentTimeMillis()
         activePatches.clear()
         activeAgentName = null
         activeRetry = null

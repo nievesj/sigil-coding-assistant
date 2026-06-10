@@ -495,16 +495,54 @@ class OpenCodeService(private val project: Project) : Disposable {
 
             sessionManager.updateServerMessageId(assistantMsgId, serverMessageId)
 
+            // Activity-aware response timeout: resets whenever SSE events arrive.
+            // Prevents false timeouts during long-running generations (subtasks, tool chains)
+            // where the LLM is actively producing output but total wall-clock time
+            // exceeds responseTimeoutSeconds.
+            //
+            // IMPORTANT: During tool execution (especially subtasks/subagents), the server
+            // sends SSE events for the CHILD session, not the parent. The parent session
+            // receives no events between tool.start and tool.result. Without the running-tool
+            // guard, the activity monitor would false-positive after responseTimeoutSeconds
+            // even though the server is actively working.
             val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds * 1000L
-            withTimeout(responseTimeoutMs) {
-                deferred.await()
+            val activityMonitorJob = scope.launch {
+                while (isActive) {
+                    delay(ACTIVITY_CHECK_INTERVAL_MS)
+                    // If any tool is actively running, the server is busy — don't timeout.
+                    // Tool events (ToolUse→ToolResult) can take arbitrarily long (subtasks,
+                    // file writes, network calls). During this time the parent session gets
+                    // no SSE events, so lastActivityTimeMs goes stale even though work is
+                    // happening server-side.
+                    val hasRunningTools = activeSession?.ctx?.toolPartStates?.values?.any { it is PartState.InProgress } == true
+                    if (hasRunningTools) {
+                        logger.debug { "[ACP] sendMessage: tools still running, skipping activity check" }
+                        continue
+                    }
+                    val lastActivity = activeSession?.ctx?.lastActivityTimeMs ?: System.currentTimeMillis()
+                    val elapsed = System.currentTimeMillis() - lastActivity
+                    if (elapsed > responseTimeoutMs) {
+                        val timeoutSec = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds
+                        logger.error { "[ACP] sendMessage: no SSE activity for ${elapsed}ms (> ${timeoutSec}s) — aborting" }
+                        sessionManager.abortStreaming("No activity for ${timeoutSec}s.")
+                        deferred.complete(Unit)
+                        break
+                    }
+                }
             }
-            return SendMessageResult.Success(assistantMsgId)
-        } catch (e: TimeoutCancellationException) {
-            val timeoutSec = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds
-            logger.error(e) { "[ACP] sendMessage: response timed out after ${timeoutSec}s (configurable via responseTimeoutSeconds setting)" }
-            sessionManager.abortStreaming("Response timed out after ${timeoutSec}s.")
-            return SendMessageResult.Error("Response timed out")
+            try {
+                deferred.await()
+            } finally {
+                activityMonitorJob.cancel()
+            }
+            // If the monitor completed the deferred (timeout), isStreaming is now false
+            // and the message was aborted. Check for that case.
+            val wasAborted = activeSession != null && !activeSession.ctx.isStreaming && activeSession.ctx.errorMessage != null
+            return if (wasAborted) {
+                SendMessageResult.Error(activeSession.ctx.errorMessage ?: "Response timed out")
+            } else {
+                SendMessageResult.Success(assistantMsgId)
+            }
         } catch (e: CancellationException) {
             sessionManager.completeStreaming(assistantMsgId)
             throw e
@@ -605,6 +643,11 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     companion object {
         fun getInstance(project: Project): OpenCodeService = project.service()
+
+        /** How often the activity-aware timeout monitor checks for SSE activity.
+         *  5s interval balances responsiveness (detects dead connections within
+         *  responseTimeoutSeconds + 5s) against overhead (one timestamp read per check). */
+        private const val ACTIVITY_CHECK_INTERVAL_MS = 5_000L
     }
 }
 

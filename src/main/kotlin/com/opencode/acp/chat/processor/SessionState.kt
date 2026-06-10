@@ -157,6 +157,7 @@ class SessionState(
     suspend fun processEvent(event: SseEvent) {
         if (closed) return
         lastAccessTime = System.currentTimeMillis()
+        ctx.lastActivityTimeMs = System.currentTimeMillis()
         try {
             eventChannel.send(event)
         } catch (_: ClosedSendChannelException) {
