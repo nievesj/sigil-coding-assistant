@@ -85,6 +85,9 @@ class SessionManager(private val scope: CoroutineScope) {
     private val _sessionListState = MutableStateFlow<SessionListState>(SessionListState.Loading)
     val sessionListState: StateFlow<SessionListState> = _sessionListState.asStateFlow()
 
+    /** High-water mark for display limit — preserves user's "load more" progress across loadSessions() calls. */
+    private val _displayLimit = MutableStateFlow(SessionListState.Loaded.DEFAULT_DISPLAY_LIMIT)
+
     private val _childSessionMap = MutableStateFlow<Map<String, List<SessionItem>>>(emptyMap())
     val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = _childSessionMap.asStateFlow()
 
@@ -164,6 +167,7 @@ class SessionManager(private val scope: CoroutineScope) {
             try {
                 ensureSessionCached(targetSessionId)
                 _activeSessionId.value = targetSessionId
+                resetDisplayLimit()
                 updateSessionSelection(targetSessionId)
                 computeSessionContext()
                 fetchTodos()
@@ -198,7 +202,8 @@ class SessionManager(private val scope: CoroutineScope) {
         if (current is SessionListState.Loaded) {
             _sessionListState.value = current.copy(
                 sessions = listOf(newItem) + current.sessions,
-                selectedId = session.id
+                selectedId = session.id,
+                displayLimit = _displayLimit.value
             )
         }
 
@@ -265,9 +270,12 @@ class SessionManager(private val scope: CoroutineScope) {
             val items = sessionList
                 .sortedByDescending { it.time?.updated ?: it.time?.created ?: 0L }
                 .map { it.toSessionItem() }
+            val loadAll = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().loadAllSessions
+            val limit = if (loadAll) Int.MAX_VALUE else _displayLimit.value
             _sessionListState.value = SessionListState.Loaded(
                 sessions = items,
-                selectedId = currentId
+                selectedId = currentId,
+                displayLimit = limit
             )
             val children = items.filter { it.parentID != null }
                 .groupBy { it.parentID!! }
@@ -309,6 +317,65 @@ class SessionManager(private val scope: CoroutineScope) {
 
         loadSessions()
         logger.info { "Archived session $targetSessionId" }
+    }
+
+    /** Increase display limit by DEFAULT_DISPLAY_LIMIT. Updates both _displayLimit
+     *  (high-water mark) and Loaded.displayLimit (current state). */
+    fun loadMoreSessions() {
+        val current = _sessionListState.value
+        if (current is SessionListState.Loaded) {
+            val newLimit = current.displayLimit + SessionListState.Loaded.DEFAULT_DISPLAY_LIMIT
+            _displayLimit.value = newLimit
+            _sessionListState.value = current.copy(displayLimit = newLimit)
+        }
+    }
+
+    /** Reset display limit to default. Called on initialize() and switchSession(). */
+    fun resetDisplayLimit() {
+        _displayLimit.value = SessionListState.Loaded.DEFAULT_DISPLAY_LIMIT
+        val current = _sessionListState.value
+        if (current is SessionListState.Loaded) {
+            _sessionListState.value = current.copy(displayLimit = SessionListState.Loaded.DEFAULT_DISPLAY_LIMIT)
+        }
+    }
+
+    /** Delete all sessions except the active one.
+     *  Only deletes top-level sessions (parentID == null) — child sessions are
+     *  expected to be cascade-deleted by the server. */
+    suspend fun clearAllSessions(): ClearAllResult {
+        val c = client ?: return ClearAllResult.Failed("Client not initialized")
+        val currentId = _activeSessionId.value
+        val loaded = _sessionListState.value as? SessionListState.Loaded
+            ?: return ClearAllResult.Failed("Sessions not loaded")
+
+        // Filter to top-level sessions only — server cascades child deletion
+        val toDelete = loaded.topLevelSessions.filter { it.id != currentId }
+        if (toDelete.isEmpty()) return ClearAllResult.Success(0)
+
+        var deleted = 0
+        var failed = 0
+        for (sessionItem in toDelete) {
+            try {
+                val ok = c.deleteSession(sessionItem.id)
+                if (ok) {
+                    // Remove from session cache
+                    val evictedState = sessionsLock.withLock { sessions.remove(sessionItem.id) }
+                    evictedState?.close()
+                    deleted++
+                } else {
+                    failed++
+                    logger.warn { "DELETE /session/${sessionItem.id} returned false during clear-all" }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failed++
+                logger.warn(e) { "Failed to delete session ${sessionItem.id} during clear-all" }
+            }
+        }
+        loadSessions()
+        return if (failed == 0) ClearAllResult.Success(deleted)
+               else ClearAllResult.Partial(deleted, failed)
     }
 
     // ── SSE Event Routing ──

@@ -232,8 +232,43 @@ data class SessionItem(
 /** Sealed state for the session list sidebar — distinguishes loading/error/loaded. */
 sealed interface SessionListState {
     data object Loading : SessionListState
-    data class Loaded(val sessions: List<SessionItem>, val selectedId: String?) : SessionListState
+    data class Loaded(
+        val sessions: List<SessionItem>,
+        val selectedId: String?,
+        /** How many top-level sessions to display in the sidebar. Defaults to DEFAULT_DISPLAY_LIMIT. */
+        val displayLimit: Int = DEFAULT_DISPLAY_LIMIT,
+    ) : SessionListState {
+        /** Top-level sessions (no parentID), sorted by updatedAt desc (same order as sessions). */
+        val topLevelSessions: List<SessionItem>
+            get() = sessions.filter { it.parentID == null }
+
+        /** Sessions currently visible to the UI (sliced to displayLimit). */
+        val displayedSessions: List<SessionItem>
+            get() = topLevelSessions.take(displayLimit)
+
+        /** Whether more sessions can be loaded. */
+        val hasMore: Boolean
+            get() = displayedSessions.size < topLevelSessions.size
+
+        companion object {
+            const val DEFAULT_DISPLAY_LIMIT = 10
+        }
+    }
     data class Error(val message: String) : SessionListState
+}
+
+/** Result of clearAllSessions(). */
+sealed class ClearAllResult {
+    data class Success(val count: Int) : ClearAllResult()
+    data class Partial(val deleted: Int, val failed: Int) : ClearAllResult()
+    data class Failed(val message: String) : ClearAllResult()
+}
+
+/** UI state for the "Clear all sessions" operation. */
+sealed class ClearAllState {
+    data object Idle : ClearAllState()
+    data class InProgress(val deleted: Int, val total: Int) : ClearAllState()
+    data class Done(val result: ClearAllResult) : ClearAllState()
 }
 
 /** Sealed state for session context — distinguishes loading, loaded, and error. */

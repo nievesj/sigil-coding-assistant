@@ -3,6 +3,7 @@ package com.opencode.acp.config.settings
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.ui.TextBrowseFolderListener
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
+import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextField
 import com.intellij.ui.JBColor
@@ -70,6 +71,12 @@ class OpenCodeSettingsPanel {
     /** List number color — hex string like "#6BBE50" */
     val listNumberColorField: JBTextField = JBTextField("#6BBE50", 8)
 
+    /** Whether to load all sessions at once (bypasses pagination). */
+    val loadAllSessionsCheckbox: JBCheckBox = JBCheckBox("Load all sessions at startup").apply {
+        toolTipText = "Warning: Loading all sessions at once may cause slow startup " +
+            "with 100+ sessions. Default loads 10 most recent."
+    }
+
     val listNumberColorButton: JButton = JButton("\u25BC").apply {
         addActionListener(ActionListener {
             val currentColor = parseColor(listNumberColorField.text)
@@ -104,6 +111,8 @@ class OpenCodeSettingsPanel {
         .addComponentToRightColumn(inlineCodeColorButton)
         .addLabeledComponent("List number color:", listNumberColorField, 5)
         .addComponentToRightColumn(listNumberColorButton)
+        .addSeparator(5)
+        .addComponent(loadAllSessionsCheckbox)
         .addComponent(statusLabel)
         .panel
 
@@ -115,6 +124,7 @@ class OpenCodeSettingsPanel {
         sseSocketTimeoutField.text = settings.sseSocketTimeoutSeconds.toString()
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
+        loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
     }
 
     fun applyTo(settings: OpenCodeSettingsState) {
@@ -125,6 +135,7 @@ class OpenCodeSettingsPanel {
         settings.sseSocketTimeoutSeconds = sseSocketTimeoutField.text.trim().toIntOrNull()?.coerceIn(30, 3600) ?: 60
         settings.inlineCodeColor = inlineCodeColorField.text.trim()
         settings.listNumberColor = listNumberColorField.text.trim()
+        settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
     }
 
     fun isModified(settings: OpenCodeSettingsState): Boolean {
@@ -134,7 +145,8 @@ class OpenCodeSettingsPanel {
                 (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
                 (sseSocketTimeoutField.text.trim().toIntOrNull() ?: 60) != settings.sseSocketTimeoutSeconds ||
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
-                listNumberColorField.text.trim() != settings.listNumberColor
+                listNumberColorField.text.trim() != settings.listNumberColor ||
+                loadAllSessionsCheckbox.isSelected != settings.loadAllSessions
     }
 
     private fun showStatus(msg: String, success: Boolean) {

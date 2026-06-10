@@ -121,6 +121,7 @@ class OpenCodeService(private val project: Project) : Disposable {
         startGlobalSseSubscription()
 
         logger.info { "[ACP] OpenCodeService.initialize: loading sessions..." }
+        sessionManager.resetDisplayLimit()
         sessionManager.loadSessions()
         logger.info { "[ACP] OpenCodeService.initialize: sessions state = ${sessionListState.value::class.simpleName}" }
 
@@ -148,9 +149,11 @@ class OpenCodeService(private val project: Project) : Disposable {
     // ── Session management (delegated) ─────────────────────────────────────
 
     suspend fun loadSessions() = sessionManager.loadSessions()
+    fun loadMoreSessions() = sessionManager.loadMoreSessions()
     suspend fun switchSession(sessionId: String) = sessionManager.switchSession(sessionId)
     suspend fun createAndSwitchSession(title: String? = null) = sessionManager.createAndSwitchSession(title)
     suspend fun archiveSession(sessionId: String) = sessionManager.archiveSession(sessionId)
+    suspend fun clearAllSessions() = sessionManager.clearAllSessions()
 
     // ── Connection stop ─────────────────────────────────────────────────────
 

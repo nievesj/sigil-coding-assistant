@@ -157,6 +157,10 @@ fun
     // Recent files — reactive state that updates when files open/close
     val recentFiles = remember { mutableStateListOf<RecentFile>() }
 
+    // Clear-all confirmation dialog state
+    var showClearAllDialog by remember { mutableStateOf(false) }
+    val clearAllState by viewModel.clearAllState.collectAsState()
+
     // Populate initially and subscribe to file editor changes
     LaunchedEffect(project) {
         // Initial load
@@ -316,11 +320,19 @@ fun
                         onRetry = { scope.launch { viewModel.loadSessions() } },
                         onContextRetry = { viewModel.retryContextFetch() },
                         onShowDetails = { /* Context tab is already showing */ },
+                        onLoadMore = { viewModel.loadMoreSessions() },
+                        onClearAll = {
+                            val loaded = sessionListState as? com.opencode.acp.chat.model.SessionListState.Loaded
+                            if (loaded != null && loaded.topLevelSessions.size > 1) {
+                                showClearAllDialog = true
+                            }
+                        },
                         project = project,
                         modifier = Modifier.width(sidebarWidth),
                         fileChangeSignal = viewModel.fileChangeSignal,
                         streamingSessionIds = streamingSessionIds,
                         pendingCreationSessionIds = pendingCreationSessionIds,
+                        clearAllState = clearAllState,
                     )
                     // Main chat area
                     Column(modifier = Modifier.weight(1f)) {
@@ -454,6 +466,17 @@ fun
                     )
                 }
             }
+        }
+
+        // Clear all sessions confirmation dialog
+        if (showClearAllDialog) {
+            val loaded = sessionListState as? com.opencode.acp.chat.model.SessionListState.Loaded
+            val countToDelete = (loaded?.topLevelSessions?.size ?: 0) - 1  // exclude active
+            ClearAllConfirmationDialog(
+                sessionCount = countToDelete.coerceAtLeast(0),
+                onConfirm = { scope.launch { viewModel.clearAllSessions() } },
+                onDismiss = { showClearAllDialog = false },
+            )
         }
     }
 }

@@ -39,6 +39,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intellij.openapi.project.Project
+import com.opencode.acp.chat.model.ClearAllState
 import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.SessionIndicator
 import com.opencode.acp.chat.model.SessionItem
@@ -47,6 +48,7 @@ import com.opencode.acp.chat.model.SidebarTab
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
+import org.jetbrains.jewel.ui.component.OutlinedButton
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
@@ -59,6 +61,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.window.Dialog
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -78,11 +81,14 @@ fun SessionSidebar(
     onRetry: () -> Unit,
     onContextRetry: () -> Unit,
     onShowDetails: () -> Unit,
+    onLoadMore: () -> Unit,
+    onClearAll: () -> Unit,
     project: Project,
     modifier: Modifier = Modifier,
     fileChangeSignal: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
     streamingSessionIds: Set<String> = emptySet(),
     pendingCreationSessionIds: Set<String> = emptySet(),
+    clearAllState: ClearAllState = ClearAllState.Idle,
 ) {
     Column(
         modifier = modifier
@@ -119,16 +125,19 @@ fun SessionSidebar(
                         if (state.sessions.isEmpty()) {
                             EmptyContent()
                         } else {
-                            // Filter out subtask sessions (they have a parentID) — only show top-level sessions
-                            val topLevelSessions = state.sessions.filter { it.parentID == null }
                             SessionList(
-                                sessions = topLevelSessions,
+                                sessions = state.displayedSessions,
+                                totalCount = state.topLevelSessions.size,
+                                hasMore = state.hasMore,
                                 selectedId = state.selectedId,
                                 onSessionSelected = onSessionSelected,
                                 onSessionArchived = onSessionArchived,
+                                onLoadMore = onLoadMore,
+                                onClearAll = onClearAll,
                                 streamingSessionIds = streamingSessionIds,
                                 pendingCreationSessionIds = pendingCreationSessionIds,
                                 listState = listState,
+                                clearAllState = clearAllState,
                             )
                         }
                     }
@@ -383,12 +392,17 @@ private fun defaultExpandedParents(
 @Composable
 private fun SessionList(
     sessions: List<SessionItem>,
+    totalCount: Int,
+    hasMore: Boolean,
     selectedId: String?,
     onSessionSelected: (String) -> Unit,
     onSessionArchived: (String) -> Unit,
+    onLoadMore: () -> Unit,
+    onClearAll: () -> Unit,
     streamingSessionIds: Set<String> = emptySet(),
     pendingCreationSessionIds: Set<String> = emptySet(),
     listState: LazyListState = rememberLazyListState(),
+    clearAllState: ClearAllState = ClearAllState.Idle,
 ) {
     val fullTree = remember(sessions) { buildSessionTree(sessions) }
 
@@ -418,37 +432,51 @@ private fun SessionList(
         true
     }
 
-    LazyColumn(
-        state = listState,
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 4.dp),
-    ) {
-        items(
-            count = visibleItems.size,
-            key = { visibleItems[it].session.id },
-        ) { index ->
-            val item = visibleItems[index]
-            val isExpanded = expandedIds[item.session.id] == true
-            val sessionId = item.session.id
-            val indicator = when {
-                sessionId in pendingCreationSessionIds -> SessionIndicator.CREATING
-                sessionId in streamingSessionIds -> SessionIndicator.STREAMING
-                else -> SessionIndicator.NONE
+    Column(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 4.dp),
+        ) {
+            items(
+                count = visibleItems.size,
+                key = { visibleItems[it].session.id },
+            ) { index ->
+                val item = visibleItems[index]
+                val isExpanded = expandedIds[item.session.id] == true
+                val sessionId = item.session.id
+                val indicator = when {
+                    sessionId in pendingCreationSessionIds -> SessionIndicator.CREATING
+                    sessionId in streamingSessionIds -> SessionIndicator.STREAMING
+                    else -> SessionIndicator.NONE
+                }
+                SessionRow(
+                    session = item.session,
+                    depth = item.depth,
+                    hasChildren = item.hasChildren,
+                    isExpanded = isExpanded,
+                    isSelected = sessionId == selectedId,
+                    indicator = indicator,
+                    onClick = { onSessionSelected(sessionId) },
+                    onToggle = {
+                        if (expandedIds[sessionId] == true) expandedIds[sessionId] = false
+                        else expandedIds[sessionId] = true
+                    },
+                    onArchive = { onSessionArchived(sessionId) },
+                )
             }
-            SessionRow(
-                session = item.session,
-                depth = item.depth,
-                hasChildren = item.hasChildren,
-                isExpanded = isExpanded,
-                isSelected = sessionId == selectedId,
-                indicator = indicator,
-                onClick = { onSessionSelected(sessionId) },
-                onToggle = {
-                    if (expandedIds[sessionId] == true) expandedIds[sessionId] = false
-                    else expandedIds[sessionId] = true
-                },
-                onArchive = { onSessionArchived(sessionId) },
+        }
+
+        // Fixed footer at bottom of sidebar — always visible, no scrolling required
+        if (totalCount > 0) {
+            SessionListFooter(
+                visibleCount = sessions.size,
+                totalCount = totalCount,
+                hasMore = hasMore,
+                onLoadMore = onLoadMore,
+                onClearAll = onClearAll,
+                clearAllState = clearAllState,
             )
         }
     }
@@ -754,6 +782,113 @@ private fun ErrorContent(
         )
         Spacer(Modifier.height(8.dp))
         Link("Retry", onClick = onRetry)
+    }
+}
+
+// ── Session List Footer ──────────────────────────────────────────────────────
+
+@Composable
+private fun SessionListFooter(
+    visibleCount: Int,
+    totalCount: Int,
+    hasMore: Boolean,
+    onLoadMore: () -> Unit,
+    onClearAll: () -> Unit,
+    clearAllState: ClearAllState,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    ) {
+        // Status text
+        val statusText = when (clearAllState) {
+            is ClearAllState.InProgress -> "Deleting ${clearAllState.deleted} of ${clearAllState.total}..."
+            is ClearAllState.Done -> when (clearAllState.result) {
+                is com.opencode.acp.chat.model.ClearAllResult.Success -> "Deleted ${clearAllState.result.count} session(s)"
+                is com.opencode.acp.chat.model.ClearAllResult.Partial -> "Deleted ${clearAllState.result.deleted}, ${clearAllState.result.failed} failed"
+                is com.opencode.acp.chat.model.ClearAllResult.Failed -> clearAllState.result.message
+            }
+            is ClearAllState.Idle -> if (hasMore) "$visibleCount of $totalCount sessions loaded"
+                                    else "All $totalCount sessions loaded"
+        }
+        Text(
+            text = statusText,
+            fontSize = 11.sp,
+            color = retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.6f),
+            modifier = Modifier.padding(bottom = 4.dp),
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // "Load more" button — disabled when no more to load or during clear-all
+            val isLoading = clearAllState is ClearAllState.InProgress
+            OutlinedButton(
+                onClick = onLoadMore,
+                enabled = hasMore && !isLoading,
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(if (hasMore) "Load more" else "All loaded")
+            }
+
+            // "Clear all" button — only when there are sessions to clear beyond the active one
+            if (totalCount > 1) {
+                val errorColor = retrieveColorOrUnspecified("Component.errorFocusColor")
+                OutlinedButton(
+                    onClick = onClearAll,
+                    enabled = clearAllState is ClearAllState.Idle,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Clear all", color = errorColor)
+                }
+            }
+        }
+    }
+}
+
+// ── Clear All Confirmation Dialog ─────────────────────────────────────────────
+
+@Composable
+fun ClearAllConfirmationDialog(
+    sessionCount: Int,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .background(JewelTheme.globalColors.panelBackground)
+                .padding(16.dp),
+        ) {
+            Text(
+                text = "Clear All Sessions",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = retrieveColorOrUnspecified("Panel.foreground"),
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = "Delete $sessionCount sessions? The active session will be kept. This cannot be undone.",
+                fontSize = 12.sp,
+                color = retrieveColorOrUnspecified("Panel.foreground"),
+            )
+            Spacer(Modifier.height(16.dp))
+            Row(
+                horizontalArrangement = Arrangement.End,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                OutlinedButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+                Spacer(Modifier.width(8.dp))
+                val errorColor = retrieveColorOrUnspecified("Component.errorFocusColor")
+                OutlinedButton(onClick = {
+                    onDismiss()
+                    onConfirm()
+                }) {
+                    Text("Delete $sessionCount sessions", color = errorColor)
+                }
+            }
+        }
     }
 }
 

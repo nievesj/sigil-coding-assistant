@@ -41,6 +41,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var autoConnect: Boolean = true
     /** Port for the OpenCode server (default 4096). */
     var port: Int = 4096
+    /** Whether to load all sessions at once (bypasses pagination). Shows performance warning. */
+    var loadAllSessions: Boolean = false
     /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save. */
     var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
 
@@ -60,6 +62,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         sseSocketTimeoutSeconds = if (state.sseSocketTimeoutSeconds > 0) state.sseSocketTimeoutSeconds else 60
         autoConnect = state.autoConnect
         port = if (state.port in 1024..65535) state.port else 4096
+        loadAllSessions = state.loadAllSessions
         commandHistory = state.commandHistory
     }
 

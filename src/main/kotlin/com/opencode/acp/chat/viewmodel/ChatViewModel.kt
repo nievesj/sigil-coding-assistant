@@ -13,6 +13,7 @@ import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.model.ConnectionState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.withLock
 import java.io.Closeable
@@ -69,6 +70,9 @@ class ChatViewModel(
 
     private val _availableCommands = MutableStateFlow<List<SlashCommand>>(emptyList())
     val availableCommands: StateFlow<List<SlashCommand>> = _availableCommands.asStateFlow()
+
+    private val _clearAllState = MutableStateFlow<ClearAllState>(ClearAllState.Idle)
+    val clearAllState: StateFlow<ClearAllState> = _clearAllState.asStateFlow()
 
     private val _fileChangeSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val fileChangeSignal: SharedFlow<Unit> = _fileChangeSignal.asSharedFlow()
@@ -309,6 +313,20 @@ class ChatViewModel(
     }
 
     suspend fun archiveSession(sessionId: String) = service.archiveSession(sessionId)
+
+    fun loadMoreSessions() = service.loadMoreSessions()
+
+    fun clearAllSessions() {
+        scope.launch {
+            val loaded = sessionListState.value as? SessionListState.Loaded ?: return@launch
+            val totalCount = loaded.topLevelSessions.count { it.id != service.sessionId }
+            _clearAllState.value = ClearAllState.InProgress(0, totalCount)
+            val result = service.clearAllSessions()
+            _clearAllState.value = ClearAllState.Done(result)
+            delay(2000)
+            _clearAllState.value = ClearAllState.Idle
+        }
+    }
 
     // --- Message sending ---
 
