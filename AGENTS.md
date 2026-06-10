@@ -612,7 +612,7 @@ The plugin has a configurable port setting in `Settings → Tools → OpenCode`
 (default: 4096). This allows the plugin to coexist with other opencode consumers
 (e.g., the OpenCode Desktop app) by automatically finding a free port.
 
-**Connection strategy (`OpenCodeConnectionManager.initialize()`):**
+**Connection strategy (`ProcessManager.initialize()`):**
 1. Always launch the plugin's own `opencode serve` instance
 2. If the configured port is already occupied, find the next available port
    (tries up to 10 ports beyond the configured one)
@@ -626,7 +626,7 @@ The plugin has a configurable port setting in `Settings → Tools → OpenCode`
 app) are left untouched since the plugin uses a different port.
 
 **Key files:** `OpenCodeSettingsState.kt` (`port` field), `OpenCodeSettingsPanel.kt`
-(port UI), `OpenCodeConnectionManager.kt` (`findAvailablePort`, connection logic)
+(port UI), `ProcessManager.kt` (`findAvailablePort`, connection logic)
 
 ---
 
@@ -695,7 +695,12 @@ app) are left untouched since the plugin uses a different port.
 - [x] SSE observability — connect/disconnect/uptime/last-event timing logged with `[ACP]` prefix
 - [x] Removed `socketTimeoutMillis` from HttpClient config — it's a no-op on Java engine (TDD §4.2.1)
 - [x] Replaced `sseSocketTimeoutSeconds` setting with `responseTimeoutSeconds` — controls `withTimeout` on `deferred.await()` (was hardcoded 5 min; see TDD §7.1)
-- [x] `OpenCodeConnectionManager` no longer sets `socketTimeoutMillis` on `HttpTimeout` plugin — no effect on Java engine
+- [x] `ProcessManager` (was `OpenCodeConnectionManager`) no longer sets `socketTimeoutMillis` on `HttpTimeout` plugin — no effect on Java engine
+- [x] `HttpClient` ownership centralized in `OpenCodeClient` — creates, configures, and closes internally; `ProcessManager` no longer creates or stores `HttpClient`
+- [x] Timeout profiles (SHORT/LONG/INFINITE) added to `OpenCodeClient` — `executeCommand` and `compactSession` use LONG profile (`responseTimeoutSeconds + longTimeoutBufferSeconds`), `sendMessageAsync` uses INFINITE, all others use SHORT (60s)
+- [x] `postSuccess`, `deleteSuccess`, `healthCheck` now propagate `CancellationException` instead of swallowing it — callers can distinguish timeout/cancellation from server errors
+- [x] `longTimeoutBufferSeconds` setting added (default 30, minimum 10) — configurable in Settings → Tools → OpenCode
+- [x] `OpenCodeService.dispose()` now cancels `sseReconnectJob` and `sseHealthCheckJob` before `shutdown()` — eliminates gap where reconnection could run against a closed client
 - [x] Input command history with Up/Down arrow navigation (configurable size, persists with attachments, draft save/restore, `onSend` signature fixed to pass files)
 - [x] `toChatMessage()` now uses `ToolMapper.toAcpKind()` instead of hardcoded `ToolKind.OTHER` — historical tool pills match live ones
 - [x] `ToolPill` defaults collapsed (`expanded = false`) — was defaulting expanded

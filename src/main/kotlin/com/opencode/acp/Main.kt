@@ -10,8 +10,6 @@ import com.opencode.acp.config.AcpServerConfig
 import com.opencode.acp.session.SessionIdMap
 import com.opencode.acp.session.SessionPersistence
 import com.opencode.acp.transport.EmbeddedTransport
-import io.ktor.client.HttpClient
-import io.ktor.client.engine.java.Java
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
@@ -26,12 +24,8 @@ fun main(args: Array<String>): Unit = runBlocking {
         val config = AcpServerConfig.parse(args)
 
         // 2. Connect to OpenCode engine (with health check)
-        val httpClient = HttpClient(Java) {
-            // TODO: configure timeouts, connection pool
-        }
         val openCodeClient = OpenCodeClient(
             baseUrl = "http://${config.openCodeHost}:${config.openCodePort}",
-            httpClient = httpClient,
             authToken = config.openCodePassword
         )
         require(openCodeClient.healthCheck()) { "OpenCode engine not reachable at ${config.openCodeHost}:${config.openCodePort}" }

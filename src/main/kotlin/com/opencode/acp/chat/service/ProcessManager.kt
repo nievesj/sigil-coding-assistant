@@ -5,24 +5,18 @@ import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.model.ConnectionState
 import io.github.oshai.kotlinlogging.KotlinLogging
-import io.ktor.client.*
-import io.ktor.client.engine.java.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.plugins.sse.*
-import io.ktor.serialization.kotlinx.json.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import kotlinx.serialization.json.Json
 import java.net.ServerSocket
 
 /**
- * Manages the HTTP client, SSE connection, and connection lifecycle.
- * Owns [OpenCodeClient] and exposes the SSE event flow.
+ * Manages the OpenCode server process lifecycle and connection state.
+ * Owns [OpenCodeClient] (which owns its own [HttpClient] internally).
  * Does NOT own message processing — that's the processor's job.
  *
  * Created once per project via [OpenCodeService]. Survives tool window disposal.
  */
-class OpenCodeConnectionManager(private val scope: CoroutineScope) {
+class ProcessManager(private val scope: CoroutineScope) {
 
     private var projectBasePath: String = "."
 
@@ -33,7 +27,6 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
     private var openCodeClient: OpenCodeClient? = null
-    private var httpClient: HttpClient? = null
     private var openCodeProcess: Process? = null
     private var processWatcherJob: Job? = null
     private var shutdownHook: Thread? = null
@@ -90,35 +83,15 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         // process, try the next ports up to MAX_PORT_ATTEMPTS.
         port = findAvailablePort(configuredPort)
         if (port != configuredPort) {
-            logger.info { "[ACP] ConnectionManager.initialize: configured port $configuredPort is in use — using port $port instead" }
+            logger.info { "[ACP] ProcessManager.initialize: configured port $configuredPort is in use — using port $port instead" }
         }
 
-        logger.info { "[ACP] ConnectionManager.initialize: launching opencode at $host:$port" }
+        logger.info { "[ACP] ProcessManager.initialize: launching opencode at $host:$port" }
         _connectionState.value = ConnectionState.CONNECTING
 
-        // Create HTTP client and OpenCodeClient for the chosen port
-        val client = HttpClient(Java) {
-            install(ContentNegotiation) {
-                json(Json {
-                    ignoreUnknownKeys = true
-                    isLenient = true
-                    encodeDefaults = true
-                })
-            }
-            install(SSE)
-            install(io.ktor.client.plugins.HttpTimeout) {
-                requestTimeoutMillis = 60_000   // 60s — total deadline for REST calls (NOT applied to SSE)
-                connectTimeoutMillis = 10_000   // 10s — TCP connection timeout
-                // socketTimeoutMillis is NOT set — it's a no-op on the Java HTTP engine.
-                // The Java engine has no socket-level idle timeout API. See TDD §4.2.1.
-                // SSE idle detection is handled client-side in OpenCodeService.
-            }
-        }
-        httpClient = client
-
+        // Create OpenCodeClient — it owns its HttpClient internally
         val opencodeClient = OpenCodeClient(
             baseUrl = "http://$host:$port",
-            httpClient = client,
             authToken = authToken
         )
         openCodeClient = opencodeClient
@@ -127,7 +100,7 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         if (settings.binaryPath.isNotBlank()) {
             launchOpenCodeBinary(settings.binaryPath)
         } else {
-            logger.warn { "[ACP] ConnectionManager.initialize: no binary path configured" }
+            logger.warn { "[ACP] ProcessManager.initialize: no binary path configured" }
             _connectionState.value = ConnectionState.ERROR
             return false
         }
@@ -138,7 +111,7 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
         while (System.currentTimeMillis() < deadline) {
             try {
                 if (opencodeClient.healthCheck()) {
-                    logger.info { "[ACP] ConnectionManager.initialize: health check passed (attempt ${attempt + 1})" }
+                    logger.info { "[ACP] ProcessManager.initialize: health check passed (attempt ${attempt + 1})" }
                     _connectionState.value = ConnectionState.CONNECTED
                     initialized = true
                     return true
@@ -151,19 +124,19 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
             // Check if the launched process died — if so, fail fast instead of polling to timeout
             val processStatus = checkProcessAlive()
             if (processStatus != null) {
-                logger.error { "[ACP] ConnectionManager.initialize: $processStatus" }
+                logger.error { "[ACP] ProcessManager.initialize: $processStatus" }
                 _connectionState.value = ConnectionState.ERROR
                 return false
             }
 
             if (attempt == 1) {
-                logger.info { "[ACP] ConnectionManager.initialize: server not ready yet, polling..." }
+                logger.info { "[ACP] ProcessManager.initialize: server not ready yet, polling..." }
             }
             delay(calculateInitBackoff(attempt))
         }
 
         // Timed out
-        logger.warn { "[ACP] ConnectionManager.initialize: server did not become healthy within ${INIT_TIMEOUT_MS / 1000}s" }
+        logger.warn { "[ACP] ProcessManager.initialize: server did not become healthy within ${INIT_TIMEOUT_MS / 1000}s" }
         _connectionState.value = ConnectionState.ERROR
         return false
     }
@@ -320,13 +293,11 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
      * the HTTP/SSE connection without restarting the opencode binary.
      */
     fun disconnect() {
-        logger.info { "[ACP] ConnectionManager.disconnect() called" }
+        logger.info { "[ACP] ProcessManager.disconnect() called" }
         processWatcherJob?.cancel()
         processWatcherJob = null
         openCodeClient?.close()
         openCodeClient = null
-        httpClient?.close()
-        httpClient = null
         initialized = false
         _connectionState.value = ConnectionState.DISCONNECTED
         // Do NOT kill the process — it may still be healthy. initialize() will
@@ -339,7 +310,7 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
      * and should clean it up.
      */
     fun shutdown() {
-        logger.info { "[ACP] ConnectionManager.shutdown() called" }
+        logger.info { "[ACP] ProcessManager.shutdown() called" }
         disconnect()
         killProcess(openCodeProcess)
         openCodeProcess = null

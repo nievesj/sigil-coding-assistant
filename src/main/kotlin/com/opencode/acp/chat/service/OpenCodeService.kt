@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicLong
  * and message processor. Survives tool window disposal/recreation.
  *
  * Architecture:
- * - [OpenCodeConnectionManager] — HTTP/SSE connection lifecycle
+ * - [ProcessManager] — server process lifecycle and connection state
  * - [SessionManager] — per-session state ownership, SSE routing, session lifecycle
  * - This service coordinates between them and exposes the public API
  *
@@ -38,7 +38,7 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     // ── Sub-components ─────────────────────────────────────────────────────
 
-    val connectionManager = OpenCodeConnectionManager(scope)
+    val connectionManager = ProcessManager(scope)
     val sessionManager = SessionManager(scope)
     val commandManager = CommandManager(
         clientProvider = { connectionManager.client },
@@ -664,6 +664,13 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     override fun dispose() {
         logger.info { "[ACP] OpenCodeService.dispose() called — project closing" }
+        // Cancel SSE reconnection before shutdown — prevents reconnecting against a closed client.
+        // stopConnection() handles this for user-initiated stops, but dispose() (IDE close)
+        // previously didn't cancel sseReconnectJob, leaving it running against a closed client.
+        sseReconnectJob?.cancel()
+        sseReconnectJob = null
+        sseHealthCheckJob?.cancel()
+        sseHealthCheckJob = null
         permissionManager.dispose()
         sessionManager.close()
         connectionManager.shutdown()

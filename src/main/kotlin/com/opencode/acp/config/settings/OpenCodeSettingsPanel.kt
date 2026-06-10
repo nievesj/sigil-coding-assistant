@@ -50,6 +50,12 @@ class OpenCodeSettingsPanel {
             "Increase for slow models or complex tool calls. Minimum: 60s."
     }
 
+    /** Long timeout buffer — extra seconds beyond response timeout for LLM-backed commands. */
+    val longTimeoutBufferField: JBTextField = JBTextField("30", 5).apply {
+        toolTipText = "Buffer time (in seconds) added to response timeout for LLM-backed commands " +
+            "(e.g., /review, /init). Accounts for server overhead. Default: 30. Minimum: 10."
+    }
+
     /** Inline code text color — hex string like "#6BBE50" */
     val inlineCodeColorField: JBTextField = JBTextField("#6BBE50", 8)
 
@@ -109,6 +115,7 @@ class OpenCodeSettingsPanel {
         .addLabeledComponent("Permission timeout (seconds):", timeoutField, 5)
         .addLabeledComponent("Command history size:", commandHistorySizeField, 5)
         .addLabeledComponent("Response timeout (seconds):", responseTimeoutField, 5)
+        .addLabeledComponent("Long timeout buffer (seconds):", longTimeoutBufferField, 5)
         .addSeparator(5)
         .addLabeledComponent("Inline code color:", inlineCodeColorField, 5)
         .addComponentToRightColumn(inlineCodeColorButton)
@@ -125,6 +132,7 @@ class OpenCodeSettingsPanel {
         timeoutField.text = settings.permissionTimeoutSeconds.toString()
         commandHistorySizeField.text = settings.commandHistorySize.toString()
         responseTimeoutField.text = settings.responseTimeoutSeconds.toString()
+        longTimeoutBufferField.text = settings.longTimeoutBufferSeconds.toString()
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
         loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
@@ -136,6 +144,7 @@ class OpenCodeSettingsPanel {
         settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60
         settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
         settings.responseTimeoutSeconds = responseTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600) ?: 300
+        settings.longTimeoutBufferSeconds = longTimeoutBufferField.text.trim().toIntOrNull()?.coerceAtLeast(10) ?: 30
         settings.inlineCodeColor = inlineCodeColorField.text.trim()
         settings.listNumberColor = listNumberColorField.text.trim()
         settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
@@ -147,6 +156,7 @@ class OpenCodeSettingsPanel {
                 (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
                 (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
                 (responseTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.responseTimeoutSeconds ||
+                (longTimeoutBufferField.text.trim().toIntOrNull() ?: 30) != settings.longTimeoutBufferSeconds ||
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
                 listNumberColorField.text.trim() != settings.listNumberColor ||
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions

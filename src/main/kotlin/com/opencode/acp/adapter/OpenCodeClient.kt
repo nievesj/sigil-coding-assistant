@@ -3,16 +3,20 @@ package com.opencode.acp.adapter
 import com.opencode.acp.PlanEntry
 import com.opencode.acp.SseEvent
 import com.opencode.acp.SseTodoItem
+import com.opencode.acp.config.settings.OpenCodeSettingsState
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.java.Java
 import io.ktor.client.plugins.*
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.sse.SSE
 import io.ktor.client.plugins.sse.sse
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -35,16 +39,68 @@ private fun debugLog(msg: String) {
  * Provides methods to interact with all OpenCode session, message,
  * agent, command, and SSE event endpoints.
  *
+ * Owns its [HttpClient] internally — creates, configures, and closes it.
+ * After [close], no HTTP calls can be made on this instance.
+ *
  * @param baseUrl the base URL of the OpenCode server (e.g. "http://localhost:3000")
- * @param httpClient the Ktor HttpClient instance
  * @param authToken optional bearer token for authenticated requests
  */
 class OpenCodeClient(
     private val baseUrl: String,
-    private val httpClient: HttpClient,
     private val authToken: String? = null
 ) : AutoCloseable {
 
+    /** Timeout profiles for different endpoint categories.
+     *  SHORT — fast server-side operations (default 60s)
+     *  LONG — operations that may trigger LLM generation (responseTimeoutSeconds + buffer)
+     *  INFINITE — blocks for entire LLM generation (no request timeout) */
+    private enum class TimeoutProfile {
+        SHORT, LONG, INFINITE
+    }
+
+    /** Applies the given timeout profile to an HTTP request builder.
+     *  SHORT uses the client-wide default (60s).
+     *  LONG uses responseTimeoutSeconds + longTimeoutBufferSeconds (both from settings).
+     *  INFINITE uses no request timeout (the activity monitor handles generation timeouts). */
+    private fun HttpRequestBuilder.applyTimeoutProfile(profile: TimeoutProfile) {
+        when (profile) {
+            TimeoutProfile.SHORT -> {
+                // SHORT uses the client-wide default (SHORT_TIMEOUT_MS) — no override needed.
+            }
+            TimeoutProfile.LONG -> {
+                val settings = OpenCodeSettingsState.getInstance().state
+                val timeoutMs = settings.responseTimeoutSeconds * 1000L + settings.longTimeoutBufferSeconds * 1000L
+                timeout { requestTimeoutMillis = timeoutMs }
+                logger.debug { "[ACP] Applying timeout profile $profile (${timeoutMs}ms)" }
+            }
+            TimeoutProfile.INFINITE -> {
+                timeout { requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS }
+                logger.debug { "[ACP] Applying timeout profile $profile (infinite)" }
+            }
+        }
+    }
+
+    private val httpClient = HttpClient(Java) {
+        install(ContentNegotiation) {
+            json(Json {
+                ignoreUnknownKeys = true
+                isLenient = true
+                encodeDefaults = true
+            })
+        }
+        install(SSE)
+        install(HttpTimeout) {
+            requestTimeoutMillis = SHORT_TIMEOUT_MS    // 60s — client-wide default for SHORT ops
+            connectTimeoutMillis = CONNECT_TIMEOUT_MS   // 10s — TCP connection timeout
+        }
+    }
+
+    // NOTE: Two separate Json instances are intentional — do NOT merge them.
+    // 1. This instance-level Json has classDiscriminator = "type" for polymorphic deserialization
+    //    used in manual json.decodeFromString<T>(body) and json.encodeToString(...) calls.
+    // 2. The ContentNegotiation plugin above uses its own Json without classDiscriminator
+    //    for automatic request/response serialization.
+    // Merging would break polymorphic deserialization in the manual helpers.
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -154,11 +210,12 @@ class OpenCodeClient(
     /**
      * Performs an HTTP POST with a JSON body and deserializes the response as [T].
      */
-    private suspend inline fun <reified T> postJson(path: String, request: Any): T {
+    private suspend inline fun <reified T> postJson(path: String, request: Any, profile: TimeoutProfile = TimeoutProfile.SHORT): T {
         val response = httpClient.post("$baseUrl$path") {
             applyAuth()
             contentType(ContentType.Application.Json)
             setBody(json.encodeToString(kotlinx.serialization.serializer(request::class.java), request))
+            applyTimeoutProfile(profile)
         }
         val body = response.bodyAsText()
         if (!response.status.isSuccess()) {
@@ -169,17 +226,22 @@ class OpenCodeClient(
     }
 
     /**
-     * Performs an HTTP POST and returns true if the status is successful.
+     * Performs an HTTP POST with optional JSON body and returns true if the status is successful.
+     * Propagates [CancellationException] (including [kotlinx.coroutines.TimeoutCancellationException])
+     * so callers can distinguish timeout/cancellation from server errors.
      */
-    private suspend fun postSuccess(path: String, request: Any? = null): Boolean = try {
+    private suspend fun postSuccess(path: String, request: Any? = null, profile: TimeoutProfile = TimeoutProfile.SHORT): Boolean = try {
         val response = httpClient.post("$baseUrl$path") {
             applyAuth()
             contentType(ContentType.Application.Json)
             if (request != null) {
                 setBody(json.encodeToString(kotlinx.serialization.serializer(request::class.java), request))
             }
+            applyTimeoutProfile(profile)
         }
         response.status.isSuccess()
+    } catch (e: CancellationException) {
+        throw e  // Propagate coroutine cancellation (includes TimeoutCancellationException)
     } catch (e: Exception) {
         logger.warn(e) { "POST $path failed" }
         false
@@ -187,12 +249,16 @@ class OpenCodeClient(
 
     /**
      * Performs an HTTP DELETE and returns true if the status is successful.
+     * Propagates [CancellationException] (including [kotlinx.coroutines.TimeoutCancellationException])
+     * so callers can distinguish timeout/cancellation from server errors.
      */
     private suspend fun deleteSuccess(path: String): Boolean = try {
         val response = httpClient.delete("$baseUrl$path") {
             applyAuth()
         }
         response.status.isSuccess()
+    } catch (e: CancellationException) {
+        throw e  // Propagate coroutine cancellation (includes timeout)
     } catch (e: Exception) {
         logger.warn(e) { "DELETE $path failed" }
         false
@@ -205,12 +271,17 @@ class OpenCodeClient(
     /**
      * Checks whether the OpenCode server is reachable and healthy.
      * GET /global/health
+     *
+     * Propagates [CancellationException] (including [kotlinx.coroutines.TimeoutCancellationException])
+     * for consistency with postSuccess/deleteSuccess — coroutine cancellation should not be swallowed.
      */
     suspend fun healthCheck(): Boolean = try {
         val response = httpClient.get("$baseUrl/global/health") {
             applyAuth()
         }
         response.status.isSuccess()
+    } catch (e: CancellationException) {
+        throw e  // Propagate coroutine cancellation (includes timeout)
     } catch (e: Exception) {
         logger.warn(e) { "Health check failed" }
         false
@@ -349,7 +420,7 @@ class OpenCodeClient(
             providerID = providerID,
             modelID = modelID,
             auto = auto
-        ))
+        ), profile = TimeoutProfile.LONG)
 
     /**
      * Reverts a specific message (and optionally a part within it) from the session.
@@ -403,9 +474,7 @@ class OpenCodeClient(
                 // monitor in sendMessageInternal() handles generation timeouts with a
                 // tool-running guard — this POST timeout must NOT compete with it.
                 // Use no request timeout so the POST waits as long as the server needs.
-                timeout {
-                    requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
-                }
+                applyTimeoutProfile(TimeoutProfile.INFINITE)
             }
             val elapsed = System.currentTimeMillis() - startTime
             logger.info { "POST /session/$sessionId/message got response: ${response.status} in ${elapsed}ms" }
@@ -484,13 +553,16 @@ class OpenCodeClient(
     /**
      * Executes a command in the context of a session.
      * POST /session/{id}/command
+     *
+     * Uses the LONG timeout profile because commands can trigger LLM generation
+     * (e.g., /review, /init) that may take minutes.
      */
     suspend fun executeCommand(
         sessionId: String,
         command: String,
         args: String
     ): OpenCodeMessage =
-        postJson("/session/$sessionId/command", ExecuteCommandRequest(command = command, args = args))
+        postJson("/session/$sessionId/command", ExecuteCommandRequest(command = command, args = args), profile = TimeoutProfile.LONG)
 
     // -------------------------------------------------------------------------
     // Permissions
@@ -1338,11 +1410,12 @@ class OpenCodeClient(
     // -------------------------------------------------------------------------
 
     /**
-     * Closes the SSE-dedicated client.
-     * The main httpClient lifecycle is managed by the owner (caller).
+     * Closes the internal HttpClient. After close(), no HTTP calls can be made
+     * on this instance. Callers must not call close() while HTTP requests are
+     * in flight — the SSE subscription should be cancelled before calling this.
      */
     override fun close() {
-        // No-op: SSE now uses the shared httpClient owned by the caller
+        httpClient.close()
     }
 
     /** Clear reasoning part ID tracking. Call on session switch. */
@@ -1351,6 +1424,11 @@ class OpenCodeClient(
     }
 
     companion object {
+        /** Client-wide default request timeout for SHORT-profile (fast server-side) operations. */
+        private const val SHORT_TIMEOUT_MS = 60_000L
+        /** TCP connection timeout — applies to all profiles (cannot be overridden per-request). */
+        private const val CONNECT_TIMEOUT_MS = 10_000L
+
         /**
          * Normalize a directory path for the `?directory=` query parameter.
          * On Windows, the server expects backslash-separated paths (e.g.

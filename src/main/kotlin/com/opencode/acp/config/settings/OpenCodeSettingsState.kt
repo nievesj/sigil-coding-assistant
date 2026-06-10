@@ -40,6 +40,11 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      *  Default 300 (5 minutes). The previous `sseSocketTimeoutSeconds` was misleading —
      *  `socketTimeoutMillis` is a no-op on the Java HTTP engine (see TDD §4.2, §7.1). */
     var responseTimeoutSeconds: Int = 300
+    /** Buffer time (seconds) added to responseTimeoutSeconds for LONG-profile HTTP calls
+     *  (e.g., executeCommand, compactSession). Accounts for server-side overhead beyond
+     *  LLM generation time: request queuing, tool execution, network latency, and
+     *  bookkeeping. Default 30, minimum 10. */
+    var longTimeoutBufferSeconds: Int = 30
     /** @deprecated Migrated to [responseTimeoutSeconds]. Kept for XStream backward compatibility.
      *  Can be removed once all users have migrated (i.e., after 2+ release cycles).
      *  The migration logic in loadState() handles the transition from old to new setting. */
@@ -78,6 +83,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             state.sseSocketTimeoutSeconds != 60 -> state.sseSocketTimeoutSeconds.coerceAtLeast(60)
             else -> 300
         }
+        longTimeoutBufferSeconds = state.longTimeoutBufferSeconds.coerceAtLeast(10)
         @Suppress("DEPRECATION")
         sseSocketTimeoutSeconds = state.sseSocketTimeoutSeconds
         autoConnect = state.autoConnect
