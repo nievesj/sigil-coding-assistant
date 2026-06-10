@@ -165,8 +165,8 @@ class OpenCodeService(private val project: Project) : Disposable {
     fun stopConnection() {
         sseReconnectJob?.cancel()
         sseReconnectJob = null
-        sseIdleWatchJob?.cancel()
-        sseIdleWatchJob = null
+        sseHealthCheckJob?.cancel()
+        sseHealthCheckJob = null
         sseJob?.cancel()
         sseJob = null
         connectionManager.disconnect()
@@ -177,61 +177,85 @@ class OpenCodeService(private val project: Project) : Disposable {
     private var sseJob: Job? = null
     private var sseReconnectJob: Job? = null
     private var sseReconnectAttempt: Int = 0
-
-    /** Timestamp (epoch ms) of the last SSE event received. Used for idle detection. */
+    /** Timestamp (epoch ms) of the last SSE event received. Used for health-check timing. */
     private val sseLastEventTimeMs = AtomicLong(0L)
-    /** Timestamp (epoch ms) of when the SSE connection was established. Used for uptime logging. */
-    private var sseConnectTimeMs: Long = 0L
-    /** Job that monitors SSE idle time and triggers reconnection if no events arrive. */
-    private var sseIdleWatchJob: Job? = null
+    /** Job that periodically health-checks the server when SSE is silent. */
+    private var sseHealthCheckJob: Job? = null
 
     /** Single global SSE subscription — all events routed to SessionManager.processEvent().
      *  Includes automatic reconnection with exponential backoff on stream end,
-     *  and client-side idle detection (the Java HTTP engine has no socket timeout —
-     *  see TDD §4.2.1). */
+     *  and periodic health-check probes when the connection is silent (the Java
+     *  HTTP engine has no socket-level idle timeout — see TDD §4.2.1). */
     private fun startGlobalSseSubscription() {
         sseJob?.cancel()
         sseReconnectJob?.cancel()
-        sseIdleWatchJob?.cancel()
+        sseHealthCheckJob?.cancel()
         val client = connectionManager.client ?: return
-        sseConnectTimeMs = System.currentTimeMillis()
-        sseLastEventTimeMs.set(sseConnectTimeMs)
-        logger.info { "[ACP] SSE connected at $sseConnectTimeMs" }
+        val connectTime = System.currentTimeMillis()
+        sseLastEventTimeMs.set(connectTime)
+        logger.info { "[ACP] SSE connected at $connectTime" }
 
-        // Start idle watch — detects dead connections that the Java engine cannot
-        sseIdleWatchJob = scope.launch {
-            while (isActive) {
-                delay(ChatConstants.SSE_IDLE_CHECK_INTERVAL_MS)
-                val lastEvent = sseLastEventTimeMs.get()
-                val idleMs = System.currentTimeMillis() - lastEvent
-                if (idleMs > ChatConstants.SSE_IDLE_TIMEOUT_MS) {
-                    val uptimeSec = (System.currentTimeMillis() - sseConnectTimeMs) / 1000
-                    logger.warn { "[ACP] SSE idle for ${idleMs}ms (uptime=${uptimeSec}s) — connection likely dead, triggering reconnect" }
-                    // Cancel the SSE subscription job — this will cause the collect to end,
-                    // which triggers the catch block and then triggerGlobalSseReconnect()
+        sseJob = launchSseJob(client, connectTime)
+        sseHealthCheckJob = launchHealthCheck(client, connectTime)
+    }
+
+    /** Launch the SSE event collection job. Shared between initial subscription
+     *  and reconnection to prevent divergence. Handles stream end by triggering
+     *  reconnection — works correctly for both user-initiated cancellation and
+     *  unexpected errors. */
+    private fun launchSseJob(client: OpenCodeClient, connectTime: Long): Job = scope.launch {
+        try {
+            client.subscribeGlobalEvents().collect { event ->
+                sseLastEventTimeMs.set(System.currentTimeMillis())
+                handleSseEvent(event)
+            }
+        } catch (_: Exception) {
+            // SSE error or cancellation — both end up here
+        }
+        // Stream ended — trigger reconnection if this wasn't a user-initiated stop.
+        // CancellationException from stopConnection() is caught above; after it,
+        // scope is cancelled so isActive=false and we skip reconnection.
+        if (isActive) {
+            val uptimeSec = (System.currentTimeMillis() - connectTime) / 1000
+            logger.info { "[ACP] SSE stream ended after ${uptimeSec}s — triggering reconnection" }
+            triggerGlobalSseReconnect()
+        }
+    }
+
+    /** Launch a health-check probe coroutine. When the SSE connection has been
+     *  silent for [ChatConstants.SSE_HEALTH_CHECK_INTERVAL_MS], sends a lightweight
+     *  GET /global/health to verify the server and connection are alive. If the
+     *  health check fails, cancels [sseJob] which triggers reconnection via
+     *  [launchSseJob]'s post-catch logic.
+     *
+     *  This replaces the old idle-detection approach that killed healthy
+     *  connections during normal user thinking time. */
+    private fun launchHealthCheck(client: OpenCodeClient, connectTime: Long): Job = scope.launch {
+        val checkInterval = ChatConstants.SSE_HEALTH_CHECK_INTERVAL_MS
+        val checkTimeout = ChatConstants.SSE_HEALTH_CHECK_TIMEOUT_MS
+        while (isActive) {
+            delay(checkInterval)
+            val lastEvent = sseLastEventTimeMs.get()
+            val silenceMs = System.currentTimeMillis() - lastEvent
+            if (silenceMs < checkInterval) continue  // Recent activity — no probe needed
+
+            try {
+                val healthy = withTimeout(checkTimeout) { client.healthCheck() }
+                if (healthy) {
+                    // Server is alive and responding — reset the timer so the SSE
+                    // connection stays open. Silence doesn't mean death.
+                    sseLastEventTimeMs.set(System.currentTimeMillis())
+                } else {
+                    logger.warn { "[ACP] SSE health check failed (server unhealthy) after ${silenceMs}ms silence — triggering reconnection" }
                     sseJob?.cancel()
                     break
-                }
-            }
-        }
-
-        sseJob = scope.launch {
-            try {
-                client.subscribeGlobalEvents().collect { event ->
-                    sseLastEventTimeMs.set(System.currentTimeMillis())
-                    handleSseEvent(event)
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                // SSE error — stream ended
-            }
-            // Stream ended without cancellation — trigger reconnection
-            if (isActive) {
-                val uptimeSec = (System.currentTimeMillis() - sseConnectTimeMs) / 1000
-                val lastEventSec = (System.currentTimeMillis() - sseLastEventTimeMs.get()) / 1000
-                logger.info { "[ACP] Global SSE stream ended after ${uptimeSec}s (last event ${lastEventSec}s ago) — triggering reconnection" }
-                triggerGlobalSseReconnect()
+                logger.warn { "[ACP] SSE health check failed (request error) after ${silenceMs}ms silence — triggering reconnection" }
+                sseJob?.cancel()
+                break
             }
         }
     }
@@ -244,8 +268,8 @@ class OpenCodeService(private val project: Project) : Disposable {
 
         sseReconnectJob = scope.launch {
             while (isActive) {
-                val base = com.opencode.acp.chat.model.ChatConstants.RECONNECT_DELAY_MS
-                val max = com.opencode.acp.chat.model.ChatConstants.RECONNECT_MAX_DELAY_MS
+                val base = ChatConstants.RECONNECT_DELAY_MS
+                val max = ChatConstants.RECONNECT_MAX_DELAY_MS
                 val exponential = (base * (1L shl sseReconnectAttempt.coerceAtMost(10))).coerceAtMost(max)
                 val jitter = (exponential * kotlin.random.Random.nextDouble(0.0, 0.2)).toLong()
                 val delayMs = (exponential + jitter).coerceAtMost(max)
@@ -274,43 +298,13 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // Server healthy — re-subscribe global SSE
                 logger.info { "[ACP] SSE reconnect: server healthy, re-subscribing" }
                 sseJob?.cancel()
-                sseIdleWatchJob?.cancel()
-                sseConnectTimeMs = System.currentTimeMillis()
-                sseLastEventTimeMs.set(sseConnectTimeMs)
-                logger.info { "[ACP] SSE reconnected at $sseConnectTimeMs" }
+                sseHealthCheckJob?.cancel()
+                val reconnectTime = System.currentTimeMillis()
+                sseLastEventTimeMs.set(reconnectTime)
+                logger.info { "[ACP] SSE reconnected at $reconnectTime" }
 
-                // Restart idle watch for the new connection
-                sseIdleWatchJob = scope.launch {
-                    while (isActive) {
-                        delay(ChatConstants.SSE_IDLE_CHECK_INTERVAL_MS)
-                        val lastEvent = sseLastEventTimeMs.get()
-                        val idleMs = System.currentTimeMillis() - lastEvent
-                        if (idleMs > ChatConstants.SSE_IDLE_TIMEOUT_MS) {
-                            val uptimeSec = (System.currentTimeMillis() - sseConnectTimeMs) / 1000
-                            logger.warn { "[ACP] SSE idle for ${idleMs}ms (uptime=${uptimeSec}s) after reconnect — connection likely dead, triggering reconnect" }
-                            sseJob?.cancel()
-                            break
-                        }
-                    }
-                }
-
-                sseJob = scope.launch {
-                    try {
-                        client.subscribeGlobalEvents().collect { event ->
-                            sseLastEventTimeMs.set(System.currentTimeMillis())
-                            handleSseEvent(event)
-                        }
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {
-                        if (isActive) {
-                            val uptimeSec = (System.currentTimeMillis() - sseConnectTimeMs) / 1000
-                            val lastEventSec = (System.currentTimeMillis() - sseLastEventTimeMs.get()) / 1000
-                            logger.info { "[ACP] Global SSE stream ended after reconnect (${uptimeSec}s uptime, last event ${lastEventSec}s ago) — triggering reconnection" }
-                            triggerGlobalSseReconnect()
-                        }
-                    }
-                }
+                sseJob = launchSseJob(client, reconnectTime)
+                sseHealthCheckJob = launchHealthCheck(client, reconnectTime)
 
                 // Recover background sessions that may have completed during disconnection
                 recoverBackgroundSessions()
@@ -525,7 +519,9 @@ class OpenCodeService(private val project: Project) : Disposable {
                         val timeoutSec = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds
                         logger.error { "[ACP] sendMessage: no SSE activity for ${elapsed}ms (> ${timeoutSec}s) — aborting" }
                         sessionManager.abortStreaming("No activity for ${timeoutSec}s.")
-                        deferred.complete(Unit)
+                        // abortStreaming() emits StreamingCompleted which completes
+                        // responseDeferred via the global signal collector. Don't call
+                        // deferred.complete() again — it would throw IllegalStateException.
                         break
                     }
                 }
@@ -575,6 +571,39 @@ class OpenCodeService(private val project: Project) : Disposable {
             session.responseDeferred?.complete(Unit)
             session.responseDeferred = null
         }
+    }
+
+    /**
+     * Cancel the in-progress response AND return a [CompletableDeferred] that
+     * completes when the send mutex is released.
+     *
+     * Used by [ChatViewModel.steerMessage] to wait for the abort to complete
+     * before sending a new message.
+     *
+     * If the mutex is not held (no send in progress), returns an already-completed
+     * deferred without calling cancel().
+     */
+    suspend fun steerCancel(): CompletableDeferred<Unit> {
+        // Fast path: mutex isn't held, nothing to abort
+        if (!sendMutex.isLocked) {
+            val deferred = CompletableDeferred<Unit>()
+            deferred.complete(Unit)
+            return deferred
+        }
+
+        // Slow path: abort in-progress response and wait for mutex release
+        cancel()
+
+        val deferred = CompletableDeferred<Unit>()
+        scope.launch {
+            // Acquire the mutex (suspends until the old sendMessage()'s
+            // finally block releases it), then immediately release it —
+            // we just want to know it's available, not hold it.
+            sendMutex.lock()
+            sendMutex.unlock()
+            deferred.complete(Unit)
+        }
+        return deferred
     }
 
     suspend fun respondPermission(permissionId: String, toolCallId: String, sessionId: String, response: PermissionResponse) =

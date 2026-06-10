@@ -903,25 +903,16 @@ fun InputArea(
 
                         Spacer(modifier = Modifier.weight(1f))
 
-                        // Send / Stop button
-                        if (isStreaming) {
-                            // Streaming: red square
-                            Box(
-                                modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .clickable(enabled = enabled) { onCancel() },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Icon(
-                                    key = AllIconsKeys.Actions.Suspend,
-                                    contentDescription = "Stop",
-                                    modifier = Modifier.size(12.dp),
-                                    tint = stopRed,
-                                )
-                            }
-                        } else {
-                            // Idle: green run triangle
+                        // Contextual Send / Stop button:
+                        // - Has text → green Send (even during streaming, triggers steer)
+                        // - No text + streaming → red Stop
+                        // - No text + idle → no button
+                        val hasText = textState.text.toString().trim().isNotEmpty()
+
+                        if (hasText) {
+                            // Green Send button — always available when there's text to send.
+                            // During streaming: triggers steer (abort + send).
+                            // During idle: triggers normal send.
                             Box(
                                 modifier = Modifier
                                     .size(28.dp)
@@ -942,6 +933,22 @@ fun InputArea(
                                     contentDescription = "Send",
                                     modifier = Modifier.size(16.dp),
                                     tint = Color(0xFF4EAF4E),
+                                )
+                            }
+                        } else if (isStreaming) {
+                            // Red Stop button — only when empty input + streaming
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable(enabled = enabled) { onCancel() },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    key = AllIconsKeys.Actions.Suspend,
+                                    contentDescription = "Stop",
+                                    modifier = Modifier.size(12.dp),
+                                    tint = stopRed,
                                 )
                             }
                         }

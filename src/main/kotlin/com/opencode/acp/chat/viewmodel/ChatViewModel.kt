@@ -362,6 +362,43 @@ class ChatViewModel(
         _isStreaming.value = false
     }
 
+    /**
+     * Send a message while streaming is in progress (steering/nudging).
+     * Auto-aborts the current response, waits for the send mutex to be released,
+     * then sends as a fresh message via [sendMessage].
+     *
+     * Does NOT call recordCommand() — that's handled by sendMessage().
+     * Does NOT set _isStreaming — that's also handled by sendMessage().
+     */
+    suspend fun steerMessage(text: String, files: List<AttachedFile> = emptyList()) {
+        // Abort in-progress response and get a signal for when the mutex is released
+        val readyDeferred = service.steerCancel()
+
+        // Await the signal — deterministic, not a fixed delay.
+        // Resumes as soon as the old sendMessage() releases the sendMutex.
+        withTimeoutOrNull(MAX_STEER_WAIT_MS) {
+            readyDeferred.await()
+        } ?: run {
+            // Safety net: mutex not released after MAX_STEER_WAIT_MS
+            logger.error { "[ACP] steerMessage: mutex not released after ${MAX_STEER_WAIT_MS}ms — giving up" }
+            _isStreaming.value = false
+            return
+        }
+
+        // Session guard: if the user switched sessions during the steer,
+        // don't send the message to the wrong session.
+        val currentSessionId = service.sessionId
+        if (currentSessionId == null) {
+            logger.warn { "[ACP] steerMessage: session lost during steer" }
+            _isStreaming.value = false
+            return
+        }
+
+        // Now the mutex is free — send through the normal path.
+        // sendMessage() handles: recordCommand, _isStreaming = true, error handling.
+        sendMessage(text, files)
+    }
+
     // --- Permission/Selection ---
 
     suspend fun respondPermission(response: PermissionResponse) {
@@ -499,6 +536,8 @@ class ChatViewModel(
     // --- Helpers ---
 
     companion object {
+        private const val MAX_STEER_WAIT_MS = 10_000L
+
         /** Load persisted command history from settings. */
         private fun loadCommandHistory(): List<CommandHistoryEntry> {
             return ArrayList(OpenCodeSettingsState.getInstance().commandHistory)

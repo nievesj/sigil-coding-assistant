@@ -391,7 +391,11 @@ fun
                     val fileSnapshot = files.toList()
                     attachedFiles.clear()
                     scope.launch {
-                        viewModel.sendMessage(text, fileSnapshot)
+                        if (isStreaming) {
+                            viewModel.steerMessage(text, fileSnapshot)
+                        } else {
+                            viewModel.sendMessage(text, fileSnapshot)
+                        }
                     }
                 },
                 onCancel = { scope.launch { viewModel.cancel() } },

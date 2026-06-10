@@ -188,26 +188,35 @@ This sets `ConnectionState.RECONNECTING`, which the `ConnectionBanner` renders a
 4. On scope cancellation or client loss: set `ERROR`, `initialized = false`
 5. In-flight streaming responses are aborted with an error message via `abortInFlightResponse()`
 
-**SSE idle detection (client-side):** The Java HTTP engine has no socket-level idle timeout
-(see TDD §4.2.1), so dead SSE connections can go undetected indefinitely. The plugin now
-tracks the last SSE event timestamp (`sseLastEventTimeMs`) and monitors it with a
-coroutine (`sseIdleWatchJob`). If no SSE events arrive within `SSE_IDLE_TIMEOUT_MS`
-(120 seconds), the SSE job is cancelled, which triggers the standard reconnection path.
-The idle check runs every `SSE_IDLE_CHECK_INTERVAL_MS` (15 seconds).
+**SSE health-check probes (client-side):** The Java HTTP engine has no socket-level idle
+timeout (see TDD §4.2.1), so half-open TCP connections can go undetected indefinitely.
+The plugin uses periodic health-check probes to detect dead connections without killing
+healthy ones during normal user thinking time.
 
-**Observability:** SSE connect time, disconnect time, uptime, and last-event idle time
-are logged with `[ACP]` prefix for `idea.log` filtering. Each event updates
-`sseLastEventTimeMs`, enabling idle detection even during quiet periods.
+When the SSE connection has been silent for `SSE_HEALTH_CHECK_INTERVAL_MS` (60 seconds),
+the plugin sends a lightweight `GET /global/health` to verify the server is alive. If the
+health check succeeds, the connection is fine and the timer resets. If it fails, the SSE
+job is cancelled, which triggers automatic reconnection via `launchSseJob()`.
 
-**Key guards:**
-- `CancellationException` in `startGlobalSseSubscription()` is re-thrown (no reconnect on user-initiated cancel)
-- `triggerGlobalSseReconnect()` checks `isActive` before firing
-- `sseIdleWatchJob` is cancelled in `stopConnection()`, `triggerGlobalSseReconnect()`, and on idle timeout
-- Idle watch is restarted after successful reconnection
+This replaces the old idle-detection approach that proactively killed connections after
+120s of silence — which was a false positive during normal user thinking time and also
+failed to trigger reconnection (the `CancellationException` re-throw bypassed the
+reconnection code).
 
-**Constants:** `ChatConstants.RECONNECT_DELAY_MS = 1000`, `RECONNECT_MAX_DELAY_MS = 30000`, `SSE_IDLE_TIMEOUT_MS = 120000`, `SSE_IDLE_CHECK_INTERVAL_MS = 15000`
+**Key design:**
+- `launchSseJob()` — shared function used by both `startGlobalSseSubscription()` and
+  `triggerGlobalSseReconnect()`. Prevents code divergence between the two paths.
+  Handles stream end by triggering reconnection for both unexpected errors and
+  cancellation (checked via `isActive` after the catch block).
+- `launchHealthCheck()` — periodic probe coroutine. Only fires when SSE has been
+  silent for the full interval. Resets the timer on success.
+- `CancellationException` is no longer re-thrown — it's caught alongside other
+  exceptions. After the catch, `isActive` distinguishes user-initiated stop
+  (scope cancelled → skip reconnect) from unexpected stream end (scope active → reconnect).
 
-- **Files:** `OpenCodeService.kt` (`startGlobalSseSubscription`, `triggerGlobalSseReconnect`, `sseLastEventTimeMs`, `sseIdleWatchJob`), `OpenCodeClient.kt` (timing logs in `subscribeGlobalEvents`), `ChatConstants.kt` (`SSE_IDLE_TIMEOUT_MS`, `SSE_IDLE_CHECK_INTERVAL_MS`), `ConnectionBanner.kt` (RECONNECTING branch), `ChatScreen.kt` (onRetry → retryConnection)
+**Constants:** `ChatConstants.RECONNECT_DELAY_MS = 1000`, `RECONNECT_MAX_DELAY_MS = 30000`, `SSE_HEALTH_CHECK_INTERVAL_MS = 60000`, `SSE_HEALTH_CHECK_TIMEOUT_MS = 10000`
+
+- **Files:** `OpenCodeService.kt` (`startGlobalSseSubscription`, `launchSseJob`, `launchHealthCheck`, `triggerGlobalSseReconnect`, `sseLastEventTimeMs`), `OpenCodeClient.kt` (timing logs in `subscribeGlobalEvents`), `ChatConstants.kt` (`SSE_HEALTH_CHECK_INTERVAL_MS`, `SSE_HEALTH_CHECK_TIMEOUT_MS`), `ConnectionBanner.kt` (RECONNECTING branch), `ChatScreen.kt` (onRetry → retryConnection)
 
 ### SSE V2 SyncEvent Wire Format — Critical Parsing Fix
 
@@ -682,7 +691,7 @@ app) are left untouched since the plugin uses a different port.
 - [x] MIME type detection for file attachments — `MimeTypes.guessFromFileName()` replaces `URLConnection.guessContentTypeFromName()` (which returns `application/octet-stream` for most dev files)
 - [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
 - [x] SSE reconnection with exponential backoff (1s→2s→4s→...→30s cap, ±20% jitter, abort in-flight response, retryConnection for ERROR state)
-- [x] SSE idle detection — client-side idle watch (`sseIdleWatchJob`) triggers reconnection if no events within 120s (Java engine has no socket timeout; see TDD §4.2.1)
+- [x] SSE idle detection — replaced with health-check probes (`launchHealthCheck`) that verify server liveness without killing healthy connections during user thinking time (see TDD §4.2.1)
 - [x] SSE observability — connect/disconnect/uptime/last-event timing logged with `[ACP]` prefix
 - [x] Removed `socketTimeoutMillis` from HttpClient config — it's a no-op on Java engine (TDD §4.2.1)
 - [x] Replaced `sseSocketTimeoutSeconds` setting with `responseTimeoutSeconds` — controls `withTimeout` on `deferred.await()` (was hardcoded 5 min; see TDD §7.1)
