@@ -3,6 +3,7 @@ package com.opencode.acp.adapter
 import com.opencode.acp.PlanEntry
 import com.opencode.acp.SseEvent
 import com.opencode.acp.SseTodoItem
+import com.opencode.acp.config.settings.OpenCodeSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.java.Java
@@ -397,6 +398,17 @@ class OpenCodeClient(
                 applyAuth()
                 contentType(ContentType.Application.Json)
                 setBody(requestBody)
+                // The server's POST /session/:id/message can take arbitrarily long when
+                // the LLM is generating (tool execution, subtasks, etc.). The client-wide
+                // requestTimeoutMillis (60s) is too short for this endpoint. Override to
+                // match the user's configured responseTimeoutSeconds (default 300s) so the
+                // HTTP POST doesn't time out before the server finishes processing.
+                // The SSE streaming phase is guarded separately by the activity monitor.
+                val responseTimeoutMs = OpenCodeSettingsState
+                    .getInstance().state.responseTimeoutSeconds * 1000L
+                timeout {
+                    requestTimeoutMillis = responseTimeoutMs + 30_000L  // +30s buffer beyond response timeout
+                }
             }
             val elapsed = System.currentTimeMillis() - startTime
             logger.info { "POST /session/$sessionId/message got response: ${response.status} in ${elapsed}ms" }
