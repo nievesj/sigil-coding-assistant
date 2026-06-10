@@ -35,7 +35,15 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var sidebarVisible: Boolean = true
     /** Maximum number of entries kept in the input command history. */
     var commandHistorySize: Int = 15
-    /** SSE socket timeout in seconds (how long to wait between SSE events before reconnecting). */
+    /** Maximum time (seconds) to wait for a response from the LLM before timing out.
+     *  Controls the `withTimeout` on `deferred.await()` in `sendMessageInternal()`.
+     *  Default 300 (5 minutes). The previous `sseSocketTimeoutSeconds` was misleading —
+     *  `socketTimeoutMillis` is a no-op on the Java HTTP engine (see TDD §4.2, §7.1). */
+    var responseTimeoutSeconds: Int = 300
+    /** @deprecated Migrated to [responseTimeoutSeconds]. Kept for XStream backward compatibility.
+     *  Can be removed once all users have migrated (i.e., after 2+ release cycles).
+     *  The migration logic in loadState() handles the transition from old to new setting. */
+    @Deprecated("Migrated to responseTimeoutSeconds", ReplaceWith("responseTimeoutSeconds"))
     var sseSocketTimeoutSeconds: Int = 60
     /** Whether to automatically connect when the plugin opens. */
     var autoConnect: Boolean = true
@@ -59,7 +67,19 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         lastSelectedModelKey = state.lastSelectedModelKey
         sidebarVisible = state.sidebarVisible
         commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
-        sseSocketTimeoutSeconds = if (state.sseSocketTimeoutSeconds > 0) state.sseSocketTimeoutSeconds else 60
+        // Migrate legacy sseSocketTimeoutSeconds → responseTimeoutSeconds.
+        // If responseTimeoutSeconds was explicitly set (not default 300), keep it.
+        // Otherwise, if sseSocketTimeoutSeconds was customized (not default 60), use that
+        // as the new responseTimeoutSeconds (coerced to minimum 60s for safety).
+        // If neither was customized, use default 300.
+        @Suppress("DEPRECATION")
+        responseTimeoutSeconds = when {
+            state.responseTimeoutSeconds != 300 -> state.responseTimeoutSeconds.coerceAtLeast(60)
+            state.sseSocketTimeoutSeconds != 60 -> state.sseSocketTimeoutSeconds.coerceAtLeast(60)
+            else -> 300
+        }
+        @Suppress("DEPRECATION")
+        sseSocketTimeoutSeconds = state.sseSocketTimeoutSeconds
         autoConnect = state.autoConnect
         port = if (state.port in 1024..65535) state.port else 4096
         loadAllSessions = state.loadAllSessions

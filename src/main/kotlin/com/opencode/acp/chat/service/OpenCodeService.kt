@@ -13,9 +13,11 @@ import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.chat.util.EDT
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.config.settings.OpenCodeSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Project-level service that owns the OpenCode connection, session management,
@@ -163,6 +165,8 @@ class OpenCodeService(private val project: Project) : Disposable {
     fun stopConnection() {
         sseReconnectJob?.cancel()
         sseReconnectJob = null
+        sseIdleWatchJob?.cancel()
+        sseIdleWatchJob = null
         sseJob?.cancel()
         sseJob = null
         connectionManager.disconnect()
@@ -174,15 +178,47 @@ class OpenCodeService(private val project: Project) : Disposable {
     private var sseReconnectJob: Job? = null
     private var sseReconnectAttempt: Int = 0
 
+    /** Timestamp (epoch ms) of the last SSE event received. Used for idle detection. */
+    private val sseLastEventTimeMs = AtomicLong(0L)
+    /** Timestamp (epoch ms) of when the SSE connection was established. Used for uptime logging. */
+    private var sseConnectTimeMs: Long = 0L
+    /** Job that monitors SSE idle time and triggers reconnection if no events arrive. */
+    private var sseIdleWatchJob: Job? = null
+
     /** Single global SSE subscription — all events routed to SessionManager.processEvent().
-     *  Includes automatic reconnection with exponential backoff on stream end. */
+     *  Includes automatic reconnection with exponential backoff on stream end,
+     *  and client-side idle detection (the Java HTTP engine has no socket timeout —
+     *  see TDD §4.2.1). */
     private fun startGlobalSseSubscription() {
         sseJob?.cancel()
         sseReconnectJob?.cancel()
+        sseIdleWatchJob?.cancel()
         val client = connectionManager.client ?: return
+        sseConnectTimeMs = System.currentTimeMillis()
+        sseLastEventTimeMs.set(sseConnectTimeMs)
+        logger.info { "[ACP] SSE connected at $sseConnectTimeMs" }
+
+        // Start idle watch — detects dead connections that the Java engine cannot
+        sseIdleWatchJob = scope.launch {
+            while (isActive) {
+                delay(ChatConstants.SSE_IDLE_CHECK_INTERVAL_MS)
+                val lastEvent = sseLastEventTimeMs.get()
+                val idleMs = System.currentTimeMillis() - lastEvent
+                if (idleMs > ChatConstants.SSE_IDLE_TIMEOUT_MS) {
+                    val uptimeSec = (System.currentTimeMillis() - sseConnectTimeMs) / 1000
+                    logger.warn { "[ACP] SSE idle for ${idleMs}ms (uptime=${uptimeSec}s) — connection likely dead, triggering reconnect" }
+                    // Cancel the SSE subscription job — this will cause the collect to end,
+                    // which triggers the catch block and then triggerGlobalSseReconnect()
+                    sseJob?.cancel()
+                    break
+                }
+            }
+        }
+
         sseJob = scope.launch {
             try {
                 client.subscribeGlobalEvents().collect { event ->
+                    sseLastEventTimeMs.set(System.currentTimeMillis())
                     handleSseEvent(event)
                 }
             } catch (e: CancellationException) {
@@ -192,7 +228,9 @@ class OpenCodeService(private val project: Project) : Disposable {
             }
             // Stream ended without cancellation — trigger reconnection
             if (isActive) {
-                logger.info { "[ACP] Global SSE stream ended — triggering reconnection" }
+                val uptimeSec = (System.currentTimeMillis() - sseConnectTimeMs) / 1000
+                val lastEventSec = (System.currentTimeMillis() - sseLastEventTimeMs.get()) / 1000
+                logger.info { "[ACP] Global SSE stream ended after ${uptimeSec}s (last event ${lastEventSec}s ago) — triggering reconnection" }
                 triggerGlobalSseReconnect()
             }
         }
@@ -235,17 +273,40 @@ class OpenCodeService(private val project: Project) : Disposable {
 
                 // Server healthy — re-subscribe global SSE
                 logger.info { "[ACP] SSE reconnect: server healthy, re-subscribing" }
-                sseJob?.cancel()  // Cancel old job before creating new one to prevent duplicate event processing
+                sseJob?.cancel()
+                sseIdleWatchJob?.cancel()
+                sseConnectTimeMs = System.currentTimeMillis()
+                sseLastEventTimeMs.set(sseConnectTimeMs)
+                logger.info { "[ACP] SSE reconnected at $sseConnectTimeMs" }
+
+                // Restart idle watch for the new connection
+                sseIdleWatchJob = scope.launch {
+                    while (isActive) {
+                        delay(ChatConstants.SSE_IDLE_CHECK_INTERVAL_MS)
+                        val lastEvent = sseLastEventTimeMs.get()
+                        val idleMs = System.currentTimeMillis() - lastEvent
+                        if (idleMs > ChatConstants.SSE_IDLE_TIMEOUT_MS) {
+                            val uptimeSec = (System.currentTimeMillis() - sseConnectTimeMs) / 1000
+                            logger.warn { "[ACP] SSE idle for ${idleMs}ms (uptime=${uptimeSec}s) after reconnect — connection likely dead, triggering reconnect" }
+                            sseJob?.cancel()
+                            break
+                        }
+                    }
+                }
+
                 sseJob = scope.launch {
                     try {
                         client.subscribeGlobalEvents().collect { event ->
+                            sseLastEventTimeMs.set(System.currentTimeMillis())
                             handleSseEvent(event)
                         }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (_: Exception) {
                         if (isActive) {
-                            logger.info { "[ACP] Global SSE stream ended again — triggering reconnection" }
+                            val uptimeSec = (System.currentTimeMillis() - sseConnectTimeMs) / 1000
+                            val lastEventSec = (System.currentTimeMillis() - sseLastEventTimeMs.get()) / 1000
+                            logger.info { "[ACP] Global SSE stream ended after reconnect (${uptimeSec}s uptime, last event ${lastEventSec}s ago) — triggering reconnection" }
                             triggerGlobalSseReconnect()
                         }
                     }
@@ -265,13 +326,18 @@ class OpenCodeService(private val project: Project) : Disposable {
      *  Re-fetches recent messages for each streaming session. If the server's
      *  last message is an assistant message (indicating generation completed),
      *  finalize it locally. Prevents responseDeferred from hanging until the
-     *  5-minute timeout.
+     *  configurable response timeout.
      *
-     *  ASSUMPTION: The server's REST API (listMessages) only returns completed
-     *  messages — in-progress messages are streamed via SSE, not available via
-     *  REST. If this assumption is wrong, a still-generating session could be
-     *  incorrectly finalized. A per-session status endpoint (GET /session/status)
-     *  would be more reliable if available. */
+     *  SAFETY: Before finalizing, checks for in-progress tool calls. If the
+     *  last assistant message has ToolUse parts without matching ToolResult
+     *  parts, the session is likely still generating — we skip finalization
+     *  and let the SSE reconnection deliver the remaining events. This
+     *  prevents incorrectly finalizing a session that's mid-tool-execution
+     *  (TDD §11 Risk 3).
+     *
+     *  ASSUMPTION: The server's REST API (listMessages) returns the current
+     *  state of messages, including in-progress tool parts. If this assumption
+     *  is wrong, the safety check may not catch all cases. */
     private suspend fun recoverBackgroundSessions() {
         val client = connectionManager.client ?: return
         val streamingSessions = sessionManager.getStreamingSessions()
@@ -288,7 +354,23 @@ class OpenCodeService(private val project: Project) : Disposable {
                 val lastIsAssistant = lastMessage?.info?.role == "assistant"
 
                 if (lastIsAssistant) {
-                    // Server has an assistant message as the last message —
+                    // Safety check: detect in-progress tool calls (TDD §11 Risk 3).
+                    // If the last assistant message has ToolUse parts without matching
+                    // ToolResult parts, the session is likely still generating.
+                    val hasInProgressTools = lastMessage.parts
+                        .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
+                        .any { toolUse ->
+                            lastMessage.parts
+                                .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
+                                .none { it.toolUseId == toolUse.id }
+                        }
+
+                    if (hasInProgressTools) {
+                        logger.info { "[ACP] recoverBackgroundSessions: session $sessionId has in-progress tools — skipping finalization (will recover via SSE)" }
+                        continue
+                    }
+
+                    // Server has a completed assistant message as the last message —
                     // generation completed while we were disconnected.
                     val activeMsgId = session.ctx.activeMessageId
                     if (activeMsgId != null) {
@@ -413,13 +495,15 @@ class OpenCodeService(private val project: Project) : Disposable {
 
             sessionManager.updateServerMessageId(assistantMsgId, serverMessageId)
 
-            withTimeout(300_000L) {
+            val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds * 1000L
+            withTimeout(responseTimeoutMs) {
                 deferred.await()
             }
             return SendMessageResult.Success(assistantMsgId)
         } catch (e: TimeoutCancellationException) {
-            logger.error(e) { "[ACP] sendMessage: SSE response timed out after 5 minutes" }
-            sessionManager.abortStreaming("Response timed out after 5 minutes.")
+            val timeoutSec = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds
+            logger.error(e) { "[ACP] sendMessage: response timed out after ${timeoutSec}s (configurable via responseTimeoutSeconds setting)" }
+            sessionManager.abortStreaming("Response timed out after ${timeoutSec}s.")
             return SendMessageResult.Error("Response timed out")
         } catch (e: CancellationException) {
             sessionManager.completeStreaming(assistantMsgId)

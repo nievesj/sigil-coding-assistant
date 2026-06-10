@@ -547,7 +547,8 @@ class OpenCodeClient(
         val job = launch {
             try {
                 httpClient.sse("$baseUrl/event") {
-                    logger.info { "SSE connected to $baseUrl/event" }
+                    val connectTime = System.currentTimeMillis()
+                    logger.info { "[ACP] SSE connected to $baseUrl/event at $connectTime" }
                     incoming.collect { event ->
                         val data = event.data ?: return@collect
                         val jsonObj: JsonObject = try {
@@ -603,10 +604,10 @@ class OpenCodeClient(
                         }
                         send(parsed)
                     }
-                    logger.info { "SSE stream ended" }
+                    logger.info { "[ACP] SSE stream ended (connected at $connectTime)" }
                 }
             } catch (e: Exception) {
-                logger.warn(e) { "SSE connection closed with error" }
+                logger.warn(e) { "[ACP] SSE connection closed with error" }
             }
         }
         awaitClose {

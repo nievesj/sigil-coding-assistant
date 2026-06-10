@@ -174,10 +174,10 @@ MarkdownStyling.create(
   factory methods default to creating fresh `InlinesStyling` instances when the
   parameter is not explicitly provided.
 
-### SSE Reconnection — Automatic with Exponential Backoff
+### SSE Reconnection — Automatic with Exponential Backoff + Idle Detection
 
 When the SSE stream (`/event`) drops unexpectedly (not cancelled by user action),
-`startSseSubscription()` detects the stream end and calls `triggerReconnect()`.
+`startGlobalSseSubscription()` detects the stream end and calls `triggerGlobalSseReconnect()`.
 This sets `ConnectionState.RECONNECTING`, which the `ConnectionBanner` renders as
 "Reconnecting..." (no Retry link — reconnection is automatic).
 
@@ -188,15 +188,26 @@ This sets `ConnectionState.RECONNECTING`, which the `ConnectionBanner` renders a
 4. On scope cancellation or client loss: set `ERROR`, `initialized = false`
 5. In-flight streaming responses are aborted with an error message via `abortInFlightResponse()`
 
+**SSE idle detection (client-side):** The Java HTTP engine has no socket-level idle timeout
+(see TDD §4.2.1), so dead SSE connections can go undetected indefinitely. The plugin now
+tracks the last SSE event timestamp (`sseLastEventTimeMs`) and monitors it with a
+coroutine (`sseIdleWatchJob`). If no SSE events arrive within `SSE_IDLE_TIMEOUT_MS`
+(120 seconds), the SSE job is cancelled, which triggers the standard reconnection path.
+The idle check runs every `SSE_IDLE_CHECK_INTERVAL_MS` (15 seconds).
+
+**Observability:** SSE connect time, disconnect time, uptime, and last-event idle time
+are logged with `[ACP]` prefix for `idea.log` filtering. Each event updates
+`sseLastEventTimeMs`, enabling idle detection even during quiet periods.
+
 **Key guards:**
-- `CancellationException` in `startSseSubscription()` is re-thrown (no reconnect on user-initiated cancel)
-- `triggerReconnect()` checks `isActive && initialized && sessionId == capturedId` before firing
-- `reconnectJob` is cancelled in `close()`, `switchSession()`, `createAndSwitchSession()`
-- `retryConnection()` (for the "Retry" button in ERROR state) does full `close()` + `initialize()`
+- `CancellationException` in `startGlobalSseSubscription()` is re-thrown (no reconnect on user-initiated cancel)
+- `triggerGlobalSseReconnect()` checks `isActive` before firing
+- `sseIdleWatchJob` is cancelled in `stopConnection()`, `triggerGlobalSseReconnect()`, and on idle timeout
+- Idle watch is restarted after successful reconnection
 
-**Constants:** `ChatConstants.RECONNECT_DELAY_MS = 1000`, `RECONNECT_MAX_DELAY_MS = 30000`
+**Constants:** `ChatConstants.RECONNECT_DELAY_MS = 1000`, `RECONNECT_MAX_DELAY_MS = 30000`, `SSE_IDLE_TIMEOUT_MS = 120000`, `SSE_IDLE_CHECK_INTERVAL_MS = 15000`
 
-- **Files:** `ChatViewModel.kt` (`triggerReconnect`, `calculateBackoff`, `abortInFlightResponse`, `retryConnection`), `ConnectionBanner.kt` (RECONNECTING branch), `ChatScreen.kt` (onRetry → retryConnection)
+- **Files:** `OpenCodeService.kt` (`startGlobalSseSubscription`, `triggerGlobalSseReconnect`, `sseLastEventTimeMs`, `sseIdleWatchJob`), `OpenCodeClient.kt` (timing logs in `subscribeGlobalEvents`), `ChatConstants.kt` (`SSE_IDLE_TIMEOUT_MS`, `SSE_IDLE_CHECK_INTERVAL_MS`), `ConnectionBanner.kt` (RECONNECTING branch), `ChatScreen.kt` (onRetry → retryConnection)
 
 ### SSE V2 SyncEvent Wire Format — Critical Parsing Fix
 
@@ -671,6 +682,11 @@ app) are left untouched since the plugin uses a different port.
 - [x] MIME type detection for file attachments — `MimeTypes.guessFromFileName()` replaces `URLConnection.guessContentTypeFromName()` (which returns `application/octet-stream` for most dev files)
 - [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
 - [x] SSE reconnection with exponential backoff (1s→2s→4s→...→30s cap, ±20% jitter, abort in-flight response, retryConnection for ERROR state)
+- [x] SSE idle detection — client-side idle watch (`sseIdleWatchJob`) triggers reconnection if no events within 120s (Java engine has no socket timeout; see TDD §4.2.1)
+- [x] SSE observability — connect/disconnect/uptime/last-event timing logged with `[ACP]` prefix
+- [x] Removed `socketTimeoutMillis` from HttpClient config — it's a no-op on Java engine (TDD §4.2.1)
+- [x] Replaced `sseSocketTimeoutSeconds` setting with `responseTimeoutSeconds` — controls `withTimeout` on `deferred.await()` (was hardcoded 5 min; see TDD §7.1)
+- [x] `OpenCodeConnectionManager` no longer sets `socketTimeoutMillis` on `HttpTimeout` plugin — no effect on Java engine
 - [x] Input command history with Up/Down arrow navigation (configurable size, persists with attachments, draft save/restore, `onSend` signature fixed to pass files)
 - [x] `toChatMessage()` now uses `ToolMapper.toAcpKind()` instead of hardcoded `ToolKind.OTHER` — historical tool pills match live ones
 - [x] `ToolPill` defaults collapsed (`expanded = false`) — was defaulting expanded

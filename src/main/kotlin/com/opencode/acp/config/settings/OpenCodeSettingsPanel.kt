@@ -44,8 +44,11 @@ class OpenCodeSettingsPanel {
     /** Command history size — how many past messages to remember. */
     val commandHistorySizeField: JBTextField = JBTextField("15", 5)
 
-    /** SSE socket timeout — seconds between SSE events before reconnecting. */
-    val sseSocketTimeoutField: JBTextField = JBTextField("60", 5)
+    /** Response timeout — max seconds to wait for LLM response before timing out. */
+    val responseTimeoutField: JBTextField = JBTextField("300", 5).apply {
+        toolTipText = "Maximum time (in seconds) to wait for an LLM response. Default: 300 (5 min). " +
+            "Increase for slow models or complex tool calls. Minimum: 60s."
+    }
 
     /** Inline code text color — hex string like "#6BBE50" */
     val inlineCodeColorField: JBTextField = JBTextField("#6BBE50", 8)
@@ -105,7 +108,7 @@ class OpenCodeSettingsPanel {
         .addLabeledComponent("Server port:", portField, 5)
         .addLabeledComponent("Permission timeout (seconds):", timeoutField, 5)
         .addLabeledComponent("Command history size:", commandHistorySizeField, 5)
-        .addLabeledComponent("SSE socket timeout (seconds):", sseSocketTimeoutField, 5)
+        .addLabeledComponent("Response timeout (seconds):", responseTimeoutField, 5)
         .addSeparator(5)
         .addLabeledComponent("Inline code color:", inlineCodeColorField, 5)
         .addComponentToRightColumn(inlineCodeColorButton)
@@ -121,7 +124,7 @@ class OpenCodeSettingsPanel {
         portField.text = settings.port.toString()
         timeoutField.text = settings.permissionTimeoutSeconds.toString()
         commandHistorySizeField.text = settings.commandHistorySize.toString()
-        sseSocketTimeoutField.text = settings.sseSocketTimeoutSeconds.toString()
+        responseTimeoutField.text = settings.responseTimeoutSeconds.toString()
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
         loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
@@ -132,7 +135,7 @@ class OpenCodeSettingsPanel {
         settings.port = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535) ?: 4096
         settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60
         settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
-        settings.sseSocketTimeoutSeconds = sseSocketTimeoutField.text.trim().toIntOrNull()?.coerceIn(30, 3600) ?: 60
+        settings.responseTimeoutSeconds = responseTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600) ?: 300
         settings.inlineCodeColor = inlineCodeColorField.text.trim()
         settings.listNumberColor = listNumberColorField.text.trim()
         settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
@@ -143,7 +146,7 @@ class OpenCodeSettingsPanel {
                 (portField.text.trim().toIntOrNull() ?: 4096) != settings.port ||
                 (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
                 (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
-                (sseSocketTimeoutField.text.trim().toIntOrNull() ?: 60) != settings.sseSocketTimeoutSeconds ||
+                (responseTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.responseTimeoutSeconds ||
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
                 listNumberColorField.text.trim() != settings.listNumberColor ||
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions

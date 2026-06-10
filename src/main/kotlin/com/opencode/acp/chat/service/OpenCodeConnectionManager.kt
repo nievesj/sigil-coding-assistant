@@ -107,10 +107,11 @@ class OpenCodeConnectionManager(private val scope: CoroutineScope) {
             }
             install(SSE)
             install(io.ktor.client.plugins.HttpTimeout) {
-                requestTimeoutMillis = 300_000
-                connectTimeoutMillis = 10_000
-                val sseTimeoutSeconds = OpenCodeSettingsState.getInstance().sseSocketTimeoutSeconds
-                socketTimeoutMillis = sseTimeoutSeconds * 1000L
+                requestTimeoutMillis = 60_000   // 60s — total deadline for REST calls (NOT applied to SSE)
+                connectTimeoutMillis = 10_000   // 10s — TCP connection timeout
+                // socketTimeoutMillis is NOT set — it's a no-op on the Java HTTP engine.
+                // The Java engine has no socket-level idle timeout API. See TDD §4.2.1.
+                // SSE idle detection is handled client-side in OpenCodeService.
             }
         }
         httpClient = client
