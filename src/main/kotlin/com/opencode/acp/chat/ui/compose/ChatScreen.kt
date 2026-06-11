@@ -41,6 +41,7 @@ import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.ui.theme.ChatTheme
+import com.opencode.acp.config.settings.OpenCodeSettingsState
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -141,6 +142,7 @@ fun
     val pendingCreationSessionIds by viewModel.pendingCreationSessionIds.collectAsState()
     val availableCommands by viewModel.availableCommands.collectAsState()
     val commandHistory by viewModel.commandHistory.collectAsState()
+    val queuedMessages by viewModel.queuedMessages.collectAsState()
     var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
 
     // Local (non-server) slash commands — always shown first
@@ -379,6 +381,12 @@ fun
                     )
                 }
 
+                // Queued messages (queue mode — shows when messages are waiting to be sent)
+                QueuedMessageBar(
+                    queuedMessages = queuedMessages,
+                    onCancelMessage = { msgId -> viewModel.removeQueuedMessage(msgId) }
+                )
+
                 // Input area (always visible at bottom, disabled when disconnected or prompt active)
                 val inputEnabled = inputState !is ChatInputState.Disabled
                 InputArea(
@@ -394,7 +402,14 @@ fun
                     attachedFiles.clear()
                     scope.launch {
                         if (isStreaming) {
-                            viewModel.steerMessage(text, fileSnapshot)
+                            val queueMode = OpenCodeSettingsState.getInstance().queueInsteadOfSteer
+                            if (queueMode) {
+                                // Queue mode: hold the message, auto-send when current response completes
+                                viewModel.queueMessage(text, fileSnapshot)
+                            } else {
+                                // Steer mode (legacy): abort current response and send immediately
+                                viewModel.steerMessage(text, fileSnapshot)
+                            }
                         } else {
                             viewModel.sendMessage(text, fileSnapshot)
                         }

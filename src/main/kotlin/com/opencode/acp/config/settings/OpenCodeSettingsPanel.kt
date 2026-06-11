@@ -94,6 +94,18 @@ class OpenCodeSettingsPanel {
         }
     }
 
+    /** Whether task/subtask pills default to expanded. */
+    val expandTaskPillsCheckbox: JBCheckBox = JBCheckBox("Task (Subtask)").apply {
+        toolTipText = "Default: collapsed for task/subtask pills"
+    }
+
+    /** Whether to queue messages instead of steering (aborting) when sending during streaming. */
+    val queueInsteadOfSteerCheckbox: JBCheckBox = JBCheckBox("Queue messages instead of steering").apply {
+        toolTipText = "When enabled, sending a message while the AI is streaming will queue it " +
+            "and auto-send when the current response completes. Tools and subtasks keep running. " +
+            "When disabled, sending aborts the current response (legacy behavior)."
+    }
+
     private fun toolKindLabel(kind: ToolKind): String = when (kind) {
         ToolKind.EXECUTE -> "Shell (Execute)"
         ToolKind.EDIT -> "Edit (Write)"
@@ -144,12 +156,14 @@ class OpenCodeSettingsPanel {
         .addComponentToRightColumn(listNumberColorButton)
         .addSeparator(5)
         .addComponent(loadAllSessionsCheckbox)
+        .addComponent(queueInsteadOfSteerCheckbox)
         .addSeparator(5)
         .addTooltip("Tool pills expanded by default:")
         .apply { 
             ToolKind.entries.forEach { kind ->
                 addComponent(toolKindCheckboxes[kind]!!)
             }
+            addComponent(expandTaskPillsCheckbox)
         }
         .addComponent(statusLabel)
         .panel
@@ -164,10 +178,12 @@ class OpenCodeSettingsPanel {
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
         loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
+        queueInsteadOfSteerCheckbox.isSelected = settings.queueInsteadOfSteer
         // Initialize ToolKind checkboxes from settings
         ToolKind.entries.forEach { kind ->
             toolKindCheckboxes[kind]!!.isSelected = settings.isToolKindDefaultExpanded(kind)
         }
+        expandTaskPillsCheckbox.isSelected = settings.expandTaskPillsByDefault
     }
 
     fun applyTo(settings: OpenCodeSettingsState) {
@@ -180,9 +196,11 @@ class OpenCodeSettingsPanel {
         settings.inlineCodeColor = inlineCodeColorField.text.trim()
         settings.listNumberColor = listNumberColorField.text.trim()
         settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
+        settings.queueInsteadOfSteer = queueInsteadOfSteerCheckbox.isSelected
         // Persist ToolKind expansion defaults
         val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }
         settings.expandedToolKinds = expandedKinds.joinToString(",")
+        settings.expandTaskPillsByDefault = expandTaskPillsCheckbox.isSelected
     }
 
     fun isModified(settings: OpenCodeSettingsState): Boolean {
@@ -197,7 +215,9 @@ class OpenCodeSettingsPanel {
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
                 listNumberColorField.text.trim() != settings.listNumberColor ||
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions ||
-                expandedKinds != currentExpandedKinds
+                queueInsteadOfSteerCheckbox.isSelected != settings.queueInsteadOfSteer ||
+                expandedKinds != currentExpandedKinds ||
+                expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault
     }
 
     private fun showStatus(msg: String, success: Boolean) {

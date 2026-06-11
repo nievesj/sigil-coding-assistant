@@ -74,6 +74,10 @@ class ChatViewModel(
     private val _clearAllState = MutableStateFlow<ClearAllState>(ClearAllState.Idle)
     val clearAllState: StateFlow<ClearAllState> = _clearAllState.asStateFlow()
 
+    /** Messages waiting to be sent when the current response completes (queue mode). */
+    private val _queuedMessages = MutableStateFlow<List<QueuedMessage>>(emptyList())
+    val queuedMessages: StateFlow<List<QueuedMessage>> = _queuedMessages.asStateFlow()
+
     // --- Computed input state (exhaustive state machine) ---
     /**
      * Exhaustive input-area state derived from connection, streaming, and prompt StateFlows.
@@ -128,6 +132,8 @@ class ChatViewModel(
                         scope.launch { fetchTodos() }
                         // Refresh sessions to pick up new child sessions
                         scope.launch { service.loadSessions() }
+                        // Auto-drain queue: send next queued message if any
+                        drainQueue()
                     }
                     is UiSignal.PermissionRequested -> {
                         _permissionPrompt.value = signal.prompt
@@ -314,6 +320,7 @@ class ChatViewModel(
         // Don't read activeSession?.isStreaming because adoptStreamingContext() unconditionally
         // marks the last assistant message as streaming, which is wrong for completed responses.
         _isStreaming.value = false
+        clearQueue()
 
         // Sync prompt state from the new session's persistent StateFlows
         val activeSession = service.sessionManager.getActiveSession()
@@ -330,6 +337,7 @@ class ChatViewModel(
         service.createAndSwitchSession(title)
         // New session — definitely not streaming yet
         _isStreaming.value = false
+        clearQueue()
         val activeSession = service.sessionManager.getActiveSession()
         _permissionPrompt.value = activeSession?.pendingPermission?.value
         _selectionPrompt.value = activeSession?.pendingSelection?.value
@@ -383,6 +391,7 @@ class ChatViewModel(
     suspend fun cancel() {
         service.cancel()
         _isStreaming.value = false
+        clearQueue()
     }
 
     /**
@@ -420,6 +429,68 @@ class ChatViewModel(
         // Now the mutex is free — send through the normal path.
         // sendMessage() handles: recordCommand, _isStreaming = true, error handling.
         sendMessage(text, files)
+    }
+
+    // --- Message Queue (queue mode) ---
+
+    /**
+     * Add a message to the queue instead of sending it immediately.
+     * Used when [isStreaming] is true and queue mode is enabled.
+     * The message will be auto-sent when the current response completes.
+     */
+    fun queueMessage(text: String, files: List<AttachedFile> = emptyList()) {
+        val msg = QueuedMessage(
+            id = generateId(),
+            text = text,
+            files = files
+        )
+        _queuedMessages.value = _queuedMessages.value + msg
+        logger.info { "[ACP] queueMessage: queued '${text.take(50)}' (${_queuedMessages.value.size} in queue)" }
+    }
+
+    /**
+     * Remove a queued message by ID (user cancelled it from the queue bar).
+     */
+    fun removeQueuedMessage(messageId: String) {
+        _queuedMessages.value = _queuedMessages.value.filter { it.id != messageId }
+        logger.info { "[ACP] removeQueuedMessage: $messageId (${_queuedMessages.value.size} remaining)" }
+    }
+
+    /**
+     * Edit a queued message's text (user clicked edit in the queue bar).
+     */
+    fun editQueuedMessage(messageId: String, newText: String) {
+        _queuedMessages.value = _queuedMessages.value.map {
+            if (it.id == messageId) it.copy(text = newText) else it
+        }
+    }
+
+    /**
+     * Clear all queued messages. Called on session switch, cancel, etc.
+     */
+    fun clearQueue() {
+        val count = _queuedMessages.value.size
+        if (count > 0) {
+            _queuedMessages.value = emptyList()
+            logger.info { "[ACP] clearQueue: cleared $count queued messages" }
+        }
+    }
+
+    /**
+     * Drain the queue — send the next queued message if any.
+     * Called automatically when StreamingCompleted fires and queue is non-empty.
+     */
+    private fun drainQueue() {
+        val queue = _queuedMessages.value
+        if (queue.isEmpty()) return
+
+        val next = queue.first()
+        _queuedMessages.value = queue.drop(1)
+        logger.info { "[ACP] drainQueue: sending '${next.text.take(50)}' (${_queuedMessages.value.size} remaining)" }
+
+        scope.launch {
+            sendMessage(next.text, next.files)
+        }
     }
 
     // --- Permission/Selection ---

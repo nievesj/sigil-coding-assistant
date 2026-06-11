@@ -899,14 +899,14 @@ fun InputArea(
                         Spacer(modifier = Modifier.weight(1f))
 
                         // Contextual Send / Stop button:
-                        // - Has text → green Send (even during streaming, triggers steer)
+                        // - Has text → green Send (even during streaming, triggers queue or steer)
                         // - No text + streaming → red Stop
                         // - No text + idle → no button
                         val hasText = textState.text.toString().trim().isNotEmpty()
 
                         if (hasText) {
                             // Green Send button — always available when there's text to send.
-                            // During streaming: triggers steer (abort + send).
+                            // During streaming: queues message (if queue mode) or steers (abort + send).
                             // During idle: triggers normal send.
                             Box(
                                 modifier = Modifier

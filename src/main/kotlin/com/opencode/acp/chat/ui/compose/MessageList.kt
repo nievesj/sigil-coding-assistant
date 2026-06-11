@@ -390,17 +390,9 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
               // (ToolPill already shows file info, line counts, and expandable content)
               val hasToolCallInMessage = message.parts.values.any { it is MessagePart.ToolCall }
               var hasToolCall = hasToolCallInMessage
-              // Sort parts: thinking first (chronological), then text content, then tool pills.
-              // Thinking always renders before text content per MessagePart.Thinking contract.
-              val sortedParts = message.parts.entries.sortedBy { (_, part) ->
-                  when (part) {
-                      is MessagePart.Thinking -> 0
-                      is MessagePart.Text, is MessagePart.Code, is MessagePart.Table -> 1
-                      is MessagePart.ToolCall -> 2
-                      else -> 3
-                  }
-              }
-             for ((key, part) in sortedParts) {
+              // Render parts in LinkedHashMap insertion order — chronological event order.
+              // resegmentTextPartsDirect preserves insertion positions via textSegments.
+             for ((key, part) in message.parts.entries) {
                  when (part) {
                         is MessagePart.Thinking -> {
                            hasThinking = true

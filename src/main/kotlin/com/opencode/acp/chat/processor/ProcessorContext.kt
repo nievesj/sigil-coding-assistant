@@ -8,6 +8,20 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
+ * Describes a slice of [textBuffer] that should be segmented and inserted
+ * after [anchorKey] in the parts map. Multiple segments allow text to be
+ * interleaved with tool calls and thinking phases chronologically.
+ *
+ * @param startOffset Character offset in textBuffer where this segment starts.
+ * @param anchorKey Key of the non-text part after which this segment's parts
+ *                  should be inserted. null = insert at the beginning.
+ */
+data class TextSegment(
+    val startOffset: Int,
+    var anchorKey: String?
+)
+
+/**
  * Mutable accumulation state for a single streaming turn.
  * Owned by [SessionState]. NOT a data class — mutable fields must not be
  * shared via copy(). Use reset() to clear between turns.
@@ -22,6 +36,11 @@ class ProcessorContext {
     val textBuffer: StringBuilder = StringBuilder()
     /** Mirrors textBuffer content as a StateFlow for real-time observation by UI (e.g. task pill). */
     val streamingText = MutableStateFlow("")
+    /** Tracks text segments split at tool call / thinking boundaries.
+     *  Each segment records where in [textBuffer] it starts and which non-text
+     *  part key it should be inserted after. This enables chronological
+     *  interleaving: text before a tool call stays before it, text after stays after. */
+    val textSegments: MutableList<TextSegment> = mutableListOf()
 
     // ── Thinking phase state ──────────────────────────────────────────────
     /** Key for the currently active thinking phase in the parts map (e.g., "thinking_0").
@@ -84,6 +103,7 @@ class ProcessorContext {
     fun resetTurnState() {
         textBuffer.clear()
         streamingText.value = ""
+        textSegments.clear()
         thinkingBuffer.clear()
         activeThinkingKey = null
         activeThinkingCompleted = false

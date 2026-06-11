@@ -358,3 +358,17 @@ enum class SessionIndicator {
     CREATING,
     STREAMING,
 }
+
+/**
+ * A message waiting in the queue to be sent when the current response completes.
+ *
+ * Queue mode replaces the old "steer" behavior (which aborted the running response).
+ * Instead, the user's message is held locally and auto-sent when the server goes idle.
+ * This preserves all running tools and subtasks.
+ */
+data class QueuedMessage(
+    val id: String,
+    val text: String,
+    val files: List<AttachedFile> = emptyList(),
+    val queuedAt: Long = System.currentTimeMillis()
+)

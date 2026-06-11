@@ -26,22 +26,21 @@ class ProcessManager(private val scope: CoroutineScope) {
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
-    private var openCodeClient: OpenCodeClient? = null
-    private var openCodeProcess: Process? = null
+    @Volatile private var openCodeClient: OpenCodeClient? = null
+    @Volatile private var openCodeProcess: Process? = null
     private var processWatcherJob: Job? = null
-    private var shutdownHook: Thread? = null
-    var initialized: Boolean = false
+    @Volatile var initialized: Boolean = false
         private set
 
-    var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
+    @Volatile var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
         private set
-    var port: Int = AcpDefaults.DEFAULT_OPENCODE_PORT
+    @Volatile var port: Int = AcpDefaults.DEFAULT_OPENCODE_PORT
         private set
-    var authToken: String? = null
+    @Volatile var authToken: String? = null
         private set
 
     /** Path to the binary we launched (if we started the process ourselves). */
-    private var launchedBinaryPath: String? = null
+    @Volatile private var launchedBinaryPath: String? = null
 
     /** The current OpenCode client. Null until [initialize] succeeds. */
     val client: OpenCodeClient? get() = openCodeClient
@@ -116,6 +115,8 @@ class ProcessManager(private val scope: CoroutineScope) {
                     initialized = true
                     return true
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 // Connection refused or similar — server not ready yet
             }
@@ -188,12 +189,10 @@ class ProcessManager(private val scope: CoroutineScope) {
                 start()
             }
 
-            if (shutdownHook == null) {
-                shutdownHook = Thread({
-                    killProcess(openCodeProcess)
-                }, "opencode-shutdown").apply { isDaemon = true }
-                Runtime.getRuntime().addShutdownHook(shutdownHook)
-            }
+            // No shutdown hook — IntelliJ's Disposer handles cleanup via
+            // OpenCodeService.dispose(). Shutdown hooks leak ClassLoader references
+            // during dynamic plugin reload (no JVM restart), preventing the old
+            // plugin from being unloaded. The process is killed in shutdown().
 
             // Start process watcher to detect unexpected death and auto-restart
             startProcessWatcher()
@@ -210,25 +209,24 @@ class ProcessManager(private val scope: CoroutineScope) {
     private fun startProcessWatcher() {
         processWatcherJob?.cancel()
         val proc = openCodeProcess ?: return
+        // Use cancellable polling instead of Future.get() which is uncancellable
+        // and leaks IO threads. Polling with delay() is cooperative — respects
+        // coroutine cancellation and doesn't block any thread pool.
         processWatcherJob = scope.launch {
-            // Wait for the process to exit (non-blocking via onExit)
-            try {
-                proc.onExit().get()
-            } catch (_: InterruptedException) {
-                return@launch
-            } catch (_: java.util.concurrent.ExecutionException) {
-                // Process terminated abnormally
+            while (isActive && proc.isAlive) {
+                delay(500)
             }
+            if (!isActive) return@launch
 
-            val exitCode = proc.exitValue()
+            val exitCode = try { proc.exitValue() } catch (_: Exception) { -1 }
             logger.warn { "[ACP] Process watcher: opencode process exited with code $exitCode" }
 
-            // If we're initialized (connected) or trying to connect, the process died unexpectedly.
-            // Restart it and set state to recovering.
-            if (launchedBinaryPath != null) {
+            // Only restart if we weren't cancelled (i.e., process died unexpectedly,
+            // not because shutdown() was called). Check launchedBinaryPath != null
+            // and scope is still active.
+            if (isActive && launchedBinaryPath != null) {
                 logger.info { "[ACP] Process watcher: auto-restarting opencode..." }
                 launchOpenCodeBinary(launchedBinaryPath!!)
-                // Signal to the rest of the system that connection needs recovery
                 if (initialized) {
                     _connectionState.value = ConnectionState.RECONNECTING
                     initialized = false
@@ -276,7 +274,14 @@ class ProcessManager(private val scope: CoroutineScope) {
         try {
             val pid = process.pid()
             if (System.getProperty("os.name").lowercase().contains("windows")) {
-                Runtime.getRuntime().exec(arrayOf("taskkill", "/F", "/T", "/PID", pid.toString())).waitFor()
+                // Use waitFor with timeout — taskkill can hang if the process tree is
+                // large or has stuck child processes. Without a timeout, this blocks
+                // the EDT indefinitely during IDE restart/plugin update.
+                val taskkill = Runtime.getRuntime().exec(arrayOf("taskkill", "/F", "/T", "/PID", pid.toString()))
+                if (!taskkill.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                    logger.warn { "[ACP] taskkill timed out after 5s for PID $pid — falling back to destroyForcibly" }
+                    taskkill.destroyForcibly()
+                }
             } else {
                 process.destroyForcibly()
             }
@@ -296,10 +301,18 @@ class ProcessManager(private val scope: CoroutineScope) {
         logger.info { "[ACP] ProcessManager.disconnect() called" }
         processWatcherJob?.cancel()
         processWatcherJob = null
-        openCodeClient?.close()
+        // Close HTTP client on a daemon thread — httpClient.close() can block
+        // on connection pool drain (especially with lingering SSE connections).
+        // Calling it on EDT would freeze the IDE during plugin update/restart.
+        val client = openCodeClient
         openCodeClient = null
         initialized = false
         _connectionState.value = ConnectionState.DISCONNECTED
+        if (client != null) {
+            Thread({
+                try { client.close() } catch (_: Exception) { }
+            }, "opencode-client-close").apply { isDaemon = true; start() }
+        }
         // Do NOT kill the process — it may still be healthy. initialize() will
         // find the same port occupied by our own process and launch on the same port.
     }
@@ -308,17 +321,22 @@ class ProcessManager(private val scope: CoroutineScope) {
      * Full shutdown: disconnect AND kill the opencode process.
      * Use this only for IDE shutdown (dispose) where we own the process
      * and should clean it up.
+     *
+     * IMPORTANT: killProcess() runs on a daemon thread to avoid blocking EDT.
+     * The process is captured and nulled immediately; actual termination is async.
      */
     fun shutdown() {
         logger.info { "[ACP] ProcessManager.shutdown() called" }
         disconnect()
-        killProcess(openCodeProcess)
+        // Kill process on a daemon thread — taskkill.waitFor() can block for
+        // seconds on Windows if the process tree is large or stuck.
+        val processToKill = openCodeProcess
         openCodeProcess = null
-        // Remove the JVM shutdown hook to prevent stale references during IDE restart
-        shutdownHook?.let {
-            try { Runtime.getRuntime().removeShutdownHook(it) } catch (_: IllegalStateException) { }
+        if (processToKill != null) {
+            Thread({
+                killProcess(processToKill)
+            }, "opencode-kill").apply { isDaemon = true; start() }
         }
-        shutdownHook = null
     }
 
     /** @deprecated Use [disconnect] for retry, or [shutdown] for IDE close. */

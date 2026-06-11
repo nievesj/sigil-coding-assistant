@@ -64,6 +64,14 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Default: EXECUTE,EDIT,READ,THINK
      */
     var expandedToolKinds: String = "EXECUTE,EDIT,READ,THINK"
+    /** Whether task/subtask pills default to expanded in the chat. */
+    var expandTaskPillsByDefault: Boolean = false
+    /**
+     * Whether to queue messages instead of steering (aborting) when sending during streaming.
+     * true = queue mode: messages wait for the current response to complete, then auto-send.
+     * false = steer mode: messages abort the current response and send immediately (legacy behavior).
+     */
+    var queueInsteadOfSteer: Boolean = true
 
     /** Returns true if the given ToolKind should default to expanded. */
     fun isToolKindDefaultExpanded(kind: com.agentclientprotocol.model.ToolKind): Boolean {
@@ -110,6 +118,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         loadAllSessions = state.loadAllSessions
         commandHistory = state.commandHistory
         expandedToolKinds = state.expandedToolKinds.ifBlank { "EXECUTE,EDIT,READ,THINK" }
+        expandTaskPillsByDefault = state.expandTaskPillsByDefault
+        queueInsteadOfSteer = state.queueInsteadOfSteer
     }
 
     companion object {

@@ -533,16 +533,24 @@ class SessionManager(private val scope: CoroutineScope) {
     }
 
     fun close() {
-        // Remove sessions from map under lock, then close outside the lock.
-        // close() is NOT O(1) — it cancels coroutines, closes channels, and
-        // completes deferreds. Holding sessionsLock during close() would block
-        // processEvent() and getActiveSession() (same pattern as evictIfNeeded).
-        val toClose = runBlocking {
-            sessionsLock.withLock {
+        // Non-blocking close — never blocks EDT.
+        // The owning scope should be cancelled BEFORE calling this method,
+        // so coroutines release locks naturally.
+        // Use tryLock() (no timeout) — returns immediately.
+        // If lock is held, skip cleanup; scope cancellation will handle it.
+        val toClose: List<SessionState> = if (sessionsLock.tryLock()) {
+            try {
                 val states = sessions.values.toList()
                 sessions.clear()
                 states
+            } finally {
+                sessionsLock.unlock()
             }
+        } else {
+            // Lock held by a coroutine that will be cancelled by scope.cancel().
+            // Return empty list — the coroutines will clean up when cancelled.
+            logger.info { "[ACP] SessionManager.close: lock held — skipping cleanup (scope cancellation will handle it)" }
+            emptyList()
         }
         toClose.forEach { it.close() }
     }

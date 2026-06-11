@@ -387,27 +387,39 @@ class SessionState(
     }
 
     fun close() {
-        stateLock.withLock {
-            if (closed) return
-            closed = true
-            eventProcessingJob?.cancel()
-            resegmentJob?.cancel()
-            signalForwardJob?.cancel()
-            ctx.pendingStopJob?.cancel()
-            eventChannel.close()
-            _pendingPermission.value = null
-            _pendingSelection.value = null
-            responseDeferred?.completeExceptionally(
-                CancellationException("Session $sessionId evicted from cache")
-            )
-            responseDeferred = null
-        }
+        // Non-blocking close — never blocks EDT.
+        // Set closed flag first to prevent new events from being processed.
+        // Cancel jobs (cooperative — they stop at next suspension point).
+        // Close channel (non-blocking — prevents new events from being enqueued).
+        // Complete responseDeferred unconditionally (prevents sendMutex leak).
+        if (closed) return
+        closed = true
+        eventProcessingJob?.cancel()
+        eventProcessingJob = null
+        resegmentJob?.cancel()
+        resegmentJob = null
+        signalForwardJob?.cancel()
+        signalForwardJob = null
+        ctx.pendingStopJob?.cancel()
+        ctx.pendingStopJob = null
+        eventChannel.close()
+        _pendingPermission.value = null
+        _pendingSelection.value = null
+        responseDeferred?.completeExceptionally(
+            CancellationException("Session $sessionId closed")
+        )
+        responseDeferred = null
     }
 
     // ── Internal: Event Processing ──────────────────────────────────────────
 
     private fun startCoroutines() {
-        eventProcessingJob = scope.launch(Dispatchers.EDT) {
+        // Use Dispatchers.Default (NOT EDT) for event processing.
+        // processEventInternal() does CPU-intensive work (markdown parsing, JSON
+        // manipulation, message map mutations) that blocks the UI thread when on EDT.
+        // StateFlow updates are thread-safe — Compose recomposes on EDT automatically.
+        // Serialization is guaranteed by the Channel<BUFFERED> (events processed one at a time).
+        eventProcessingJob = scope.launch(Dispatchers.Default) {
             for (event in eventChannel) {
                 logger.info { "[ACP] processEvent DEQUEUE: ${event::class.simpleName} sid=${event.sessionId}" }
                 processEventInternal(event)
@@ -547,6 +559,10 @@ class SessionState(
                     ctx.activeThinkingKey = key
                     ctx.thinkingPhaseIndex++
                     emitStreamingStartedIfNeeded(msgId)
+                    // Add text segment boundary if text has already started
+                    if (ctx.firstTextChunkReceived) {
+                        ctx.textSegments.add(TextSegment(ctx.textBuffer.length, key))
+                    }
                 }
                 ctx.thinkingBuffer.append(event.text)
                 updateMessage(msgId) { msg ->
@@ -568,6 +584,10 @@ class SessionState(
                     ctx.activeThinkingKey = key
                     ctx.thinkingPhaseIndex++
                     emitStreamingStartedIfNeeded(msgId)
+                    // Add text segment boundary if text has already started
+                    if (ctx.firstTextChunkReceived) {
+                        ctx.textSegments.add(TextSegment(ctx.textBuffer.length, key))
+                    }
                 }
                 ctx.thinkingBuffer.setLength(0)
                 ctx.thinkingBuffer.append(event.text)
@@ -592,6 +612,10 @@ class SessionState(
                 if (!ctx.firstTextChunkReceived && text.isNotBlank()) {
                     ctx.firstTextChunkReceived = true
                     emitStreamingStartedIfNeeded(msgId)
+                    // Initialize first text segment (anchor set in resegmentTextPartsDirect)
+                    if (ctx.textSegments.isEmpty()) {
+                        ctx.textSegments.add(TextSegment(0, null))
+                    }
                     val userText = ctx.lastUserText
                     if (userText != null && text.startsWith(userText, ignoreCase = true)) {
                         ctx.userEchoStripped = true
@@ -620,6 +644,9 @@ class SessionState(
                     ctx.textBuffer.delete(0, userText.length)
                     ctx.userEchoStripped = true
                 }
+                // TextReplace replaces the entire buffer — reset segments
+                ctx.textSegments.clear()
+                ctx.textSegments.add(TextSegment(0, null))  // anchor set in resegmentTextPartsDirect
                 ctx.streamingText.value = ctx.textBuffer.toString()
                 scheduleResegment(msgId)
             }
@@ -720,6 +747,12 @@ class SessionState(
                     val parts = LinkedHashMap(msg.parts)
                     parts[event.toolCallId] = MessagePart.ToolCall(pill = pill, state = PartState.InProgress)
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
+                }
+
+                // Add text segment boundary: text arriving after this tool call
+                // belongs after it in the parts map (chronological interleaving).
+                if (ctx.firstTextChunkReceived) {
+                    ctx.textSegments.add(TextSegment(ctx.textBuffer.length, event.toolCallId))
                 }
 
                 // For task tools: proactively cache the child session so ToolPill can get its messages
@@ -1066,7 +1099,8 @@ class SessionState(
             return
         }
         resegmentJob?.cancel()
-        resegmentJob = scope.launch(Dispatchers.EDT) {
+        // Use Dispatchers.Default (NOT EDT) — markdown parsing is CPU-intensive.
+        resegmentJob = scope.launch(Dispatchers.Default) {
             try {
                 delay(DEBOUNCE_MS)
                 resegmentTextPartsDirect(msgId)
@@ -1079,86 +1113,137 @@ class SessionState(
             if (ctx.textBuffer.isEmpty()) {
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
-                    parts.keys.removeIf { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") }
+                    parts.keys.removeIf { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }
                     msg.copy(parts = parts)
                 }
                 return@withLock
             }
-            val raw = ctx.textBuffer.toString()
-            val segments = if (ctx.isStreaming) {
-                MarkdownSegmenter.segmentHealed(raw)
-            } else {
-                MarkdownSegmenter.segment(raw)
+
+            // Ensure at least one segment exists
+            if (ctx.textSegments.isEmpty()) {
+                ctx.textSegments.add(TextSegment(0, null))
             }
-            val newParts = mutableListOf<Pair<String, MessagePart>>()
-            segments.forEachIndexed { i, segment ->
-                when (segment.type) {
-                    MarkdownSegment.Type.TEXT -> {
-                        if (segment.content.isNotBlank()) newParts.add("text_$i" to MessagePart.Text(segment.content))
+
+            // Set first segment's anchor if not yet set — the last non-text part
+            // that existed when text first arrived.
+            if (ctx.textSegments[0].anchorKey == null) {
+                updateMessage(msgId) { msg ->
+                    val lastNonTextEntry = msg.parts.entries.lastOrNull { entry ->
+                        !entry.key.startsWith("text_") && !entry.key.startsWith("code_") &&
+                            !entry.key.startsWith("table_") && !entry.key.startsWith("task_")
                     }
-                    MarkdownSegment.Type.CODE -> {
-                        if (segment.content.isNotBlank()) newParts.add("code_$i" to MessagePart.Code(segment.language ?: "", segment.content))
-                    }
-                    MarkdownSegment.Type.TABLE -> {
-                        val parsed = MarkdownSegmenter.parseTable(segment.content.lines())
-                        if (parsed != null) {
-                            newParts.add("table_$i" to MessagePart.Table(
-                                rawMarkdown = segment.content,
-                                headers = parsed.header,
-                                rows = parsed.rows,
-                                alignments = parsed.alignments
-                            ))
-                        } else {
-                            newParts.add("text_$i" to MessagePart.Text(segment.content))
-                        }
-                    }
-                    MarkdownSegment.Type.TASK -> {
-                        val state = segment.taskAttrs?.get("state") ?: "completed"
-                        val status = when (state) {
-                            "completed" -> ToolCallStatus.COMPLETED
-                            "failed" -> ToolCallStatus.FAILED
-                            else -> ToolCallStatus.IN_PROGRESS
-                        }
-                        val agentId = segment.taskAttrs?.get("id") ?: ""
-                        val output = listOf(kotlinx.serialization.json.JsonObject(
-                            mapOf("text" to kotlinx.serialization.json.JsonPrimitive(segment.content))
-                        ))
-                        val pill = ToolCallPill(
-                            toolCallId = "task_${agentId.hashCode().toString(16).takeLast(8)}",
-                            toolName = "task",
-                            title = "task",
-                            kind = com.agentclientprotocol.model.ToolKind.OTHER,
-                            status = status,
-                            output = output,
-                        )
-                        newParts.add("task_$i" to MessagePart.ToolCall(
-                            pill = pill,
-                            state = if (status == ToolCallStatus.COMPLETED) PartState.Completed else PartState.InProgress
-                        ))
-                    }
+                    ctx.textSegments[0].anchorKey = lastNonTextEntry?.key
+                    msg
                 }
             }
+
+            val raw = ctx.textBuffer.toString()
+
+            // Segment each text segment independently and collect parts per segment.
+            // Each segment covers a slice of textBuffer: [startOffset, nextSegment.startOffset).
+            val partsBySegment = mutableListOf<List<Pair<String, MessagePart>>>()
+            for (segIdx in ctx.textSegments.indices) {
+                val start = ctx.textSegments[segIdx].startOffset
+                val end = if (segIdx + 1 < ctx.textSegments.size) ctx.textSegments[segIdx + 1].startOffset else raw.length
+                if (start >= end) {
+                    partsBySegment.add(emptyList())
+                    continue
+                }
+                val segmentText = raw.substring(start, end)
+                val segments = if (ctx.isStreaming) {
+                    MarkdownSegmenter.segmentHealed(segmentText)
+                } else {
+                    MarkdownSegmenter.segment(segmentText)
+                }
+                val segParts = mutableListOf<Pair<String, MessagePart>>()
+                segments.forEachIndexed { i, segment ->
+                    when (segment.type) {
+                        MarkdownSegment.Type.TEXT -> {
+                            if (segment.content.isNotBlank()) segParts.add("text_${segIdx}_$i" to MessagePart.Text(segment.content))
+                        }
+                        MarkdownSegment.Type.CODE -> {
+                            if (segment.content.isNotBlank()) segParts.add("code_${segIdx}_$i" to MessagePart.Code(segment.language ?: "", segment.content))
+                        }
+                        MarkdownSegment.Type.TABLE -> {
+                            val parsed = MarkdownSegmenter.parseTable(segment.content.lines())
+                            if (parsed != null) {
+                                segParts.add("table_${segIdx}_$i" to MessagePart.Table(
+                                    rawMarkdown = segment.content,
+                                    headers = parsed.header,
+                                    rows = parsed.rows,
+                                    alignments = parsed.alignments
+                                ))
+                            } else {
+                                segParts.add("text_${segIdx}_$i" to MessagePart.Text(segment.content))
+                            }
+                        }
+                        MarkdownSegment.Type.TASK -> {
+                            val state = segment.taskAttrs?.get("state") ?: "completed"
+                            val status = when (state) {
+                                "completed" -> ToolCallStatus.COMPLETED
+                                "failed" -> ToolCallStatus.FAILED
+                                else -> ToolCallStatus.IN_PROGRESS
+                            }
+                            val agentId = segment.taskAttrs?.get("id") ?: ""
+                            val output = listOf(kotlinx.serialization.json.JsonObject(
+                                mapOf("text" to kotlinx.serialization.json.JsonPrimitive(segment.content))
+                            ))
+                            val pill = ToolCallPill(
+                                toolCallId = "task_${agentId.hashCode().toString(16).takeLast(8)}",
+                                toolName = "task",
+                                title = "task",
+                                kind = com.agentclientprotocol.model.ToolKind.OTHER,
+                                status = status,
+                                output = output,
+                            )
+                            segParts.add("task_${segIdx}_$i" to MessagePart.ToolCall(
+                                pill = pill,
+                                state = if (status == ToolCallStatus.COMPLETED) PartState.Completed else PartState.InProgress
+                            ))
+                        }
+                    }
+                }
+                partsBySegment.add(segParts)
+            }
+
             updateMessage(msgId) { msg ->
                 val oldParts = LinkedHashMap(msg.parts)
+
+                // Remove all text-derived parts, preserve non-text parts in order
                 val preserved = mutableListOf<Pair<String, MessagePart>>()
-                var lastNonTextIndex = -1
-                oldParts.entries.forEachIndexed { i, entry ->
-                    val isTextDerived = entry.key.startsWith("text_") || entry.key.startsWith("code_") || entry.key.startsWith("table_") || entry.key.startsWith("task_")
+                oldParts.entries.forEach { entry ->
+                    val isTextDerived = entry.key.startsWith("text_") || entry.key.startsWith("code_") ||
+                        entry.key.startsWith("table_") || entry.key.startsWith("task_")
                     if (!isTextDerived) {
                         preserved.add(entry.key to entry.value)
-                        lastNonTextIndex = preserved.size - 1
                     }
                 }
+
+                // Rebuild map: insert each segment's parts after its anchor
                 val newMap = linkedMapOf<String, MessagePart>()
-                preserved.forEachIndexed { i, (key, part) ->
+                var nextSegToInsert = 0
+
+                // Insert segments with null anchor at the beginning
+                while (nextSegToInsert < ctx.textSegments.size && ctx.textSegments[nextSegToInsert].anchorKey == null) {
+                    partsBySegment[nextSegToInsert].forEach { (tKey, tPart) -> newMap[tKey] = tPart }
+                    nextSegToInsert++
+                }
+
+                // Iterate preserved parts, inserting segment parts after their anchors
+                preserved.forEach { (key, part) ->
                     newMap[key] = part
-                    if (i == lastNonTextIndex || (lastNonTextIndex == -1 && i == 0)) {
-                        newParts.forEach { (tKey, tPart) -> newMap[tKey] = tPart }
+                    while (nextSegToInsert < ctx.textSegments.size && ctx.textSegments[nextSegToInsert].anchorKey == key) {
+                        partsBySegment[nextSegToInsert].forEach { (tKey, tPart) -> newMap[tKey] = tPart }
+                        nextSegToInsert++
                     }
                 }
-                if (lastNonTextIndex == -1) {
-                    newParts.forEach { (tKey, tPart) -> newMap[tKey] = tPart }
+
+                // Insert remaining segments (anchors were removed, e.g., compaction)
+                while (nextSegToInsert < ctx.textSegments.size) {
+                    partsBySegment[nextSegToInsert].forEach { (tKey, tPart) -> newMap[tKey] = tPart }
+                    nextSegToInsert++
                 }
+
                 msg.copy(parts = newMap)
             }
         }

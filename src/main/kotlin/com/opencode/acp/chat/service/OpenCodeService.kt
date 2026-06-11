@@ -11,7 +11,6 @@ import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
-import com.opencode.acp.chat.util.EDT
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -369,11 +368,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                     val activeMsgId = session.ctx.activeMessageId
                     if (activeMsgId != null) {
                         // completeStreaming() acquires stateLock (a JVM ReentrantLock) and
-                        // does CPU-intensive markdown segmentation. Must run on EDT to avoid
-                        // blocking the EDT event processing coroutine that also acquires stateLock.
-                        withContext(Dispatchers.EDT) {
-                            session.completeStreaming(activeMsgId)
-                        }
+                        // does markdown segmentation. Runs on the coroutine's dispatcher
+                        // (Default) — NOT on EDT, which would block the UI thread.
+                        // stateLock handles thread-safety with the EDT event processor.
+                        session.completeStreaming(activeMsgId)
                     }
                     session.responseDeferred?.complete(Unit)
                     session.responseDeferred = null
@@ -664,17 +662,16 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     override fun dispose() {
         logger.info { "[ACP] OpenCodeService.dispose() called — project closing" }
-        // Cancel SSE reconnection before shutdown — prevents reconnecting against a closed client.
-        // stopConnection() handles this for user-initiated stops, but dispose() (IDE close)
-        // previously didn't cancel sseReconnectJob, leaving it running against a closed client.
-        sseReconnectJob?.cancel()
+        // Cancel scope FIRST — stops all coroutines, releases locks naturally.
+        // This ensures sessionManager.close() can acquire locks without blocking.
+        scope.cancel()
+        // Cancel SSE jobs explicitly (scope.cancel handles them too, but be explicit)
+        sseJob = null
         sseReconnectJob = null
-        sseHealthCheckJob?.cancel()
         sseHealthCheckJob = null
         permissionManager.dispose()
         sessionManager.close()
         connectionManager.shutdown()
-        scope.cancel()
     }
 
     companion object {

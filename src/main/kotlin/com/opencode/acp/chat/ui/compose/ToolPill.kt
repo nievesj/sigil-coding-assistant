@@ -41,11 +41,11 @@ fun ToolPill(
     modifier: Modifier = Modifier,
     getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
 ) {
-    // Default expanded from settings, with task pills expanded when running
-    val defaultExpanded = OpenCodeSettingsState.getInstance().isToolKindDefaultExpanded(pill.kind)
-    var expanded by remember {
-        mutableStateOf(defaultExpanded || (pill.toolName == "task" && pill.status == ToolCallStatus.IN_PROGRESS))
-    }
+    // Default expanded from settings — task pills use dedicated setting, others use ToolKind setting
+    val settings = OpenCodeSettingsState.getInstance()
+    val defaultExpanded = if (pill.toolName == "task") settings.expandTaskPillsByDefault
+        else settings.isToolKindDefaultExpanded(pill.kind)
+    var expanded by remember { mutableStateOf(defaultExpanded) }
 
     val isTask = pill.toolName == "task"
     val childSessionId = if (isTask) {
