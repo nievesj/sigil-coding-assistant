@@ -99,13 +99,16 @@ fun MessageList(
     project: Project? = null,
     onImagePreview: ((String) -> Unit)? = null,
     getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
+    queuedMessages: List<com.opencode.acp.chat.model.QueuedMessage> = emptyList(),
+    onCancelQueuedMessage: ((String) -> Unit)? = null,
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
     suspend fun scrollToEnd() {
-        if (messages.isEmpty()) return
-        listState.scrollToItem(messages.size - 1, Int.MAX_VALUE)
+        val totalItems = messages.size + queuedMessages.size + if (queuedMessages.isNotEmpty() && messages.isNotEmpty()) 1 else 0
+        if (totalItems == 0) return
+        listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
     }
 
     // Auto-scroll state: starts ON, stays ON until user manually scrolls up.
@@ -157,12 +160,13 @@ fun MessageList(
             }
     }
 
-    // Scroll on new messages. If the last message is from the user (Enter pressed),
+    // Scroll on new messages or queued messages. If the last message is from the user (Enter pressed),
     // force auto-scroll on even if the user had scrolled up.
-    LaunchedEffect(messages.size) {
-        if (messages.isEmpty()) return@LaunchedEffect
+    LaunchedEffect(messages.size, queuedMessages.size) {
+        if (messages.isEmpty() && queuedMessages.isEmpty()) return@LaunchedEffect
         val lastIsUser = messages.lastOrNull()?.role == MessageRole.USER
-        if (lastIsUser) {
+        val hasQueued = queuedMessages.isNotEmpty()
+        if (lastIsUser || hasQueued) {
             autoScrollEnabled = true
         }
         if (autoScrollEnabled) {
@@ -202,6 +206,28 @@ fun MessageList(
                     MessageItem(messages[index], project, onImagePreview, getStreamingText = getStreamingText)
                     if (index < messages.size - 1) {
                         Spacer(modifier = Modifier.height(12.dp))
+                    }
+                }
+
+                // Queued messages — rendered at the bottom of the chat as user-style bubbles
+                if (queuedMessages.isNotEmpty()) {
+                    // Spacer between last real message and queued messages
+                    if (messages.isNotEmpty()) {
+                        item(key = "queue_spacer") {
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+                    }
+                    items(
+                        count = queuedMessages.size,
+                        key = { index -> "queued_${queuedMessages[index].id}" }
+                    ) { index ->
+                        QueuedMessageBubble(
+                            message = queuedMessages[index],
+                            onCancel = { onCancelQueuedMessage?.invoke(queuedMessages[index].id) }
+                        )
+                        if (index < queuedMessages.size - 1) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
                     }
                 }
             }
@@ -1095,5 +1121,114 @@ private fun parseColorOrDefault(hex: String, defaultColor: Color): Color {
         Color(argb.toInt())
     } catch (_: Exception) {
         defaultColor
+    }
+}
+
+/**
+ * A queued message rendered as a user-style bubble at the bottom of the chat.
+ * Shows the message text with a "Queued" badge and a cancel (X) button.
+ * Styled to look like a pending user message — right-aligned, same bubble shape,
+ * but with a dashed border and muted colors to indicate it hasn't been sent yet.
+ */
+@Composable
+private fun QueuedMessageBubble(
+    message: com.opencode.acp.chat.model.QueuedMessage,
+    onCancel: () -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.End
+    ) {
+        // Queued badge + cancel button row
+        Row(
+            modifier = Modifier.padding(bottom = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // "Queued" label
+            Text(
+                text = "Queued",
+                fontSize = 10.sp,
+                color = ChatTheme.colors.text.muted,
+            )
+            // Cancel button
+            Icon(
+                key = AllIconsKeys.Actions.Close,
+                contentDescription = "Remove from queue",
+                modifier = Modifier
+                    .size(14.dp)
+                    .clip(CircleShape)
+                    .clickable { onCancel() }
+                    .padding(1.dp),
+                tint = ChatTheme.colors.text.muted,
+            )
+        }
+
+        // Message bubble — same shape as user messages but with dashed border
+        Box(
+            modifier = Modifier
+                .background(
+                    color = ChatTheme.colors.accent.userBubbleBg.copy(alpha = 0.6f),
+                    shape = ChatTheme.shapes.messageBubbleCornerRadius
+                )
+                .border(
+                    width = 1.dp,
+                    color = ChatTheme.colors.text.muted.copy(alpha = 0.4f),
+                    shape = ChatTheme.shapes.messageBubbleCornerRadius
+                )
+                .padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = 6.dp)
+        ) {
+            Text(
+                text = message.text,
+                color = ChatTheme.colors.text.primary.copy(alpha = 0.7f),
+            )
+        }
+
+        // Attached files indicator
+        if (message.files.isNotEmpty()) {
+            Row(
+                modifier = Modifier.padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                message.files.forEach { file ->
+                    if (file.mime.startsWith("image/")) {
+                        val bitmap = remember(file.dataUri) { decodeDataUriToBitmap(file.dataUri) }
+                        if (bitmap != null) {
+                            Box(
+                                modifier = Modifier
+                                    .size(60.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(ChatTheme.colors.border.default.copy(alpha = 0.5f))
+                            ) {
+                                ComposeImage(
+                                    bitmap = bitmap,
+                                    contentDescription = file.name,
+                                    modifier = Modifier
+                                        .size(60.dp)
+                                        .clip(RoundedCornerShape(6.dp)),
+                                    contentScale = ContentScale.Crop
+                                )
+                            }
+                        }
+                    } else {
+                        // File attachment chip
+                        Box(
+                            modifier = Modifier
+                                .background(
+                                    color = ChatTheme.colors.accent.userBubbleBg.copy(alpha = 0.4f),
+                                    shape = RoundedCornerShape(4.dp)
+                                )
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = file.name,
+                                fontSize = 10.sp,
+                                color = ChatTheme.colors.text.muted,
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }

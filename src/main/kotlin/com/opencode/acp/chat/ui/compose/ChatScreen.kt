@@ -39,6 +39,7 @@ import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
+import com.opencode.acp.chat.model.QueuedMessage
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.config.settings.OpenCodeSettingsState
@@ -357,6 +358,8 @@ fun
                             project = project,
                             onImagePreview = { uri -> previewImageUri = uri },
                             getStreamingText = { sessionId -> viewModel.getStreamingText(sessionId) },
+                            queuedMessages = queuedMessages,
+                            onCancelQueuedMessage = { msgId -> viewModel.removeQueuedMessage(msgId) },
                         )
                     }
                 }
@@ -380,12 +383,6 @@ fun
                         onDismiss = { viewModel.respondSelection(SelectionResponse(emptySet())) }
                     )
                 }
-
-                // Queued messages (queue mode — shows when messages are waiting to be sent)
-                QueuedMessageBar(
-                    queuedMessages = queuedMessages,
-                    onCancelMessage = { msgId -> viewModel.removeQueuedMessage(msgId) }
-                )
 
                 // Input area (always visible at bottom, disabled when disconnected or prompt active)
                 val inputEnabled = inputState !is ChatInputState.Disabled
