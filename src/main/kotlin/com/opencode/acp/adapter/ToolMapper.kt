@@ -1,6 +1,7 @@
 package com.opencode.acp.adapter
 
 import com.agentclientprotocol.model.ToolKind
+import kotlinx.serialization.json.JsonObject
 
 /**
  * Maps OpenCode tool names to ACP [ToolKind] values.
@@ -31,6 +32,31 @@ object ToolMapper {
         "lsp" -> ToolKind.READ
         "skill", "todowrite", "task", "external_directory" -> ToolKind.OTHER
         else -> ToolKind.OTHER
+    }
+
+    /**
+     * Detects tool kind from input JSON when the tool name is generic ("tool" or unknown).
+     * Checks for characteristic input keys:
+     * - `command` → EXECUTE
+     * - `old_string`/`new_string` + `file_path` → EDIT
+     * - `file_path` only → READ
+     * - `pattern`/`query` → SEARCH
+     */
+    fun detectKindFromInput(input: JsonObject?): ToolKind {
+        if (input == null || input.isEmpty()) return ToolKind.OTHER
+        val hasFilePath = input.containsKey("file_path") || input.containsKey("filePath") || input.containsKey("path")
+        return when {
+            input.containsKey("command") -> ToolKind.EXECUTE
+            // Edit: has file_path AND (content or old_string/new_string or old/new)
+            hasFilePath && (
+                input.containsKey("content") ||
+                input.containsKey("old_string") || input.containsKey("new_string") ||
+                input.containsKey("old") || input.containsKey("new")
+            ) -> ToolKind.EDIT
+            input.containsKey("file_path") || input.containsKey("filePath") || input.containsKey("path") -> ToolKind.READ
+            input.containsKey("pattern") || input.containsKey("query") -> ToolKind.SEARCH
+            else -> ToolKind.OTHER
+        }
     }
 
     /**

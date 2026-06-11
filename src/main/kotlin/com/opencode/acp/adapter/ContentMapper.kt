@@ -44,6 +44,9 @@ class ContentMapper {
         is OpenCodePart.Text -> ContentBlock.Text(
             text = part.text
         )
+        is OpenCodePart.File -> ContentBlock.Text(
+            text = "[File: ${part.filename ?: part.url} (${part.mime})]"
+        )
         is OpenCodePart.ToolUse -> {
             val toolCallJson = buildString {
                 append("Tool call: ")
@@ -62,8 +65,21 @@ class ContentMapper {
             val resultText = part.content.joinToString("\n") { childPart ->
                 when (childPart) {
                     is OpenCodePart.Text -> childPart.text
+                    is OpenCodePart.File -> "[File: ${childPart.filename ?: childPart.url}]"
                     is OpenCodePart.ToolUse -> "[ToolUse: ${childPart.name} (${childPart.id})]"
                     is OpenCodePart.ToolResult -> "[ToolResult: ${childPart.toolUseId}]"
+                    is OpenCodePart.StepStart -> "[StepStart]"
+                    is OpenCodePart.StepFinish -> "[StepFinish]"
+                    is OpenCodePart.Thinking -> childPart.text
+                    is OpenCodePart.Reasoning -> childPart.text
+                    is OpenCodePart.Image -> "[Image: ${childPart.filename ?: childPart.url}]"
+                    is OpenCodePart.Patch -> "[Patch: ${childPart.hash}]"
+                    is OpenCodePart.Agent -> "[Agent: ${childPart.name}]"
+                    is OpenCodePart.Retry -> "[Retry: ${childPart.attempt}/${childPart.maxAttempts}]"
+                    is OpenCodePart.Compaction -> "[Compaction]"
+                    is OpenCodePart.Snapshot -> "[Snapshot: ${childPart.id}]"
+                    is OpenCodePart.Subtask -> "[Subtask: ${childPart.description ?: childPart.prompt}]"
+                    is OpenCodePart.Unknown -> "[${childPart.type}]"
                 }
             }
             val fullText = if (part.isError) {
@@ -73,6 +89,18 @@ class ContentMapper {
             }
             ContentBlock.Text(text = fullText)
         }
+        is OpenCodePart.StepStart -> ContentBlock.Text(text = "[StepStart]")
+        is OpenCodePart.StepFinish -> ContentBlock.Text(text = "[StepFinish]")
+        is OpenCodePart.Thinking -> ContentBlock.Text(text = part.text)
+        is OpenCodePart.Reasoning -> ContentBlock.Text(text = part.text)
+        is OpenCodePart.Image -> ContentBlock.Text(text = "[Image: ${part.filename ?: part.url}]")
+        is OpenCodePart.Patch -> ContentBlock.Text(text = "[Patch: ${part.hash} — ${part.files.size} file(s)]")
+        is OpenCodePart.Agent -> ContentBlock.Text(text = "[Agent: ${part.name}]")
+        is OpenCodePart.Retry -> ContentBlock.Text(text = "[Retry: ${part.attempt}/${part.maxAttempts}]")
+        is OpenCodePart.Compaction -> ContentBlock.Text(text = "[Compaction]")
+        is OpenCodePart.Snapshot -> ContentBlock.Text(text = "[Snapshot: ${part.id}]")
+        is OpenCodePart.Subtask -> ContentBlock.Text(text = "[Subtask: ${part.description ?: part.prompt}]")
+        is OpenCodePart.Unknown -> ContentBlock.Text(text = "[${part.type}]")
     }
 
     /**

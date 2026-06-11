@@ -1,47 +1,52 @@
 package com.opencode.acp.chat.viewmodel
 
-import com.agentclientprotocol.model.ToolCallStatus
-import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
-import com.opencode.acp.adapter.OpenCodePart
+import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.chat.model.*
+import com.opencode.acp.chat.processor.UiSignal
+import com.opencode.acp.chat.service.OpenCodeService
+import com.opencode.acp.chat.service.SendMessageResult
+import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
-import com.opencode.acp.chat.util.renderMarkdownToHtml
-import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.chat.OpenCodeNotifications
+import com.opencode.acp.chat.model.ConnectionState
+import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
-import io.ktor.client.HttpClient
-import io.ktor.client.engine.cio.CIO
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.plugins.sse.SSE
-import io.ktor.serialization.kotlinx.json.json
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.*
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.launch
-import kotlinx.serialization.json.Json
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.withLock
 import java.io.Closeable
 
+/**
+ * Thin UI wrapper around [OpenCodeService].
+ *
+ * Owns only UI-specific state (control bar, permission prompts, etc.).
+ * Delegates all connection, session, and message operations to the service.
+ * Created per tool window — safe to dispose/recreate without losing state.
+ */
 class ChatViewModel(
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val service: OpenCodeService,
+    private val project: Project
 ) : Closeable {
 
     private val logger = KotlinLogging.logger {}
 
-    // --- State ---
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
-    val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+    // --- Forwarded from service (read-only for UI) ---
+    val messages: StateFlow<Map<String, ChatMessage>> = service.messages
+    val connectionState: StateFlow<ConnectionState> = service.connectionState
+    val sessionListState: StateFlow<SessionListState> = service.sessionListState
+    val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = service.childSessionMap
+    val todoItems: StateFlow<List<TodoItem>> = service.todoItems
+    val sessionContextState: StateFlow<SessionContextState> = service.sessionContextState
+    val streamingSessionIds: StateFlow<Set<String>> = service.streamingSessionIds
+    val pendingCreationSessionIds: StateFlow<Set<String>> = service.pendingCreationSessionIds
+    val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = service.sessionCachedFlow
 
-    private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
-    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
-
+    // --- UI-specific state ---
     private val _controlState = MutableStateFlow(ControlBarState())
     val controlState: StateFlow<ControlBarState> = _controlState.asStateFlow()
 
@@ -51,139 +56,193 @@ class ChatViewModel(
     private val _permissionPrompt = MutableStateFlow<PermissionPrompt?>(null)
     val permissionPrompt: StateFlow<PermissionPrompt?> = _permissionPrompt.asStateFlow()
 
-    // --- Internal: OpenCode engine connection ---
-    private var openCodeClient: OpenCodeClient? = null
-    private var httpClient: HttpClient? = null
-    private var sessionId: String? = null
-    private var sseJob: Job? = null
-    private var openCodeProcess: Process? = null
-    private var permissionTimeoutJob: Job? = null
+    private val _selectionPrompt = MutableStateFlow<SelectionPrompt?>(null)
+    val selectionPrompt: StateFlow<SelectionPrompt?> = _selectionPrompt.asStateFlow()
 
-    /** Tracks the assistant message currently being streamed. */
-    private var activeAssistantMessageId: String? = null
+    private val _pasteImageSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val pasteImageSignal: SharedFlow<Unit> = _pasteImageSignal.asSharedFlow()
 
-    /** Deferred completed when the current response finishes (Stop event). */
-    private var responseDeferred: CompletableDeferred<Unit>? = null
+    private val _pasteTextSignal = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val pasteTextSignal: SharedFlow<String> = _pasteTextSignal.asSharedFlow()
 
-    // --- Index maps for O(1) message/tool lookups ---
-    private val toolCallIndex = mutableMapOf<String, String>()  // toolCallId → messageId
-    private val messageIndex = mutableMapOf<String, Int>()       // messageId → position
+    private val _isSidebarVisible = MutableStateFlow(OpenCodeSettingsState.getInstance().sidebarVisible)
+    val isSidebarVisible: StateFlow<Boolean> = _isSidebarVisible.asStateFlow()
 
-    // --- Configuration ---
-    private var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
-    private var port: Int = AcpDefaults.DEFAULT_OPENCODE_PORT
-    private var authToken: String? = null
+    private val _commandHistory = MutableStateFlow<List<CommandHistoryEntry>>(emptyList())
+    val commandHistory: StateFlow<List<CommandHistoryEntry>> = _commandHistory.asStateFlow()
 
-    // --- Public API ---
+    private val _availableCommands = MutableStateFlow<List<SlashCommand>>(emptyList())
+    val availableCommands: StateFlow<List<SlashCommand>> = _availableCommands.asStateFlow()
 
-    /** Read settings from persistent state and update local fields. */
-    private fun loadSettings() {
-        // host, port, authToken use AcpDefaults — no user configuration needed
+    private val _clearAllState = MutableStateFlow<ClearAllState>(ClearAllState.Idle)
+    val clearAllState: StateFlow<ClearAllState> = _clearAllState.asStateFlow()
+
+    /** Messages waiting to be sent when the current response completes (queue mode). */
+    private val _queuedMessages = MutableStateFlow<List<QueuedMessage>>(emptyList())
+    val queuedMessages: StateFlow<List<QueuedMessage>> = _queuedMessages.asStateFlow()
+
+    // --- Computed input state (exhaustive state machine) ---
+    /**
+     * Exhaustive input-area state derived from connection, streaming, and prompt StateFlows.
+     * Composables switch on this instead of combining booleans.
+     * Priority: Disabled > AwaitingPermission > AwaitingSelection > Streaming > Idle
+     */
+    val inputState: StateFlow<ChatInputState> = combine(
+        connectionState,
+        permissionPrompt,
+        selectionPrompt,
+        isStreaming,
+    ) { conn, perm, sel, streaming ->
+        when {
+            conn != ConnectionState.CONNECTED -> ChatInputState.Disabled
+            perm != null -> ChatInputState.AwaitingPermission(perm)
+            sel != null -> ChatInputState.AwaitingSelection(sel)
+            streaming -> ChatInputState.Streaming
+            else -> ChatInputState.Idle
+        }
+    }.stateIn(scope, SharingStarted.WhileSubscribed(5_000), ChatInputState.Disabled)
+
+    private val _fileChangeSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val fileChangeSignal: SharedFlow<Unit> = _fileChangeSignal.asSharedFlow()
+
+    // --- Init ---
+
+    init {
+        // Log message count changes for diagnostics
+        scope.launch {
+            service.messages.collect { msgMap ->
+                if (msgMap.isNotEmpty()) {
+                    val userCount = msgMap.values.count { it.role == MessageRole.USER }
+                    val assistantCount = msgMap.values.count { it.role == MessageRole.ASSISTANT }
+                    logger.info { "[ACP] VM messages snapshot: ${msgMap.size} total (${userCount} user, $assistantCount assistant), ids=${msgMap.keys.toList().takeLast(3).joinToString(",")}" }
+                } else {
+                    logger.info { "[ACP] VM messages snapshot: EMPTY map" }
+                }
+            }
+        }
+
+        // Collect active session signals and update UI state
+        scope.launch {
+            service.signals.collect { signal ->
+                when (signal) {
+                    is UiSignal.StreamingStarted -> {
+                        _isStreaming.value = true
+                    }
+                    is UiSignal.StreamingCompleted -> {
+                        _isStreaming.value = false
+                        // IDE notification — only when user is not looking at the IDE
+                        OpenCodeNotifications.notifyResponseComplete(project)
+                        // Refresh context and todos after response completes
+                        scope.launch { computeSessionContext() }
+                        scope.launch { fetchTodos() }
+                        // Refresh sessions to pick up new child sessions
+                        scope.launch { service.loadSessions() }
+                        // Auto-drain queue: send next queued message if any
+                        drainQueue()
+                    }
+                    is UiSignal.PermissionRequested -> {
+                        _permissionPrompt.value = signal.prompt
+                        OpenCodeNotifications.notifyPermissionNeeded(project)
+                        startPermissionTimeout()
+                    }
+                    is UiSignal.SelectionRequested -> {
+                        _selectionPrompt.value = signal.prompt
+                        OpenCodeNotifications.notifyQuestionAsked(project)
+                    }
+                    is UiSignal.Error -> {
+                        // Error already handled by processor (added as Error part)
+                    }
+                    is UiSignal.TodoUpdated -> {
+                        // Todo updates come via SSE, processor handles them
+                    }
+                    is UiSignal.SessionCreated -> {
+                        // Should not arrive on activeSignals (routed to globalSignals)
+                    }
+                    is UiSignal.SessionIdle -> {
+                        // Should not arrive on activeSignals (routed to globalSignals)
+                    }
+                    is UiSignal.SessionError -> {
+                        // Should not arrive on activeSignals (routed to globalSignals)
+                    }
+                    is UiSignal.SessionCompacted -> {
+                        // Should not arrive on activeSignals (routed to globalSignals)
+                    }
+                    is UiSignal.FileChanged -> {
+                        _fileChangeSignal.tryEmit(Unit)
+                    }
+                }
+            }
+        }
+
+        // Collect global signals (SessionCreated, etc.)
+        scope.launch {
+            service.globalSignals.collect { signal ->
+                when (signal) {
+                    is UiSignal.SessionCreated -> {
+                        scope.launch { service.loadSessions() }
+                    }
+                    is UiSignal.SessionIdle -> {
+                        // Server-authoritative idle signal — refresh context immediately
+                        // (eliminates the 300ms debounce dependency from StreamingCompleted)
+                        scope.launch { computeSessionContext() }
+                    }
+                    is UiSignal.SessionError -> {
+                        logger.warn { "[ACP] ViewModel received session error: session=${signal.sessionId}, error=${signal.errorMessage}" }
+                    }
+                    is UiSignal.SessionCompacted -> {
+                        // Server performed auto-compaction — local message cache is stale.
+                        // Refresh messages from server, then recompute context.
+                        scope.launch {
+                            service.refreshActiveSessionMessages()
+                            computeSessionContext()
+                        }
+                    }
+                    else -> { /* other global signals */ }
+                }
+            }
+        }
+
+        // Load persisted command history
+        val settings = OpenCodeSettingsState.getInstance()
+        _commandHistory.value = ArrayList(settings.commandHistory)
     }
 
-    /** Launch the OpenCode binary as a subprocess if auto-launch is enabled. */
-    private fun launchOpenCodeBinary(binaryPath: String) {
-        if (openCodeProcess?.isAlive == true) {
-            logger.info { "OpenCode process already running, skipping launch" }
+    // --- Initialization ---
+
+    suspend fun initialize(projectBasePath: String?) {
+        val success = service.initialize(projectBasePath)
+        if (!success) {
+            logger.warn { "Service initialization failed" }
             return
         }
 
+        // Load agents for control bar
         try {
-            logger.info { "Launching: $binaryPath serve --host $host --port $port" }
-            val pb = ProcessBuilder(binaryPath, "serve", "--host", host, "--port", port.toString())
-                .redirectErrorStream(true)
-            openCodeProcess = pb.start()
-            logger.info { "OpenCode process started (PID: ${openCodeProcess?.pid()})" }
-
-            // Drain stdout/stderr to a background thread (non-blocking)
-            Thread({
-                openCodeProcess?.inputStream?.bufferedReader()?.use { reader ->
-                    reader.lines().forEach { line ->
-                        logger.debug { "[opencode] $line" }
-                    }
+            val allAgents = service.listAgents()
+            logger.info { "[ACP] ChatViewModel.initialize: got ${allAgents.size} agents from server" }
+            val agents = allAgents.filter { it.mode != "subagent" && it.hidden != true }
+            _controlState.value = _controlState.value.copy(
+                agents = agents.map { info ->
+                    OpenCodeAgentInfo(id = info.id, name = info.name, description = info.description)
                 }
-            }, "opencode-stdout-drain").apply {
-                isDaemon = true
-                start()
+            )
+            val defaultAgent = agents.firstOrNull { it.name == "orchestrator" }?.name
+                ?: agents.firstOrNull()?.name
+            if (defaultAgent != null) {
+                val agentInfo = _controlState.value.agents.find { it.id == defaultAgent }
+                if (agentInfo != null) {
+                    _controlState.value = _controlState.value.copy(selectedAgent = agentInfo)
+                }
             }
         } catch (e: Exception) {
-            logger.error(e) { "Failed to launch OpenCode binary at $binaryPath" }
+            logger.warn(e) { "Failed to load agents (non-fatal)" }
         }
-    }
 
-    /** Initialise the connection: launch binary, create client, health check, create session. */
-    suspend fun initialize(projectBasePath: String) {
-        logger.info { "Initializing connection to OpenCode at $host:$port" }
-        _connectionState.value = ConnectionState.CONNECTING
+        // Load providers and models
         try {
-            // Load persisted settings
-            loadSettings()
-
-            // Always launch the OpenCode binary if a path is configured
-            val settings = OpenCodeSettingsState.getInstance().state
-            if (settings.binaryPath.isNotBlank()) {
-                logger.info { "Launching OpenCode binary: ${settings.binaryPath}" }
-                launchOpenCodeBinary(settings.binaryPath)
-                // Give the server time to start
-                delay(2000)
-            } else {
-                logger.warn { "No OpenCode binary path configured — cannot start server" }
-                _connectionState.value = ConnectionState.ERROR
-                return
-            }
-
-            // Create HTTP client and OpenCodeClient
-            logger.info { "Creating HTTP client for $host:$port" }
-            val client = HttpClient(CIO) {
-                install(ContentNegotiation) {
-                    json(Json {
-                        ignoreUnknownKeys = true
-                        isLenient = true
-                        encodeDefaults = true
-                    })
-                }
-                install(SSE)
-            }
-            httpClient = client
-
-            val opencodeClient = OpenCodeClient(
-                baseUrl = "http://$host:$port",
-                httpClient = client,
-                authToken = authToken
-            )
-            openCodeClient = opencodeClient
-
-            // Health check
-            logger.info { "Running health check..." }
-            if (!opencodeClient.healthCheck()) {
-                logger.warn { "Health check failed — server not reachable at $host:$port" }
-                _connectionState.value = ConnectionState.ERROR
-                return
-            }
-            logger.info { "Health check passed" }
-
-            // Create session
-            logger.info { "Creating session" }
-            val session = opencodeClient.createSession()
-            sessionId = session.id
-            logger.info { "Session created: ${session.id}" }
-
-            // Load agents
-            try {
-                val agents = opencodeClient.listAgents()
-                logger.info { "Loaded ${agents.size} agents" }
-                _controlState.value = _controlState.value.copy(
-                    agents = agents.map { info ->
-                        OpenCodeAgentInfo(id = info.id, name = info.name, description = info.description)
-                    }
-                )
-            } catch (e: Exception) {
-                logger.warn(e) { "Failed to load agents (non-fatal)" }
-            }
-
-            // Load providers and models (only from connected/authenticated providers)
-            try {
-                val providerResponse = opencodeClient.listProviders()
+            val providerResponse = service.listProviders()
+            logger.info { "[ACP] ChatViewModel.initialize: providerResponse = ${providerResponse?.all?.size} providers" }
+            if (providerResponse != null) {
                 val connectedIds = providerResponse.connected.toSet()
                 val models = providerResponse.all
                     .filter { it.id in connectedIds }
@@ -193,35 +252,50 @@ class ChatViewModel(
                                 providerID = provider.id,
                                 modelID = modelData.id,
                                 displayName = "${provider.name} / ${modelData.name}",
-                                reasoning = modelData.reasoning
+                                reasoning = modelData.reasoning,
+                                contextWindow = modelData.limit?.context ?: 0,
+                                providerIconId = provider.id,
+                                variants = modelData.variants?.keys?.toList() ?: emptyList()
                             )
+                        }
                     }
-                }
-                logger.info { "Loaded ${models.size} models from ${providerResponse.all.size} providers" }
+                val allModels = providerResponse.all
+                    .flatMap { provider ->
+                        provider.models.map { (_, modelData) ->
+                            ProviderModel(
+                                providerID = provider.id,
+                                modelID = modelData.id,
+                                displayName = "${provider.name} / ${modelData.name}",
+                                reasoning = modelData.reasoning,
+                                contextWindow = modelData.limit?.context ?: 0,
+                                providerIconId = provider.id,
+                                variants = modelData.variants?.keys?.toList() ?: emptyList()
+                            )
+                        }
+                    }
+                val savedKey = OpenCodeSettingsState.getInstance().lastSelectedModelKey
+                val restoredModel = if (savedKey.isNotEmpty()) {
+                    models.find {
+                        OpenCodeSettingsState.modelKey(it.providerID, it.modelID) == savedKey
+                    }
+                } else null
                 _controlState.value = _controlState.value.copy(
                     models = models,
-                    selectedModel = models.firstOrNull()
+                    allModels = allModels,
+                    selectedModel = restoredModel ?: models.firstOrNull()
                 )
-            } catch (e: Exception) {
-                logger.warn(e) { "Failed to load providers (non-fatal)" }
             }
-
-            // Subscribe to global SSE events (long-lived background subscription)
-            val currentSessionId = sessionId ?: return
-            logger.info { "Subscribing to SSE events for session $currentSessionId" }
-            sseJob = scope.launch {
-                opencodeClient.subscribeGlobalEvents()
-                    .filter { event -> event.sessionId == currentSessionId }
-                    .collect { event -> handleSseEvent(event) }
-            }
-
-            _connectionState.value = ConnectionState.CONNECTED
-            logger.info { "Connected to OpenCode successfully" }
         } catch (e: Exception) {
-            logger.error(e) { "Failed to initialize connection" }
-            _connectionState.value = ConnectionState.ERROR
+            logger.warn(e) { "Failed to load providers (non-fatal)" }
         }
+
+        // Fetch initial context and commands
+        computeSessionContext()
+        fetchTodos()
+        fetchAvailableCommands()
     }
+
+    // --- Control bar actions ---
 
     fun selectAgent(agent: OpenCodeAgentInfo) {
         _controlState.value = _controlState.value.copy(selectedAgent = agent)
@@ -229,251 +303,345 @@ class ChatViewModel(
 
     fun selectModel(model: ProviderModel) {
         _controlState.value = _controlState.value.copy(selectedModel = model)
+        val settings = OpenCodeSettingsState.getInstance()
+        settings.lastSelectedModelKey = OpenCodeSettingsState.modelKey(model.providerID, model.modelID)
     }
 
     fun selectThinkingEffort(effort: ThinkingEffort) {
         _controlState.value = _controlState.value.copy(thinkingEffort = effort)
     }
 
-    /** Send a user message to the OpenCode engine. Suspends until the response is complete. */
-    suspend fun sendMessage(text: String) {
-        val client = openCodeClient ?: return
-        val currentSessionId = sessionId ?: return
-
-        // Add user message to chat
-        val userMsg = ChatMessage(
-            id = generateId(),
-            role = MessageRole.USER,
-            content = text,
-            timestamp = System.currentTimeMillis()
-        )
-        addMessage(userMsg)
-
-        // Create streaming assistant message (initially empty)
-        val assistantMsg = ChatMessage(
-            id = generateId(),
-            role = MessageRole.ASSISTANT,
-            content = "",
-            isStreaming = true,
-            timestamp = System.currentTimeMillis()
-        )
-        addMessage(assistantMsg)
-        activeAssistantMessageId = assistantMsg.id
-
-        _isStreaming.value = true
-        val deferred = CompletableDeferred<Unit>()
-        responseDeferred = deferred
-
-        try {
-            // Build message parts
-            val parts = listOf(OpenCodePart.Text(text = text))
-
-            // Send via OpenCodeClient (returns immediately with correlationId)
-            client.sendMessageAsync(currentSessionId, parts)
-
-            // Suspend until the SSE subscription delivers a Stop event
-            deferred.await()
-        } catch (_: CancellationException) {
-            markStreamingComplete(assistantMsg.id)
-        } finally {
-            _isStreaming.value = false
-            responseDeferred = null
-            activeAssistantMessageId = null
-        }
+    fun toggleSidebar() {
+        val newValue = !_isSidebarVisible.value
+        _isSidebarVisible.value = newValue
+        OpenCodeSettingsState.getInstance().sidebarVisible = newValue
     }
 
-    /** Abort the current in-progress response. */
-    suspend fun cancel() {
-        val client = openCodeClient
-        val currentSessionId = sessionId
-        if (client != null && currentSessionId != null) {
-            client.abortSession(currentSessionId)
-        }
-        // Complete any pending deferred so sendMessage() unblocks
-        responseDeferred?.complete(Unit)
-        responseDeferred = null
+    // --- Session actions ---
+
+    suspend fun loadSessions() = service.loadSessions()
+
+    suspend fun switchSession(sessionId: String) {
+        service.switchSession(sessionId)
+        // After switching, assume NOT streaming — SSE events will set it to true if needed.
+        // Don't read activeSession?.isStreaming because adoptStreamingContext() unconditionally
+        // marks the last assistant message as streaming, which is wrong for completed responses.
         _isStreaming.value = false
+        clearQueue()
+
+        // Sync prompt state from the new session's persistent StateFlows
+        val activeSession = service.sessionManager.getActiveSession()
+        _permissionPrompt.value = activeSession?.pendingPermission?.value
+        _selectionPrompt.value = activeSession?.pendingSelection?.value
+
+        // If a permission prompt was restored, restart the timeout
+        if (_permissionPrompt.value != null) {
+            startPermissionTimeout()
+        }
     }
 
-    /** Respond to a permission prompt from the OpenCode engine. */
+    suspend fun createAndSwitchSession(title: String? = null) {
+        service.createAndSwitchSession(title)
+        // New session — definitely not streaming yet
+        _isStreaming.value = false
+        clearQueue()
+        val activeSession = service.sessionManager.getActiveSession()
+        _permissionPrompt.value = activeSession?.pendingPermission?.value
+        _selectionPrompt.value = activeSession?.pendingSelection?.value
+    }
+
+    suspend fun archiveSession(sessionId: String) = service.archiveSession(sessionId)
+
+    fun loadMoreSessions() = service.loadMoreSessions()
+
+    fun clearAllSessions() {
+        scope.launch {
+            val loaded = sessionListState.value as? SessionListState.Loaded ?: return@launch
+            val totalCount = loaded.topLevelSessions.count { it.id != service.sessionId }
+            _clearAllState.value = ClearAllState.InProgress(0, totalCount)
+            val result = service.clearAllSessions()
+            _clearAllState.value = ClearAllState.Done(result)
+            delay(2000)
+            _clearAllState.value = ClearAllState.Idle
+        }
+    }
+
+    // --- Message sending ---
+
+    suspend fun sendMessage(text: String, files: List<AttachedFile> = emptyList()) {
+        recordCommand(text, files)
+
+        // Show streaming indicator immediately — don't wait for the first SSE event
+        _isStreaming.value = true
+
+        val state = _controlState.value
+        val result = service.sendMessage(
+            text = text,
+            files = files,
+            modelID = state.selectedModel?.modelID,
+            providerID = state.selectedModel?.providerID,
+            variant = state.thinkingEffort.variant,
+            agent = state.selectedAgent?.id,
+            model = state.selectedModel?.let {
+                OpenCodeClient.MessageModel(providerID = it.providerID, modelID = it.modelID)
+            }
+        )
+
+        when (result) {
+            is SendMessageResult.Success -> { /* handled by service */ }
+            is SendMessageResult.Error -> {
+                _isStreaming.value = false
+            }
+        }
+    }
+
+    suspend fun cancel() {
+        service.cancel()
+        _isStreaming.value = false
+        clearQueue()
+    }
+
+    /**
+     * Send a message while streaming is in progress (steering/nudging).
+     * Auto-aborts the current response, waits for the send mutex to be released,
+     * then sends as a fresh message via [sendMessage].
+     *
+     * Does NOT call recordCommand() — that's handled by sendMessage().
+     * Does NOT set _isStreaming — that's also handled by sendMessage().
+     */
+    suspend fun steerMessage(text: String, files: List<AttachedFile> = emptyList()) {
+        // Abort in-progress response and get a signal for when the mutex is released
+        val readyDeferred = service.steerCancel()
+
+        // Await the signal — deterministic, not a fixed delay.
+        // Resumes as soon as the old sendMessage() releases the sendMutex.
+        withTimeoutOrNull(MAX_STEER_WAIT_MS) {
+            readyDeferred.await()
+        } ?: run {
+            // Safety net: mutex not released after MAX_STEER_WAIT_MS
+            logger.error { "[ACP] steerMessage: mutex not released after ${MAX_STEER_WAIT_MS}ms — giving up" }
+            _isStreaming.value = false
+            return
+        }
+
+        // Session guard: if the user switched sessions during the steer,
+        // don't send the message to the wrong session.
+        val currentSessionId = service.sessionId
+        if (currentSessionId == null) {
+            logger.warn { "[ACP] steerMessage: session lost during steer" }
+            _isStreaming.value = false
+            return
+        }
+
+        // Now the mutex is free — send through the normal path.
+        // sendMessage() handles: recordCommand, _isStreaming = true, error handling.
+        sendMessage(text, files)
+    }
+
+    // --- Message Queue (queue mode) ---
+
+    /**
+     * Add a message to the queue instead of sending it immediately.
+     * Used when [isStreaming] is true and queue mode is enabled.
+     * The message will be auto-sent when the current response completes.
+     */
+    fun queueMessage(text: String, files: List<AttachedFile> = emptyList()) {
+        val msg = QueuedMessage(
+            id = generateId(),
+            text = text,
+            files = files
+        )
+        _queuedMessages.value = _queuedMessages.value + msg
+        logger.info { "[ACP] queueMessage: queued '${text.take(50)}' (${_queuedMessages.value.size} in queue)" }
+    }
+
+    /**
+     * Remove a queued message by ID (user cancelled it from the queue bar).
+     */
+    fun removeQueuedMessage(messageId: String) {
+        _queuedMessages.value = _queuedMessages.value.filter { it.id != messageId }
+        logger.info { "[ACP] removeQueuedMessage: $messageId (${_queuedMessages.value.size} remaining)" }
+    }
+
+    /**
+     * Edit a queued message's text (user clicked edit in the queue bar).
+     */
+    fun editQueuedMessage(messageId: String, newText: String) {
+        _queuedMessages.value = _queuedMessages.value.map {
+            if (it.id == messageId) it.copy(text = newText) else it
+        }
+    }
+
+    /**
+     * Clear all queued messages. Called on session switch, cancel, etc.
+     */
+    fun clearQueue() {
+        val count = _queuedMessages.value.size
+        if (count > 0) {
+            _queuedMessages.value = emptyList()
+            logger.info { "[ACP] clearQueue: cleared $count queued messages" }
+        }
+    }
+
+    /**
+     * Drain the queue — send the next queued message if any.
+     * Called automatically when StreamingCompleted fires and queue is non-empty.
+     */
+    private fun drainQueue() {
+        val queue = _queuedMessages.value
+        if (queue.isEmpty()) return
+
+        val next = queue.first()
+        _queuedMessages.value = queue.drop(1)
+        logger.info { "[ACP] drainQueue: sending '${next.text.take(50)}' (${_queuedMessages.value.size} remaining)" }
+
+        scope.launch {
+            sendMessage(next.text, next.files)
+        }
+    }
+
+    // --- Permission/Selection ---
+
     suspend fun respondPermission(response: PermissionResponse) {
         val prompt = _permissionPrompt.value ?: return
-        val client = openCodeClient
-        val currentSessionId = sessionId
-        if (client != null && currentSessionId != null) {
-            try {
-                client.respondPermission(
-                    sessionId = currentSessionId,
-                    permissionId = prompt.permissionId,
-                    response = response.optionId
-                )
-                when (response) {
-                    PermissionResponse.REJECT_ONCE ->
-                        updateToolCallStatus(prompt.toolCallId, ToolCallStatus.FAILED)
-                    PermissionResponse.ALLOW_ONCE,
-                    PermissionResponse.ALLOW_ALWAYS ->
-                        updateToolCallStatus(prompt.toolCallId, ToolCallStatus.IN_PROGRESS)
-                }
-                _permissionPrompt.value = null
-            } catch (_: Exception) {
-                // Network error — keep prompt open for retry
-            }
-        }
-        permissionTimeoutJob?.cancel()
-        permissionTimeoutJob = null
-    }
-
-    override fun close() {
-        sseJob?.cancel()
-        sseJob = null
-        permissionTimeoutJob?.cancel()
-        permissionTimeoutJob = null
-        responseDeferred?.complete(Unit)
-        responseDeferred = null
-        activeAssistantMessageId = null
-        openCodeClient?.close()
-        openCodeClient = null
-        httpClient?.close()
-        httpClient = null
-        sessionId = null
-        // Kill the launched OpenCode process if we own it
-        openCodeProcess?.destroyForcibly()
-        openCodeProcess = null
-    }
-
-    // --- SSE Event Handling ---
-
-    private fun handleSseEvent(event: SseEvent) {
-        val msgId = activeAssistantMessageId ?: return
-
-        when (event) {
-            is SseEvent.TextChunk -> {
-                appendTextToMessage(msgId, event.text)
-            }
-
-            is SseEvent.ToolUse -> {
-                val pill = ToolCallPill(
-                    toolCallId = event.toolCallId,
-                    toolName = event.toolName,
-                    title = event.title ?: event.toolName,
-                    kind = ToolKind.OTHER,
-                    status = ToolCallStatus.IN_PROGRESS
-                )
-                toolCallIndex[event.toolCallId] = msgId
-                addToolCallPill(msgId, pill)
-            }
-
-            is SseEvent.ToolResult -> {
-                val targetMessageId = toolCallIndex[event.toolCallId] ?: msgId
-                val resolvedStatus = if (event.isError) ToolCallStatus.FAILED else ToolCallStatus.COMPLETED
-                updateToolCallStatus(targetMessageId, event.toolCallId, resolvedStatus)
-            }
-
-            is SseEvent.Stop -> {
-                markStreamingComplete(msgId)
-                responseDeferred?.complete(Unit)
-            }
-
-            is SseEvent.Permission -> {
-                updateToolCallStatus(event.toolCallId, ToolCallStatus.PENDING)
-                val prompt = PermissionPrompt(
-                    permissionId = event.toolCallId,
-                    toolCallId = event.toolCallId,
-                    toolName = event.action,
-                    description = event.description
-                )
-                _permissionPrompt.value = prompt
-                startPermissionTimeout()
-            }
-
-            is SseEvent.Error -> {
-                appendTextToMessage(msgId, "\n\n**Error:** ${event.message}")
-                markStreamingComplete(msgId)
-                responseDeferred?.complete(Unit)
-            }
-
-            is SseEvent.Plan -> {
-                // Plan events are informational; could be surfaced in UI later
-            }
-
-            is SseEvent.SessionCreated -> {
-                // Already handled during initialization
-            }
-
-            is SseEvent.MessageComplete -> {
-                // Message fully persisted on the server side
-            }
-        }
-    }
-
-    // --- State Mutations ---
-
-    private fun addMessage(message: ChatMessage) {
-        _messages.value = _messages.value + message
-        messageIndex[message.id] = _messages.value.size - 1
-        // FIFO eviction
-        if (_messages.value.size > ChatConstants.MAX_MESSAGE_HISTORY) {
-            val evictCount = _messages.value.size - ChatConstants.MAX_MESSAGE_HISTORY
-            val evicted = _messages.value.take(evictCount)
-            val remaining = _messages.value.drop(evictCount)
-            evicted.forEach { messageIndex.remove(it.id) }
-            _messages.value = remaining
-            messageIndex.clear()
-            _messages.value.forEachIndexed { i, msg -> messageIndex[msg.id] = i }
-        }
-    }
-
-    private fun appendTextToMessage(messageId: String, text: String) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        messages[index] = msg.copy(content = msg.content + text)
-        _messages.value = messages
-    }
-
-    private fun markStreamingComplete(messageId: String) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        messages[index] = msg.copy(
-            isStreaming = false,
-            renderedHtml = renderMarkdownToHtml(msg.content)
-        )
-        _messages.value = messages
-    }
-
-    private fun addToolCallPill(messageId: String, pill: ToolCallPill) {
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        messages[index] = msg.copy(toolCalls = msg.toolCalls + pill)
-        _messages.value = messages
-    }
-
-    private fun updateToolCallStatus(messageId: String, toolCallId: String, status: ToolCallStatus?) {
-        if (status == null) return
-        val messages = _messages.value.toMutableList()
-        val index = messageIndex[messageId] ?: return
-        val msg = messages[index]
-        val updatedPills = msg.toolCalls.map { pill ->
-            if (pill.toolCallId == toolCallId) pill.copy(status = status) else pill
-        }
-        messages[index] = msg.copy(toolCalls = updatedPills)
-        _messages.value = messages
-    }
-
-    private fun updateToolCallStatus(toolCallId: String, status: ToolCallStatus) {
-        val messageId = toolCallIndex[toolCallId] ?: return
-        updateToolCallStatus(messageId, toolCallId, status)
+        service.respondPermission(prompt.permissionId, prompt.toolCallId, prompt.sessionId, response)
+        _permissionPrompt.value = null
+        service.permissionManager.cancelPermissionTimeout()
     }
 
     private fun startPermissionTimeout() {
-        permissionTimeoutJob?.cancel()
-        val timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds
-        if (timeoutSeconds <= 0) return
-        permissionTimeoutJob = scope.launch {
-            delay(timeoutSeconds * 1000L)
+        service.permissionManager.startPermissionTimeout(
+            timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds
+        ) {
             _permissionPrompt.value = null
+        }
+    }
+
+    fun respondSelection(response: SelectionResponse) {
+        val prompt = _selectionPrompt.value ?: return
+        scope.launch {
+            try {
+                val selectedLabels = response.selectedIndices.mapNotNull { idx ->
+                    prompt.options.getOrNull(idx)?.label
+                }
+                val answers = mutableListOf<List<String>>()
+                if (selectedLabels.isNotEmpty()) {
+                    answers.add(selectedLabels)
+                }
+                response.customInput?.let { answers.add(listOf(it)) }
+                if (answers.isEmpty()) {
+                    service.rejectQuestion(prompt.promptId, prompt.sessionId)
+                } else {
+                    service.respondQuestion(prompt.promptId, answers, prompt.sessionId)
+                }
+                _selectionPrompt.value = null
+            } catch (e: Exception) {
+                logger.warn(e) { "Failed to respond to question ${prompt.promptId}" }
+            }
+        }
+    }
+
+    // --- Paste signals ---
+
+    fun requestImagePaste() {
+        _pasteImageSignal.tryEmit(Unit)
+    }
+
+    fun requestTextPaste(text: String) {
+        _pasteTextSignal.tryEmit(text)
+    }
+
+    // --- Context ---
+
+    suspend fun computeSessionContext() {
+        service.computeSessionContext(_controlState.value)
+    }
+
+    fun retryContextFetch() {
+        scope.launch { computeSessionContext() }
+    }
+
+    // --- Todos ---
+
+    private suspend fun fetchTodos() = service.fetchTodos()
+
+    // --- Commands ---
+
+    fun fetchAvailableCommands() {
+        scope.launch {
+            _availableCommands.value = service.fetchAvailableCommands()
+        }
+    }
+
+    fun executeServerCommand(commandName: String, args: String = "") {
+        scope.launch {
+            service.executeServerCommand(commandName, args)
+        }
+    }
+
+    /** Get messages StateFlow for a child session (used by ToolPill for task pills). */
+    fun getSessionMessages(sessionId: String) = service.getSessionMessages(sessionId)
+
+    fun getStreamingText(sessionId: String) = service.getStreamingText(sessionId)
+
+    // --- Command history ---
+
+    private fun recordCommand(text: String, files: List<AttachedFile>) {
+        if (text.isBlank() && files.isEmpty()) return
+        val entry = CommandHistoryEntry(text = text, files = files)
+        val maxSize = OpenCodeSettingsState.getInstance().commandHistorySize.coerceIn(1, 100)
+        val current = _commandHistory.value.toMutableList()
+        current.removeAll { existing ->
+            existing.text == text &&
+                existing.attachedFilePaths.size == files.size &&
+                existing.attachedFilePaths.zip(files.map { it.path }).all { (a, b) -> a == b } &&
+                existing.attachedFileDataUris.size == files.size &&
+                existing.attachedFileDataUris.zip(files.map { it.dataUri }).all { (a, b) -> a == b }
+        }
+        current.add(0, entry)
+        val trimmed = if (current.size > maxSize) current.take(maxSize) else current
+        _commandHistory.value = trimmed
+        val settings = OpenCodeSettingsState.getInstance()
+        settings.commandHistory = java.util.ArrayList(trimmed)
+    }
+
+    fun clearCommandHistory() {
+        _commandHistory.value = emptyList()
+        OpenCodeSettingsState.getInstance().commandHistory = java.util.ArrayList()
+    }
+
+    // --- Retry ---
+
+    suspend fun retryConnection(projectBasePath: String?) {
+        service.initialize(projectBasePath)
+    }
+
+    suspend fun connect(projectBasePath: String?) {
+        if (connectionState.value == ConnectionState.CONNECTED || 
+            connectionState.value == ConnectionState.CONNECTING) {
+            return
+        }
+        service.initialize(projectBasePath)
+    }
+
+    fun stopConnection() {
+        service.stopConnection()
+    }
+
+    // --- Cleanup ---
+
+    override fun close() {
+        service.permissionManager.cancelPermissionTimeout()
+    }
+
+    // --- Helpers ---
+
+    companion object {
+        private const val MAX_STEER_WAIT_MS = 10_000L
+
+        /** Load persisted command history from settings. */
+        private fun loadCommandHistory(): List<CommandHistoryEntry> {
+            return ArrayList(OpenCodeSettingsState.getInstance().commandHistory)
         }
     }
 }

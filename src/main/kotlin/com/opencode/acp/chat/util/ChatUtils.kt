@@ -3,10 +3,6 @@ package com.opencode.acp.chat.util
 import com.intellij.icons.AllIcons
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
-import com.vladsch.flexmark.ext.gfm.strikethrough.StrikethroughExtension
-import com.vladsch.flexmark.ext.tables.TablesExtension
-import com.vladsch.flexmark.html.HtmlRenderer
-import com.vladsch.flexmark.parser.Parser
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,29 +24,6 @@ fun edtScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.ED
 
 /** Generate a stable UUID for message/tool IDs. */
 fun generateId(): String = UUID.randomUUID().toString()
-
-/** Renders markdown to sanitized HTML.
- *  Strips inline styles and classes that Swing's limited CSS parser cannot handle. */
-fun renderMarkdownToHtml(markdown: String): String {
-    val parser = Parser.builder()
-        .extensions(listOf(StrikethroughExtension.create(), TablesExtension.create()))
-        .build()
-    val renderer = HtmlRenderer.builder()
-        .build()
-    val document = parser.parse(markdown)
-    return renderer.render(document)
-        // Strip inline styles Swing's limited CSS parser cannot handle
-        .replace(Regex(""" style\s*=\s*"[^"]*""""), "")
-        // Strip class attributes Swing doesn't use
-        .replace(Regex(""" class\s*=\s*"[^"]*""""), "")
-}
-
-/** Escape HTML for user message display. */
-fun escapeHtml(text: String): String = text
-    .replace("&", "&amp;")
-    .replace("<", "&lt;")
-    .replace(">", "&gt;")
-    .replace("\"", "&quot;")
 
 /** Tool call status display mapping. Uses IntelliJ platform icons. */
 object ToolStatusDisplay {

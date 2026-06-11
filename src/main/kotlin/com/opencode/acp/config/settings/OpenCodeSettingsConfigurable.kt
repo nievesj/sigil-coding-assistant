@@ -11,23 +11,23 @@ class OpenCodeSettingsConfigurable : Configurable {
 
     override fun createComponent(): JComponent {
         val settingsPanel = OpenCodeSettingsPanel()
-        settingsPanel.setState(OpenCodeSettingsState.getInstance().state)
+        settingsPanel.setState(OpenCodeSettingsState.getInstance())
         panel = settingsPanel
         return settingsPanel.panel
     }
 
     override fun isModified(): Boolean {
-        val currentState = OpenCodeSettingsState.getInstance().state
-        return panel?.isModified(currentState) ?: false
+        val settings = OpenCodeSettingsState.getInstance()
+        return panel?.isModified(settings) ?: false
     }
 
     override fun apply() {
-        val newState = panel?.getState() ?: return
-        OpenCodeSettingsState.getInstance().loadState(newState)
+        val settings = OpenCodeSettingsState.getInstance()
+        panel?.applyTo(settings)
     }
 
     override fun reset() {
-        val currentState = OpenCodeSettingsState.getInstance().state
-        panel?.setState(currentState)
+        val settings = OpenCodeSettingsState.getInstance()
+        panel?.setState(settings)
     }
 }

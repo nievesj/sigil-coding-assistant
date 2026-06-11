@@ -1,3 +1,8 @@
+@file:OptIn(
+    com.agentclientprotocol.annotations.UnstableApi::class,
+    kotlinx.coroutines.ExperimentalCoroutinesApi::class
+)
+
 package com.opencode.acp
 
 import com.agentclientprotocol.agent.AgentSession
@@ -99,6 +104,14 @@ class OpenCodeAgentSession(
                         )
                     ))
 
+                    is SseEvent.TextReplace -> emit(Event.SessionUpdateEvent(
+                        update = SessionUpdate.AgentMessageChunk(
+                            content = ContentBlock.Text(text = sseEvent.text)
+                        )
+                    ))
+
+                    is SseEvent.MessageFinalized -> { /* informational — token/cost data */ }
+
                     is SseEvent.ToolUse -> emit(Event.SessionUpdateEvent(
                         // Initial tool call: use SessionUpdate.ToolCall for the first appearance
                         update = SessionUpdate.ToolCall(
@@ -170,8 +183,98 @@ class OpenCodeAgentSession(
                         logger.debug { "Session created: ${sseEvent.sessionId}" }
                     }
 
+                    is SseEvent.SessionIdle -> {
+                        logger.debug { "Session idle: ${sseEvent.sessionId}" }
+                    }
+
+                    is SseEvent.SessionError -> {
+                        logger.warn { "Session error: ${sseEvent.sessionId}, error=${sseEvent.errorMessage}" }
+                    }
+
+                    is SseEvent.SessionCompacted -> {
+                        logger.info { "Session compacted: ${sseEvent.sessionId}" }
+                    }
+
+                    is SseEvent.MessageRemoved -> {
+                        logger.debug { "Message removed: ${sseEvent.messageId}" }
+                    }
+
                     is SseEvent.MessageComplete -> {
                         logger.debug { "Message completed: ${sseEvent.messageId}" }
+                    }
+
+                    is SseEvent.ThinkingChunk -> {
+                        // Thinking content is handled by ChatViewModel for the chat UI.
+                        // In the ACP SDK path, this is informational only.
+                        logger.debug { "Thinking chunk: ${sseEvent.text.take(100)}" }
+                    }
+
+                    is SseEvent.ThinkingReplace -> {
+                        logger.debug { "Thinking replace: ${sseEvent.text.take(100)}" }
+                    }
+
+                    is SseEvent.TodoUpdated -> {
+                        // Todo updates are handled by ChatViewModel for the chat UI.
+                        logger.debug { "Todo updated: ${sseEvent.todos.size} items" }
+                    }
+
+                    is SseEvent.UserMessage -> {
+                        // User message from server - handled by ChatViewModel for the chat UI.
+                        logger.debug { "User message received: ${sseEvent.text.take(100)}" }
+                    }
+
+                    is SseEvent.QuestionAsked -> {
+                        // Question prompts are handled by ChatViewModel for the chat UI.
+                        logger.debug { "Question asked: ${sseEvent.requestId}" }
+                    }
+
+                    is SseEvent.Patch -> {
+                        // TODO: Implement when ACP SDK needs patch handling — emit appropriate event
+                        logger.debug { "Patch: ${sseEvent.hash} — ${sseEvent.files.size} file(s)" }
+                    }
+
+                    is SseEvent.Agent -> {
+                        // TODO: Implement when ACP SDK needs agent identification — emit appropriate event
+                        logger.debug { "Agent: ${sseEvent.agentName}" }
+                    }
+
+                    is SseEvent.Retry -> {
+                        // TODO: Implement when ACP SDK needs retry status — emit appropriate event
+                        logger.debug { "Retry: ${sseEvent.attempt}/${sseEvent.maxAttempts}" }
+                    }
+
+                    is SseEvent.Compaction -> {
+                        // TODO: Implement when ACP SDK needs compaction notification — emit appropriate event
+                        logger.debug { "Compaction: ${sseEvent.summary}" }
+                    }
+
+                    is SseEvent.Snapshot -> {
+                        // TODO: Implement when ACP SDK needs snapshot markers — emit appropriate event
+                        logger.debug { "Snapshot: ${sseEvent.id}" }
+                    }
+
+                    is SseEvent.StepFinish -> {
+                        // TODO: Implement when ACP SDK needs step finish with token data — emit appropriate event
+                        logger.debug { "Step finish: ${sseEvent.snapshot}" }
+                    }
+
+                    is SseEvent.Subtask -> {
+                        // TODO: Implement when ACP SDK needs subtask creation — emit appropriate event
+                        logger.debug { "Subtask: ${sseEvent.description ?: sseEvent.prompt}" }
+                    }
+
+                    is SseEvent.AssistantFile -> {
+                        // TODO: Implement when ACP SDK needs assistant file handling — emit appropriate event
+                        logger.debug { "Assistant file: ${sseEvent.filename ?: sseEvent.url}" }
+                    }
+
+                    is SseEvent.AssistantImage -> {
+                        // TODO: Implement when ACP SDK needs assistant image handling — emit appropriate event
+                        logger.debug { "Assistant image: ${sseEvent.filename ?: sseEvent.url}" }
+                    }
+
+                    is SseEvent.Ignored -> {
+                        logger.debug { "Ignored: ${sseEvent.eventType} — ${sseEvent.reason}" }
                     }
                 }
             }

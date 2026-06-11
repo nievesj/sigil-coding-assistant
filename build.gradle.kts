@@ -2,6 +2,7 @@ plugins {
     id("org.jetbrains.intellij.platform") version("2.16.0")
     kotlin("jvm") version "2.3.0"
     kotlin("plugin.serialization") version "2.3.0"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.3.0"
 }
 
 group = providers.gradleProperty("pluginGroup").get()
@@ -20,7 +21,7 @@ dependencies {
 
     // Ktor HTTP client — exclude coroutines (IntelliJ Platform bundles its own patched fork)
     implementation(libs.ktor.client.core)
-    implementation(libs.ktor.client.cio)
+    implementation(libs.ktor.client.java)
     implementation(libs.ktor.client.content.negotiation)
     implementation(libs.ktor.serialization.json)
 
@@ -33,20 +34,8 @@ dependencies {
     // compileOnly for coroutines — compile against platform's version, don't bundle
     compileOnly(libs.kotlinx.coroutines.core)
 
-    // Flexmark (Markdown rendering)
-    implementation(libs.flexmark.core) {
-        exclude(group = "org.jetbrains", module = "annotations")
-        exclude(group = "junit", module = "junit")
-    }
-    implementation(libs.flexmark.ext.strikethrough) {
-        exclude(group = "org.jetbrains", module = "annotations")
-    }
-    implementation(libs.flexmark.ext.tables) {
-        exclude(group = "org.jetbrains", module = "annotations")
-    }
-
-    // Logging — IntelliJ Platform bundles SLF4J; keep logback for development but exclude transitive SLF4J
-    implementation(libs.slf4j.api)
+    // Logging — IntelliJ Platform bundles SLF4J; compile-only, exclude from plugin zip
+    compileOnly(libs.slf4j.api)
     implementation(libs.logback.classic) {
         exclude(group = "org.slf4j", module = "slf4j-api")
     }
@@ -65,11 +54,22 @@ dependencies {
     intellijPlatform {
         intellijIdea(providers.gradleProperty("platformVersion"))
         bundledPlugin("com.intellij.java")
+
+        // Jewel/Compose bundled modules
+        composeUI()
+
+        // Jewel Markdown (not included in composeUI)
+        bundledModule("intellij.platform.jewel.markdown.core")
+        bundledModule("intellij.platform.jewel.markdown.ideLafBridgeStyling")
+        bundledModule("intellij.platform.jewel.markdown.extensions.gfmTables")
+        bundledModule("intellij.platform.jewel.markdown.extensions.gfmAlerts")
+        bundledModule("intellij.platform.jewel.markdown.extensions.gfmStrikethrough")
+        bundledModule("intellij.platform.jewel.markdown.extensions.autolink")
     }
 }
 
 // Global exclusions: catch anything missed by per-dependency excludes
-// Must NOT use configureEach — coroutines must remain on compileClasspath for the compiler
+// Must NOT use configureEach — these must remain on compileClasspath for the compiler
 configurations.runtimeClasspath {
     // Coroutines — IDE bundles its own patched fork; must not be in plugin JAR
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core")
@@ -79,6 +79,29 @@ configurations.runtimeClasspath {
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-reactor")
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-slf4j")
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-debug")
+
+    // Kotlin stdlib — IDE bundles its own; duplicates cause classloader conflicts
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk7")
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
+
+    // SLF4J — IDE bundles its own
+    exclude(group = "org.slf4j", module = "slf4j-api")
+
+    // JetBrains Annotations — IDE bundles its own
+    exclude(group = "org.jetbrains", module = "annotations")
+
+    // Netty — no longer needed (Java engine uses java.net.http.HttpClient)
+    exclude(group = "io.netty", module = "netty-common")
+    exclude(group = "io.netty", module = "netty-buffer")
+    exclude(group = "io.netty", module = "netty-transport")
+    exclude(group = "io.netty", module = "netty-handler")
+    exclude(group = "io.netty", module = "netty-codec")
+    exclude(group = "io.netty", module = "netty-codec-http")
+    exclude(group = "io.netty", module = "netty-codec-http2")
+    exclude(group = "io.netty", module = "netty-resolver")
+    exclude(group = "io.netty", module = "netty-resolver-dns")
+    exclude(group = "io.netty", module = "netty-codec-dns")
 }
 
 intellijPlatform {

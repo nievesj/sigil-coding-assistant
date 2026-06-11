@@ -1,3 +1,5 @@
+@file:OptIn(com.agentclientprotocol.annotations.UnstableApi::class)
+
 package com.opencode.acp
 
 import com.agentclientprotocol.agent.AgentInfo

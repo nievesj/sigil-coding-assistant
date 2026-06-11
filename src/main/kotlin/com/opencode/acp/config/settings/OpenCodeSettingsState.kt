@@ -2,32 +2,151 @@ package com.opencode.acp.config.settings
 
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.PersistentStateComponent
+import com.intellij.openapi.components.RoamingType
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
+import com.opencode.acp.chat.model.CommandHistoryEntry
+import com.opencode.acp.chat.model.ProviderModel
 
 /**
  * Persistent settings for the OpenCode plugin.
+ *
+ * Uses a plain class (not data class) with var fields for reliable XStream
+ * serialization. Kotlin data classes can fail to deserialize because the
+ * compiler-generated constructor uses default parameters that XStream can't
+ * invoke via reflection.
  */
 @Service(Service.Level.APP)
-@State(name = "OpenCodeSettings", storages = [Storage("opencode-settings.xml")])
-class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState.State> {
+@State(name = "OpenCodeSettings", storages = [Storage("opencode-settings.xml", roamingType = RoamingType.DISABLED)])
+class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
-    data class State(
-        var binaryPath: String = "",
-        var permissionTimeoutSeconds: Int = 60,
-    )
+    var binaryPath: String = ""
+    var permissionTimeoutSeconds: Int = 60
+    /** Favorite model keys in format "providerID/modelID" (slash-separated for XML safety). */
+    var favoriteModels: java.util.ArrayList<String> = java.util.ArrayList()
+    /** Inline code text color as "#RRGGBB" */
+    var inlineCodeColor: String = "#6BBE50"
+    /** List number color as "#RRGGBB" */
+    var listNumberColor: String = "#6BBE50"
+    /** Last selected model key in format "providerID/modelID". */
+    var lastSelectedModelKey: String = ""
+    /** Whether the session sidebar is visible. Persisted across tool window reopens. */
+    var sidebarVisible: Boolean = true
+    /** Maximum number of entries kept in the input command history. */
+    var commandHistorySize: Int = 15
+    /** Maximum time (seconds) to wait for a response from the LLM before timing out.
+     *  Controls the `withTimeout` on `deferred.await()` in `sendMessageInternal()`.
+     *  Default 300 (5 minutes). The previous `sseSocketTimeoutSeconds` was misleading —
+     *  `socketTimeoutMillis` is a no-op on the Java HTTP engine (see TDD §4.2, §7.1). */
+    var responseTimeoutSeconds: Int = 300
+    /** Buffer time (seconds) added to responseTimeoutSeconds for LONG-profile HTTP calls
+     *  (e.g., executeCommand, compactSession). Accounts for server-side overhead beyond
+     *  LLM generation time: request queuing, tool execution, network latency, and
+     *  bookkeeping. Default 30, minimum 10. */
+    var longTimeoutBufferSeconds: Int = 30
+    /** @deprecated Migrated to [responseTimeoutSeconds]. Kept for XStream backward compatibility.
+     *  Can be removed once all users have migrated (i.e., after 2+ release cycles).
+     *  The migration logic in loadState() handles the transition from old to new setting. */
+    @Deprecated("Migrated to responseTimeoutSeconds", ReplaceWith("responseTimeoutSeconds"))
+    var sseSocketTimeoutSeconds: Int = 60
+    /** Whether to automatically connect when the plugin opens. */
+    var autoConnect: Boolean = true
+    /** Port for the OpenCode server (default 4096). */
+    var port: Int = 4096
+    /** Whether to load all sessions at once (bypasses pagination). Shows performance warning. */
+    var loadAllSessions: Boolean = false
+    /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save. */
+    var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
+    /**
+     * Tool kinds that default to expanded in the chat.
+     * Stored as a comma-separated string of ToolKind names for XStream compatibility.
+     * Default: EXECUTE,EDIT,READ,THINK
+     */
+    var expandedToolKinds: String = "EXECUTE,EDIT,READ,THINK"
+    /** Whether task/subtask pills default to expanded in the chat. */
+    var expandTaskPillsByDefault: Boolean = false
+    /**
+     * Whether to queue messages instead of steering (aborting) when sending during streaming.
+     * true = queue mode: messages wait for the current response to complete, then auto-send.
+     * false = steer mode: messages abort the current response and send immediately (legacy behavior).
+     */
+    var queueInsteadOfSteer: Boolean = true
 
-    private var myState: State = State()
+    /** Returns true if the given ToolKind should default to expanded. */
+    fun isToolKindDefaultExpanded(kind: com.agentclientprotocol.model.ToolKind): Boolean {
+        val expanded = expandedToolKinds.split(",").map { it.trim() }.toSet()
+        return kind.name in expanded
+    }
 
-    override fun getState(): State = myState
+    /** Toggles a ToolKind in the expanded set. */
+    fun toggleToolKindDefaultExpanded(kind: com.agentclientprotocol.model.ToolKind) {
+        val expanded = expandedToolKinds.split(",").map { it.trim() }.toMutableSet()
+        if (kind.name in expanded) expanded.remove(kind.name) else expanded.add(kind.name)
+        expandedToolKinds = expanded.sorted().joinToString(",")
+    }
 
-    override fun loadState(state: State) {
-        myState = state
+    override fun getState(): OpenCodeSettingsState {
+        return this
+    }
+
+    override fun loadState(state: OpenCodeSettingsState) {
+        binaryPath = state.binaryPath
+        permissionTimeoutSeconds = state.permissionTimeoutSeconds
+        favoriteModels = state.favoriteModels
+        inlineCodeColor = state.inlineCodeColor
+        listNumberColor = state.listNumberColor
+        lastSelectedModelKey = state.lastSelectedModelKey
+        sidebarVisible = state.sidebarVisible
+        commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
+        // Migrate legacy sseSocketTimeoutSeconds → responseTimeoutSeconds.
+        // If responseTimeoutSeconds was explicitly set (not default 300), keep it.
+        // Otherwise, if sseSocketTimeoutSeconds was customized (not default 60), use that
+        // as the new responseTimeoutSeconds (coerced to minimum 60s for safety).
+        // If neither was customized, use default 300.
+        @Suppress("DEPRECATION")
+        responseTimeoutSeconds = when {
+            state.responseTimeoutSeconds != 300 -> state.responseTimeoutSeconds.coerceAtLeast(60)
+            state.sseSocketTimeoutSeconds != 60 -> state.sseSocketTimeoutSeconds.coerceAtLeast(60)
+            else -> 300
+        }
+        longTimeoutBufferSeconds = state.longTimeoutBufferSeconds.coerceAtLeast(10)
+        @Suppress("DEPRECATION")
+        sseSocketTimeoutSeconds = state.sseSocketTimeoutSeconds
+        autoConnect = state.autoConnect
+        port = if (state.port in 1024..65535) state.port else 4096
+        loadAllSessions = state.loadAllSessions
+        commandHistory = state.commandHistory
+        expandedToolKinds = state.expandedToolKinds.ifBlank { "EXECUTE,EDIT,READ,THINK" }
+        expandTaskPillsByDefault = state.expandTaskPillsByDefault
+        queueInsteadOfSteer = state.queueInsteadOfSteer
     }
 
     companion object {
         fun getInstance(): OpenCodeSettingsState =
             ApplicationManager.getApplication().getService(OpenCodeSettingsState::class.java)
+
+        /** Uses slash to separate provider and model IDs (safe for XML, unlike \x1F). */
+        fun modelKey(providerID: String, modelID: String) = "$providerID/$modelID"
+    }
+
+    fun isFavoriteModel(providerID: String, modelID: String): Boolean {
+        val key = modelKey(providerID, modelID)
+        return favoriteModels.contains(key)
+    }
+
+    fun toggleFavoriteModel(providerID: String, modelID: String) {
+        val key = modelKey(providerID, modelID)
+        if (favoriteModels.contains(key)) {
+            favoriteModels.remove(key)
+        } else {
+            favoriteModels.add(key)
+        }
+    }
+
+    /** Remove stale favorites for models that no longer exist. Only runs when models are loaded. */
+    fun cleanupStaleFavorites(allModels: List<ProviderModel>) {
+        val validKeys = allModels.map { modelKey(it.providerID, it.modelID) }.toSet()
+        favoriteModels.removeAll { it !in validKeys }
     }
 }

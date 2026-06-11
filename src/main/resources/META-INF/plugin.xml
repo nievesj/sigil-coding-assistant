@@ -1,17 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<idea-plugin>
+<idea-plugin require-restart="true">
     <id>com.opencode.plugin</id>
     <name>OpenCode Plugin</name>
     <vendor>OpenCode</vendor>
     <description>AI-assisted development plugin for IntelliJ IDEA.</description>
 
-    <depends>com.intellij.modules.platform</depends>
-    <depends>com.intellij.java</depends>
+    <dependencies>
+        <plugin id="com.intellij.modules.platform"/>
+        <plugin id="com.intellij.java"/>
+        <module name="intellij.platform.jewel.foundation"/>
+        <module name="intellij.platform.jewel.ui"/>
+        <module name="intellij.platform.jewel.ideLafBridge"/>
+        <module name="intellij.platform.jewel.markdown.core"/>
+        <module name="intellij.platform.jewel.markdown.ideLafBridgeStyling"/>
+        <module name="intellij.platform.jewel.markdown.extensions.gfmTables"/>
+        <module name="intellij.platform.jewel.markdown.extensions.gfmAlerts"/>
+        <module name="intellij.platform.jewel.markdown.extensions.gfmStrikethrough"/>
+        <module name="intellij.platform.jewel.markdown.extensions.autolink"/>
+        <module name="intellij.libraries.compose.foundation.desktop"/>
+        <module name="intellij.libraries.compose.runtime.desktop"/>
+        <module name="intellij.libraries.skiko"/>
+    </dependencies>
+
+    <depends optional="true">Git4Idea</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <applicationService
-            serviceImplementation="com.opencode.acp.config.settings.OpenCodeSettingsState"/>
-
         <applicationConfigurable
             parentId="tools"
             instance="com.opencode.acp.config.settings.OpenCodeSettingsConfigurable"
@@ -19,10 +32,14 @@
             displayName="OpenCode"/>
 
         <toolWindow
-            id="OpenCode Chat"
+            id="AI Coding Assistant - OpenCode"
             secondary="true"
             icon="/icons/opencode-toolwindow.svg"
             factoryClass="com.opencode.acp.chat.ChatToolWindowFactory"/>
+
+        <notificationGroup id="OpenCode"
+                           displayType="BALLOON"
+                           isLogByDefault="true"/>
     </extensions>
 
     <actions>
