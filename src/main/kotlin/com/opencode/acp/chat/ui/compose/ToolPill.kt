@@ -2,18 +2,15 @@ package com.opencode.acp.chat.ui.compose
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -24,16 +21,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ToolCallPill
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
@@ -73,7 +69,7 @@ fun ToolPill(
         else -> AllIconsKeys.Actions.Execute
     }
 
-    val accentColor = if (isTask) Color(0xFF7EE787) else toolKindColor(pill.kind)
+    val accentColor = if (isTask) ChatTheme.colors.component.taskAccent else toolKindColor(pill.kind)
     val kindLabel = if (isTask) "Task" else toolKindLabel(pill.kind)
     // Task pills always have an expandable body; other pills only if they have input/output
     val hasDetails = isTask || pill.input != null || pill.output != null
@@ -88,8 +84,8 @@ fun ToolPill(
         modifier = modifier
             .padding(horizontal = 12.dp, vertical = 4.dp)
             .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(Color(0x0CFFFFFF))
+            .clip(ChatTheme.shapes.toolPillCornerRadius)
+            .background(ChatTheme.colors.accent.pillContainerBg)
     ) {
         // ── Header row (always visible, clickable to toggle) ──
         Row(
@@ -101,9 +97,9 @@ fun ToolPill(
             // Colored accent strip
             Box(
                 modifier = Modifier
-                    .width(3.dp)
-                    .height(40.dp)
-                    .clip(RoundedCornerShape(1.5.dp))
+                    .width(ChatTheme.dims.toolAccentStripWidth)
+                    .height(ChatTheme.dims.toolAccentStripHeight)
+                    .clip(ChatTheme.shapes.toolAccentCornerRadius)
                     .background(accentColor)
             )
             Spacer(Modifier.width(8.dp))
@@ -121,8 +117,8 @@ fun ToolPill(
             Text(
                 text = kindLabel,
                 color = accentColor,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
+                fontSize = ChatTheme.fonts.toolKindLabel,
+                fontWeight = ChatTheme.fontWeights.toolKindLabel,
             )
             Spacer(Modifier.width(6.dp))
 
@@ -130,8 +126,8 @@ fun ToolPill(
             val headerText = if (isTask) "@${taskAgentName?.replaceFirstChar { it.uppercase() }}" else (fileName ?: description)
             Text(
                 text = headerText,
-                color = Color(0xFFBBBBBB),
-                fontSize = 12.sp,
+                color = ChatTheme.colors.tool.read,
+                fontSize = ChatTheme.fonts.toolFileName,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f, fill = false),
@@ -143,18 +139,18 @@ fun ToolPill(
                 if (lineDelta.first > 0) {
                     Text(
                         text = "+${lineDelta.first}",
-                        color = Color(0xFF7EE787),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
+                        color = ChatTheme.colors.tool.edit,
+                        fontSize = ChatTheme.fonts.toolLineDelta,
+                        fontWeight = ChatTheme.fontWeights.toolLineDelta,
                     )
                 }
                 if (lineDelta.second > 0) {
                     if (lineDelta.first > 0) Spacer(Modifier.width(4.dp))
                     Text(
                         text = "-${lineDelta.second}",
-                        color = Color(0xFFFF7B72),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
+                        color = ChatTheme.colors.tool.delete,
+                        fontSize = ChatTheme.fonts.toolLineDelta,
+                        fontWeight = ChatTheme.fontWeights.toolLineDelta,
                     )
                 }
             }
@@ -166,7 +162,7 @@ fun ToolPill(
                     key = if (expanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
                     contentDescription = if (expanded) "Collapse" else "Expand",
                     modifier = Modifier.size(14.dp),
-                    tint = Color(0xFF808080),
+                    tint = ChatTheme.colors.component.taskRunning,
                 )
                 Spacer(Modifier.width(4.dp))
             }
@@ -192,8 +188,8 @@ fun ToolPill(
                                 if (prompt.isNotBlank()) {
                                     Text(
                                         text = prompt.take(500),
-                                        color = Color(0xFFCCCCCC),
-                                        fontSize = 12.sp,
+                                        color = ChatTheme.colors.component.taskCompleted,
+                                        fontSize = ChatTheme.fonts.toolTaskDescription,
                                         maxLines = 10,
                                         overflow = TextOverflow.Ellipsis,
                                         modifier = Modifier.padding(vertical = 2.dp),
@@ -201,14 +197,14 @@ fun ToolPill(
                                 } else if (desc.isNotBlank()) {
                                     Text(
                                         text = desc,
-                                        color = Color(0xFFCCCCCC),
-                                        fontSize = 12.sp,
+                                        color = ChatTheme.colors.component.taskCompleted,
+                                        fontSize = ChatTheme.fonts.toolTaskDescription,
                                         maxLines = 3,
                                         overflow = TextOverflow.Ellipsis,
                                         modifier = Modifier.padding(vertical = 2.dp),
                                     )
                                 } else {
-                                    Text("Running task…", color = Color(0xFF808080), fontSize = 11.sp)
+                                    Text("Running task…", color = ChatTheme.colors.component.taskRunning, fontSize = ChatTheme.fonts.toolTaskStatus)
                                 }
                             }
                         }
@@ -222,12 +218,12 @@ fun ToolPill(
                                 if (desc.isNotBlank()) {
                                     Text(
                                         text = desc,
-                                        color = Color(0xFFBBBBBB),
-                                        fontSize = 12.sp,
+                                        color = ChatTheme.colors.tool.read,
+                                        fontSize = ChatTheme.fonts.toolTaskDescription,
                                         modifier = Modifier.padding(vertical = 2.dp),
                                     )
                                 } else {
-                                    Text("Task completed", color = Color(0xFF808080), fontSize = 11.sp)
+                                    Text("Task completed", color = ChatTheme.colors.component.taskRunning, fontSize = ChatTheme.fonts.toolTaskStatus)
                                 }
                             }
                         }
@@ -236,11 +232,11 @@ fun ToolPill(
                             if (!taskOutput.isNullOrBlank()) {
                                 ChatFencedCodeBlock(content = taskOutput, language = "text")
                             } else {
-                                Text("Task failed", color = Color(0xFFFF7B72), fontSize = 11.sp)
+                                Text("Task failed", color = ChatTheme.colors.component.taskFailed, fontSize = ChatTheme.fonts.toolTaskStatus)
                             }
                         }
                         else -> {
-                            Text("Task pending…", color = Color(0xFF808080), fontSize = 11.sp)
+                            Text("Task pending…", color = ChatTheme.colors.component.taskPending, fontSize = ChatTheme.fonts.toolTaskStatus)
                         }
                     }
                 } else {
@@ -451,15 +447,16 @@ private fun formatTaskOutput(output: List<kotlinx.serialization.json.JsonObject>
     return text.ifBlank { null }
 }
 
+@Composable
 private fun toolKindColor(kind: ToolKind): Color = when (kind) {
-    ToolKind.EXECUTE -> Color(0xFF3574F0)
-    ToolKind.EDIT -> Color(0xFF7EE787)
-    ToolKind.READ -> Color(0xFFBBBBBB)
-    ToolKind.SEARCH -> Color(0xFFF0C674)
-    ToolKind.DELETE -> Color(0xFFFF7B72)
-    ToolKind.MOVE -> Color(0xFFBBBBBB)
-    ToolKind.FETCH -> Color(0xFFF0C674)
-    ToolKind.THINK -> Color(0xFF9E9E9E)
-    ToolKind.SWITCH_MODE -> Color(0xFF9E9E9E)
-    ToolKind.OTHER -> Color(0xFF9E9E9E)
+    ToolKind.EXECUTE -> ChatTheme.colors.tool.execute
+    ToolKind.EDIT -> ChatTheme.colors.tool.edit
+    ToolKind.READ -> ChatTheme.colors.tool.read
+    ToolKind.SEARCH -> ChatTheme.colors.tool.search
+    ToolKind.DELETE -> ChatTheme.colors.tool.delete
+    ToolKind.MOVE -> ChatTheme.colors.tool.move
+    ToolKind.FETCH -> ChatTheme.colors.tool.fetch
+    ToolKind.THINK -> ChatTheme.colors.tool.think
+    ToolKind.SWITCH_MODE -> ChatTheme.colors.tool.switchMode
+    ToolKind.OTHER -> ChatTheme.colors.tool.other
 }

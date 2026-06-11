@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -45,9 +44,9 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.Image as ComposeImage
 import com.opencode.acp.chat.model.ProviderModel
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
@@ -55,42 +54,6 @@ import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.TextField
 import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
-
-// ── Colors ──────────────────────────────────────────────────────────────────
-private val BgColor = Color(0xFF2B2B2B)
-private val BorderColor = Color(0xFF3E3E3E)
-private val MutedTextColor = Color(0xFF808080)
-private val PrimaryTextColor = Color(0xFFCCCCCC)
-private val StarGold = Color(0xFFE5C100)
-private val StarMuted = Color(0xFF606060)
-private val HoverBg = Color(0xFF363636)
-private val SelectedBg = Color(0xFF2D4F6D)
-private val ContextTextColor = Color(0xFF808080)
-private val SectionHeaderColor = Color(0xFF589DF6)
-
-// ── Provider icon colors ────────────────────────────────────────────────────
-private val providerColors = mapOf(
-    "anthropic" to Color(0xFFCC785C),
-    "openai" to Color(0xFF10A37F),
-    "deepseek" to Color(0xFF4D6BFE),
-    "google" to Color(0xFF4285F4),
-    "ollama-cloud" to Color(0xFFCCCCCC),
-    "mistral" to Color(0xFFDDA63A),
-    "cohere" to Color(0xFF39D98A),
-    "groq" to Color(0xFFF55036),
-    "togetherai" to Color(0xFF6366F1),
-    "fireworks-ai" to Color(0xFFFF6B35),
-    "nvidia" to Color(0xFF76B900),
-    "openrouter" to Color(0xFF8B5CF6),
-    "github-copilot" to Color(0xFFCCCCCC),
-    "xai" to Color(0xFFCCCCCC),
-    "alibaba" to Color(0xFFFF6A00),
-    "minimax" to Color(0xFF6366F1),
-    "moonshotai" to Color(0xFFCCCCCC),
-    "stepfun" to Color(0xFFCCCCCC),
-    "zhipuai" to Color(0xFF4D6BFE),
-    "kimi-for-coding" to Color(0xFFCCCCCC),
-)
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -137,9 +100,9 @@ fun ModelPickerPanel(
         modifier = modifier
             .width(340.dp)
             .heightIn(max = 480.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(BgColor)
-            .border(1.dp, BorderColor, RoundedCornerShape(8.dp)),
+            .clip(ChatTheme.shapes.pickerCornerRadius)
+            .background(ChatTheme.colors.component.inputBg)
+            .border(1.dp, ChatTheme.colors.border.default, ChatTheme.shapes.pickerCornerRadius),
     ) {
         // ── Search field ────────────────────────────────────────────────────
         Row(
@@ -152,7 +115,7 @@ fun ModelPickerPanel(
                 key = AllIconsKeys.Actions.Search,
                 contentDescription = null,
                 modifier = Modifier.size(14.dp),
-                tint = MutedTextColor,
+                tint = ChatTheme.colors.text.muted,
             )
             Spacer(modifier = Modifier.width(8.dp))
             TextField(
@@ -166,7 +129,7 @@ fun ModelPickerPanel(
                             true
                         } else false
                     },
-                placeholder = { Text("Search models", color = MutedTextColor, fontSize = 12.sp) },
+                placeholder = { Text("Search models", color = ChatTheme.colors.text.muted, fontSize = ChatTheme.fonts.pickerSearchPlaceholder) },
             )
         }
 
@@ -183,7 +146,7 @@ fun ModelPickerPanel(
                     SectionHeader(
                         title = "FAVORITES",
                         iconKey = AllIconsKeys.Nodes.Favorite,
-                        iconColor = StarGold,
+                        iconColor = ChatTheme.colors.component.starGold,
                         expanded = favoritesExpanded,
                         onToggle = { favoritesExpanded = !favoritesExpanded },
                     )
@@ -247,8 +210,8 @@ fun ModelPickerPanel(
                 item(key = "empty") {
                     Text(
                         text = "No models found",
-                        fontSize = 12.sp,
-                        color = MutedTextColor,
+                        fontSize = ChatTheme.fonts.pickerModelName,
+                        color = ChatTheme.colors.text.muted,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                     )
                 }
@@ -278,7 +241,7 @@ internal fun SectionHeader(
     title: String,
     iconText: String? = null,
     iconKey: org.jetbrains.jewel.ui.icon.IconKey? = null,
-    iconColor: Color = MutedTextColor,
+    iconColor: Color = ChatTheme.colors.text.muted,
     expanded: Boolean,
     onToggle: () -> Unit,
 ) {
@@ -294,7 +257,7 @@ internal fun SectionHeader(
             key = if (expanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
             contentDescription = if (expanded) "Collapse" else "Expand",
             modifier = Modifier.size(10.dp),
-            tint = MutedTextColor,
+            tint = ChatTheme.colors.text.muted,
         )
         Spacer(modifier = Modifier.width(6.dp))
 
@@ -310,7 +273,7 @@ internal fun SectionHeader(
         } else if (iconText != null) {
             Text(
                 text = iconText,
-                fontSize = 12.sp,
+                fontSize = ChatTheme.fonts.pickerModelName,
                 color = iconColor,
             )
             Spacer(modifier = Modifier.width(4.dp))
@@ -319,9 +282,9 @@ internal fun SectionHeader(
         // Title
         Text(
             text = title,
-            fontSize = 11.sp,
+            fontSize = ChatTheme.fonts.pickerSectionHeader,
             fontWeight = FontWeight.Bold,
-            color = SectionHeaderColor,
+            color = ChatTheme.colors.accent.infoBlue,
         )
     }
 }
@@ -341,8 +304,8 @@ private fun ModelRow(
     val isHovered by interactionSource.collectIsHoveredAsState()
 
     val bgColor = when {
-        isSelected -> SelectedBg
-        isHovered -> HoverBg
+        isSelected -> ChatTheme.colors.component.selectedRowBg
+        isHovered -> ChatTheme.colors.component.hoverBg
         else -> Color.Transparent
     }
 
@@ -350,7 +313,7 @@ private fun ModelRow(
         modifier = Modifier
             .fillMaxWidth()
             .height(32.dp)
-            .clip(RoundedCornerShape(4.dp))
+            .clip(ChatTheme.shapes.pickerRowCornerRadius)
             .background(bgColor)
             .hoverable(interactionSource)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
@@ -367,8 +330,8 @@ private fun ModelRow(
         // Model name
         Text(
             text = model.modelID,
-            fontSize = 12.sp,
-            color = if (isSelected) Color.White else PrimaryTextColor,
+            fontSize = ChatTheme.fonts.pickerModelName,
+            color = if (isSelected) Color.White else ChatTheme.colors.text.secondary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
@@ -381,7 +344,7 @@ private fun ModelRow(
                     key = AllIconsKeys.Actions.Lightning,
                     contentDescription = "Reasoning",
                     modifier = Modifier.size(10.dp),
-                    tint = Color(0xFFE5C100),
+                    tint = ChatTheme.colors.component.starGold,
                 )
             }
             if (hasVisionCapability(model)) {
@@ -389,7 +352,7 @@ private fun ModelRow(
                     key = AllIconsKeys.Actions.Search,
                     contentDescription = "Vision",
                     modifier = Modifier.size(10.dp),
-                    tint = Color(0xFF4285F4),
+                    tint = ChatTheme.colors.component.capabilityVision,
                 )
             }
         }
@@ -400,8 +363,8 @@ private fun ModelRow(
         if (model.contextWindow > 0) {
             Text(
                 text = formatContextWindow(model.contextWindow),
-                fontSize = 10.sp,
-                color = ContextTextColor,
+                fontSize = ChatTheme.fonts.pickerContextWindow,
+                color = ChatTheme.colors.text.muted,
                 modifier = Modifier.padding(start = 4.dp),
             )
             Spacer(modifier = Modifier.width(6.dp))
@@ -413,10 +376,10 @@ private fun ModelRow(
             contentDescription = if (isFavorite) "Remove from favorites" else "Add to favorites",
             modifier = Modifier
                 .size(14.dp)
-                .clip(CircleShape)
+                .clip(ChatTheme.shapes.modelPickerButtonShape)
                 .clickable(onClick = onToggleFavorite)
                 .padding(horizontal = 2.dp),
-            tint = if (isFavorite) StarGold else StarMuted,
+            tint = if (isFavorite) ChatTheme.colors.component.starGold else ChatTheme.colors.component.starMuted,
         )
     }
 }
@@ -441,7 +404,7 @@ internal fun ProviderIcon(
         )
     } else {
         // Fallback: text-based colored circle with initial
-        val color = tint ?: (providerColors[providerId] ?: MutedTextColor)
+        val color = tint ?: (ChatTheme.colors.provider.colorMap[providerId] ?: ChatTheme.colors.text.muted)
         val initial = providerId.firstOrNull()?.uppercaseChar()?.toString() ?: "?"
 
         Box(
@@ -453,7 +416,7 @@ internal fun ProviderIcon(
         ) {
             Text(
                 text = initial,
-                fontSize = 9.sp,
+                fontSize = ChatTheme.fonts.pickerProviderLetter,
                 fontWeight = FontWeight.Bold,
                 color = color,
             )
@@ -467,8 +430,8 @@ internal fun ProviderIcon(
 private fun FooterHint(text: String) {
     Text(
         text = text,
-        fontSize = 10.sp,
-        color = MutedTextColor,
+        fontSize = ChatTheme.fonts.pickerFooter,
+        color = ChatTheme.colors.text.muted,
     )
 }
 

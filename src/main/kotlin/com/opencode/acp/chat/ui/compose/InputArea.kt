@@ -80,6 +80,7 @@ import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.ThinkingEffort
 import com.opencode.acp.chat.model.TodoItem
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
@@ -464,12 +465,6 @@ fun InputArea(
         }
     }
 
-    val inputBg = Color(0xFF2B2B2B)
-    val inputBorder = Color(0xFF3E3E3E)
-    val mutedText = Color(0xFF808080)
-    val accentGreen = Color(0xFF6BBE50)
-    val stopRed = Color(0xFFE5534B)
-
     // Watch text changes to show/hide slash palette
     LaunchedEffect(Unit) {
         androidx.compose.runtime.snapshotFlow { textState.text.toString() }
@@ -481,7 +476,7 @@ fun InputArea(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = ChatTheme.dims.inputOuterPaddingH, vertical = ChatTheme.dims.inputOuterPaddingV),
     ) {
         // Slash command palette — shown above the input when text starts with "/"
         if (showSlashPalette) {
@@ -535,12 +530,12 @@ fun InputArea(
                     initialValue = 0f,
                     targetValue = 360f,
                     animationSpec = infiniteRepeatable(
-                        animation = tween(2500, easing = LinearEasing)
+                        animation = tween(ChatTheme.animations.glowPulseMs, easing = LinearEasing)
                     ),
                     label = "rotation"
                 )
                 val density = LocalDensity.current
-                val cornerRadiusPx = with(density) { 12.dp.toPx() }
+                val cornerRadiusPx = with(density) { ChatTheme.dims.inputCornerRadius.toPx() }
                 val glowPath = remember { androidx.compose.ui.graphics.Path() }
 
                 // Animated blue glow when LLM is streaming.
@@ -555,15 +550,15 @@ fun InputArea(
                     0.00f, 0.35f, 0.42f, 0.46f, 0.50f, 0.54f, 0.58f, 0.65f, 1.00f
                 )
                 val baseColors = arrayOf(
-                    Color.Transparent,                              // 0.00
-                    Color.Transparent,                              // 0.35
-                    Color(0xFF4A9EFF).copy(alpha = 0.15f),          // 0.42
-                    Color(0xFF4A9EFF).copy(alpha = 0.45f),          // 0.46
-                    Color(0xFF00D4FF).copy(alpha = 0.85f),          // 0.50  ← peak
-                    Color(0xFF4A9EFF).copy(alpha = 0.45f),          // 0.54
-                    Color(0xFF4A9EFF).copy(alpha = 0.15f),          // 0.58
-                    Color.Transparent,                              // 0.65
-                    Color.Transparent,                              // 1.00
+                    ChatTheme.colors.component.glowTransparent,               // 0.00
+                    ChatTheme.colors.component.glowTransparent,               // 0.35
+                    ChatTheme.colors.component.glowStart,                     // 0.42
+                    ChatTheme.colors.component.glowPeak,                      // 0.46
+                    ChatTheme.colors.component.glowHot,                       // 0.50  ← peak
+                    ChatTheme.colors.component.glowPeak,                      // 0.54
+                    ChatTheme.colors.component.glowStart,                     // 0.58
+                    ChatTheme.colors.component.glowTransparent,               // 0.65
+                    ChatTheme.colors.component.glowTransparent,               // 1.00
                 )
                 val shiftedStops = FloatArray(baseStops.size) { i ->
                     (baseStops[i] + offset) % 1f
@@ -601,12 +596,12 @@ fun InputArea(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(if (isDragging) Color(0xFF2E3A2E) else inputBg)
+                    .clip(ChatTheme.shapes.inputCornerRadius)
+                    .background(if (isDragging) ChatTheme.colors.component.dragActiveBg else ChatTheme.colors.component.inputBg)
                     .border(
-                        width = if (isDragging) 2.dp else 1.dp,
-                        color = if (isDragging) accentGreen else inputBorder,
-                        shape = RoundedCornerShape(12.dp),
+                        width = if (isDragging) ChatTheme.dims.inputDragBorderWidth else ChatTheme.dims.inputDefaultBorderWidth,
+                        color = if (isDragging) ChatTheme.colors.accent.green else ChatTheme.colors.component.inputBorder,
+                        shape = ChatTheme.shapes.inputCornerRadius,
                     )
                     .then(
                         DropTargetElement(
@@ -633,9 +628,9 @@ fun InputArea(
                                 }
                                 Box(
                                     modifier = Modifier
-                                        .size(48.dp)
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(Color(0xFF3E3E3E))
+                                        .size(ChatTheme.dims.attachmentThumbnailSize)
+                                        .clip(ChatTheme.shapes.attachmentCornerRadius)
+                                        .background(ChatTheme.colors.component.attachmentBg)
                                         .clickable { onImagePreview(file.dataUri) },
                                     contentAlignment = Alignment.Center,
                                 ) {
@@ -644,8 +639,8 @@ fun InputArea(
                                             bitmap = bitmap,
                                             contentDescription = file.name,
                                             modifier = Modifier
-                                                .size(48.dp)
-                                                .clip(RoundedCornerShape(6.dp)),
+                                                .size(ChatTheme.dims.attachmentThumbnailSize)
+                                                .clip(ChatTheme.shapes.attachmentCornerRadius),
                                             contentScale = ContentScale.Crop,
                                         )
                                     } else {
@@ -653,24 +648,24 @@ fun InputArea(
                                             key = AllIconsKeys.FileTypes.Image,
                                             contentDescription = file.name,
                                             modifier = Modifier.size(20.dp),
-                                            tint = Color(0xFFBBBBBB),
+                                            tint = ChatTheme.colors.component.attachmentRemoveIcon,
                                         )
                                     }
                                     // Remove button overlay
                                     Box(
                                         modifier = Modifier
                                             .align(Alignment.TopEnd)
-                                            .size(16.dp)
-                                            .clip(CircleShape)
-                                            .background(Color(0xFF555555))
+                                            .size(ChatTheme.dims.attachmentImageRemoveSize)
+                                            .clip(ChatTheme.shapes.imageRemoveBadgeShape)
+                                            .background(ChatTheme.colors.component.attachmentImageOverlay)
                                             .clickable { onRemoveFile(index) },
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(
                                             key = AllIconsKeys.Actions.Close,
                                             contentDescription = "Remove",
-                                            modifier = Modifier.size(10.dp),
-                                            tint = Color(0xFFCCCCCC),
+                                            modifier = Modifier.size(ChatTheme.dims.attachmentImageRemoveBadge),
+                                            tint = ChatTheme.colors.component.attachmentImageRemove,
                                         )
                                     }
                                 }
@@ -678,22 +673,22 @@ fun InputArea(
                                 // Non-image file pill
                                 Row(
                                     modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(Color(0xFF3E3E3E))
-                                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                                        .clip(ChatTheme.shapes.attachmentCornerRadius)
+                                        .background(ChatTheme.colors.component.attachmentBg)
+                                        .padding(horizontal = ChatTheme.dims.attachmentChipPaddingH, vertical = ChatTheme.dims.attachmentChipPaddingV),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Icon(
                                         key = AllIconsKeys.FileTypes.Text,
                                         contentDescription = null,
-                                        modifier = Modifier.size(14.dp),
-                                        tint = Color(0xFFBBBBBB),
+                                        modifier = Modifier.size(ChatTheme.dims.attachmentFileIconSize),
+                                        tint = ChatTheme.colors.component.attachmentRemoveIcon,
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
                                         text = file.name,
-                                        fontSize = 11.sp,
-                                        color = Color(0xFFBBBBBB),
+                                        fontSize = ChatTheme.fonts.attachmentFileName,
+                                        color = ChatTheme.colors.component.attachmentRemoveIcon,
                                         maxLines = 1,
                                         modifier = Modifier.widthIn(max = 120.dp),
                                     )
@@ -701,15 +696,15 @@ fun InputArea(
                                     Box(
                                         modifier = Modifier
                                             .size(14.dp)
-                                            .clip(CircleShape)
+                                            .clip(ChatTheme.shapes.fileRemoveBadgeShape)
                                             .clickable { onRemoveFile(index) },
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(
                                             key = AllIconsKeys.Actions.Close,
                                             contentDescription = "Remove",
-                                            modifier = Modifier.size(10.dp),
-                                            tint = Color(0xFF808080),
+                                            modifier = Modifier.size(ChatTheme.dims.attachmentFileRemoveBadge),
+                                            tint = ChatTheme.colors.component.attachmentFileSize,
                                         )
                                     }
                                 }
@@ -726,15 +721,15 @@ fun InputArea(
                     val scrollState = rememberScrollState()
                     val lineCount = textState.text.lines().size.coerceAtLeast(1)
                     val maxLines = 7
-                    val lineHeight = 20.dp
+                    val lineHeight = ChatTheme.dims.inputLineHeight
                     val targetHeight = (lineCount.coerceAtMost(maxLines) * lineHeight.value).dp + 16.dp // 16dp for vertical padding
-                    val textFieldHeight = targetHeight.coerceIn(56.dp, 156.dp)
+                    val textFieldHeight = targetHeight.coerceIn(ChatTheme.dims.inputMinHeight, ChatTheme.dims.inputMaxHeight)
 
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(textFieldHeight)
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(horizontal = ChatTheme.dims.inputContentPaddingH, vertical = ChatTheme.dims.inputContentPaddingV),
                     ) {
                         BasicTextField(
                             state = textState,
@@ -820,10 +815,10 @@ fun InputArea(
                                     } else false
                                 },
                             enabled = enabled,
-                            cursorBrush = SolidColor(Color.White),
+                            cursorBrush = SolidColor(ChatTheme.colors.component.inputCursor),
                             textStyle = TextStyle(
-                                color = Color(0xFFCCCCCC),
-                                fontSize = 13.sp,
+                                color = ChatTheme.colors.component.inputText,
+                                fontSize = ChatTheme.fonts.inputText,
                             ),
                             decorator = { innerTextField ->
                                 Box(
@@ -835,8 +830,8 @@ fun InputArea(
                                     if (textState.text.isEmpty()) {
                                         Text(
                                             text = "Type a message...",
-                                            color = mutedText,
-                                            fontSize = 13.sp,
+                                            color = ChatTheme.colors.component.inputPlaceholder,
+                                            fontSize = ChatTheme.fonts.inputPlaceholder,
                                         )
                                     }
                                     innerTextField()
@@ -853,8 +848,8 @@ fun InputArea(
                         // Attach button — opens the attach menu popup
                         Box(
                             modifier = Modifier
-                                .size(32.dp)
-                                .clip(CircleShape)
+                                .size(ChatTheme.dims.modelPickerButtonSize)
+                                .clip(ChatTheme.shapes.modelPickerButtonShape)
                                 .clickable(enabled = enabled) {
                                     showAttachMenu = !showAttachMenu
 
@@ -865,8 +860,8 @@ fun InputArea(
                             Icon(
                                 key = AllIconsKeys.General.Add,
                                 contentDescription = "Attach",
-                                modifier = Modifier.size(16.dp),
-                                tint = mutedText,
+                                modifier = Modifier.size(ChatTheme.dims.actionIconSize),
+                                tint = ChatTheme.colors.component.inputPlaceholder,
                             )
 
                             // Attach menu popup anchored to the + button
@@ -915,8 +910,8 @@ fun InputArea(
                             // During idle: triggers normal send.
                             Box(
                                 modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(RoundedCornerShape(6.dp))
+                                    .size(ChatTheme.dims.actionButtonSize)
+                                    .clip(ChatTheme.shapes.actionButtonCornerRadius)
                                     .clickable(enabled = enabled) {
                                         val text = textState.text.toString().trim()
                                         if (text.isNotEmpty()) {
@@ -931,24 +926,24 @@ fun InputArea(
                                 Icon(
                                     key = AllIconsKeys.Actions.Execute,
                                     contentDescription = "Send",
-                                    modifier = Modifier.size(16.dp),
-                                    tint = Color(0xFF4EAF4E),
+                                    modifier = Modifier.size(ChatTheme.dims.actionIconSize),
+                                    tint = ChatTheme.colors.accent.greenLight,
                                 )
                             }
                         } else if (isStreaming) {
                             // Red Stop button — only when empty input + streaming
                             Box(
                                 modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(RoundedCornerShape(6.dp))
+                                    .size(ChatTheme.dims.actionButtonSize)
+                                    .clip(ChatTheme.shapes.actionButtonCornerRadius)
                                     .clickable(enabled = enabled) { onCancel() },
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Icon(
                                     key = AllIconsKeys.Actions.Suspend,
                                     contentDescription = "Stop",
-                                    modifier = Modifier.size(12.dp),
-                                    tint = stopRed,
+                                    modifier = Modifier.size(ChatTheme.dims.stopIconSize),
+                                    tint = ChatTheme.colors.accent.red,
                                 )
                             }
                         }
@@ -976,7 +971,7 @@ fun InputArea(
                     text = modelDisplayText,
                     onClick = { showModelPicker = !showModelPicker },
                     leadingIcon = if (selectedProviderIconId != null) {
-                        { ProviderIcon(providerId = selectedProviderIconId, modifier = Modifier.size(14.dp), tint = Color(0xFFCCCCCC)) }
+                        { ProviderIcon(providerId = selectedProviderIconId, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.inputText) }
                     } else null,
                 )
 

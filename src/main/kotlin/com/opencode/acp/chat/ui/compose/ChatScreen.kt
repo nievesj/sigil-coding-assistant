@@ -34,12 +34,13 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
-import com.opencode.acp.chat.model.ChatConstants
+import com.opencode.acp.chat.model.ChatInputState
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.viewmodel.ChatViewModel
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -128,9 +129,10 @@ fun
     val messages by viewModel.messages.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
     val controlState by viewModel.controlState.collectAsState()
-    val isStreaming by viewModel.isStreaming.collectAsState()
-    val permissionPrompt by viewModel.permissionPrompt.collectAsState()
-    val selectionPrompt by viewModel.selectionPrompt.collectAsState()
+    val inputState by viewModel.inputState.collectAsState()
+    val isStreaming = inputState is ChatInputState.Streaming
+    val permissionPrompt = (inputState as? ChatInputState.AwaitingPermission)?.prompt
+    val selectionPrompt = (inputState as? ChatInputState.AwaitingSelection)?.prompt
     val sessionListState by viewModel.sessionListState.collectAsState()
     val isSidebarVisible by viewModel.isSidebarVisible.collectAsState()
     val sessionContextState by viewModel.sessionContextState.collectAsState()
@@ -299,13 +301,13 @@ fun
                     // Sidebar — animated width for show/hide and tab switching
                     val sidebarTargetWidth = if (isSidebarVisible) {
                         when (selectedSidebarTab) {
-                            SidebarTab.SESSIONS -> ChatConstants.SIDEBAR_WIDTH_DP
-                            SidebarTab.CONTEXT -> ChatConstants.SIDEBAR_CONTEXT_WIDTH_DP
-                            SidebarTab.REVIEW -> ChatConstants.SIDEBAR_REVIEW_WIDTH_DP
+                            SidebarTab.SESSIONS -> ChatTheme.dims.sidebarWidth
+                            SidebarTab.CONTEXT -> ChatTheme.dims.sidebarContextWidth
+                            SidebarTab.REVIEW -> ChatTheme.dims.sidebarReviewWidth
                         }
-                    } else 0
+                    } else 0.dp
                     val sidebarWidth by animateDpAsState(
-                        targetValue = sidebarTargetWidth.dp,
+                        targetValue = sidebarTargetWidth,
                         label = "sidebarWidth"
                     )
 
@@ -378,7 +380,7 @@ fun
                 }
 
                 // Input area (always visible at bottom, disabled when disconnected or prompt active)
-                val inputEnabled = connectionState == ConnectionState.CONNECTED && permissionPrompt == null && selectionPrompt == null
+                val inputEnabled = inputState !is ChatInputState.Disabled
                 InputArea(
                     enabled = inputEnabled,
                 isStreaming = isStreaming,
@@ -448,7 +450,7 @@ fun
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color(0x88000000))
+                        .background(ChatTheme.colors.accent.overlaySemiTransparent)
                         .clickable(
                             interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
                             indication = null,
@@ -461,7 +463,7 @@ fun
                         modifier = Modifier
                             .fillMaxWidth(0.85f)
                             .fillMaxHeight(0.85f)
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(ChatTheme.shapes.overlayCornerRadius)
                             .clickable(
                                 interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
                                 indication = null,

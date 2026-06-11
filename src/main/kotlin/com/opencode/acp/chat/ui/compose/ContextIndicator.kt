@@ -35,32 +35,25 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.opencode.acp.chat.model.ChatConstants
 import com.opencode.acp.chat.model.SessionContext
 import com.opencode.acp.chat.model.SessionContextState
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Text
 
 // ── Context indicator colors ──────────────────────────────────────────────────
 
-private val ContextGreen = Color(0xFF6BBE50)
-private val ContextYellow = Color(0xFFE5A617)
-private val ContextRed = Color(0xFFE5534B)
-private val ContextUnknown = Color(0xFF808080)
-private val IndicatorBg = Color(0xFF3C3C3C)
-private val TooltipBg = Color(0xFF2B2B2B)
-private val TooltipBorder = Color(0xFF4A4A4A)
-private val TooltipText = Color(0xFFCCCCCC)
-private val TooltipMuted = Color(0xFF999999)
-
 /** Returns the context color for a given usage percentage. */
+@Composable
 fun contextColorForPercent(percent: Float): Color {
+    val colors = ChatTheme.colors
     return when {
-        percent < 0f -> ContextUnknown
-        percent < 50f -> ContextGreen
-        percent < 75f -> ContextYellow
-        else -> ContextRed
+        percent < 0f -> colors.accent.contextUnknown
+        percent < 50f -> colors.accent.contextGreen
+        percent < 75f -> colors.accent.contextYellow
+        else -> colors.accent.contextRed
     }
 }
 
@@ -75,19 +68,25 @@ fun ContextIndicator(
     onRetry: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val colors = ChatTheme.colors
+    val dims = ChatTheme.dims
+    val fonts = ChatTheme.fonts
+    val shapes = ChatTheme.shapes
+    val animations = ChatTheme.animations
+
     // Pulsing animation while streaming
     val infiniteTransition = rememberInfiniteTransition(label = "contextPulse")
     val pulseAlpha by infiniteTransition.animateFloat(
         initialValue = 1f,
         targetValue = 0.5f,
         animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 800, easing = LinearEasing),
+            animation = tween(durationMillis = animations.contextPulseMs, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse
         ),
         label = "contextPulseAlpha"
     )
 
-    val sizeDp = ChatConstants.CONTEXT_INDICATOR_SIZE_DP
+    val sizeDp = dims.contextIndicatorSize
 
     TooltipArea(
         tooltip = {
@@ -97,7 +96,7 @@ fun ContextIndicator(
     ) {
         Box(
             modifier = Modifier
-                .size(sizeDp.dp)
+                .size(sizeDp)
                 .clickable { onClickAction(state, onShowDetails, onRetry) }
         ) {
             when (state) {
@@ -116,10 +115,10 @@ fun ContextIndicator(
                     if (ctx.contextLimit > 0L && ctx.usagePercent >= 75f) {
                         Canvas(
                             modifier = Modifier
-                                .size((sizeDp + 4).dp)
+                                .size(sizeDp + 4.dp)
                                 .align(Alignment.Center)
                         ) {
-                            val outerDiameter = (sizeDp + 4).dp.toPx()
+                            val outerDiameter = (sizeDp + 4.dp).toPx()
                             val ringRadius = outerDiameter / 2f - 2.dp.toPx()
                             drawCircle(
                                 color = color.copy(alpha = alpha),
@@ -160,19 +159,20 @@ private fun onClickAction(state: SessionContextState, onShowDetails: () -> Unit,
 // ── Loading Circle ──────────────────────────────────────────────────────────
 
 @Composable
-private fun LoadingCircle(sizeDp: Int) {
+private fun LoadingCircle(sizeDp: Dp) {
+    val colors = ChatTheme.colors
     Box(
         modifier = Modifier
-            .size(sizeDp.dp)
+            .size(sizeDp)
             .clip(CircleShape)
-            .background(IndicatorBg)
-            .border(1.dp, TooltipBorder, CircleShape),
+            .background(colors.component.indicatorBg)
+            .border(1.dp, colors.component.tooltipBorder, CircleShape),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = "⋯",
-            fontSize = 10.sp,
-            color = TooltipMuted
+            fontSize = ChatTheme.fonts.contextPercent,
+            color = colors.component.tooltipMuted
         )
     }
 }
@@ -183,21 +183,22 @@ private fun LoadingCircle(sizeDp: Int) {
 private fun DoughnutRing(
     fillFraction: Float,
     fillColor: Color,
-    sizeDp: Int,
+    sizeDp: Dp,
     modifier: Modifier = Modifier
 ) {
+    val colors = ChatTheme.colors
     val displayText = "${(fillFraction * 100).toInt()}"
 
-    Box(modifier = modifier.size(sizeDp.dp), contentAlignment = Alignment.Center) {
-        Canvas(modifier = Modifier.size(sizeDp.dp)) {
-            val diameter = sizeDp.dp.toPx()
+    Box(modifier = modifier.size(sizeDp), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.size(sizeDp)) {
+            val diameter = sizeDp.toPx()
             val radius = diameter / 2f
             val stroke = 3.dp.toPx() // Thick stroke for doughnut effect
             val innerRadius = radius - stroke
 
             // Background ring (track)
             drawCircle(
-                color = IndicatorBg,
+                color = colors.component.indicatorBg,
                 radius = innerRadius,
                 center = center,
                 style = Stroke(width = stroke, cap = StrokeCap.Round)
@@ -218,7 +219,7 @@ private fun DoughnutRing(
 
             // Outer border ring
             drawCircle(
-                color = TooltipBorder,
+                color = colors.component.tooltipBorder,
                 radius = radius,
                 center = center,
                 style = Stroke(width = 1.dp.toPx())
@@ -228,8 +229,8 @@ private fun DoughnutRing(
         // Center text
         Text(
             text = displayText,
-            fontSize = 8.sp,
-            fontWeight = FontWeight.Bold,
+            fontSize = ChatTheme.fonts.contextErrorBadge,
+            fontWeight = ChatTheme.fontWeights.contextPercent,
             color = Color.White,
             maxLines = 1
         )
@@ -239,20 +240,22 @@ private fun DoughnutRing(
 // ── Error Circle ───────────────────────────────────────────────────────────
 
 @Composable
-private fun ErrorCircle(retryable: Boolean, sizeDp: Int, modifier: Modifier = Modifier) {
+private fun ErrorCircle(retryable: Boolean, sizeDp: Dp, modifier: Modifier = Modifier) {
+    val colors = ChatTheme.colors
+    val borderColor = if (retryable) colors.accent.contextYellow else colors.accent.contextRed
     Box(
         modifier = modifier
-            .size(sizeDp.dp)
+            .size(sizeDp)
             .clip(CircleShape)
-            .background(IndicatorBg)
-            .border(1.dp, if (retryable) ContextYellow else ContextRed, CircleShape),
+            .background(colors.component.indicatorBg)
+            .border(1.dp, borderColor, CircleShape),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = if (retryable) "!" else "✕",
-            fontSize = if (retryable) 11.sp else 9.sp,
+            fontSize = if (retryable) ChatTheme.fonts.contextTooltipValue else ChatTheme.fonts.contextTooltipSub,
             fontWeight = FontWeight.Bold,
-            color = if (retryable) ContextYellow else ContextRed
+            color = borderColor
         )
     }
 }
@@ -264,17 +267,22 @@ private fun ContextTooltip(
     state: SessionContextState,
     isStreaming: Boolean
 ) {
+    val colors = ChatTheme.colors
+    val dims = ChatTheme.dims
+    val shapes = ChatTheme.shapes
+    val fonts = ChatTheme.fonts
+
     Box(
         modifier = Modifier
-            .width(240.dp)
-            .clip(RoundedCornerShape(6.dp))
-            .background(TooltipBg)
-            .border(1.dp, TooltipBorder, RoundedCornerShape(6.dp))
-            .padding(8.dp)
+            .width(dims.contextTooltipWidth)
+            .clip(shapes.contextTooltipCornerRadius)
+            .background(colors.component.tooltipBg)
+            .border(1.dp, colors.component.tooltipBorder, shapes.contextTooltipCornerRadius)
+            .padding(dims.contextTooltipPadding)
     ) {
         when (state) {
             is SessionContextState.Loading -> {
-                Text("Loading context...", fontSize = 11.sp, color = TooltipMuted)
+                Text("Loading context...", fontSize = fonts.contextTooltipValue, color = colors.component.tooltipMuted)
             }
             is SessionContextState.Loaded -> {
                 val ctx = state.context
@@ -282,9 +290,9 @@ private fun ContextTooltip(
                     // Model line
                     Text(
                         text = "${ctx.providerName} / ${ctx.modelName}".ifBlank { "Unknown model" },
-                        fontSize = 11.sp,
+                        fontSize = fonts.contextTooltipValue,
                         fontWeight = FontWeight.Medium,
-                        color = TooltipText,
+                        color = colors.component.tooltipText,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -296,20 +304,20 @@ private fun ContextTooltip(
                         } else {
                             "Usage: ${formatTooltipTokens(ctx.totalTokens)} tokens (limit unknown)"
                         },
-                        fontSize = 10.sp,
+                        fontSize = fonts.contextTooltipLabel,
                         color = contextColorForPercent(ctx.usagePercent)
                     )
                     // Cost line
                     Text(
                         text = "Cost: ${formatTooltipCost(ctx.totalCost)}",
-                        fontSize = 10.sp,
-                        color = TooltipMuted
+                        fontSize = fonts.contextTooltipLabel,
+                        color = colors.component.tooltipMuted
                     )
                     if (isStreaming) {
                         Text(
                             text = "Updating...",
-                            fontSize = 9.sp,
-                            color = TooltipMuted
+                            fontSize = fonts.contextTooltipSub,
+                            color = colors.component.tooltipMuted
                         )
                     }
                 }
@@ -318,21 +326,21 @@ private fun ContextTooltip(
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
                         text = "Context unavailable",
-                        fontSize = 11.sp,
+                        fontSize = fonts.contextTooltipValue,
                         fontWeight = FontWeight.Medium,
-                        color = if (state.retryable) ContextYellow else ContextRed
+                        color = if (state.retryable) colors.accent.contextYellow else colors.accent.contextRed
                     )
                     Text(
                         text = state.message,
-                        fontSize = 10.sp,
-                        color = TooltipMuted,
+                        fontSize = fonts.contextTooltipLabel,
+                        color = colors.component.tooltipMuted,
                         maxLines = 2
                     )
                     if (state.retryable) {
                         Text(
                             text = "Click to retry",
-                            fontSize = 10.sp,
-                            color = ContextGreen
+                            fontSize = fonts.contextTooltipLabel,
+                            color = colors.accent.contextGreen
                         )
                     }
                 }

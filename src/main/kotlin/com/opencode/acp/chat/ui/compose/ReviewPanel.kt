@@ -18,7 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -34,7 +34,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.diff.DiffManager
 import com.intellij.diff.DiffContentFactory
@@ -60,12 +60,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
-import org.jetbrains.jewel.foundation.theme.JewelTheme
 
 // ── Review Panel (sidebar tab content) ───────────────────────────────────────
 
@@ -232,17 +230,17 @@ private fun ChangedFileRow(
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
 
-    // Colors — retrieveColorOrUnspecified is @Composable so must be called directly
-    val hoverBg = retrieveColorOrUnspecified("MenuItem.selectionBackground")
-    val addedColor = Color(0xFF7EE787)   // Bright mint green like OpenCode
-    val deletedColor = Color(0xFFFF7B72) // Salmon/coral red like OpenCode
-    val pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)
-    val normalColor = JewelTheme.globalColors.text.normal
+    // Colors — ChatTheme provides semantic colors
+    val hoverBg = ChatTheme.colors.component.hoverBg
+    val addedColor = ChatTheme.colors.accent.codeAdded   // Bright mint green like OpenCode
+    val deletedColor = ChatTheme.colors.accent.codeDeleted // Salmon/coral red like OpenCode
+    val pathColor = ChatTheme.colors.text.link.copy(alpha = 0.5f)
+    val normalColor = ChatTheme.colors.text.primary
 
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(4.dp))
+            .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
             .background(if (isHovered) hoverBg else Color.Transparent)
             .hoverable(interactionSource)
             .clickable(onClick = onClick)
@@ -253,7 +251,7 @@ private fun ChangedFileRow(
         Icon(
             key = getFileTypeIcon(file.fileName),
             contentDescription = file.fileName,
-            modifier = Modifier.size(16.dp),
+            modifier = Modifier.size(ChatTheme.dims.reviewFileIconSize),
             tint = Color.Unspecified
         )
         Spacer(Modifier.width(8.dp))
@@ -267,7 +265,7 @@ private fun ChangedFileRow(
             ) {
                 Text(
                     text = file.fileName,
-                    fontSize = 12.sp,
+                    fontSize = ChatTheme.fonts.reviewFileName,
                     fontWeight = FontWeight.Normal,
                     color = normalColor,
                     maxLines = 1,
@@ -277,16 +275,16 @@ private fun ChangedFileRow(
                 if (file.status == FileChangeStatus.UNTRACKED) {
                     Text(
                         text = "Added",
-                        fontSize = 10.sp,
+                        fontSize = ChatTheme.fonts.reviewStatusLabel,
                         fontWeight = FontWeight.Medium,
-                        color = Color(0xFF7CB342)  // Green color like in the image
+                        color = ChatTheme.colors.component.reviewAddedLabel  // Green color like in the image
                     )
                 }
             }
             // Relative path (dimmed, tinted)
             Text(
                 text = file.filePath,
-                fontSize = 10.sp,
+                fontSize = ChatTheme.fonts.reviewFilePath,
                 color = pathColor,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -299,7 +297,7 @@ private fun ChangedFileRow(
                 if (delta.additions > 0) {
                     Text(
                         text = "+${delta.additions}",
-                        fontSize = 11.sp,
+                        fontSize = ChatTheme.fonts.reviewLineDelta,
                         fontWeight = FontWeight.Medium,
                         color = addedColor
                     )
@@ -308,7 +306,7 @@ private fun ChangedFileRow(
                     if (delta.additions > 0) Spacer(Modifier.width(4.dp))
                     Text(
                         text = "-${delta.deletions}",
-                        fontSize = 11.sp,
+                        fontSize = ChatTheme.fonts.reviewLineDelta,
                         fontWeight = FontWeight.Medium,
                         color = deletedColor
                     )
@@ -316,7 +314,7 @@ private fun ChangedFileRow(
                 if (delta.additions == 0 && delta.deletions == 0) {
                     Text(
                         text = "0",
-                        fontSize = 11.sp,
+                        fontSize = ChatTheme.fonts.reviewLineDelta,
                         color = pathColor
                     )
                 }
@@ -324,7 +322,7 @@ private fun ChangedFileRow(
             is LineDelta.Unknown -> {
                 Text(
                     text = "—",
-                    fontSize = 11.sp,
+                    fontSize = ChatTheme.fonts.reviewLineDelta,
                     color = pathColor
                 )
             }
@@ -337,7 +335,7 @@ private fun ChangedFileRow(
                 key = AllIconsKeys.General.Locate,
                 contentDescription = "Open file",
                 modifier = Modifier
-                    .size(18.dp)
+                    .size(ChatTheme.dims.reviewOpenFileIconSize)
                     .clickable(onClick = onOpenFile)
                     .padding(1.dp),
                 tint = pathColor
@@ -388,8 +386,8 @@ private fun ReviewLoadingContent(modifier: Modifier = Modifier) {
     ) {
         Text(
             text = "Loading changes...",
-            fontSize = 12.sp,
-            color = JewelTheme.globalColors.text.disabled
+            fontSize = ChatTheme.fonts.reviewLoading,
+            color = ChatTheme.colors.text.disabled
         )
     }
 }
@@ -402,8 +400,8 @@ private fun ReviewEmptyContent(modifier: Modifier = Modifier) {
     ) {
         Text(
             text = "No changes",
-            fontSize = 12.sp,
-            color = JewelTheme.globalColors.text.disabled
+            fontSize = ChatTheme.fonts.reviewEmpty,
+            color = ChatTheme.colors.text.disabled
         )
     }
 }
@@ -424,13 +422,13 @@ private fun ReviewErrorContent(
             key = AllIconsKeys.General.BalloonError,
             contentDescription = null,
             modifier = Modifier.size(24.dp),
-            tint = Color(0xFFDB4437),
+            tint = ChatTheme.colors.text.error,
         )
         Spacer(Modifier.height(8.dp))
         Text(
             text = message,
-            fontSize = 12.sp,
-            color = JewelTheme.globalColors.text.disabled,
+            fontSize = ChatTheme.fonts.reviewError,
+            color = ChatTheme.colors.text.disabled,
             maxLines = 2
         )
         if (retryable) {

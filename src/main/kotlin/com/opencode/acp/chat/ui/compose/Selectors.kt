@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,32 +29,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.opencode.acp.chat.model.ControlBarState
 import com.opencode.acp.chat.model.OpenCodeAgentInfo
 import com.opencode.acp.chat.model.ThinkingEffort
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
-
-// ── Shared colors ───────────────────────────────────────────────────────────
-private val ChipBg = Color(0xFF2B2B2B)
-private val ChipBorder = Color(0xFF3E3E3E)
-private val ChipText = Color(0xFFCCCCCC)
-private val ChipTextDisabled = Color(0xFF606060)
-private val ChipBorderDisabled = Color(0xFF333333)
-private val PanelBg = Color(0xFF2B2B2B)
-private val PanelBorder = Color(0xFF3E3E3E)
-private val HoverBg = Color(0xFF363636)
-private val SelectedBg = Color(0xFF2D4F6D)
-private val MutedText = Color(0xFF808080)
-private val PrimaryText = Color(0xFFCCCCCC)
-private val SectionHeaderColor = Color(0xFF589DF6)
 
 // ── Agent Selector ──────────────────────────────────────────────────────────
 
@@ -173,8 +157,8 @@ internal fun SelectorChip(
     onClick: (() -> Unit)? = null,
     leadingIcon: (@Composable () -> Unit)? = null,
 ) {
-    val textColor = if (enabled) ChipText else ChipTextDisabled
-    val borderColor = if (enabled) ChipBorder else ChipBorderDisabled
+    val textColor = if (enabled) ChatTheme.colors.text.secondary else ChatTheme.colors.component.starMuted
+    val borderColor = if (enabled) ChatTheme.colors.component.inputBorder else ChatTheme.colors.border.subtle
 
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
@@ -184,13 +168,13 @@ internal fun SelectorChip(
         label = "chipHoverAlpha",
     )
 
-    val tintBase = Color(0xFF3574F0) // IntelliJ blue
+    val tintBase = ChatTheme.colors.accent.blue
     val bgColor = tintBase.copy(alpha = 0.12f * hoverAlpha)
 
     val modifier = Modifier
-        .clip(RoundedCornerShape(6.dp))
+        .clip(ChatTheme.shapes.chipCornerRadius)
         .background(bgColor)
-        .border(1.dp, if (isHovered && enabled) tintBase.copy(alpha = 0.3f) else borderColor, RoundedCornerShape(6.dp))
+        .border(1.dp, if (isHovered && enabled) tintBase.copy(alpha = 0.3f) else borderColor, ChatTheme.shapes.chipCornerRadius)
         .padding(horizontal = 10.dp, vertical = 5.dp)
         .hoverable(interactionSource)
 
@@ -210,7 +194,7 @@ internal fun SelectorChip(
         }
         Text(
             text = text,
-            fontSize = 12.sp,
+            fontSize = ChatTheme.fonts.selectorChip,
             color = textColor,
         )
         Icon(
@@ -244,9 +228,9 @@ private fun SimplePickerPanel(
         modifier = Modifier
             .widthIn(min = 140.dp, max = 240.dp)
             .heightIn(max = 320.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(PanelBg)
-            .border(1.dp, PanelBorder, RoundedCornerShape(8.dp)),
+            .clip(ChatTheme.shapes.pickerCornerRadius)
+            .background(ChatTheme.colors.component.inputBg)
+            .border(1.dp, ChatTheme.colors.component.inputBorder, ChatTheme.shapes.pickerCornerRadius),
     ) {
         // Section header — same as ModelPickerPanel
         SectionHeader(
@@ -286,8 +270,8 @@ private fun PickerItemRow(
     val isHovered by interactionSource.collectIsHoveredAsState()
 
     val bgColor = when {
-        isSelected -> SelectedBg
-        isHovered -> HoverBg
+        isSelected -> ChatTheme.colors.component.selectedRowBg
+        isHovered -> ChatTheme.colors.component.hoverBg
         else -> Color.Transparent
     }
 
@@ -295,7 +279,7 @@ private fun PickerItemRow(
         modifier = Modifier
             .fillMaxWidth()
             .height(32.dp)
-            .clip(RoundedCornerShape(4.dp))
+            .clip(ChatTheme.shapes.pickerRowCornerRadius)
             .background(bgColor)
             .hoverable(interactionSource)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
@@ -304,8 +288,8 @@ private fun PickerItemRow(
     ) {
         Text(
             text = label,
-            fontSize = 12.sp,
-            color = if (isSelected) Color.White else PrimaryText,
+            fontSize = ChatTheme.fonts.selectorItem,
+            color = if (isSelected) Color.White else ChatTheme.colors.text.secondary,
             maxLines = 1,
             modifier = Modifier.weight(1f),
         )

@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
@@ -24,12 +23,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.SelectionOption
 import com.opencode.acp.chat.model.SelectionPrompt
 import com.opencode.acp.chat.model.SelectionResponse
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.DefaultButton
 import org.jetbrains.jewel.ui.component.OutlinedButton
 import org.jetbrains.jewel.ui.component.Text
@@ -48,13 +46,13 @@ fun SelectionPrompt(
         modifier = Modifier
             .padding(horizontal = 8.dp, vertical = 4.dp)
             .border(
-                width = 1.dp,
-                color = Color(0x40808080),
-                shape = RoundedCornerShape(8.dp)
+                width = ChatTheme.dims.selectionBorderWidth,
+                color = ChatTheme.colors.border.default,
+                shape = ChatTheme.shapes.selectionCornerRadius
             )
             .background(
-                color = Color(0x10808080),
-                shape = RoundedCornerShape(8.dp)
+                color = ChatTheme.colors.surface.card,
+                shape = ChatTheme.shapes.selectionCornerRadius
             )
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -63,14 +61,14 @@ fun SelectionPrompt(
         Column {
             Text(
                 text = prompt.question,
-                fontWeight = FontWeight.Bold,
-                fontSize = 14.sp
+                fontWeight = ChatTheme.fontWeights.selectionQuestion,
+                fontSize = ChatTheme.fonts.selectionQuestion
             )
             if (prompt.subtitle != null) {
                 Text(
                     text = prompt.subtitle,
-                    color = Color.Gray,
-                    fontSize = 12.sp
+                    color = ChatTheme.colors.text.muted,
+                    fontSize = ChatTheme.fonts.selectionSubtitle
                 )
             }
         }
@@ -79,7 +77,7 @@ fun SelectionPrompt(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = 240.dp)
+                .heightIn(max = ChatTheme.dims.selectionMaxHeight)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
@@ -110,14 +108,14 @@ fun SelectionPrompt(
             ) {
                 Text(
                     text = "\u2022",
-                    color = Color(0xFF4CAF50),
-                    fontSize = 16.sp,
+                    color = ChatTheme.colors.component.selectionCustomBullet,
+                    fontSize = ChatTheme.fonts.selectionCustomBullet,
                     modifier = Modifier.width(20.dp)
                 )
                 TextField(
                     state = customInputState,
                     modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("Type your own answer", color = Color.Gray) }
+                    placeholder = { Text("Type your own answer", color = ChatTheme.colors.text.muted) }
                 )
             }
         }
@@ -158,11 +156,11 @@ private fun CheckboxOptionRow(
         verticalAlignment = Alignment.Top,
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(4.dp))
+            .clip(ChatTheme.shapes.selectionRowCornerRadius)
             .clickable(onClick = onToggle)
             .background(
-                if (isSelected) Color(0x182196F3) else Color.Transparent,
-                RoundedCornerShape(4.dp)
+                if (isSelected) ChatTheme.colors.accent.highlightBlueAlpha else Color.Transparent,
+                ChatTheme.shapes.selectionRowCornerRadius
             )
             .padding(horizontal = 8.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -170,12 +168,12 @@ private fun CheckboxOptionRow(
         // Checkbox indicator
         Box(
             modifier = Modifier
-                .size(18.dp)
+                .size(ChatTheme.dims.selectionCheckboxSize)
                 .then(
                     if (isSelected) {
-                        Modifier.background(Color(0xFF2196F3), RoundedCornerShape(3.dp))
+                        Modifier.background(ChatTheme.colors.component.selectionCheckboxFill, ChatTheme.shapes.selectionCheckboxCornerRadius)
                     } else {
-                        Modifier.border(1.dp, Color.Gray, RoundedCornerShape(3.dp))
+                        Modifier.border(ChatTheme.dims.selectionBorderWidth, ChatTheme.colors.component.selectionCheckboxBorder, ChatTheme.shapes.selectionCheckboxCornerRadius)
                     }
                 ),
             contentAlignment = Alignment.Center
@@ -183,9 +181,9 @@ private fun CheckboxOptionRow(
             if (isSelected) {
                 Text(
                     text = "\u2713",
-                    color = Color.White,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold
+                    color = ChatTheme.colors.text.inverse,
+                    fontSize = ChatTheme.fonts.selectionCheckmark,
+                    fontWeight = ChatTheme.fontWeights.selectionCheckmark
                 )
             }
         }
@@ -194,13 +192,13 @@ private fun CheckboxOptionRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = option.title,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium
+                fontSize = ChatTheme.fonts.selectionOptionTitle,
+                fontWeight = ChatTheme.fontWeights.selectionOptionTitle
             )
             Text(
                 text = option.description,
-                fontSize = 11.sp,
-                color = Color.Gray
+                fontSize = ChatTheme.fonts.selectionOptionDescription,
+                color = ChatTheme.colors.component.selectionCheckboxBorder
             )
         }
     }

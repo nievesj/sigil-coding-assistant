@@ -45,6 +45,7 @@ import org.jetbrains.jewel.foundation.code.highlighting.LocalCodeHighlighter
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
+import com.opencode.acp.chat.ui.theme.ChatTheme
 
 /**
  * Language name mapping: markdown code fence language → language
@@ -167,7 +168,7 @@ fun ChatFencedCodeBlock(
 
     Column(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(ChatTheme.shapes.codeBlockCornerRadius)
             .background(editorBgColor)
             .fillMaxWidth(),
     ) {
@@ -176,7 +177,7 @@ fun ChatFencedCodeBlock(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                    .padding(horizontal = ChatTheme.dims.codeHeaderPaddingH, vertical = ChatTheme.dims.codeHeaderPaddingV),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
@@ -184,13 +185,13 @@ fun ChatFencedCodeBlock(
                     Icon(
                         key = languageIcon(language.orEmpty()),
                         contentDescription = displayName,
-                        modifier = Modifier.size(14.dp),
-                        tint = Color(0xFF6BBE50),
+                        modifier = Modifier.size(ChatTheme.dims.codeLanguageIconSize),
+                        tint = ChatTheme.colors.component.codeCopyIcon,
                     )
                     Spacer(Modifier.width(6.dp))
                     Text(
                         text = displayName,
-                        style = codeTextStyle.copy(fontSize = 12.sp, color = Color(0xFF6BBE50)),
+                        style = codeTextStyle.copy(fontSize = ChatTheme.fonts.codeLanguageLabel, color = ChatTheme.colors.component.codeCopyIcon),
                     )
                 }
 
@@ -198,13 +199,13 @@ fun ChatFencedCodeBlock(
                     key = AllIconsKeys.Actions.Copy,
                     contentDescription = "Copy code",
                     modifier = Modifier
-                        .size(16.dp)
+                        .size(ChatTheme.dims.codeCopyIconSize)
                         .clickable {
                             coroutineScope.launch {
                                 clipboard.setClipEntry(ClipEntry(StringSelection(content)))
                             }
                         },
-                    tint = Color(0xFFBBBBBB),
+                    tint = ChatTheme.colors.component.codeLanguageLabel,
                 )
             }
         }

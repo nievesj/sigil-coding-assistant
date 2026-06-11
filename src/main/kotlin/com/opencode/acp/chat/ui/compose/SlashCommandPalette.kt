@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -19,12 +18,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
+import com.opencode.acp.chat.ui.theme.ChatTheme
 
 /**
  * A slash command definition.
@@ -38,13 +36,6 @@ data class SlashCommand(
     val iconKey: IconKey? = null,
     val isServerCommand: Boolean = false
 )
-
-private val PaletteBg = Color(0xFF252525)
-private val PaletteHoverBg = Color(0xFF2E3A2E)
-private val PaletteBorderColor = Color(0xFF3E3E3E)
-private val PaletteMutedText = Color(0xFF808080)
-private val PaletteBrightText = Color(0xFFDDDDDD)
-private val PaletteAccent = Color(0xFF3574F0)
 
 /**
  * Slash command palette popup. Shown when the user types `/` at the start of the input.
@@ -63,6 +54,12 @@ fun SlashCommandPalette(
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val colors = ChatTheme.colors
+    val shapes = ChatTheme.shapes
+    val dims = ChatTheme.dims
+    val fonts = ChatTheme.fonts
+    val fontWeights = ChatTheme.fontWeights
+
     val filtered = remember(query, commands) {
         if (query.isBlank()) commands
         else commands.filter { it.name.startsWith(query, ignoreCase = true) }
@@ -72,14 +69,14 @@ fun SlashCommandPalette(
         // No matches — show "No matching commands"
         Column(
             modifier = modifier
-                .clip(RoundedCornerShape(8.dp))
-                .background(PaletteBg)
+                .clip(shapes.paletteCornerRadius)
+                .background(colors.surface.dark)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             Text(
                 text = "No matching commands",
-                fontSize = 12.sp,
-                color = PaletteMutedText,
+                fontSize = fonts.paletteEmpty,
+                color = colors.text.muted,
             )
         }
         return
@@ -87,9 +84,9 @@ fun SlashCommandPalette(
 
     Column(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(PaletteBg)
-            .widthIn(max = 300.dp)
+            .clip(shapes.paletteCornerRadius)
+            .background(colors.surface.dark)
+            .widthIn(max = dims.paletteMaxWidth)
     ) {
         filtered.forEach { command ->
             var isHovered by remember { mutableStateOf(false) }
@@ -97,8 +94,8 @@ fun SlashCommandPalette(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(4.dp))
-                    .background(if (isHovered) PaletteHoverBg else Color.Transparent)
+                    .clip(shapes.paletteRowCornerRadius)
+                    .background(if (isHovered) colors.component.paletteHoverBg else Color.Transparent)
                     .clickable {
                         onCommandSelected(command)
                     }
@@ -112,22 +109,22 @@ fun SlashCommandPalette(
                         key = command.iconKey,
                         contentDescription = command.name,
                         modifier = Modifier.size(14.dp),
-                        tint = PaletteAccent,
+                        tint = colors.accent.blue,
                     )
                 }
 
                 // Command name with `/` prefix highlighted
                 Text(
                     text = "/${command.name}",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = PaletteAccent,
+                    fontSize = fonts.paletteCommand,
+                    fontWeight = fontWeights.commandName,
+                    color = colors.accent.blue,
                 )
 
                 Text(
                     text = command.description,
-                    fontSize = 11.sp,
-                    color = PaletteMutedText,
+                    fontSize = fonts.paletteDescription,
+                    color = colors.text.muted,
                     modifier = Modifier.weight(1f),
                 )
             }

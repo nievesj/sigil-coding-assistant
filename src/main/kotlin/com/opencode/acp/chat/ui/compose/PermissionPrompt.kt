@@ -18,6 +18,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.opencode.acp.chat.model.PermissionPrompt
 import com.opencode.acp.chat.model.PermissionResponse
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.DefaultButton
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.OutlinedButton
@@ -31,15 +32,15 @@ fun PermissionPrompt(
 ) {
     Column(
         modifier = Modifier
-            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .padding(horizontal = ChatTheme.dims.permissionPaddingH, vertical = ChatTheme.dims.permissionPaddingV)
             .border(
-                width = 1.dp,
-                color = Color(0x40808080),
-                shape = RoundedCornerShape(4.dp)
+                width = ChatTheme.dims.permissionBorderWidth,
+                color = ChatTheme.colors.accent.permissionBorder,
+                shape = ChatTheme.shapes.permissionCornerRadius
             )
             .background(
-                color = Color(0x10808080),
-                shape = RoundedCornerShape(4.dp)
+                color = ChatTheme.colors.accent.permissionBg,
+                shape = ChatTheme.shapes.permissionCornerRadius
             )
             .padding(8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -60,7 +61,8 @@ fun PermissionPrompt(
                 )
                 Text(
                     text = prompt.description ?: "This tool requires permission.",
-                    color = Color.Gray
+                    color = ChatTheme.colors.text.muted,
+                    fontSize = ChatTheme.fonts.permissionDescription
                 )
             }
         }

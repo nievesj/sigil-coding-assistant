@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -35,12 +34,12 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.TextField
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
+import com.opencode.acp.chat.ui.theme.ChatTheme
 
 /**
  * Recent file entry for the attachment menu.
@@ -69,11 +68,11 @@ fun AttachMenu(
     val searchFocusRequester = remember { FocusRequester() }
     var hoveredIndex by remember { mutableStateOf(-1) }
 
-    val bgColor = Color(0xFF2B2B2B)
-    val borderColor = Color(0xFF3E3E3E)
-    val mutedTextColor = Color(0xFF808080)
-    val hoverBg = Color(0xFF3E3E3E)
-    val dividerColor = Color(0xFF3E3E3E)
+    val bgColor = ChatTheme.colors.component.inputBg
+    val borderColor = ChatTheme.colors.border.default
+    val mutedTextColor = ChatTheme.colors.text.muted
+    val hoverBg = ChatTheme.colors.component.hoverBg
+    val dividerColor = ChatTheme.colors.border.default
 
     // Filter recent files by search query — computed directly so TextFieldState changes trigger recomposition
     val searchQuery = searchState.text.toString()
@@ -106,9 +105,9 @@ fun AttachMenu(
         modifier = modifier
             .width(320.dp)
             .heightIn(max = 480.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .clip(ChatTheme.shapes.attachMenuCornerRadius)
             .background(bgColor)
-            .border(1.dp, borderColor, RoundedCornerShape(8.dp)),
+            .border(1.dp, borderColor, ChatTheme.shapes.attachMenuCornerRadius),
     ) {
         // Search field
         Row(
@@ -135,14 +134,14 @@ fun AttachMenu(
                             true
                         } else false
                     },
-                placeholder = { Text("Search", color = mutedTextColor, fontSize = 12.sp) },
+                placeholder = { Text("Search", color = mutedTextColor, fontSize = ChatTheme.fonts.attachMenuSearchPlaceholder) },
             )
         }
 
         // Files and Folders
         AttachMenuItem(
             icon = AllIconsKeys.Nodes.Folder,
-            iconTint = Color(0xFFBBBBBB),
+            iconTint = ChatTheme.colors.component.attachmentRemoveIcon,
             label = "Files and Folders",
             trailing = {
                 Icon(
@@ -164,7 +163,7 @@ fun AttachMenu(
         // Image...
         AttachMenuItem(
             icon = AllIconsKeys.FileTypes.Image,
-            iconTint = Color(0xFFBBBBBB),
+            iconTint = ChatTheme.colors.component.attachmentRemoveIcon,
             label = "Image...",
             hovered = hoveredIndex == 1,
             hoverBg = hoverBg,
@@ -188,14 +187,14 @@ fun AttachMenu(
             // No matches for search query
             Text(
                 text = "No matching files",
-                fontSize = 11.sp,
+                fontSize = ChatTheme.fonts.attachMenuSectionLabel,
                 color = mutedTextColor,
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
             )
         } else if (displayFiles.isNotEmpty()) {
             Text(
                 text = sectionLabel,
-                fontSize = 11.sp,
+                fontSize = ChatTheme.fonts.attachMenuSectionLabel,
                 color = mutedTextColor,
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
             )
@@ -255,7 +254,7 @@ private fun AttachMenuItem(
         modifier = Modifier
             .fillMaxWidth()
             .height(28.dp)
-            .clip(RoundedCornerShape(4.dp))
+            .clip(ChatTheme.shapes.attachFileRowCornerRadius)
             .background(bgColor)
             .clickable(onClick = onClick)
             .padding(horizontal = 10.dp, vertical = 2.dp),
@@ -271,15 +270,15 @@ private fun AttachMenuItem(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = label,
-                fontSize = 12.sp,
-                color = Color(0xFFCCCCCC),
+                fontSize = ChatTheme.fonts.attachMenuFileName,
+                color = ChatTheme.colors.text.secondary,
                 maxLines = 1,
             )
             if (subtitle != null) {
                 Text(
                     text = subtitle,
-                    fontSize = 10.sp,
-                    color = Color(0xFF666666),
+                    fontSize = ChatTheme.fonts.attachMenuFilePath,
+                    color = ChatTheme.colors.text.disabled,
                     maxLines = 1,
                 )
             }
@@ -292,25 +291,26 @@ private fun AttachMenuItem(
  * Returns the appropriate IntelliJ icon and tint color for a file based on its extension.
  * Only uses icons known to exist in the IntelliJ platform.
  */
+@Composable
 private fun fileIconForFile(fileName: String): Pair<org.jetbrains.jewel.ui.icon.IconKey, Color> {
     val ext = fileName.substringAfterLast('.', "").lowercase()
     return when {
-        ext == "kt" || ext == "kts" -> AllIconsKeys.Language.Kotlin to Color(0xFFA97BFF)
-        ext == "java" -> AllIconsKeys.FileTypes.Java to Color(0xFFED8B00)
-        ext == "js" || ext == "jsx" -> AllIconsKeys.FileTypes.JavaScript to Color(0xFFF7DF1E)
-        ext == "ts" || ext == "tsx" -> AllIconsKeys.FileTypes.JavaScript to Color(0xFF3178C6)
-        ext == "py" -> AllIconsKeys.Language.Python to Color(0xFF3776AB)
-        ext == "rb" -> AllIconsKeys.Language.Ruby to Color(0xFFCC342D)
-        ext == "go" -> AllIconsKeys.Language.GO to Color(0xFF00ADD8)
-        ext == "rs" -> AllIconsKeys.Language.Rust to Color(0xFFCE422B)
-        ext == "html" || ext == "htm" -> AllIconsKeys.FileTypes.Html to Color(0xFFE44D26)
-        ext == "css" || ext == "scss" -> AllIconsKeys.FileTypes.Css to Color(0xFF264DE4)
-        ext == "xml" -> AllIconsKeys.FileTypes.Xml to Color(0xFF0060AC)
-        ext == "json" -> AllIconsKeys.FileTypes.Json to Color(0xFFBBBBBB)
-        ext == "yaml" || ext == "yml" -> AllIconsKeys.FileTypes.Yaml to Color(0xFFCB171E)
-        ext == "md" -> AllIconsKeys.FileTypes.Text to Color(0xFF519ABA)
-        ext == "sql" -> AllIconsKeys.FileTypes.Text to Color(0xFFE38C00)
-        ext == "sh" || ext == "bash" -> AllIconsKeys.Nodes.Console to Color(0xFF4EAA25)
-        else -> AllIconsKeys.FileTypes.Text to Color(0xFFBBBBBB)
+        ext == "kt" || ext == "kts" -> AllIconsKeys.Language.Kotlin to ChatTheme.colors.file.kotlin
+        ext == "java" -> AllIconsKeys.FileTypes.Java to ChatTheme.colors.file.java
+        ext == "js" || ext == "jsx" -> AllIconsKeys.FileTypes.JavaScript to ChatTheme.colors.file.javaScript
+        ext == "ts" || ext == "tsx" -> AllIconsKeys.FileTypes.JavaScript to ChatTheme.colors.file.typeScript
+        ext == "py" -> AllIconsKeys.Language.Python to ChatTheme.colors.file.python
+        ext == "rb" -> AllIconsKeys.Language.Ruby to ChatTheme.colors.file.ruby
+        ext == "go" -> AllIconsKeys.Language.GO to ChatTheme.colors.file.go
+        ext == "rs" -> AllIconsKeys.Language.Rust to ChatTheme.colors.file.rust
+        ext == "html" || ext == "htm" -> AllIconsKeys.FileTypes.Html to ChatTheme.colors.file.html
+        ext == "css" || ext == "scss" -> AllIconsKeys.FileTypes.Css to ChatTheme.colors.file.css
+        ext == "xml" -> AllIconsKeys.FileTypes.Xml to ChatTheme.colors.file.xml
+        ext == "json" -> AllIconsKeys.FileTypes.Json to ChatTheme.colors.file.json
+        ext == "yaml" || ext == "yml" -> AllIconsKeys.FileTypes.Yaml to ChatTheme.colors.file.yaml
+        ext == "md" -> AllIconsKeys.FileTypes.Text to ChatTheme.colors.file.markdown
+        ext == "sql" -> AllIconsKeys.FileTypes.Text to ChatTheme.colors.file.sql
+        ext == "sh" || ext == "bash" -> AllIconsKeys.Nodes.Console to ChatTheme.colors.file.shell
+        else -> AllIconsKeys.FileTypes.Text to ChatTheme.colors.component.attachmentRemoveIcon
     }
 }

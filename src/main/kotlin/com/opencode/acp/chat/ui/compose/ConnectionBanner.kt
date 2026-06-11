@@ -8,14 +8,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
@@ -57,15 +55,15 @@ private fun BannerRow(
         modifier = Modifier
             .fillMaxWidth()
             .background(
-                color = if (isError) Color(0x1ADB4437) else Color(0x1A589DF6),
-                shape = RoundedCornerShape(4.dp)
+                color = if (isError) ChatTheme.colors.accent.bannerErrorBg else ChatTheme.colors.accent.bannerInfoBg,
+                shape = ChatTheme.shapes.bannerCornerRadius
             )
             .border(
-                width = 1.dp,
-                color = if (isError) Color(0x40DB4437) else Color(0x40589DF6),
-                shape = RoundedCornerShape(4.dp)
+                width = ChatTheme.dims.bannerBorderWidth,
+                color = if (isError) ChatTheme.colors.accent.bannerErrorBorder else ChatTheme.colors.accent.bannerInfoBorder,
+                shape = ChatTheme.shapes.bannerCornerRadius
             )
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(horizontal = ChatTheme.dims.bannerPaddingH, vertical = ChatTheme.dims.bannerPaddingV),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
@@ -73,11 +71,11 @@ private fun BannerRow(
             key = if (isError) AllIconsKeys.General.BalloonError
                   else AllIconsKeys.General.BalloonInformation,
             contentDescription = null,
-            modifier = Modifier.size(16.dp)
+            modifier = Modifier.size(ChatTheme.dims.bannerIconSize)
         )
         Text(
             text = text,
-            fontWeight = FontWeight.Medium
+            fontWeight = ChatTheme.fontWeights.bannerText
         )
         if (retryLink != null) {
             Spacer(Modifier.weight(1f))

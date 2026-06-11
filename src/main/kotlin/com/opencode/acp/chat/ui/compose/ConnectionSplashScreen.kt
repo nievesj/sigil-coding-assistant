@@ -16,8 +16,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -27,14 +25,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.intellij.openapi.project.Project
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.viewmodel.ChatViewModel
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
@@ -59,7 +56,7 @@ fun ConnectionSplashScreen(
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF1E1E1E)),
+            .background(ChatTheme.colors.component.splashBg),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -71,8 +68,8 @@ fun ConnectionSplashScreen(
             Icon(
                 key = AllIconsKeys.General.Information,
                 contentDescription = "OpenCode",
-                modifier = Modifier.size(64.dp),
-                tint = Color(0xFF4CAF50)
+                modifier = Modifier.size(ChatTheme.dims.splashLogoSize),
+                tint = ChatTheme.colors.component.splashConnected
             )
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -80,9 +77,9 @@ fun ConnectionSplashScreen(
             // Title
             Text(
                 text = "OpenCode",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color.White
+                fontSize = ChatTheme.fonts.splashTitle,
+                fontWeight = ChatTheme.fontWeights.splashTitle,
+                color = ChatTheme.colors.text.inverse
             )
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -97,15 +94,15 @@ fun ConnectionSplashScreen(
             }
 
             val statusColor = when (connectionState) {
-                ConnectionState.CONNECTED -> Color(0xFF4CAF50)
-                ConnectionState.ERROR -> Color(0xFFF44336)
-                ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> Color(0xFFFFC107)
-                else -> Color(0xFF9E9E9E)
+                ConnectionState.CONNECTED -> ChatTheme.colors.component.splashConnected
+                ConnectionState.ERROR -> ChatTheme.colors.component.splashError
+                ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> ChatTheme.colors.component.sidebarShimmerCreating
+                else -> ChatTheme.colors.text.muted
             }
 
             Text(
                 text = statusMessage,
-                fontSize = 14.sp,
+                fontSize = ChatTheme.fonts.splashStatus,
                 color = statusColor,
                 textAlign = TextAlign.Center
             )
@@ -120,7 +117,7 @@ fun ConnectionSplashScreen(
                         text = "Connect",
                         icon = AllIconsKeys.Actions.Execute,
                         onClick = onConnect,
-                        backgroundColor = Color(0xFF4CAF50)
+                        backgroundColor = ChatTheme.colors.component.splashConnected
                     )
                 }
                 ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> {
@@ -129,7 +126,7 @@ fun ConnectionSplashScreen(
                         text = "Stop",
                         icon = AllIconsKeys.Actions.Suspend,
                         onClick = onStop,
-                        backgroundColor = Color(0xFFF44336)
+                        backgroundColor = ChatTheme.colors.component.splashError
                     )
                 }
                 ConnectionState.ERROR -> {
@@ -138,7 +135,7 @@ fun ConnectionSplashScreen(
                         text = "Retry",
                         icon = AllIconsKeys.Actions.Refresh,
                         onClick = onRetry,
-                        backgroundColor = Color(0xFFFF9800)
+                        backgroundColor = ChatTheme.colors.component.splashRetry
                     )
                 }
                 ConnectionState.CONNECTED -> {
@@ -152,7 +149,7 @@ fun ConnectionSplashScreen(
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(ChatTheme.shapes.splashButtonCornerRadius)
                     .clickable {
                         autoConnect = !autoConnect
                         settings.autoConnect = autoConnect
@@ -162,15 +159,15 @@ fun ConnectionSplashScreen(
             ) {
                 Box(
                     modifier = Modifier
-                        .size(16.dp)
+                        .size(ChatTheme.dims.splashIndicatorSize)
                         .border(
                             width = 1.dp,
-                            color = if (autoConnect) Color(0xFF4CAF50) else Color(0xFF9E9E9E),
-                            shape = RoundedCornerShape(2.dp)
+                            color = if (autoConnect) ChatTheme.colors.component.splashConnected else ChatTheme.colors.text.muted,
+                            shape = ChatTheme.shapes.splashSettingsCornerRadius
                         )
                         .background(
-                            color = if (autoConnect) Color(0xFF4CAF50) else Color.Transparent,
-                            shape = RoundedCornerShape(2.dp)
+                            color = if (autoConnect) ChatTheme.colors.component.splashConnected else Color.Transparent,
+                            shape = ChatTheme.shapes.splashSettingsCornerRadius
                         ),
                     contentAlignment = Alignment.Center
                 ) {
@@ -178,8 +175,8 @@ fun ConnectionSplashScreen(
                     Icon(
                         key = AllIconsKeys.Actions.Checked,
                         contentDescription = "Checked",
-                        modifier = Modifier.size(12.dp),
-                        tint = Color.White
+                        modifier = Modifier.size(ChatTheme.dims.splashSettingsDotSize),
+                        tint = ChatTheme.colors.text.inverse
                     )
                 }
                 }
@@ -188,8 +185,8 @@ fun ConnectionSplashScreen(
 
                 Text(
                     text = "Connect automatically when plugin opens",
-                    fontSize = 12.sp,
-                    color = Color(0xFFBBBBBB)
+                    fontSize = ChatTheme.fonts.splashSettingsLabel,
+                    color = ChatTheme.colors.text.secondary
                 )
             }
         }
@@ -206,7 +203,7 @@ private fun ActionButton(
 ) {
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(ChatTheme.shapes.splashButtonCornerRadius)
             .background(backgroundColor)
             .clickable(onClick = onClick)
             .padding(horizontal = 24.dp, vertical = 12.dp),
@@ -219,15 +216,15 @@ private fun ActionButton(
             Icon(
                 key = icon,
                 contentDescription = text,
-                modifier = Modifier.size(16.dp),
-                tint = Color.White
+                modifier = Modifier.size(ChatTheme.dims.splashIndicatorSize),
+                tint = ChatTheme.colors.text.inverse
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = text,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                color = Color.White
+                fontSize = ChatTheme.fonts.splashStatus,
+                fontWeight = ChatTheme.fontWeights.splashError,
+                color = ChatTheme.colors.text.inverse
             )
         }
     }

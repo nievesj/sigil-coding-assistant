@@ -13,16 +13,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Text
 
@@ -44,20 +41,20 @@ fun ChatTable(
         // Fallback: render as plain text if parsing fails
         Text(
             text = rawMarkdown,
-            color = Color(0xFFD4D4D4),
-            fontSize = 13.sp,
+            color = ChatTheme.colors.component.tableCellText,
+            fontSize = ChatTheme.fonts.tableCell,
             modifier = modifier.padding(8.dp),
         )
         return
     }
 
-    val headerTextColor = Color(0xFF6BBE50)
-    val cellTextColor = Color(0xFFD4D4D4)
-    val separatorColor = Color(0xFF3E3E3E)
-    val headerBgColor = Color(0xFF2A2A2A)
-    val hoverBgColor = Color(0xFF252525)
-    val borderColor = Color(0xFF3E3E3E)
-    val cellFontSize = 13.sp
+    val headerTextColor = ChatTheme.colors.component.tableHeaderText
+    val cellTextColor = ChatTheme.colors.component.tableCellText
+    val separatorColor = ChatTheme.colors.component.tableSeparator
+    val headerBgColor = ChatTheme.colors.component.tableHeaderBg
+    val hoverBgColor = ChatTheme.colors.component.tableHoverBg
+    val borderColor = ChatTheme.colors.component.tableBorder
+    val cellFontSize = ChatTheme.fonts.tableCell
     val cellPaddingHorizontal = 12.dp
     val cellPaddingVertical = 6.dp
 
@@ -76,8 +73,8 @@ fun ChatTable(
 
     Column(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFF1E1E1E))
+            .clip(ChatTheme.shapes.tableCornerRadius)
+            .background(ChatTheme.colors.component.tableContainerBg)
             .fillMaxWidth()
             .horizontalScroll(rememberScrollState()),
     ) {
@@ -100,9 +97,9 @@ fun ChatTable(
                     text = cell,
                     color = headerTextColor,
                     fontSize = cellFontSize,
-                    fontWeight = FontWeight.Bold,
+                    fontWeight = ChatTheme.fontWeights.tableHeader,
                     textAlign = textAlign,
-                    inlineCodeColor = Color(0xFF6BBE50),
+                    inlineCodeColor = headerTextColor,
                     modifier = Modifier
                         .width(columnWidths.getOrElse(colIdx) { 100.dp })
                         .padding(horizontal = cellPaddingHorizontal),
@@ -142,7 +139,7 @@ fun ChatTable(
                         color = cellTextColor,
                         fontSize = cellFontSize,
                         textAlign = textAlign,
-                        inlineCodeColor = Color(0xFF6BBE50),
+                        inlineCodeColor = headerTextColor,
                         modifier = Modifier
                             .width(columnWidths.getOrElse(colIdx) { 100.dp })
                             .padding(horizontal = cellPaddingHorizontal),

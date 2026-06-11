@@ -10,6 +10,7 @@ import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.chat.ui.compose.ChatScreen
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.util.edtScope
 import java.awt.event.KeyEvent
@@ -27,7 +28,9 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         // addComposeTab() automatically handles SwingBridgeTheme, enableNewSwingCompositing(),
         // and JewelComposePanel creation — no explicit SwingBridgeTheme {} wrapper needed.
         toolWindow.addComposeTab("") {
-            ChatScreen(viewModel, project)
+            ChatTheme {
+                ChatScreen(viewModel, project)
+            }
         }
 
         // Register Ctrl+V / Cmd+V action on the tool window content component.

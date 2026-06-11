@@ -22,6 +22,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.SessionContext
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.chat.model.SessionContextState
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
@@ -56,7 +57,7 @@ private fun LoadingContent(modifier: Modifier = Modifier) {
     ) {
         Text(
             text = "Loading context...",
-            fontSize = 12.sp,
+            fontSize = ChatTheme.fonts.contextPanelTitle,
             color = JewelTheme.globalColors.text.disabled
         )
     }
@@ -71,14 +72,14 @@ private fun ErrorContent(message: String, retryable: Boolean, onRetry: () -> Uni
     ) {
         Text(
             text = "Failed to load context",
-            fontSize = 12.sp,
+            fontSize = ChatTheme.fonts.contextPanelTitle,
             fontWeight = FontWeight.Medium,
-            color = Color(0xFFE5534B)
+            color = ChatTheme.colors.accent.red
         )
         Spacer(Modifier.height(4.dp))
         Text(
             text = message,
-            fontSize = 11.sp,
+            fontSize = ChatTheme.fonts.contextDetailValue,
             color = JewelTheme.globalColors.text.disabled,
             maxLines = 2
         )
@@ -91,11 +92,11 @@ private fun ErrorContent(message: String, retryable: Boolean, onRetry: () -> Uni
 
 @Composable
 private fun ContextDetails(context: SessionContext, modifier: Modifier = Modifier) {
-    val sectionColor = Color(0xFFCCCCCC)
-    val labelColor = Color(0xFF999999)
-    val valueColor = Color(0xFFDDDDDD)
-    val separator = Color(0xFF3E3E3E)
-    val progressBg = Color(0xFF3C3C3C)
+    val sectionColor = ChatTheme.colors.component.contextPanelValue
+    val labelColor = ChatTheme.colors.component.contextPanelLabel
+    val valueColor = ChatTheme.colors.component.contextPanelValue
+    val separator = ChatTheme.colors.component.contextPanelSeparator
+    val progressBg = ChatTheme.colors.component.contextProgressBarBg
 
     Column(
         modifier = modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp),
@@ -156,8 +157,8 @@ private fun ContextDetails(context: SessionContext, modifier: Modifier = Modifie
         if (context.additions > 0 || context.deletions > 0 || context.filesModified > 0) {
             SectionHeader("Changes", sectionColor)
             DetailRow(label = "Files", value = "${context.filesModified}", labelColor, valueColor)
-            DetailRow(label = "Added", value = "+${context.additions}", labelColor, Color(0xFF6BBE50))
-            DetailRow(label = "Removed", value = "-${context.deletions}", labelColor, Color(0xFFE5534B))
+            DetailRow(label = "Added", value = "+${context.additions}", labelColor, ChatTheme.colors.accent.codeAdded)
+            DetailRow(label = "Removed", value = "-${context.deletions}", labelColor, ChatTheme.colors.accent.red)
 
             Spacer(Modifier.height(10.dp))
             HorizontalSeparator(separator)
@@ -184,8 +185,8 @@ private fun ContextDetails(context: SessionContext, modifier: Modifier = Modifie
 private fun SectionHeader(text: String, color: Color) {
     Text(
         text = text,
-        fontSize = 11.sp,
-        fontWeight = FontWeight.SemiBold,
+        fontSize = ChatTheme.fonts.contextSectionHeader,
+        fontWeight = ChatTheme.fontWeights.detailLabel,
         color = color
     )
     Spacer(Modifier.height(4.dp))
@@ -199,14 +200,14 @@ private fun DetailRow(label: String, value: String, labelColor: Color, valueColo
     ) {
         Text(
             text = label,
-            fontSize = 11.sp,
+            fontSize = ChatTheme.fonts.contextDetailLabel,
             color = labelColor,
             modifier = Modifier.width(90.dp)
         )
         Text(
             text = value,
-            fontSize = 11.sp,
-            fontWeight = if (bold) FontWeight.Medium else FontWeight.Normal,
+            fontSize = ChatTheme.fonts.contextDetailValue,
+            fontWeight = if (bold) ChatTheme.fontWeights.detailLabel else ChatTheme.fontWeights.detailValue,
             color = if (bold) valueColor else labelColor
         )
     }
@@ -226,21 +227,21 @@ private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long,
         ) {
             Text(
                 text = displayPercent,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
+                fontSize = ChatTheme.fonts.contextPanelTitle,
+                fontWeight = ChatTheme.fontWeights.contextPercent,
                 color = color
             )
             if (!isUnknown) {
                 Text(
                     text = "${formatPanelTokens(totalTokens)} / ${formatPanelTokens(contextLimit)}",
                     fontSize = 10.sp,
-                    color = Color(0xFF999999)
+                    color = ChatTheme.colors.component.contextPanelLabel
                 )
             } else {
                 Text(
                     text = "${formatPanelTokens(totalTokens)} tokens",
                     fontSize = 10.sp,
-                    color = Color(0xFF999999)
+                    color = ChatTheme.colors.component.contextPanelLabel
                 )
             }
         }
@@ -250,7 +251,7 @@ private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(8.dp)
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(ChatTheme.shapes.contextProgressBarCornerRadius)
                     .background(progressBg)
             ) {
                 val fillFraction = (usagePercent / 100f).coerceIn(0f, 1f)
@@ -259,7 +260,7 @@ private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long,
                     modifier = Modifier
                         .fillMaxWidth(fillFraction)
                         .height(8.dp)
-                        .clip(RoundedCornerShape(topStart = 4.dp, bottomStart = 4.dp))
+                        .clip(RoundedCornerShape(topStart = ChatTheme.dims.contextProgressBarCornerRadius, bottomStart = ChatTheme.dims.contextProgressBarCornerRadius))
                         .background(color)
                 )
                 if (usagePercent > 100f) {
@@ -270,7 +271,7 @@ private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long,
                     ) {
                         Text(
                             text = "+",
-                            fontSize = 7.sp,
+                            fontSize = ChatTheme.fonts.contextProgressBarPercent,
                             fontWeight = FontWeight.Bold,
                             color = contextColorForPercent(usagePercent)
                         )
@@ -282,14 +283,14 @@ private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(8.dp)
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(ChatTheme.shapes.contextProgressBarCornerRadius)
                     .background(progressBg),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = "N/A",
-                    fontSize = 7.sp,
-                    color = Color(0xFF666666)
+                    fontSize = ChatTheme.fonts.contextProgressBarPercent,
+                    color = ChatTheme.colors.text.disabled
                 )
             }
         }

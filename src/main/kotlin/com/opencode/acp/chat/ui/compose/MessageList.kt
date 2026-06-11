@@ -71,8 +71,10 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.opencode.acp.chat.model.ChatFileChange
 import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.MessagePart
+import com.opencode.acp.chat.model.MessageRenderPhase
 import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.MessageState
+import com.opencode.acp.chat.model.renderPhase
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.foundation.code.highlighting.NoOpCodeHighlighter
@@ -88,6 +90,7 @@ import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.VerticalScrollbar
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
+import com.opencode.acp.chat.ui.theme.ChatTheme
 
 @Composable
 fun MessageList(
@@ -166,15 +169,10 @@ fun MessageList(
         }
     }
 
-    // Show jump button when auto-scroll is disabled and there's content below.
+    // Show jump button whenever there are messages (always visible).
     val showJumpButton by remember {
         derivedStateOf {
-            if (autoScrollEnabled) return@derivedStateOf false
-            if (messages.isEmpty()) return@derivedStateOf false
-            val lastItemIndex = messages.size - 1
-            val visibleItems = listState.layoutInfo.visibleItemsInfo
-            val lastItemVisible = visibleItems.any { it.index == lastItemIndex }
-            !lastItemVisible
+            messages.isNotEmpty()
         }
     }
 
@@ -221,12 +219,12 @@ fun MessageList(
                     .graphicsLayer { alpha = jumpButtonAlpha }
                     .size(36.dp)
                     .background(
-                        color = Color(0xFF3574F0),
+                        color = ChatTheme.colors.accent.blue,
                         shape = CircleShape
                     )
                     .border(
                         width = 1.dp,
-                        color = Color(0xFF5E9AFF),
+                        color = ChatTheme.colors.accent.userAvatarFill,
                         shape = CircleShape
                     )
                     .clickable {
@@ -276,7 +274,7 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
                                 modifier = Modifier
                                     .size(100.dp)
                                     .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0xFF3E3E3E))
+                                    .background(ChatTheme.colors.border.default)
                                     .clickable(
                                         interactionSource = remember { MutableInteractionSource() },
                                         indication = null,
@@ -303,10 +301,10 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
             Box(
                 modifier = Modifier
                     .background(
-                        color = Color(0xFF3574F0).copy(alpha = 0.12f),
-                        shape = RoundedCornerShape(8.dp)
+                        color = ChatTheme.colors.accent.userBubbleBg,
+                        shape = ChatTheme.shapes.messageBubbleCornerRadius
                     )
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                    .padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = 6.dp)
             ) {
                 org.jetbrains.jewel.ui.component.Text(textContent)
             }
@@ -321,18 +319,21 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
      // Set up markdown styling once for the entire message (needed by Text and Code parts)
      val currentProject = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
      val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
-     val defaultGreen = Color(0xFF6BBE50)
+     val defaultGreen = ChatTheme.colors.accent.green
      val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
      val listNumberColor = parseColorOrDefault(settings.listNumberColor, defaultGreen)
-     val customInlinesStyling = remember(inlineCodeColor) {
-         val linkColor = Color(0xFF3574F0)
+     val linkColor = ChatTheme.colors.accent.blue
+     val customInlinesStyling = remember(inlineCodeColor, linkColor) {
          InlinesStyling.create(
              inlineCode = SpanStyle(color = inlineCodeColor, background = Color.Transparent, fontFamily = FontFamily.Monospace),
              link = SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline),
              linkHovered = SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline),
          )
      }
-     val markdownStyling = remember(customInlinesStyling, listNumberColor) {
+     val blockLineColor = ChatTheme.colors.accent.blockQuoteLine
+     val blockTextColor = ChatTheme.colors.accent.blockQuoteText
+     val orderedListFontSize = ChatTheme.fonts.messageOrderedListItem
+     val markdownStyling = remember(customInlinesStyling, listNumberColor, blockLineColor, blockTextColor, orderedListFontSize) {
          val baseTextStyle = org.jetbrains.jewel.bridge.theme.retrieveDefaultTextStyle()
          MarkdownStyling.create(
              inlinesStyling = customInlinesStyling,
@@ -346,7 +347,7 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
              ),
              list = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.create(
                  ordered = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.create(
-                     numberStyle = TextStyle(color = listNumberColor, fontSize = 14.sp),
+                      numberStyle = TextStyle(color = listNumberColor, fontSize = orderedListFontSize),
                      numberFormatStyles = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles(
                          firstLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
                          secondLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
@@ -354,11 +355,11 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                      ),
                  ),
              ),
-             blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
+              blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
                  padding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                  lineWidth = 3.dp,
-                 lineColor = Color(0xFF3E3E3E),
-                 textColor = Color(0xFF9E9E9E),
+                 lineColor = blockLineColor,
+                 textColor = blockTextColor,
              ),
          )
      }
@@ -415,7 +416,7 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                              Markdown(
                                  markdownBlocks = parsedBlocks,
                                  markdown = part.content,
-                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                                 modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
                                  selectable = true,
                                  onUrlClick = { url -> BrowserUtil.open(url) },
                              )
@@ -425,16 +426,16 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                      is MessagePart.Table -> key(key) { ChatTable(rawMarkdown = part.rawMarkdown, modifier = Modifier.fillMaxWidth()) }
                      is MessagePart.Patch -> if (!hasToolCall) key(key) {
                          Column(
-                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp).fillMaxWidth()
-                                 .background(color = Color(0xFF2D2D2D), shape = RoundedCornerShape(8.dp)).padding(8.dp),
+                             modifier = Modifier.padding(horizontal = 8.dp, vertical = ChatTheme.dims.messagePaddingV).fillMaxWidth()
+                                 .background(color = ChatTheme.colors.surface.card, shape = ChatTheme.shapes.messageBubbleCornerRadius).padding(8.dp),
                              verticalArrangement = Arrangement.spacedBy(4.dp),
                               ) {
-                              Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                  Icon(key = AllIconsKeys.Nodes.Folder, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFF9E9E9E))
-                                  Text(text = "${part.files.size} changed file${if (part.files.size != 1) "s" else ""}", style = TextStyle(fontSize = 12.sp, color = Color(0xFF9E9E9E), fontWeight = FontWeight.Medium))
-                              }
-                             part.files.forEach { filePath ->
-                                 Text(text = "  ${filePath.substringAfterLast('/')}", style = TextStyle(fontSize = 11.sp, color = Color(0xFFBBBBBB)))
+                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                 Icon(key = AllIconsKeys.Nodes.Folder, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.thinkingChevron)
+                                 Text(text = "${part.files.size} changed file${if (part.files.size != 1) "s" else ""}", style = TextStyle(fontSize = ChatTheme.fonts.messagePatchFileCount, color = ChatTheme.colors.component.thinkingChevron, fontWeight = FontWeight.Medium))
+                             }
+                            part.files.forEach { filePath ->
+                                Text(text = "  ${filePath.substringAfterLast('/')}", style = TextStyle(fontSize = ChatTheme.fonts.messagePatchFileName, color = ChatTheme.colors.component.attachmentRemoveIcon))
                              }
                          }
                      }
@@ -442,30 +443,30 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                      is MessagePart.StepFinish -> key(key) { StepFinishPill(part) }
                      is MessagePart.Retry -> key(key) { RetryPill(part.attempt, part.maxAttempts, part.error) }
                      is MessagePart.Compaction -> key(key) { CompactionPill(part.summary) }
-                      is MessagePart.FileChange -> if (!hasToolCall) key(key) { FileChangeCard(change = part.change, project = project, addedColor = Color(0xFF7EE787), deletedColor = Color(0xFFFF7B72), pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)) }
+                      is MessagePart.FileChange -> if (!hasToolCall) key(key) { FileChangeCard(change = part.change, project = project, addedColor = ChatTheme.colors.accent.codeAdded, deletedColor = ChatTheme.colors.accent.codeDeleted, pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)) }
                       is MessagePart.AssistantFile -> key(key) {
                          Row(
                              modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp).fillMaxWidth()
-                                 .background(color = Color(0xFF2D2D2D), shape = RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 6.dp),
+                                 .background(color = ChatTheme.colors.surface.card, shape = ChatTheme.shapes.attachmentCornerRadius).padding(horizontal = 8.dp, vertical = 6.dp),
                              verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
                           ) {
-                              Icon(key = AllIconsKeys.FileTypes.Text, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFBBBBBB))
+                              Icon(key = AllIconsKeys.FileTypes.Text, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.attachmentRemoveIcon)
                               Column {
-                                 Text(text = part.filename ?: "file", style = TextStyle(fontSize = 12.sp, color = Color(0xFFBBBBBB), fontWeight = FontWeight.Medium))
-                                 Text(text = part.mime, style = TextStyle(fontSize = 10.sp, color = Color(0xFF7E7E7E)))
+                                 Text(text = part.filename ?: "file", style = TextStyle(fontSize = ChatTheme.fonts.messageFileName, color = ChatTheme.colors.component.attachmentRemoveIcon, fontWeight = FontWeight.Medium))
+                                 Text(text = part.mime, style = TextStyle(fontSize = ChatTheme.fonts.messageFileMime, color = ChatTheme.colors.component.mimeText))
                              }
                          }
                      }
-                     is MessagePart.Image -> key(key) {
+                      is MessagePart.Image -> key(key) {
                          Row(
                              modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp).fillMaxWidth()
-                                 .background(color = Color(0xFF2D2D2D), shape = RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 6.dp),
+                                 .background(color = ChatTheme.colors.surface.card, shape = ChatTheme.shapes.attachmentCornerRadius).padding(horizontal = 8.dp, vertical = 6.dp),
                              verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
                           ) {
-                              Icon(key = AllIconsKeys.FileTypes.Image, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFBBBBBB))
+                              Icon(key = AllIconsKeys.FileTypes.Image, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.attachmentRemoveIcon)
                               Column {
-                                 Text(text = part.filename ?: "image", style = TextStyle(fontSize = 12.sp, color = Color(0xFFBBBBBB), fontWeight = FontWeight.Medium))
-                                 Text(text = part.mime, style = TextStyle(fontSize = 10.sp, color = Color(0xFF7E7E7E)))
+                                 Text(text = part.filename ?: "image", style = TextStyle(fontSize = ChatTheme.fonts.messageFileName, color = ChatTheme.colors.component.attachmentRemoveIcon, fontWeight = FontWeight.Medium))
+                                 Text(text = part.mime, style = TextStyle(fontSize = ChatTheme.fonts.messageFileMime, color = ChatTheme.colors.component.mimeText))
                              }
                          }
                      }
@@ -474,30 +475,33 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                              withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("Error: ") }
                              append(part.message)
                          }
-                         Text(text = errorText, color = Color(0xFFFF7B72), modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
+                         Text(text = errorText, color = ChatTheme.colors.accent.codeDeleted, modifier = Modifier.padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV))
                      }
                  }
               }
               // Show "Interrupted" banner when message was aborted by user
               if (message.state == MessageState.Aborted) {
                   Row(
-                      modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                      modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = 8.dp),
                       verticalAlignment = Alignment.CenterVertically,
                   ) {
-                      Spacer(Modifier.weight(1f).height(1.dp).background(Color(0xFF444444)))
+                      Spacer(Modifier.weight(1f).height(1.dp).background(ChatTheme.colors.component.interruptedDivider))
                       Text(
                           text = "Interrupted",
-                          color = Color(0xFF808080),
-                          fontSize = 12.sp,
-                          modifier = Modifier.padding(horizontal = 12.dp),
+                          color = ChatTheme.colors.text.muted,
+                          fontSize = ChatTheme.fonts.messageInterrupted,
+                          modifier = Modifier.padding(horizontal = ChatTheme.dims.messagePaddingH),
                       )
-                      Spacer(Modifier.weight(1f).height(1.dp).background(Color(0xFF444444)))
+                      Spacer(Modifier.weight(1f).height(1.dp).background(ChatTheme.colors.component.interruptedDivider))
                   }
               }
-              // Show thinking indicator when streaming with no content yet
-             if (message.isStreaming && !hasThinking && !hasToolCall && message.parts.values.none { it is MessagePart.Text || it is MessagePart.Code || it is MessagePart.Table }) {
-                 ThinkingIndicator()
-             }
+              // Show thinking indicator when streaming with no content yet.
+              // Only show if no CollapsibleThinkingPill was rendered in the for-loop above
+              // (hasThinking guard prevents duplicate indicators).
+              when (message.renderPhase()) {
+                  MessageRenderPhase.THINKING -> if (!hasThinking) ThinkingIndicator()
+                  else -> { /* HAS_CONTENT or COMPLETE — no standalone indicator needed */ }
+              }
          }
      }
 }
@@ -514,12 +518,12 @@ private fun RenderTextContent(textParts: List<MessagePart>, project: Project?) {
     val currentProject = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
 
     val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
-    val defaultGreen = Color(0xFF6BBE50)
+    val defaultGreen = ChatTheme.colors.accent.green
     val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
     val listNumberColor = parseColorOrDefault(settings.listNumberColor, defaultGreen)
 
-    val customInlinesStyling = remember(inlineCodeColor) {
-        val linkColor = Color(0xFF3574F0)
+    val linkColor = ChatTheme.colors.accent.blue
+    val customInlinesStyling = remember(inlineCodeColor, linkColor) {
         InlinesStyling.create(
             inlineCode = SpanStyle(
                 color = inlineCodeColor,
@@ -537,7 +541,10 @@ private fun RenderTextContent(textParts: List<MessagePart>, project: Project?) {
         )
     }
 
-    val markdownStyling = remember(customInlinesStyling, listNumberColor) {
+     val blockLineColor = ChatTheme.colors.accent.blockQuoteLine
+     val blockTextColor = ChatTheme.colors.accent.blockQuoteText
+     val orderedListFontSize = ChatTheme.fonts.messageOrderedListItem
+     val markdownStyling = remember(customInlinesStyling, listNumberColor, blockLineColor, blockTextColor, orderedListFontSize) {
         val baseTextStyle = org.jetbrains.jewel.bridge.theme.retrieveDefaultTextStyle()
         MarkdownStyling.create(
             inlinesStyling = customInlinesStyling,
@@ -563,7 +570,7 @@ private fun RenderTextContent(textParts: List<MessagePart>, project: Project?) {
             ),
             list = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.create(
                 ordered = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.create(
-                    numberStyle = TextStyle(color = listNumberColor, fontSize = 14.sp),
+                    numberStyle = TextStyle(color = listNumberColor, fontSize = orderedListFontSize),
                     numberFormatStyles = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles(
                         firstLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
                         secondLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
@@ -574,8 +581,8 @@ private fun RenderTextContent(textParts: List<MessagePart>, project: Project?) {
             blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
                 padding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                 lineWidth = 3.dp,
-                lineColor = Color(0xFF3E3E3E),
-                textColor = Color(0xFF9E9E9E),
+                lineColor = blockLineColor,
+                textColor = blockTextColor,
             ),
         )
     }
@@ -594,7 +601,7 @@ private fun RenderTextContent(textParts: List<MessagePart>, project: Project?) {
         codeHighlighter = codeHighlighter,
     ) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             textParts.forEach { part ->
@@ -637,7 +644,7 @@ private fun RenderFileChanges(fileChangeParts: List<MessagePart.FileChange>, pro
     FileChangesList(
         changes = fileChangeParts.map { it.change },
         project = project,
-        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+        modifier = Modifier.padding(horizontal = 8.dp, vertical = ChatTheme.dims.messagePaddingV),
     )
 }
 
@@ -650,8 +657,8 @@ private fun RenderErrorParts(errorParts: List<MessagePart.Error>) {
         }
         Text(
             text = errorText,
-            color = Color(0xFFFF7B72),
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            color = ChatTheme.colors.accent.codeDeleted,
+            modifier = Modifier.padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
         )
     }
 }
@@ -666,13 +673,13 @@ private fun AgentBadge(name: String) {
         Text(
             text = name,
             style = TextStyle(
-                fontSize = 11.sp,
-                color = Color(0xFF9E9E9E),
+                fontSize = ChatTheme.fonts.messageAgentBadge,
+                color = ChatTheme.colors.component.thinkingChevron,
                 fontWeight = FontWeight.Medium,
             ),
             modifier = Modifier
                 .background(
-                    color = Color(0xFF3E3E3E),
+                    color = ChatTheme.colors.border.default,
                     shape = RoundedCornerShape(4.dp)
                 )
                 .padding(horizontal = 6.dp, vertical = 2.dp),
@@ -686,22 +693,22 @@ private fun RenderPatchCards(patchParts: List<MessagePart.Patch>) {
     patchParts.forEach { patch ->
         Column(
             modifier = Modifier
-                .padding(horizontal = 8.dp, vertical = 4.dp)
+                .padding(horizontal = 8.dp, vertical = ChatTheme.dims.messagePaddingV)
                 .fillMaxWidth()
                 .background(
-                    color = Color(0xFF2D2D2D),
-                    shape = RoundedCornerShape(8.dp)
+                    color = ChatTheme.colors.surface.card,
+                    shape = ChatTheme.shapes.messageBubbleCornerRadius
                 )
                 .padding(8.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Icon(key = AllIconsKeys.Nodes.Folder, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFF9E9E9E))
+                Icon(key = AllIconsKeys.Nodes.Folder, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.thinkingChevron)
                 Text(
                     text = "${patch.files.size} changed file${if (patch.files.size != 1) "s" else ""}",
                     style = TextStyle(
-                        fontSize = 12.sp,
-                        color = Color(0xFF9E9E9E),
+                        fontSize = ChatTheme.fonts.messagePatchFileCount,
+                        color = ChatTheme.colors.component.thinkingChevron,
                         fontWeight = FontWeight.Medium,
                     ),
                 )
@@ -711,8 +718,8 @@ private fun RenderPatchCards(patchParts: List<MessagePart.Patch>) {
                 Text(
                     text = "  $fileName",
                     style = TextStyle(
-                        fontSize = 11.sp,
-                        color = Color(0xFFBBBBBB),
+                        fontSize = ChatTheme.fonts.messagePatchFileName,
+                        color = ChatTheme.colors.component.attachmentRemoveIcon,
                     ),
                 )
             }
@@ -743,8 +750,8 @@ private fun StepFinishPill(stepFinish: MessagePart.StepFinish) {
         Text(
             text = label,
             style = TextStyle(
-                fontSize = 11.sp,
-                color = Color(0xFF7E7E7E),
+                fontSize = ChatTheme.fonts.messageStepFinish,
+                color = ChatTheme.colors.component.mimeText,
             ),
         )
     }
@@ -762,8 +769,8 @@ private fun RetryPill(attempt: Int, maxAttempts: Int, error: String?) {
         modifier = Modifier
             .padding(horizontal = 8.dp, vertical = 2.dp)
             .background(
-                color = Color(0xFF5C4A00),
-                shape = RoundedCornerShape(4.dp)
+                color = ChatTheme.colors.component.retryBg,
+                shape = ChatTheme.shapes.retryPillCornerRadius
             )
             .padding(horizontal = 6.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -772,8 +779,8 @@ private fun RetryPill(attempt: Int, maxAttempts: Int, error: String?) {
         Text(
             text = "↻ Retry $attempt/$maxAttempts",
             style = TextStyle(
-                fontSize = 11.sp,
-                color = Color(0xFFFFD666),
+                fontSize = ChatTheme.fonts.messageAgentBadge,
+                color = ChatTheme.colors.component.retryText,
                 fontWeight = FontWeight.Medium,
             ),
         )
@@ -781,8 +788,8 @@ private fun RetryPill(attempt: Int, maxAttempts: Int, error: String?) {
             Text(
                 text = "— $error",
                 style = TextStyle(
-                    fontSize = 10.sp,
-                    color = Color(0xFFCCAA44),
+                    fontSize = ChatTheme.fonts.messageFileMime,
+                    color = ChatTheme.colors.component.retryErrorDetail,
                 ),
             )
         }
@@ -798,28 +805,28 @@ private fun RenderAssistantFileCards(parts: List<MessagePart.AssistantFile>) {
                 .padding(horizontal = 8.dp, vertical = 2.dp)
                 .fillMaxWidth()
                 .background(
-                    color = Color(0xFF2D2D2D),
-                    shape = RoundedCornerShape(6.dp)
+                    color = ChatTheme.colors.surface.card,
+                    shape = ChatTheme.shapes.attachmentCornerRadius
                 )
                 .padding(horizontal = 8.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Icon(key = AllIconsKeys.FileTypes.Text, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFBBBBBB))
+            Icon(key = AllIconsKeys.FileTypes.Text, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.attachmentRemoveIcon)
             Column {
                 Text(
                     text = file.filename ?: "file",
                     style = TextStyle(
-                        fontSize = 12.sp,
-                        color = Color(0xFFBBBBBB),
+                        fontSize = ChatTheme.fonts.messageFileName,
+                        color = ChatTheme.colors.component.attachmentRemoveIcon,
                         fontWeight = FontWeight.Medium,
                     ),
                 )
                 Text(
                     text = file.mime,
                     style = TextStyle(
-                        fontSize = 10.sp,
-                        color = Color(0xFF7E7E7E),
+                        fontSize = ChatTheme.fonts.messageFileMime,
+                        color = ChatTheme.colors.component.mimeText,
                     ),
                 )
             }
@@ -836,28 +843,28 @@ private fun RenderAssistantImageCards(parts: List<MessagePart.Image>) {
                 .padding(horizontal = 8.dp, vertical = 2.dp)
                 .fillMaxWidth()
                 .background(
-                    color = Color(0xFF2D2D2D),
-                    shape = RoundedCornerShape(6.dp)
+                    color = ChatTheme.colors.surface.card,
+                    shape = ChatTheme.shapes.attachmentCornerRadius
                 )
                 .padding(horizontal = 8.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Icon(key = AllIconsKeys.FileTypes.Image, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFBBBBBB))
+            Icon(key = AllIconsKeys.FileTypes.Image, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.attachmentRemoveIcon)
             Column {
                 Text(
                     text = image.filename ?: "image",
                     style = TextStyle(
-                        fontSize = 12.sp,
-                        color = Color(0xFFBBBBBB),
+                        fontSize = ChatTheme.fonts.messageFileName,
+                        color = ChatTheme.colors.component.attachmentRemoveIcon,
                         fontWeight = FontWeight.Medium,
                     ),
                 )
                 Text(
                     text = image.mime,
                     style = TextStyle(
-                        fontSize = 10.sp,
-                        color = Color(0xFF7E7E7E),
+                        fontSize = ChatTheme.fonts.messageFileMime,
+                        color = ChatTheme.colors.component.mimeText,
                     ),
                 )
             }
@@ -871,19 +878,19 @@ private fun CompactionPill(summary: String?) {
         modifier = Modifier
             .padding(horizontal = 8.dp, vertical = 2.dp)
             .background(
-                color = Color(0xFF1A2A1A),
+                color = ChatTheme.colors.component.compactionBg,
                 shape = RoundedCornerShape(4.dp)
             )
             .padding(horizontal = 6.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            Icon(key = AllIconsKeys.General.BalloonInformation, contentDescription = null, modifier = Modifier.size(12.dp), tint = Color(0xFF7EBF7E))
+            Icon(key = AllIconsKeys.General.BalloonInformation, contentDescription = null, modifier = Modifier.size(12.dp), tint = ChatTheme.colors.component.compactionIcon)
             Text(
                 text = "Context compacted${if (summary != null) " — $summary" else ""}",
                 style = TextStyle(
-                    fontSize = 11.sp,
-                    color = Color(0xFF7EBF7E),
+                    fontSize = ChatTheme.fonts.messageStepFinish,
+                    color = ChatTheme.colors.component.compactionText,
                 ),
             )
         }
@@ -903,8 +910,8 @@ private fun FileChangesList(
     project: Project?,
     modifier: Modifier = Modifier,
 ) {
-    val addedColor = Color(0xFF7EE787)
-    val deletedColor = Color(0xFFFF7B72)
+    val addedColor = ChatTheme.colors.accent.codeAdded
+    val deletedColor = ChatTheme.colors.accent.codeDeleted
     val pathColor = retrieveColorOrUnspecified("Link.activeForeground").copy(alpha = 0.5f)
     val headerColor = retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.55f)
 
@@ -915,10 +922,10 @@ private fun FileChangesList(
         // Header label
         Text(
             text = "Modified files",
-            fontSize = 11.sp,
+            fontSize = ChatTheme.fonts.reviewStatusLabel,
             fontWeight = FontWeight.Medium,
             color = headerColor,
-            modifier = Modifier.padding(vertical = 4.dp),
+            modifier = Modifier.padding(vertical = ChatTheme.dims.messagePaddingV),
         )
 
         changes.forEach { change ->
@@ -943,8 +950,8 @@ private fun FileChangeCard(
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
-    val hoverBg = retrieveColorOrUnspecified("MenuItem.selectionBackground")
-    val normalColor = JewelTheme.globalColors.text.normal
+    val hoverBg = ChatTheme.colors.component.hoverBg
+    val normalColor = ChatTheme.colors.text.primary
 
     // Resolve file type icon
     val fileIconKey = remember(change.fileName) {
@@ -963,7 +970,7 @@ private fun FileChangeCard(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(4.dp))
+            .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
             .background(if (isHovered) hoverBg else Color.Transparent)
             .hoverable(interactionSource)
             .clickable {
@@ -987,7 +994,7 @@ private fun FileChangeCard(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = change.fileName,
-                fontSize = 12.sp,
+                fontSize = ChatTheme.fonts.reviewFileName,
                 fontWeight = FontWeight.Medium,
                 color = normalColor,
                 maxLines = 1,
@@ -995,7 +1002,7 @@ private fun FileChangeCard(
             )
             Text(
                 text = change.filePath,
-                fontSize = 10.sp,
+                fontSize = ChatTheme.fonts.reviewFilePath,
                 color = pathColor,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -1007,7 +1014,7 @@ private fun FileChangeCard(
             if (change.additions > 0) {
                 Text(
                     text = "+${change.additions}",
-                    fontSize = 11.sp,
+                    fontSize = ChatTheme.fonts.reviewLineDelta,
                     fontWeight = FontWeight.Medium,
                     color = addedColor,
                 )
@@ -1016,7 +1023,7 @@ private fun FileChangeCard(
                 if (change.additions > 0) Spacer(Modifier.width(4.dp))
                 Text(
                     text = "-${change.deletions}",
-                    fontSize = 11.sp,
+                    fontSize = ChatTheme.fonts.reviewLineDelta,
                     fontWeight = FontWeight.Medium,
                     color = deletedColor,
                 )

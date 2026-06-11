@@ -13,13 +13,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.PartState
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.markdown.Markdown
 import org.jetbrains.jewel.markdown.processing.MarkdownProcessor
 import org.jetbrains.jewel.ui.component.CircularProgressIndicator
@@ -31,11 +30,11 @@ fun ThinkingIndicator(modifier: Modifier = Modifier) {
         modifier = modifier.padding(horizontal = 16.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        CircularProgressIndicator(modifier = Modifier.size(16.dp))
+        CircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingSpinnerSize))
         Text(
             text = " Thinking...",
             fontStyle = FontStyle.Italic,
-            color = Color.Gray
+            color = ChatTheme.colors.component.thinkingText
         )
     }
 }
@@ -48,10 +47,9 @@ fun CollapsibleThinkingPill(
 ) {
     var expanded by remember { mutableStateOf(state is PartState.Streaming) }
 
-    // Auto-expand when streaming starts, auto-collapse when completed
+    // Auto-expand when streaming starts; keep expanded when completed so user can read content.
     LaunchedEffect(state) {
         if (state is PartState.Streaming) expanded = true
-        else if (state is PartState.Completed && expanded) expanded = false
     }
 
     androidx.compose.foundation.layout.Column(modifier = modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
@@ -64,17 +62,17 @@ fun CollapsibleThinkingPill(
         ) {
             Text(
                 text = if (expanded) "▾" else "▸",
-                color = Color(0xFF9E9E9E),
-                style = TextStyle(fontSize = 16.sp)
+                color = ChatTheme.colors.component.thinkingChevron,
+                style = TextStyle(fontSize = ChatTheme.fonts.thinkingChevron)
             )
             Text(
                 text = if (expanded) "Thought" else "\uD83E\uDDE0 Thought",
                 fontStyle = FontStyle.Italic,
-                color = Color(0xFF9E9E9E),
-                style = TextStyle(fontSize = 13.sp)
+                color = ChatTheme.colors.component.thinkingChevron,
+                style = TextStyle(fontSize = ChatTheme.fonts.thinkingLabel)
             )
             if (state is PartState.Streaming) {
-                CircularProgressIndicator(modifier = Modifier.size(14.dp))
+                CircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingStreamingSpinnerSize))
             }
         }
 

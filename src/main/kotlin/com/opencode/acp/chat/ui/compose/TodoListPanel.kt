@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -17,22 +16,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.TodoItem
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
-
-private val TodoBg = Color(0xFF252525)
-private val TodoHeaderColor = Color(0xFF808080)
-private val TodoPendingColor = Color(0xFF808080)
-private val TodoInProgressColor = Color(0xFFE5A617)
-private val TodoCompletedColor = Color(0xFF6BBE50)
-private val TodoCancelledColor = Color(0xFF666666)
-private val TodoAccent = Color(0xFF3574F0)
 
 /**
  * Collapsible todo list panel showing the current session's tasks.
@@ -50,12 +40,18 @@ fun TodoListPanel(
 
     var expanded by remember { mutableStateOf(true) }
 
+    val colors = ChatTheme.colors
+    val dims = ChatTheme.dims
+    val fonts = ChatTheme.fonts
+    val fontWeights = ChatTheme.fontWeights
+    val shapes = ChatTheme.shapes
+
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(TodoBg)
-            .padding(horizontal = 12.dp, vertical = 6.dp),
+            .clip(shapes.todoCornerRadius)
+            .background(colors.component.todoBg)
+            .padding(horizontal = dims.todoPaddingH, vertical = dims.todoPaddingV),
         verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
         // Header with toggle
@@ -70,19 +66,19 @@ fun TodoListPanel(
             Icon(
                 key = if (incomplete.size > 4 && !expanded) AllIconsKeys.General.ChevronRight else AllIconsKeys.General.ChevronDown,
                 contentDescription = if (expanded) "Collapse" else "Expand",
-                modifier = Modifier.size(12.dp),
-                tint = TodoHeaderColor,
+                modifier = Modifier.size(dims.todoChevronSize),
+                tint = colors.component.todoHeader,
             )
             Text(
                 text = "Todo",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = TodoAccent,
+                fontSize = fonts.todoHeader,
+                fontWeight = fontWeights.todoHeader,
+                color = colors.component.todoAccent,
             )
             Text(
                 text = "${incomplete.size}",
-                fontSize = 10.sp,
-                color = TodoPendingColor,
+                fontSize = fonts.todoCount,
+                color = colors.component.todoPending,
             )
         }
 
@@ -94,8 +90,8 @@ fun TodoListPanel(
         if (!expanded && incomplete.size > 4) {
             Text(
                 text = "  +${incomplete.size - 2} more…",
-                fontSize = 10.sp,
-                color = TodoPendingColor,
+                fontSize = fonts.todoMoreHint,
+                color = colors.component.todoPending,
                 modifier = Modifier.padding(start = 16.dp)
             )
         }
@@ -104,29 +100,33 @@ fun TodoListPanel(
 
 @Composable
 private fun TodoRow(todo: TodoItem) {
+    val colors = ChatTheme.colors
+    val dims = ChatTheme.dims
+    val fonts = ChatTheme.fonts
+
     val (iconKey, color) = when (todo.status) {
-        "completed" -> AllIconsKeys.Actions.Checked to TodoCompletedColor
-        "in_progress" -> AllIconsKeys.Actions.Execute to TodoInProgressColor
-        "cancelled" -> AllIconsKeys.Actions.Cancel to TodoCancelledColor
-        else -> AllIconsKeys.Actions.Lightning to TodoPendingColor
+        "completed" -> AllIconsKeys.Actions.Checked to colors.component.todoCompleted
+        "in_progress" -> AllIconsKeys.Actions.Execute to colors.component.todoInProgress
+        "cancelled" -> AllIconsKeys.Actions.Cancel to colors.component.todoCancelled
+        else -> AllIconsKeys.Actions.Lightning to colors.component.todoPending
     }
 
     Row(
-        modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp),
+        modifier = Modifier.fillMaxWidth().padding(start = dims.todoPaddingH, end = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.Top
     ) {
         Icon(
             key = iconKey,
             contentDescription = todo.status,
-            modifier = Modifier.size(12.dp),
+            modifier = Modifier.size(dims.todoStatusIconSize),
             tint = color,
         )
         Text(
             text = todo.content,
-            fontSize = 11.sp,
-            color = if (todo.status == "completed" || todo.status == "cancelled") TodoPendingColor
-                    else Color(0xFFDDDDDD),
+            fontSize = fonts.todoContent,
+            color = if (todo.status == "completed" || todo.status == "cancelled") colors.component.todoPending
+                    else colors.component.todoActiveText,
             lineHeight = 14.sp,
             modifier = Modifier.weight(1f).padding(end = 4.dp)
         )

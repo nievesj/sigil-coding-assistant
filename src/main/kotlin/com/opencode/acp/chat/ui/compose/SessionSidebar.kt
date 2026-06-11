@@ -45,6 +45,7 @@ import com.opencode.acp.chat.model.SessionIndicator
 import com.opencode.acp.chat.model.SessionItem
 import com.opencode.acp.chat.model.SessionListState
 import com.opencode.acp.chat.model.SidebarTab
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
@@ -210,7 +211,7 @@ private fun SidebarTabButton(
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
     val linkColor = retrieveColorOrUnspecified("Link.activeForeground")
-    val selectedColor = if (linkColor == Color.Unspecified) Color(0xFF3574F0) else linkColor
+    val selectedColor = if (linkColor == Color.Unspecified) ChatTheme.colors.accent.blue else linkColor
     val unselectedColor = retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.55f)
     val underlineColor = if (isSelected) selectedColor else Color.Transparent
     val bgColor = if (isHovered) selectedColor.copy(alpha = 0.12f) else Color.Transparent
@@ -549,8 +550,8 @@ private fun SessionRow(
     val shimmerProgress = if (indicator != SessionIndicator.NONE) rawShimmerProgress else 0f
 
     val shimmerColor = when (indicator) {
-        SessionIndicator.CREATING -> Color(0xFFFFC107)   // amber
-        SessionIndicator.STREAMING -> Color(0xFF4CAF50)  // green
+        SessionIndicator.CREATING -> ChatTheme.colors.component.sidebarShimmerCreating   // amber
+        SessionIndicator.STREAMING -> ChatTheme.colors.component.sidebarShimmerStreaming  // green
         SessionIndicator.NONE -> Color.Transparent
     }
 

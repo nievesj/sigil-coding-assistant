@@ -74,6 +74,27 @@ class ChatViewModel(
     private val _clearAllState = MutableStateFlow<ClearAllState>(ClearAllState.Idle)
     val clearAllState: StateFlow<ClearAllState> = _clearAllState.asStateFlow()
 
+    // --- Computed input state (exhaustive state machine) ---
+    /**
+     * Exhaustive input-area state derived from connection, streaming, and prompt StateFlows.
+     * Composables switch on this instead of combining booleans.
+     * Priority: Disabled > AwaitingPermission > AwaitingSelection > Streaming > Idle
+     */
+    val inputState: StateFlow<ChatInputState> = combine(
+        connectionState,
+        permissionPrompt,
+        selectionPrompt,
+        isStreaming,
+    ) { conn, perm, sel, streaming ->
+        when {
+            conn != ConnectionState.CONNECTED -> ChatInputState.Disabled
+            perm != null -> ChatInputState.AwaitingPermission(perm)
+            sel != null -> ChatInputState.AwaitingSelection(sel)
+            streaming -> ChatInputState.Streaming
+            else -> ChatInputState.Idle
+        }
+    }.stateIn(scope, SharingStarted.WhileSubscribed(5_000), ChatInputState.Disabled)
+
     private val _fileChangeSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val fileChangeSignal: SharedFlow<Unit> = _fileChangeSignal.asSharedFlow()
 
@@ -289,11 +310,13 @@ class ChatViewModel(
 
     suspend fun switchSession(sessionId: String) {
         service.switchSession(sessionId)
-        // After switching, sync the streaming indicator to the new session's state
-        val activeSession = service.sessionManager.getActiveSession()
-        _isStreaming.value = activeSession?.isStreaming ?: false
+        // After switching, assume NOT streaming — SSE events will set it to true if needed.
+        // Don't read activeSession?.isStreaming because adoptStreamingContext() unconditionally
+        // marks the last assistant message as streaming, which is wrong for completed responses.
+        _isStreaming.value = false
 
         // Sync prompt state from the new session's persistent StateFlows
+        val activeSession = service.sessionManager.getActiveSession()
         _permissionPrompt.value = activeSession?.pendingPermission?.value
         _selectionPrompt.value = activeSession?.pendingSelection?.value
 
@@ -305,9 +328,9 @@ class ChatViewModel(
 
     suspend fun createAndSwitchSession(title: String? = null) {
         service.createAndSwitchSession(title)
-        // Sync UI state after creating a new session (same as switchSession)
+        // New session — definitely not streaming yet
+        _isStreaming.value = false
         val activeSession = service.sessionManager.getActiveSession()
-        _isStreaming.value = activeSession?.isStreaming ?: false
         _permissionPrompt.value = activeSession?.pendingPermission?.value
         _selectionPrompt.value = activeSession?.pendingSelection?.value
     }
