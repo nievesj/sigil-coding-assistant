@@ -721,6 +721,27 @@ app) are left untouched since the plugin uses a different port.
 - **File:** `OpenCodeModels.kt:261` (`CommandInfo` data class), `OpenCodeClient.kt:1365` (`listCommands()`)
 - **Impact:** Non-critical — local commands (`/clear`, `/cancel`) still work. Server commands (`/init`, `/review`, `/simplify`, etc.) are unavailable in the palette.
 
+### IDE-Level Notifications (Response Complete / Question / Permission)
+
+The plugin shows IntelliJ balloon notifications for events that need user attention.
+Uses the `Notification` API with group ID `"OpenCode"` (registered in `plugin.xml`).
+
+**Three notification types:**
+1. **Response complete** (`notifyResponseComplete`) — fires when `StreamingCompleted` sets `_isStreaming = false`. Only fires when the IDE window is NOT focused (checked via `WindowManager.getInstance().getFrame(project)?.isActive`). Plays system beep.
+2. **Question asked** (`notifyQuestionAsked`) — fires when `SelectionRequested` arrives. Always fires (blocks conversation). Plays system beep.
+3. **Permission needed** (`notifyPermissionNeeded`) — fires when `PermissionRequested` arrives. Always fires (blocks conversation). Plays system beep.
+
+All notifications include an "Open" action button that focuses the OpenCode tool window.
+
+**Focus detection:** `WindowManager.getInstance().getFrame(project)?.isActive` checks if the
+project frame has focus. Response-complete notifications are suppressed when the IDE is focused
+(since the user can already see the chat updating).
+
+**Sound:** `Toolkit.getDefaultToolkit().beep()` — system beep. IntelliJ also lets users assign
+custom sounds per notification group via Settings → Appearance & Behavior → Notifications.
+
+- **Files:** `Notifications.kt` (utility), `ChatViewModel.kt` (signal handlers), `plugin.xml` (notification group), `OpenCodeService.kt` (`project` made public)
+
 ---
 
 ## Completed (for reference)
@@ -770,6 +791,7 @@ app) are left untouched since the plugin uses a different port.
 - [x] `pendingFileChanges` cleared on session switch via `resetSessionState()` — no memory leak across sessions
 - [x] `addShutdownHook` only registered once (stored in `shutdownHook` field) — no thread leak on re-initialization
 - [x] `respondPermission`/`respondQuestion`/`rejectQuestion` in `OpenCodeClient` now throw on failure instead of swallowing — ViewModel catch blocks are reachable
+- [x] IDE-level notifications (response complete, question asked, permission needed) — `Notifications.kt`, focus detection via `WindowManager`, system beep, "Open" action to focus tool window
 - [x] `SessionItem.createdAt` renamed to `updatedAt` (was actually `time.updated`, not `time.created`)
 - [x] `SessionContext` fields (`additions`/`deletions`/`filesModified`/`sessionCreated`/`lastUpdated`) now populated from `GET /session/:id` summary — were hardcoded to 0
 - [x] `computeSessionContext()` accumulates token/cost from local message cache (all assistant messages) instead of always-zero `session.tokens`/`.cost` or single `lastAssistant` lookup

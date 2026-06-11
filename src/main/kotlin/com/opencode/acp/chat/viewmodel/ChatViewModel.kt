@@ -10,7 +10,9 @@ import com.opencode.acp.chat.service.SendMessageResult
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.chat.OpenCodeNotifications
 import com.opencode.acp.chat.model.ConnectionState
+import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.delay
@@ -27,7 +29,8 @@ import java.io.Closeable
  */
 class ChatViewModel(
     private val scope: CoroutineScope,
-    private val service: OpenCodeService
+    private val service: OpenCodeService,
+    private val project: Project
 ) : Closeable {
 
     private val logger = KotlinLogging.logger {}
@@ -127,6 +130,8 @@ class ChatViewModel(
                     }
                     is UiSignal.StreamingCompleted -> {
                         _isStreaming.value = false
+                        // IDE notification — only when user is not looking at the IDE
+                        OpenCodeNotifications.notifyResponseComplete(project)
                         // Refresh context and todos after response completes
                         scope.launch { computeSessionContext() }
                         scope.launch { fetchTodos() }
@@ -137,10 +142,12 @@ class ChatViewModel(
                     }
                     is UiSignal.PermissionRequested -> {
                         _permissionPrompt.value = signal.prompt
+                        OpenCodeNotifications.notifyPermissionNeeded(project)
                         startPermissionTimeout()
                     }
                     is UiSignal.SelectionRequested -> {
                         _selectionPrompt.value = signal.prompt
+                        OpenCodeNotifications.notifyQuestionAsked(project)
                     }
                     is UiSignal.Error -> {
                         // Error already handled by processor (added as Error part)

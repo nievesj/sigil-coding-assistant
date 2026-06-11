@@ -36,6 +36,10 @@
             secondary="true"
             icon="/icons/opencode-toolwindow.svg"
             factoryClass="com.opencode.acp.chat.ChatToolWindowFactory"/>
+
+        <notificationGroup id="OpenCode"
+                           displayType="BALLOON"
+                           isLogByDefault="true"/>
     </extensions>
 
     <actions>

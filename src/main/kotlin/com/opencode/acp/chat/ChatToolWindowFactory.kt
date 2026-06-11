@@ -29,7 +29,7 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         // (health check, list agents/providers) don't block the UI thread.
         // StateFlow updates are thread-safe — Compose recomposes on EDT automatically.
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val viewModel = ChatViewModel(scope, service)
+        val viewModel = ChatViewModel(scope, service, project)
 
         // addComposeTab() automatically handles SwingBridgeTheme, enableNewSwingCompositing(),
         // and JewelComposePanel creation — no explicit SwingBridgeTheme {} wrapper needed.
