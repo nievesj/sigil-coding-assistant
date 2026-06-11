@@ -1,3 +1,5 @@
+@file:OptIn(org.jetbrains.jewel.foundation.ExperimentalJewelApi::class)
+
 package com.opencode.acp.chat.ui.compose
 
 import androidx.compose.foundation.clickable
@@ -19,6 +21,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
 import com.opencode.acp.chat.model.PartState
 import com.opencode.acp.chat.ui.theme.ChatTheme
+import com.opencode.acp.config.settings.OpenCodeSettingsState
+import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.markdown.Markdown
 import org.jetbrains.jewel.markdown.processing.MarkdownProcessor
 import org.jetbrains.jewel.ui.component.CircularProgressIndicator
@@ -45,7 +49,11 @@ fun CollapsibleThinkingPill(
     state: PartState,
     modifier: Modifier = Modifier,
 ) {
-    var expanded by remember { mutableStateOf(state is PartState.Streaming) }
+    // Use settings default for THINK kind; auto-expand during streaming
+    val defaultExpanded = OpenCodeSettingsState.getInstance().isToolKindDefaultExpanded(
+        com.agentclientprotocol.model.ToolKind.THINK
+    )
+    var expanded by remember { mutableStateOf(defaultExpanded || state is PartState.Streaming) }
 
     // Auto-expand when streaming starts; keep expanded when completed so user can read content.
     LaunchedEffect(state) {

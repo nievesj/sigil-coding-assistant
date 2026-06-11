@@ -25,7 +25,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.animation.core.animateFloatAsState
+
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 
@@ -36,7 +36,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.derivedStateOf
+
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshotFlow
 
@@ -147,6 +147,16 @@ fun MessageList(
             }
     }
 
+    // Sticky scroll: re-enable auto-scroll when user scrolls back to the bottom.
+    // This runs independently of autoScrollEnabled — the existing LaunchedEffect above
+    // exits early when autoScrollEnabled is false, so it can't detect the re-arrival at bottom.
+    LaunchedEffect(Unit) {
+        snapshotFlow { !listState.canScrollForward }
+            .collect { isAtBottom ->
+                if (isAtBottom) autoScrollEnabled = true
+            }
+    }
+
     // Scroll on new messages. If the last message is from the user (Enter pressed),
     // force auto-scroll on even if the user had scrolled up.
     LaunchedEffect(messages.size) {
@@ -169,18 +179,6 @@ fun MessageList(
         }
     }
 
-    // Show jump button whenever there are messages (always visible).
-    val showJumpButton by remember {
-        derivedStateOf {
-            messages.isNotEmpty()
-        }
-    }
-
-    val jumpButtonAlpha by animateFloatAsState(
-        targetValue = if (showJumpButton) 1f else 0f,
-        label = "jumpButtonAlpha"
-    )
-
     Box(modifier = modifier) {
         SelectionContainer {
             // Arrangement.Bottom anchors items to the BOTTOM of the viewport.
@@ -193,7 +191,13 @@ fun MessageList(
             ) {
                 items(
                     count = messages.size,
-                    key = { index -> messages[index].id }
+                    key = { index ->
+                        val m = messages[index]
+                        // Include parts count and streaming state in key so LazyColumn
+                        // detects data changes (new tool calls, thinking completed, etc.)
+                        // and recreates the composition instead of reusing stale data.
+                        "${m.id}_${m.parts.size}_${m.isStreaming}"
+                    }
                 ) { index ->
                     MessageItem(messages[index], project, onImagePreview, getStreamingText = getStreamingText)
                     if (index < messages.size - 1) {
@@ -210,21 +214,24 @@ fun MessageList(
             scrollState = listState,
         )
 
-        // Jump to bottom button
-        if (jumpButtonAlpha > 0f) {
+        // Jump to bottom button — always visible when there are messages.
+        // Bright when scrolled up (actionable), dimmed when already at bottom.
+        if (messages.isNotEmpty()) {
+            val isAtBottom = !listState.canScrollForward
+            val buttonBg = if (isAtBottom) ChatTheme.colors.text.muted.copy(alpha = 0.3f) else ChatTheme.colors.accent.blue
+            val iconTint = if (isAtBottom) ChatTheme.colors.text.muted.copy(alpha = 0.6f) else Color.White
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .padding(end = 16.dp, bottom = 16.dp)
-                    .graphicsLayer { alpha = jumpButtonAlpha }
                     .size(36.dp)
                     .background(
-                        color = ChatTheme.colors.accent.blue,
+                        color = buttonBg,
                         shape = CircleShape
                     )
                     .border(
                         width = 1.dp,
-                        color = ChatTheme.colors.accent.userAvatarFill,
+                        color = if (isAtBottom) ChatTheme.colors.text.muted.copy(alpha = 0.2f) else ChatTheme.colors.accent.userAvatarFill,
                         shape = CircleShape
                     )
                     .clickable {
@@ -239,7 +246,7 @@ fun MessageList(
                     key = AllIconsKeys.General.ChevronDown,
                     contentDescription = "Jump to bottom",
                     modifier = Modifier.size(16.dp),
-                    tint = Color.White
+                    tint = iconTint
                 )
             }
         }
@@ -376,18 +383,19 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
          markdownProcessor = markdownProcessor,
          codeHighlighter = codeHighlighter,
      ) {
-         Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
-              // Render parts in LinkedHashMap insertion order — the order events arrived.
+          Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
+               // Render parts in LinkedHashMap insertion order — the order events arrived.
               var hasThinking = false
               // Pre-compute: if message has any ToolCall parts, suppress Patch/FileChange cards
               // (ToolPill already shows file info, line counts, and expandable content)
               val hasToolCallInMessage = message.parts.values.any { it is MessagePart.ToolCall }
               var hasToolCall = hasToolCallInMessage
-              // Sort parts: text content renders above tool pills (matching desktop app)
+              // Sort parts: thinking first (chronological), then text content, then tool pills.
+              // Thinking always renders before text content per MessagePart.Thinking contract.
               val sortedParts = message.parts.entries.sortedBy { (_, part) ->
                   when (part) {
-                      is MessagePart.Text, is MessagePart.Code, is MessagePart.Table -> 0
-                      is MessagePart.Thinking -> 1
+                      is MessagePart.Thinking -> 0
+                      is MessagePart.Text, is MessagePart.Code, is MessagePart.Table -> 1
                       is MessagePart.ToolCall -> 2
                       else -> 3
                   }

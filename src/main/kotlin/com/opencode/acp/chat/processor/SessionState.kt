@@ -495,17 +495,24 @@ class SessionState(
         val needsNewMessage = when {
             ctx.activeMessageId == null && isContentEvent -> true // No streaming context at all
             eventServerId != null && eventServerId != ctx.activeMessageId && eventServerId != ctx.activeServerMessageId -> {
-                // A new message is streaming — the event's server messageId differs from
-                // the currently active one. This happens for child/subagent sessions where
-                // adoptStreamingContext adopted a REST-loaded message but the server is now
-                // streaming a different message.
-                logger.info { "[ACP] New message detected for session $sessionId: eventServerId=$eventServerId vs activeMsgId=${ctx.activeMessageId}/activeServerId=${ctx.activeServerMessageId}" }
-                // Finalize the current streaming message before starting a new one
-                val currentId = ctx.activeMessageId
-                if (currentId != null && ctx.isStreaming) {
-                    finalizeStreaming(currentId, "new_message")
+                // If activeServerMessageId is null, we're still waiting for the HTTP
+                // response from sendMessageAsync. SSE events arriving now belong to
+                // the message we just created — don't create a duplicate.
+                if (ctx.activeServerMessageId == null) {
+                    false
+                } else {
+                    // A new message is streaming — the event's server messageId differs from
+                    // the currently active one. This happens for child/subagent sessions where
+                    // adoptStreamingContext adopted a REST-loaded message but the server is now
+                    // streaming a different message.
+                    logger.info { "[ACP] New message detected for session $sessionId: eventServerId=$eventServerId vs activeMsgId=${ctx.activeMessageId}/activeServerId=${ctx.activeServerMessageId}" }
+                    // Finalize the current streaming message before starting a new one
+                    val currentId = ctx.activeMessageId
+                    if (currentId != null && ctx.isStreaming) {
+                        finalizeStreaming(currentId, "new_message")
+                    }
+                    true
                 }
-                true
             }
             else -> false
         }
@@ -1173,8 +1180,9 @@ class SessionState(
     private fun updateMessage(messageId: String, transform: (ChatMessage) -> ChatMessage) = stateLock.withLock {
         val map = _messages.value
         val existing = map[messageId] ?: return@withLock
+        val result = transform(existing)
         val updated = LinkedHashMap(map)
-        updated[messageId] = transform(existing)
+        updated[messageId] = result
         _messages.value = updated
     }
 

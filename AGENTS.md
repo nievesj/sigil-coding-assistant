@@ -422,6 +422,60 @@ Now both paths pass the current `attachedFiles` list to `onSend`.
 - Used by Zed, JetBrains AI Assistant, Neovim plugins
 - Our plugin uses `opencode serve` (HTTP REST + SSE) instead — gives more control over custom UI
 
+### LazyColumn items(count, key) — Stale Data When Keys Are Stable
+
+**Problem:** Compose Foundation's `LazyColumn` with `items(count, key)` does NOT
+re-render items that stay in the viewport when only the underlying data changes
+(same count, same keys). LazyColumn reuses the existing item composition without
+re-evaluating the item content lambda, so the composable renders stale data.
+
+**Symptoms:**
+- Thinking pill disappears when tool pills appear (data is correct, UI is stale)
+- Scrolling items off-screen and back makes them reappear (disposal + recreation
+  uses fresh data)
+- Diagnostic: `LaunchedEffect(message.parts.keys)` never fires again after initial
+  render, even though the data model changes
+
+**Root cause:** `items(count, key)` registers item content as a lambda captured in a
+closure. When LazyColumn detects stable keys (same message IDs), it reuses the
+existing composition slot. The OLD lambda (capturing OLD data) is called, not the new
+one. This is a known behavior in Compose Foundation bundled with IntelliJ Platform.
+
+**Fix:** Include data-dependent fields in the LazyColumn key so key changes when
+data changes, forcing LazyColumn to treat it as a new item:
+
+```kotlin
+items(
+    count = messages.size,
+    key = { index ->
+        val m = messages[index]
+        "${m.id}_${m.parts.size}_${m.isStreaming}"
+    }
+) { index ->
+    MessageItem(messages[index], ...)
+}
+```
+
+**Why `key()` composable inside the item doesn't work:** `key(msg.hashCode())`
+inside the item content lambda is never re-evaluated because LazyColumn doesn't
+re-call the item content lambda when the outer key is stable. The inner `key()`
+is dead code in this context.
+
+**Why `items(items = List)` overload doesn't work:** The IntelliJ Platform bundles
+an older Compose Foundation version that only has the `items(count, key)` overload.
+`items(items = messages, key = { it.id })` does not compile.
+
+**Trade-off:** When the key changes (e.g., `parts.size` grows), LazyColumn disposes
+the old item and creates a new one. This resets any internal `remember` state
+(expanded/collapsed pills). This is acceptable because pill expanded state is
+managed by settings defaults + streaming state, not persistent user toggles.
+
+**Warning:** Do NOT use `items(count, key)` with a stable-only key (e.g., just message
+ID) for any list item whose data changes while visible. Always include
+data-dependent fields in the key, or use a different data flow pattern.
+
+- **Files:** `MessageList.kt` (LazyColumn items key)
+
 ### IntelliJ Platform Icons (AllIcons) — Confirmed Available
 
 Icons referenced via `AllIcons.*` that are **known to compile** in this project.

@@ -1,5 +1,6 @@
 package com.opencode.acp.config.settings
 
+import com.agentclientprotocol.model.ToolKind
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.ui.TextBrowseFolderListener
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
@@ -86,6 +87,26 @@ class OpenCodeSettingsPanel {
             "with 100+ sessions. Default loads 10 most recent."
     }
 
+    /** Checkboxes for which ToolKinds default to expanded in the chat. */
+    private val toolKindCheckboxes: Map<ToolKind, JBCheckBox> = ToolKind.entries.associateWith { kind ->
+        JBCheckBox(toolKindLabel(kind)).apply {
+            toolTipText = "Default: expanded for ${toolKindLabel(kind)} pills"
+        }
+    }
+
+    private fun toolKindLabel(kind: ToolKind): String = when (kind) {
+        ToolKind.EXECUTE -> "Shell (Execute)"
+        ToolKind.EDIT -> "Edit (Write)"
+        ToolKind.READ -> "Read"
+        ToolKind.SEARCH -> "Search"
+        ToolKind.DELETE -> "Delete"
+        ToolKind.MOVE -> "Move"
+        ToolKind.FETCH -> "Fetch"
+        ToolKind.THINK -> "Think"
+        ToolKind.SWITCH_MODE -> "Switch Mode"
+        ToolKind.OTHER -> "Other"
+    }
+
     val listNumberColorButton: JButton = JButton("\u25BC").apply {
         addActionListener(ActionListener {
             val currentColor = parseColor(listNumberColorField.text)
@@ -123,6 +144,13 @@ class OpenCodeSettingsPanel {
         .addComponentToRightColumn(listNumberColorButton)
         .addSeparator(5)
         .addComponent(loadAllSessionsCheckbox)
+        .addSeparator(5)
+        .addTooltip("Tool pills expanded by default:")
+        .apply { 
+            ToolKind.entries.forEach { kind ->
+                addComponent(toolKindCheckboxes[kind]!!)
+            }
+        }
         .addComponent(statusLabel)
         .panel
 
@@ -136,6 +164,10 @@ class OpenCodeSettingsPanel {
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
         loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
+        // Initialize ToolKind checkboxes from settings
+        ToolKind.entries.forEach { kind ->
+            toolKindCheckboxes[kind]!!.isSelected = settings.isToolKindDefaultExpanded(kind)
+        }
     }
 
     fun applyTo(settings: OpenCodeSettingsState) {
@@ -148,9 +180,14 @@ class OpenCodeSettingsPanel {
         settings.inlineCodeColor = inlineCodeColorField.text.trim()
         settings.listNumberColor = listNumberColorField.text.trim()
         settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
+        // Persist ToolKind expansion defaults
+        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }
+        settings.expandedToolKinds = expandedKinds.joinToString(",")
     }
 
     fun isModified(settings: OpenCodeSettingsState): Boolean {
+        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }.toSet()
+        val currentExpandedKinds = settings.expandedToolKinds.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
         return binaryPathField.text.trim() != settings.binaryPath ||
                 (portField.text.trim().toIntOrNull() ?: 4096) != settings.port ||
                 (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
@@ -159,7 +196,8 @@ class OpenCodeSettingsPanel {
                 (longTimeoutBufferField.text.trim().toIntOrNull() ?: 30) != settings.longTimeoutBufferSeconds ||
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
                 listNumberColorField.text.trim() != settings.listNumberColor ||
-                loadAllSessionsCheckbox.isSelected != settings.loadAllSessions
+                loadAllSessionsCheckbox.isSelected != settings.loadAllSessions ||
+                expandedKinds != currentExpandedKinds
     }
 
     private fun showStatus(msg: String, success: Boolean) {

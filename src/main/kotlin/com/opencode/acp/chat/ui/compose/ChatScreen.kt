@@ -73,7 +73,7 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
     val seen = mutableSetOf<String>()
 
     // Exact filename match first
-    com.intellij.psi.search.FilenameIndex.getVirtualFilesByName(project, query, com.intellij.psi.search.GlobalSearchScope.projectScope(project))
+    com.intellij.psi.search.FilenameIndex.getVirtualFilesByName(query, com.intellij.psi.search.GlobalSearchScope.projectScope(project))
         .filter { it.isValid && !it.isDirectory }
         .take(maxResults)
         .forEach { vf ->

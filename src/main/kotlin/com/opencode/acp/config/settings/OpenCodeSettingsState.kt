@@ -58,6 +58,25 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var loadAllSessions: Boolean = false
     /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save. */
     var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
+    /**
+     * Tool kinds that default to expanded in the chat.
+     * Stored as a comma-separated string of ToolKind names for XStream compatibility.
+     * Default: EXECUTE,EDIT,READ,THINK
+     */
+    var expandedToolKinds: String = "EXECUTE,EDIT,READ,THINK"
+
+    /** Returns true if the given ToolKind should default to expanded. */
+    fun isToolKindDefaultExpanded(kind: com.agentclientprotocol.model.ToolKind): Boolean {
+        val expanded = expandedToolKinds.split(",").map { it.trim() }.toSet()
+        return kind.name in expanded
+    }
+
+    /** Toggles a ToolKind in the expanded set. */
+    fun toggleToolKindDefaultExpanded(kind: com.agentclientprotocol.model.ToolKind) {
+        val expanded = expandedToolKinds.split(",").map { it.trim() }.toMutableSet()
+        if (kind.name in expanded) expanded.remove(kind.name) else expanded.add(kind.name)
+        expandedToolKinds = expanded.sorted().joinToString(",")
+    }
 
     override fun getState(): OpenCodeSettingsState {
         return this
@@ -90,6 +109,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         port = if (state.port in 1024..65535) state.port else 4096
         loadAllSessions = state.loadAllSessions
         commandHistory = state.commandHistory
+        expandedToolKinds = state.expandedToolKinds.ifBlank { "EXECUTE,EDIT,READ,THINK" }
     }
 
     companion object {

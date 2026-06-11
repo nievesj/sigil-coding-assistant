@@ -350,11 +350,11 @@ object OpenCodePartSerializer : KSerializer<OpenCodePart> {
                 }
                 val reconstructed = kotlinx.serialization.json.buildJsonObject {
                     for ((key, value) in element) put(key, value)
-                    if (stateInput != null) put("input", stateInput!!)
+                    stateInput?.let { put("input", it) }
                     // Inject state.title at top level for ToolUse
                     if (stateTitle != null) put("title", kotlinx.serialization.json.JsonPrimitive(stateTitle))
                     // Also inject state.output at top level for ToolResult
-                    if (stateOutput != null && element["output"] == null) put("output", stateOutput!!)
+                    if (stateOutput != null && element["output"] == null) put("output", stateOutput)
                 }
                 return json.decodeFromJsonElement(serializer, reconstructed)
             }

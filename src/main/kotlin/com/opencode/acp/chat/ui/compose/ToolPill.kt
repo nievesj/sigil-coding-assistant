@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ToolCallPill
+import com.opencode.acp.config.settings.OpenCodeSettingsState
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -40,9 +41,10 @@ fun ToolPill(
     modifier: Modifier = Modifier,
     getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
 ) {
-    // Edit and Shell pills expanded by default; task pills expanded when running
+    // Default expanded from settings, with task pills expanded when running
+    val defaultExpanded = OpenCodeSettingsState.getInstance().isToolKindDefaultExpanded(pill.kind)
     var expanded by remember {
-        mutableStateOf(pill.kind == ToolKind.EXECUTE || pill.kind == ToolKind.EDIT || (pill.toolName == "task" && pill.status == ToolCallStatus.IN_PROGRESS))
+        mutableStateOf(defaultExpanded || (pill.toolName == "task" && pill.status == ToolCallStatus.IN_PROGRESS))
     }
 
     val isTask = pill.toolName == "task"
