@@ -23,28 +23,45 @@ import org.jetbrains.jewel.bridge.addComposeTab
 
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
+
+    companion object {
+        /** Reference to the active ComposePanel for JVM shutdown hook cleanup. */
+        @Volatile
+        private var activeComposePanel: androidx.compose.ui.awt.ComposePanel? = null
+
+        private fun disposeComposePanel(container: java.awt.Container?) {
+            if (container == null) return
+            for (child in container.components) {
+                if (child is androidx.compose.ui.awt.ComposePanel) {
+                    try { child.dispose() } catch (_: Exception) { }
+                    return
+                }
+                if (child is java.awt.Container) {
+                    disposeComposePanel(child)
+                }
+            }
+        }
+    }
+
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
         val service = project.service<OpenCodeService>()
-        // Use Dispatchers.Default (not EDT) so initialization HTTP calls
-        // (health check, list agents/providers) don't block the UI thread.
-        // StateFlow updates are thread-safe — Compose recomposes on EDT automatically.
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val viewModel = ChatViewModel(scope, service, project)
 
-        // addComposeTab() automatically handles SwingBridgeTheme, enableNewSwingCompositing(),
-        // and JewelComposePanel creation — no explicit SwingBridgeTheme {} wrapper needed.
         toolWindow.addComposeTab("") {
             ChatTheme {
                 ChatScreen(viewModel, project)
             }
         }
 
-        // Register Ctrl+V / Cmd+V action on the tool window content component.
-        // IntelliJ's action system consumes Ctrl+V before it reaches Compose's onPreviewKeyEvent,
-        // so we must intercept at the IDE level and signal the Compose UI.
         val content = toolWindow.contentManager.contents.firstOrNull()
         if (content != null) {
             val component = content.component
+
+            // Find and store the ComposePanel reference for shutdown cleanup.
+            val composePanelRef = findComposePanel(component)
+            activeComposePanel = composePanelRef
+
             val pasteAction = DumbAwareAction.create {
                 viewModel.requestImagePaste()
             }
@@ -54,64 +71,50 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
             )
             pasteAction.registerCustomShortcutSet(pasteShortcut, component, project)
 
-            // CRITICAL: Set a proper Content disposer.
-            // addComposeTab() does NOT set Content.setDisposer(), which means the
-            // ComposePanel's Skiko rendering thread is never properly disposed during
-            // IDE shutdown/plugin update. Skiko holds Swing's treeLock during paint,
-            // and the IDE's disposal sequence needs treeLock too — causing a deadlock
-            // that freezes the IDE until the user manually closes the plugin window.
-            // By setting a disposer, IntelliJ's disposal system calls dispose() on the
-            // content before completing shutdown, which stops Skiko's rendering thread.
             content.setDisposer(object : com.intellij.openapi.Disposable {
                 override fun dispose() {
-                    // Cancel the ViewModel's coroutine scope first — stops all background
-                    // work (SSE, HTTP calls, event processing).
                     scope.cancel()
                     viewModel.close()
-                    // Dispose the ComposePanel explicitly — stops Skiko's rendering thread
-                    // and releases Swing treeLock. Without this, the IDE hangs during
-                    // shutdown/plugin update because Skiko's paint loop holds treeLock
-                    // while the IDE tries to acquire a write lock for disposal.
-                    disposeComposePanel(component)
+                    // Stop Skiko rendering before disposing. Setting isVisible=false
+                    // tells Skiko to skip rendering, letting the render thread finish
+                    // its current frame so dispose() completes quickly.
+                    try { component.isVisible = false } catch (_: Exception) {}
+                    composePanelRef?.let {
+                        try { it.dispose() } catch (_: Exception) {}
+                    }
+                    activeComposePanel = null
                 }
             })
         }
 
-        // Auto-connect on tool window open (if setting enabled)
+        // Register a JVM shutdown hook that disposes the ComposePanel if it
+        // hasn't been disposed yet. IntelliJ's restart sequence may NOT call
+        // Content.dispose() — it might just close projects and exit the JVM.
+        // Without this hook, Skiko's non-daemon rendering thread keeps running
+        // and prevents the JVM from exiting, blocking the restart.
+        // Safe for restart (JVM is exiting anyway) and only triggers if the
+        // Content disposer hasn't already cleaned up.
+        Runtime.getRuntime().addShutdownHook(Thread({
+            activeComposePanel?.let {
+                try { it.dispose() } catch (_: Exception) {}
+                activeComposePanel = null
+            }
+        }, "opencode-compose-shutdown").apply { isDaemon = true })
+
         val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance()
         if (settings.autoConnect) {
-            scope.launch {
-                viewModel.initialize(project.basePath)
-            }
+            scope.launch { viewModel.initialize(project.basePath) }
         }
     }
 
-    companion object {
-        /**
-         * Dispose the [ComposePanel][androidx.compose.ui.awt.ComposePanel] inside
-         * a Jewel container by traversing the Swing component hierarchy.
-         *
-         * [JewelToolWindowComposePanel] wraps a JPanel containing a ComposePanel
-         * as its child. The ComposePanel's Skiko rendering thread must be stopped
-         * explicitly — it does not auto-dispose during IDE shutdown because
-         * `addComposeTab()` never sets `Content.setDisposer()`.
-         */
-        private fun disposeComposePanel(container: java.awt.Container?) {
-            if (container == null) return
-            for (child in container.components) {
-                if (child is androidx.compose.ui.awt.ComposePanel) {
-                    try {
-                        child.dispose()
-                    } catch (_: Exception) {
-                        // ComposePanel.dispose() may throw if already disposed
-                        // or if Skiko's renderer is in a bad state during shutdown.
-                    }
-                    return
-                }
-                if (child is java.awt.Container) {
-                    disposeComposePanel(child)
-                }
+    private fun findComposePanel(container: java.awt.Container): androidx.compose.ui.awt.ComposePanel? {
+        for (child in container.components) {
+            if (child is androidx.compose.ui.awt.ComposePanel) return child
+            if (child is java.awt.Container) {
+                val found = findComposePanel(child)
+                if (found != null) return found
             }
         }
+        return null
     }
 }

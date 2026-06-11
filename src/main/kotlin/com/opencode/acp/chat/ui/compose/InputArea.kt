@@ -113,13 +113,12 @@ suspend fun readClipboardContent(): ClipboardResult? {
     } else {
         withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
-                var result: Any? = null
-                java.awt.EventQueue.invokeAndWait {
-                    result = readClipboardOnEdt()
+                val deferred = kotlinx.coroutines.CompletableDeferred<Any?>()
+                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                    deferred.complete(readClipboardOnEdt())
                 }
-                result
+                deferred.await()
             } catch (e: Exception) {
-
                 null
             }
         }

@@ -27,7 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
-import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -44,8 +44,10 @@ import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Computes recent files: currently open editors first, then recently closed files.
@@ -168,9 +170,13 @@ fun
 
     // Populate initially and subscribe to file editor changes
     LaunchedEffect(project) {
-        // Initial load
-        val initial = ApplicationManager.getApplication().runReadAction<List<RecentFile>> {
-            computeRecentFiles(project)
+        // Initial load — use submit() + get() on IO dispatcher instead of
+        // executeSynchronously() which wraps in a non-cancellable runReadAction
+        // that blocks write actions (settings dialog, plugin updater).
+        val initial = withContext(Dispatchers.IO) {
+            ReadAction.nonBlocking<List<RecentFile>> {
+                computeRecentFiles(project)
+            }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
         }
         recentFiles.clear()
         recentFiles.addAll(initial)
@@ -179,19 +185,27 @@ fun
         val connection = project.messageBus.connect()
         connection.subscribe(FileEditorManagerListener.FILE_EDITOR_MANAGER, object : FileEditorManagerListener {
             override fun fileOpened(source: FileEditorManager, file: VirtualFile) {
-                val updated = ApplicationManager.getApplication().runReadAction<List<RecentFile>> {
-                    computeRecentFiles(project)
+                scope.launch {
+                    val updated = withContext(Dispatchers.IO) {
+                        ReadAction.nonBlocking<List<RecentFile>> {
+                            computeRecentFiles(project)
+                        }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
+                    }
+                    recentFiles.clear()
+                    recentFiles.addAll(updated)
                 }
-                recentFiles.clear()
-                recentFiles.addAll(updated)
             }
 
             override fun fileClosed(source: FileEditorManager, file: VirtualFile) {
-                val updated = ApplicationManager.getApplication().runReadAction<List<RecentFile>> {
-                    computeRecentFiles(project)
+                scope.launch {
+                    val updated = withContext(Dispatchers.IO) {
+                        ReadAction.nonBlocking<List<RecentFile>> {
+                            computeRecentFiles(project)
+                        }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
+                    }
+                    recentFiles.clear()
+                    recentFiles.addAll(updated)
                 }
-                recentFiles.clear()
-                recentFiles.addAll(updated)
             }
         })
 
@@ -269,11 +283,15 @@ fun
         if (query.isBlank()) {
             searchResults.clear()
         } else {
-            val results = ApplicationManager.getApplication().runReadAction<List<RecentFile>> {
-                searchProjectFiles(project, query)
+            scope.launch {
+                val results = withContext(Dispatchers.IO) {
+                    ReadAction.nonBlocking<List<RecentFile>> {
+                        searchProjectFiles(project, query)
+                    }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
+                }
+                searchResults.clear()
+                searchResults.addAll(results)
             }
-            searchResults.clear()
-            searchResults.addAll(results)
         }
     }
 
