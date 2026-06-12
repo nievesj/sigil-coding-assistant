@@ -32,6 +32,10 @@ The TDD was written before probing the actual JetBrains MCP Server. Key deviatio
 
 10. **`McpToolList` stores empty lists — no REST endpoint for tool discovery.** Since the JetBrains MCP Server doesn't expose `/api/mcp/list_tools`, `McpToolList` simply stores an empty list per server to indicate registration. Tool details are managed by OpenCode internally via the MCP protocol.
 
+11. **§10 Tool Permissions — partially implemented with parallel discovery systems.** The settings panel has basic tool discovery (`GET /experimental/tool/ids` for built-in tools) and a per-tool checkbox + permission dropdown UI. However: (a) MCP tool discovery in settings is a stub returning `emptyMap()` — the existing `McpToolDiscovery` class (which correctly implements MCP `tools/list` via JSON-RPC over SSE) is NOT wired in; (b) there are two parallel data models (`ToolInfo` in `ToolRegistry.kt` vs `ToolPermissionInfo` in `OpenCodeSettingsPanel.kt`) that should be unified; (c) missing UI features: Enable All/Disable All buttons, filter/search bar, source dropdown, "N/M enabled" counter, per-server grouping headers, restart warning; (d) tool states are not persisted in `OpenCodeSettingsState` — must re-discover on each settings panel open.
+
+12. **`OpenCodeSettingsConfigurable.discoverMcpTools()` is a stub.** It returns `emptyMap()` with a `TODO: Implement MCP protocol tool discovery` comment. The full implementation exists in `McpToolDiscovery.kt` but is not called from the settings flow. The fix is to get connected MCP server URLs from `McpManager` and call `McpToolDiscovery.discoverAllTools()`.
+
 ---
 
 ## 1. TL;DR
@@ -791,10 +795,30 @@ suspend fun addMcpServer(body: JsonObject): Boolean {
 
 **Why raw JSON body instead of typed `McpServerConfig`:** The OpenCode server's Zod validator is strict about the `config` shape. Using a typed `McpServerConfig` data class with kotlinx.serialization risks field name mismatches (e.g., `oauth: Boolean` vs the Zod union `z.union([McpOAuth, z.literal(false)])`). Building the JSON manually with `buildJsonObject` gives us exact control over the wire format and avoids serialization surprises.
 
-**F. Settings Panel — MCP section**
+**F. Settings Panel — MCP section (sub-child of OpenCode settings)**
+
+The MCP Integration section is nested under the OpenCode server settings in `OpenCodeSettingsPanel`, not as a separate top-level section. This reflects the dependency: MCP servers are registered with the plugin's OpenCode instance, so MCP configuration belongs under OpenCode configuration.
 
 ```kotlin
 // OpenCodeSettingsPanel.kt — additions
+
+// The panel layout groups MCP under OpenCode:
+//   OpenCode binary: [field] [Discover]
+//   Server port: [field]
+//   Permission timeout: [field]
+//   ... (other OpenCode settings) ...
+//   ─────────────────────────────────────
+//   MCP Integration (OpenCode):
+//     [x] Enable IntelliJ MCP integration
+//     IntelliJ MCP SSE URL: [field]
+//     Additional MCP servers: [text area]
+//     MCP integration: disabled [label]
+//     [Retry MCP Connection] [button]
+//   ─────────────────────────────────────
+//   Tool Permissions (OpenCode):
+//     [tool list panel]
+//     [Discover Tools] [Apply Tool Permissions]
+//     [status label]
 
 /** IntelliJ MCP section */
 val enableIntellijMcpCheckbox: JBCheckBox = JBCheckBox("Enable IntelliJ MCP integration").apply {
@@ -919,7 +943,7 @@ OpenCodeService.initialize()
 | File | Change |
 |------|--------|
 | `OpenCodeSettingsState.kt` | Add `enableIntellijMcp`, `mcpServerUrl`, `additionalMcpServers` fields + `loadState()` |
-| `OpenCodeSettingsPanel.kt` | Add MCP section: toggle, URL field, retry button, status label, tool list, additional servers field |
+| `OpenCodeSettingsPanel.kt` | Add MCP section as sub-child of OpenCode settings: toggle, URL field, retry button, status label, tool list, additional servers field |
 | `OpenCodeClient.kt` | Add `addMcpServer(body: JsonObject): Boolean` method |
 | `OpenCodeService.kt` | Add `mcpManager` field, `disconnectMcp()`, `disconnectIntellijMcp()`, `retryMcp()`, `resetMcpOnServerRestart()` |
 | `ProcessManager.kt` | Add `onMcpReset` callback, invoke in process watcher auto-restart path |
@@ -1210,7 +1234,378 @@ class McpManagerTest {
 
 ---
 
-## 10. Document History
+## 10. Tool Permissions Feature (v2)
+
+### 10.1 Goal
+
+Every tool available to the LLM (both built-in OpenCode tools and MCP tools from all connected servers) should be listed in a table in the Settings panel. The user can toggle each tool on/off and set its permission level (Allow/Ask/Deny). Changes are written to `.opencode/opencode.json` and take effect after an OpenCode server restart.
+
+**Trade-off acknowledged**: This approach modifies the project directory (`.opencode/opencode.json`). This was explicitly deferred in §4.5.2H because it touches project files. In v2 we accept this trade-off because: (a) `.opencode/` is gitignored by convention, (b) it's the only enforceable mechanism — all other approaches (PATCH /config, DELETE /mcp, prompt instructions) are unreliable or nonexistent, (c) the file is written atomically and preserves non-plugin config keys.
+
+### 10.2 Implementation Status
+
+The tool permissions feature is **partially implemented**. What exists and what's still needed:
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| `ToolRegistry.kt` | ✅ Done | Aggregates built-in + MCP tools, provides `discoverAll()`, `exportPermissions()`, `setToolPermission()`, `setToolEnabled()` |
+| `McpToolDiscovery.kt` | ✅ Done | MCP protocol `tools/list` via JSON-RPC over SSE. Supports single and parallel multi-server discovery |
+| `McpConfigWriter.writeToolPermissions()` | ✅ Done | Writes per-agent permission rules to `.opencode/opencode.json`, merges with existing config, atomic write via temp file + rename |
+| `ToolPermission` enum | ✅ Done | `ALLOW`, `ASK`, `DENY` with `toActionString()`/`fromActionString()` in `McpModels.kt` |
+| Built-in tool discovery | ✅ Done | `GET /experimental/tool/ids` called in `OpenCodeSettingsConfigurable.discoverToolsFromOpenCode()`, with hardcoded description fallbacks |
+| Settings panel UI | ⚠️ Basic | Has `toolPermissionsPanel` (vertical list), `discoverToolsButton`, `applyToolPermissionsButton`, per-tool checkbox + permission dropdown. **Missing**: Enable All/Disable All buttons, filter/search bar, source dropdown, grouped sections with headers, "N / M enabled" counter |
+| MCP tool discovery in settings | ⚠️ Stub | `discoverMcpTools()` in `OpenCodeSettingsConfigurable` returns `emptyMap()`. The existing `McpToolDiscovery` class is NOT wired into the settings flow |
+| Tool state persistence | ❌ Not done | Discovered tools are not persisted in `OpenCodeSettingsState`. Must re-discover on each settings open |
+| Apply flow | ✅ Done | `applyToolPermissions()` reads UI state, converts to `Map<String, ToolPermission>`, writes via `McpConfigWriter.writeToolPermissions()` |
+
+**Two parallel tool discovery systems exist** — they need to be unified:
+
+1. **`ToolRegistry`** + **`McpToolDiscovery`** (in `com.opencode.acp.mcp`): Uses MCP protocol `tools/list` via JSON-RPC over SSE. Has `discoverAll(opencodeBaseUrl, mcpServerUrls)` that discovers both built-in and MCP tools. NOT wired into the settings panel.
+2. **`OpenCodeSettingsConfigurable.discoverToolsFromOpenCode()`** (in `com.opencode.acp.config.settings`): Uses `GET /experimental/tool/ids` for built-in tools (working) and has a stub `discoverMcpTools()` (returns empty map). Creates `ToolPermissionInfo` objects (separate from `ToolInfo` in `ToolRegistry`).
+
+### 10.3 API Endpoints for Tool Discovery
+
+| Endpoint | Purpose | Response | Verification Status |
+|----------|---------|----------|---------------------|
+| `GET /experimental/tool/ids` | List all built-in tool IDs | `{"value": ["bash", "read", "glob", ...], "Count": 20}` | **Verified** — implemented in `OpenCodeSettingsConfigurable.discoverToolsFromOpenCode()` |
+| MCP protocol `tools/list` | List tools from an MCP server | JSON-RPC response with `result.tools[].name`, `result.tools[].description` | **Verified** — implemented in `McpToolDiscovery.kt` |
+
+**Built-in tools** (from `GET /experimental/tool/ids`): `bash`, `read`, `glob`, `grep`, `edit`, `write`, `task`, `webfetch`, `todowrite`, `websearch`, `skill`, `apply_patch`, `council_session`, `auto_continue`, `ast_grep_search`, `ast_grep_replace`, `subtask`, `read_session`
+
+**MCP tools**: Discovered per server via MCP protocol `tools/list` JSON-RPC over SSE. For the IntelliJ MCP server, tools are prefixed with `intellij_` (e.g., `intellij_read_file`, `intellij_edit_file`).
+
+**MCP protocol flow** (implemented in `McpToolDiscovery`):
+
+```
+1. GET http://127.0.0.1:<port>/sse → SSE stream
+2. Parse: event: session → data: {"sessionId": "abc123"}
+3. POST http://127.0.0.1:<port>/message?sessionId=abc123
+   Body: {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+4. Parse response: {"jsonrpc": "2.0", "id": 1, "result": {"tools": [...]}}
+5. Disconnect — the SSE connection is used only for discovery.
+```
+
+**Why the plugin creates its own SSE connection for discovery**: OpenCode manages persistent MCP connections for tool execution, but the plugin cannot query OpenCode for the tool list of a specific MCP server (GET /mcp doesn't return tool details). The plugin opens a short-lived SSE connection to each MCP server, sends one `tools/list` JSON-RPC request, parses the response, and disconnects. This is a read-only operation that doesn't interfere with OpenCode's persistent connection.
+
+### 10.4 Permission Format in `opencode.json`
+
+Permissions are written per-agent in the config file. The `orchestrator` agent is the primary target.
+
+```json
+{
+  "mcp": {
+    "intellij": { ... }
+  },
+  "agent": {
+    "orchestrator": {
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "intellij_*": "allow",
+        "intellij_read_file": "deny"
+      }
+    }
+  }
+}
+```
+
+**Key behavior**: OpenCode reads `.opencode/opencode.json` on startup. Changes require an OpenCode server restart to take effect (call `ProcessManager.shutdown()` then `initialize()`).
+
+**Permission values**: `"allow"` | `"ask"` | `"deny"`
+
+**Glob patterns**: `"intellij_*"` matches all tools prefixed with `intellij_`. Specific tool patterns (e.g., `"intellij_read_file"`) override globs (last-match-wins in OpenCode's permission resolution).
+
+**Implementation note**: `McpConfigWriter.writeToolPermissions()` merges new permissions with existing ones — new values override existing keys, but permissions for tools not in the new map are preserved. This prevents accidental removal of manually configured permissions.
+
+### 10.5 UI Design
+
+#### Current Implementation
+
+The settings panel (`OpenCodeSettingsPanel`) has a basic tool permissions section below the MCP Integration section (both nested under OpenCode server settings):
+
+- `toolPermissionsPanel: JPanel` — vertical `BoxLayout` with per-tool rows (checkbox + label + dropdown)
+- `discoverToolsButton: JButton("Discover Tools")` — triggers `discoverTools()` in configurable
+- `applyToolPermissionsButton: JButton("Apply Tool Permissions")` — writes permissions to `opencode.json`
+- Per-tool row: `JBCheckBox` (enabled) + `JBLabel` (name) + `JComboBox<String>("allow", "ask", "deny")`
+- Tools grouped into "Built-in Tools" and "MCP Tools" sections via `createToolSection()`
+- `ToolPermissionInfo` data class: `description`, `source` ("builtin"/"mcp"), `enabled`, `permission`
+
+**What works**: Discover built-in tools, display them with checkbox + permission dropdown, apply permissions to `opencode.json`.
+
+**What's missing** (compare to JetBrains MCP Tools reference design):
+
+| Feature | Current | Target |
+|---------|---------|--------|
+| "N / M tools enabled" counter | ❌ Missing | Header shows count |
+| Enable All / Disable All buttons | ❌ Missing | Bulk toggle buttons |
+| Filter/search bar | ❌ Missing | Search by name or description |
+| Source dropdown filter | ❌ Missing | Filter by "All", "Built-in", specific MCP server |
+| MCP tool discovery | ❌ Stub (`discoverMcpTools()` returns `emptyMap()`) | Use `McpToolDiscovery` via SSE |
+| Tool state persistence | ❌ Not persisted in settings state | Save in `OpenCodeSettingsState.toolPermissions` |
+| Status label for restart requirement | ⚠️ Generic `showStatus()` | Show "Changes take effect after OpenCode restart" |
+| Per-server grouping | ⚠️ Only 2 groups (Built-in/MCP) | Group by server name (e.g., "MCP: intellij (12 tools)") |
+| Partial failure handling | ❌ Missing | Show per-group error state when one source fails |
+
+#### Target Layout (top to bottom)
+
+```
++-----------------------------------------------------------------+
+| 18 / 20 tools enabled                                           |
+|  [Enable All]  [Disable All]                                     |
+|                                                                  |
+|  Filter tools by name or ID              [All tools v]           |
+|                                                                  |
+|  +-- Built-in Tools ------------------------------------------+  |
+|  | [x] bash        Execute shell commands          [Allow v]  |  |
+|  | [x] read        Read file contents              [Allow v]  |  |
+|  | [x] edit        Edit files with replacement     [Allow v]  |  |
+|  | [x] grep        Search file contents with regex [Allow v]  |  |
+|  | [x] glob        Find files by pattern           [Allow v]  |  |
+|  | [x] write       Write new files                 [Allow v]  |  |
+|  | [ ] apply_patch Apply patches to files          [Deny  v]  |  |
+|  | ... (remaining built-in tools)                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                  |
+|  +-- MCP: intellij (12 tools) --------------------------------+  |
+|  | [x] intellij_read_file       Read file with PSI awareness  |  |
+|  |                                            [Allow v]       |  |
+|  | [x] intellij_edit_file       Edit file with PSI awareness  |  |
+|  |                                            [Allow v]       |  |
+|  | [x] intellij_get_symbol_info Get symbol info               |  |
+|  |                                            [Allow v]       |  |
+|  | ... (remaining intellij tools)                            |  |
+|  +------------------------------------------------------------+  |
+|                                                                  |
+|  +-- MCP: websearch (3 tools) --------------------------------+  |
+|  | [x] websearch_web_search_exa  Web search via Exa           |  |
+|  |                                            [Allow v]       |  |
+|  | ...                                                       |  |
+|  +------------------------------------------------------------+  |
+|                                                                  |
+|  Status: Ready. Changes take effect after OpenCode restart.      |
++-----------------------------------------------------------------+
+```
+
+#### Behavior
+
+1. **On panel open**: Tools are NOT auto-discovered (avoids slow settings open). If tool states were persisted in `OpenCodeSettingsState.toolPermissions`, the table is populated from the saved state. Otherwise, the table is empty until the user clicks "Discover Tools".
+
+2. **"Discover Tools" button**:
+   - Button text changes to "Discovering..." and is disabled during discovery
+   - Calls `GET /experimental/tool/ids` on OpenCode server (built-in tools) — **implemented**
+   - Calls `McpToolDiscovery.discoverAllTools(mcpServerUrls)` for each connected MCP server — **stub, needs wiring**
+   - On success: populates the table with all discovered tools, grouped by source. Merges with any previously persisted tool states (preserves user's permission choices for tools that still exist).
+   - On partial failure: successfully discovered groups are shown; failed groups show an error header (e.g., "MCP: intellij — discovery failed: connection refused") with a per-group retry link.
+   - On total failure: shows error in status label, table remains empty.
+   - Each newly discovered tool defaults to `enabled = true`, `permission = "allow"` (unless a persisted state exists for that tool).
+   - Persists the discovered tool states to `OpenCodeSettingsState.toolPermissions`.
+
+3. **"Enable All" / "Disable All"** — **not yet implemented**: Toggle all visible checkboxes at once (respecting the current filter). Updates the "N / M tools enabled" counter.
+
+4. **Filter field** — **not yet implemented**: Filters the table by tool name or description. Source dropdown filters by "All tools", "Built-in only", or specific MCP server name. Filter is applied to the in-memory tool list — no additional HTTP calls.
+
+5. **Per-tool checkbox**: Enables/disables the tool. When unchecked, the tool is written as `permission: "deny"` in `opencode.json`. Updates the "N / M tools enabled" counter.
+
+6. **Per-tool permission dropdown**: Sets the permission level (Allow/Ask/Deny). This overrides the checkbox state — if set to "Deny", the tool is denied regardless of checkbox. Setting "Allow" or "Ask" re-enables the checkbox.
+
+7. **"Apply Tool Permissions" button** — **implemented**: Reads all tool states from the UI, converts to `Map<String, ToolPermission>`, calls `McpConfigWriter.writeToolPermissions(permissions)`. Shows success/failure status. Persists the final tool states to `OpenCodeSettingsState.toolPermissions`.
+
+8. **Status label**: Shows "Tool permissions written to .opencode/opencode.json. Changes take effect after OpenCode restart." on success. Shows "Failed to write tool permissions: <reason>" on error.
+
+### 10.6 Implementation Blueprint
+
+#### Data Models
+
+**Already implemented** in `McpModels.kt` and `ToolRegistry.kt`:
+
+```kotlin
+// McpModels.kt
+enum class ToolPermission {
+    ALLOW, ASK, DENY;
+    fun toActionString(): String = when (this) {
+        ALLOW -> "allow"; ASK -> "ask"; DENY -> "deny"
+    }
+    companion object {
+        fun fromActionString(s: String): ToolPermission = when (s) {
+            "allow" -> ALLOW; "ask" -> ASK; "deny" -> DENY; else -> ALLOW
+        }
+    }
+}
+
+// ToolRegistry.kt
+data class ToolInfo(
+    val name: String,
+    val description: String,
+    val source: ToolSource,  // BUILTIN or MCP
+    val serverName: String,  // "builtin", "intellij", "websearch", etc.
+    val enabled: Boolean = true,
+    val permission: ToolPermission = ToolPermission.ALLOW
+)
+enum class ToolSource { BUILTIN, MCP }
+```
+
+**Also exists** in `OpenCodeSettingsPanel.kt` (separate, parallel — to be removed):
+
+```kotlin
+data class ToolPermissionInfo(
+    val description: String,
+    val source: String,  // "builtin" or "mcp"
+    val enabled: Boolean,
+    val permission: String  // "allow", "ask", or "deny"
+)
+```
+
+**TODO**: Unify `ToolPermissionInfo` with `ToolInfo` — remove `ToolPermissionInfo` and use `ToolInfo` directly in the settings panel. Add `serverName` field to `ToolInfo` if not already present (needed for per-server grouping).
+
+#### Remaining Work
+
+**1. Wire `McpToolDiscovery` into settings flow** (`OpenCodeSettingsConfigurable.kt`):
+
+Replace the stub `discoverMcpTools()` with actual MCP tool discovery:
+
+```kotlin
+private suspend fun discoverMcpTools(mcpServerUrls: Map<String, String>): Map<String, List<ToolInfo>> {
+    if (mcpServerUrls.isEmpty()) return emptyMap()
+    val mcpToolDiscovery = McpToolDiscovery(HttpClient(Java))
+    return try {
+        mcpToolDiscovery.discoverAllTools(mcpServerUrls)
+    } catch (e: Exception) {
+        logger.warn(e) { "[ACP] MCP tool discovery failed" }
+        emptyMap()
+    }
+}
+```
+
+The caller (`discoverTools()`) merges built-in tools with MCP tools, groups by `serverName`, and populates the UI. Failed MCP servers are shown as error groups, not silent failures.
+
+**2. Add Enable All / Disable All buttons** (`OpenCodeSettingsPanel.kt`):
+
+```kotlin
+val enableAllToolsButton: JButton = JButton("Enable All").apply {
+    toolTipText = "Enable all visible tools (set permission to Allow)"
+}
+val disableAllToolsButton: JButton = JButton("Disable All").apply {
+    toolTipText = "Disable all visible tools (set permission to Deny)"
+}
+```
+
+Wire in `OpenCodeSettingsConfigurable`: iterate visible `toolEnabledCheckboxes` (respecting current filter) and set all to `true`/`false`, update corresponding `toolPermissionComboBoxes` to "allow"/"deny". Update counter.
+
+**3. Add "N / M tools enabled" counter** (`OpenCodeSettingsPanel.kt`):
+
+```kotlin
+val toolCountLabel: JBLabel = JBLabel("0 / 0 tools enabled")
+```
+
+Update on every checkbox change and after discovery. Count includes only enabled tools (checkbox checked).
+
+**4. Add filter/search field and source dropdown** (`OpenCodeSettingsPanel.kt`):
+
+```kotlin
+val toolFilterField: JBTextField = JBTextField().apply {
+    emptyText.text = "Filter tools by name..."
+}
+val toolSourceFilterCombo: JComboBox<String> = JComboBox(arrayOf("All tools", "Built-in only"))
+// MCP server names added dynamically after discovery
+```
+
+Filter logic: `toolFilterField` text matches against tool name (case-insensitive substring). `toolSourceFilterCombo` filters by `ToolSource` / `serverName`. Both filters are AND-combined. Filtering hides/shows rows in the existing panel — no data structure changes.
+
+**5. Per-server grouping** — Group tools by `serverName` in `createToolSection()`. Section headers:
+- Built-in: `"Built-in Tools (N tools)"`
+- MCP: `"MCP: <serverName> (N tools)"` — e.g., `"MCP: intellij (12 tools)"`
+
+Each group is a collapsible section (click header to toggle). Groups with discovery errors show the header in red with error text below.
+
+**6. Persist tool states** — Add `toolPermissions: String` field to `OpenCodeSettingsState`:
+
+```kotlin
+var toolPermissions: String = ""  // JSON: {"bash":{"enabled":true,"permission":"allow"},...}
+```
+
+Schema: `Map<String, SerializedToolState>` where `SerializedToolState = { enabled: Boolean, permission: String }`. Serialize on Apply, deserialize on panel open. This avoids re-discovery on every settings open.
+
+**7. Add restart warning status** — After applying tool permissions, show: "Tool permissions written to .opencode/opencode.json. Changes take effect after OpenCode restart."
+
+**8. Handle partial discovery failure** — When `discoverTools()` runs, built-in and MCP discovery are independent. If MCP discovery fails for one server (timeout, connection refused), the built-in tools and other MCP servers' tools are still shown. The failed server's group shows an error header:
+
+```
++-- MCP: intellij -- discovery failed: connection refused --+
+|  [Retry]                                                   |
++------------------------------------------------------------+
+```
+
+The "Retry" link re-runs discovery for that specific server only.
+
+### 10.7 Files to Modify
+
+| File | Status | Change Needed |
+|------|--------|----------------|
+| `McpToolDiscovery.kt` | ✅ Done | Already implements MCP protocol `tools/list` via JSON-RPC over SSE |
+| `ToolRegistry.kt` | ✅ Done | Already aggregates built-in + MCP tools. Add `serverName` field to `ToolInfo` for per-server grouping |
+| `McpConfigWriter.kt` | ✅ Done | `writeToolPermissions()` already writes per-agent config |
+| `McpModels.kt` | ✅ Done | `ToolPermission` enum with `ALLOW`/`ASK`/`DENY` already exists |
+| `OpenCodeSettingsPanel.kt` | ⚠️ Partial | Has basic tool list. **Needs**: Enable All/Disable All buttons, filter field, source dropdown, "N/M enabled" counter, per-server grouping with error states, restart warning, remove `ToolPermissionInfo` in favor of `ToolInfo` |
+| `OpenCodeSettingsConfigurable.kt` | ⚠️ Partial | Built-in discovery works. **Needs**: Wire `McpToolDiscovery` into `discoverMcpTools()`, unify with `ToolRegistry`, add Enable All/Disable All handlers, add filter logic, persist tool states on Apply |
+| `OpenCodeSettingsState.kt` | ❌ Missing | **Needs**: `toolPermissions: String` field for persisting discovered tool states |
+| `McpManager.kt` | ⚠️ Minor | **Needs**: Expose connected server SSE URLs (e.g., `getServerUrls(): Map<String, String>`) for `McpToolDiscovery` to use |
+
+### 10.8 Constraints
+
+- **No auto-discovery on settings open**: Tool discovery makes HTTP calls. The settings panel must open instantly. If persisted tool states exist, show them; otherwise show empty table until user clicks "Discover Tools".
+- **Restart required**: OpenCode reads `.opencode/opencode.json` on startup only. Permission changes take effect after restart. The UI must make this clear — status label after Apply, not buried in docs.
+- **Atomic writes**: Config file is written via temp file + rename to prevent corruption. `McpConfigWriter` already handles this.
+- **Preserve non-plugin config**: The config writer must preserve `model`, `agent.*.prompt`, `agent.*.model`, and any non-plugin `mcp` entries. `McpConfigWriter` already handles this.
+- **No emoji in UI**: Standard Swing components only. No emoji in tool names, descriptions, or section headers. Use text indicators (e.g., "[x]" not checkbox emoji).
+- **Two discovery systems must unify**: `ToolRegistry` + `McpToolDiscovery` (in `com.opencode.acp.mcp`) and `OpenCodeSettingsConfigurable.discoverToolsFromOpenCode()` (in `com.opencode.acp.config.settings`) are parallel implementations. They should be unified so the settings panel uses `ToolRegistry.discoverAll()` instead of its own HTTP calls.
+- **Concurrency**: "Discover Tools" must be disabled while discovery is in progress (prevent double-click). "Apply" must be disabled while discovery is in progress (prevent writing partial state). Use a `isDiscovering` flag checked by both buttons.
+- **Partial failure tolerance**: Built-in and MCP discovery are independent. A failure in one MCP server must not prevent other tools from being shown or applied.
+- **Tool name prefixing consistency**: MCP tool names must be prefixed with the server name (e.g., `intellij_read_file`) in both discovery and permission writing. The prefix convention must match what OpenCode uses when routing tool calls. Verify the actual prefix format (separator is `_` or `__`) before implementing.
+
+### 10.9 Key Design Decisions
+
+1. **Separate "Discover Tools" button rather than auto-discovery**: Settings panel must open instantly. HTTP calls for tool discovery would make it slow. The user explicitly triggers discovery.
+
+2. **Separate "Apply Tool Permissions" button rather than integrating with IntelliJ settings Apply**: Tool permission writes go to `.opencode/opencode.json` (project file), not to IntelliJ's settings store. The IntelliJ Apply button saves to `opencode-settings.xml` (app-level). These are different stores with different lifecycles. A separate button makes this distinction clear to the user.
+
+3. **`ToolPermissionInfo` vs `ToolInfo` duplication**: The settings panel uses `OpenCodeSettingsPanel.ToolPermissionInfo` (inner data class) while `ToolRegistry` uses `ToolInfo`. These serve the same purpose but evolved independently. They should be unified — remove `ToolPermissionInfo` and use `ToolInfo` directly in the settings panel.
+
+4. **Checkbox / permission dropdown relationship**: When a tool is unchecked, it's written as `"deny"` in `opencode.json`. When checked, the dropdown value (`"allow"`/`"ask"`) is used. The dropdown overrides the checkbox — setting "Deny" in the dropdown effectively unchecks the tool. This is consistent with OpenCode's permission model where `"deny"` is the strongest restriction.
+
+5. **Tool name prefixing for MCP tools**: MCP tool names are prefixed with the server name (e.g., `intellij_read_file`). The prefix must be consistent between discovery (`McpToolDiscovery`) and permission writing (`McpConfigWriter`). The separator character (`_` vs `__`) must match OpenCode's convention — verify empirically before implementing.
+
+6. **Persist tool states to avoid re-discovery**: Tool states are saved in `OpenCodeSettingsState.toolPermissions` as JSON. On panel open, if persisted states exist, the table is populated immediately (no HTTP calls). "Discover Tools" refreshes the list and merges with persisted states (preserving user permission choices for tools that still exist). This avoids the slow re-discovery on every settings open while keeping the list fresh when the user explicitly requests it.
+
+7. **Merge semantics for Apply**: `McpConfigWriter.writeToolPermissions()` merges new permissions with existing `agent.orchestrator.permission` entries. New values override existing keys. Permissions for tools NOT in the new map are preserved. This prevents the plugin from accidentally removing manually configured permissions (e.g., a user who added `"bash": "deny"` directly in the file).
+
+### 10.10 Testing Strategy
+
+| Scenario | Expected Behavior |
+|----------|-------------------|
+| Discover with OpenCode server running | Built-in tools populated in table |
+| Discover with MCP server connected | MCP tools populated under server group header |
+| Discover with MCP server disconnected | Built-in tools shown; MCP group shows error with retry link |
+| Discover with OpenCode server down | Error in status label, table empty |
+| Enable All with filter active | Only visible (filtered) tools are enabled |
+| Disable All with filter active | Only visible (filtered) tools are disabled |
+| Apply with all tools allowed | `opencode.json` has `agent.orchestrator.permission` with all "allow" |
+| Apply with one tool denied | `opencode.json` has that tool as "deny", others preserved |
+| Apply preserves existing config | `model`, `agent.*.prompt`, `mcp` entries unchanged in `opencode.json` |
+| Apply with malformed `.opencode/opencode.json` | Error shown, file not corrupted (atomic write) |
+| Panel open with persisted states | Table populated instantly from `OpenCodeSettingsState.toolPermissions` |
+| Panel open without persisted states | Table empty, user must click "Discover Tools" |
+| Filter by tool name | Only matching tools shown, counter updates |
+| Filter by source dropdown | Only tools from selected source shown |
+| Checkbox unchecked → Apply | Tool written as `"deny"` in `opencode.json` |
+| Permission dropdown set to "Deny" → Apply | Tool written as `"deny"` regardless of checkbox state |
+| Double-click "Discover Tools" | Second click ignored (button disabled during discovery) |
+| Click "Apply" during discovery | Button disabled, click ignored |
+| Restart OpenCode after Apply | New permissions take effect |
+
+---
+
+## 11. Document History
 
 | Date | Author | Change |
 |------|--------|--------|
@@ -1218,6 +1613,10 @@ class McpManagerTest {
 | 2026-06-11 | — | v2: Fixed false assumptions, applied SOLID principles, added connection state machine, removed PATCH /config approach |
 | 2026-06-11 | — | v3: Fixed critical port error (64342→63342), replaced nonexistent `McpServerSettings` API with `BuiltInServerManager`, removed `DELETE /mcp/:name` dependency, replaced broken `GET /mcp` tool fetching with IntelliJ REST API, removed unimplementable per-tool enable/disable and enforceable tool hiding from v1, simplified architecture (removed over-engineered interface hierarchy), added HTTP-based MCP verification instead of TCP probing, documented all API limitations |
 | 2026-06-11 | — | v4: Generalized from single-server `IntellijMcpManager` to multi-server `McpManager`. `McpRegistrar` now tracks a set of registered server names (not just "intellij"). `McpToolList` stores per-server tool maps. `McpManager.resolveConfigs()` builds config list from settings (built-in + additional). Added `additionalMcpServers` JSON setting. `McpServerDiscovery` uses `McpServerConfig` with `McpServerType` enum. Settings panel includes additional servers text field. |
+| 2026-06-11 | — | v5: Added §10 (Tool Permissions Feature). Spec for per-tool enable/disable UI with table layout matching JetBrains MCP Tools page. Tool discovery via `/experimental/tool/ids` (built-in) and MCP protocol `tools/list` (MCP servers). Per-agent permission rules written to `.opencode/opencode.json`. UI: enable/disable checkboxes, Allow/Ask/Deny dropdowns, filter, Enable All/Disable All. Config writer merges permissions into `agent.orchestrator.permission`. |
+| 2026-06-11 | — | v6: Rewrote §10 to reflect actual implementation state. Marked what's done (ToolRegistry, McpToolDiscovery, McpConfigWriter.writeToolPermissions, built-in discovery, basic UI) vs what's missing (MCP discovery wiring, Enable All/Disable All, filter, counter, per-server grouping, persistence). Added implementation deviation items 11-12 for parallel discovery systems and stub discoverMcpTools(). |
+| 2026-06-11 | — | v7: Reviewed and improved §10. Added §10.1 trade-off acknowledgment for modifying project directory. Added verification status column to §10.3 API table. Added §10.3 explanation of why plugin creates its own SSE connection for discovery. Added partial failure handling to §10.5 behavior (per-group error states, retry links). Removed emoji from §10.5 layout (contradicted §10.8 constraint). Added §10.8 constraints for concurrency (isDiscovering flag), partial failure tolerance, and tool name prefixing consistency. Added §10.9 decisions for merge semantics and persist-then-merge strategy. Added §10.10 testing strategy with 18 scenarios. Clarified checkbox/dropdown relationship in §10.5 behavior item 6. |
+| 2026-06-11 | — | v8: Moved MCP Integration and Tool Permissions sections to be sub-children of OpenCode server settings in the settings panel hierarchy. Updated §4.5.2F to show the nested layout with "MCP Integration (OpenCode):" and "Tool Permissions (OpenCode):" labels. This reflects the dependency: MCP servers are registered with the plugin's OpenCode instance, so MCP configuration belongs under OpenCode configuration. |
 
 ---
 

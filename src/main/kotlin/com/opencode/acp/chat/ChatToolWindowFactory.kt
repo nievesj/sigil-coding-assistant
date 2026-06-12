@@ -25,9 +25,23 @@ import org.jetbrains.jewel.bridge.addComposeTab
 class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
     companion object {
-        /** Reference to the active ComposePanel for JVM shutdown hook cleanup. */
+        /** Reference to the active ComposePanel for cleanup during project disposal. */
         @Volatile
-        private var activeComposePanel: androidx.compose.ui.awt.ComposePanel? = null
+        var activeComposePanel: androidx.compose.ui.awt.ComposePanel? = null
+            private set
+
+        /** Dispose the active ComposePanel if it hasn't been disposed yet.
+         *  Called from OpenCodeService.dispose() to ensure Skiko's non-daemon
+         *  rendering thread is stopped before the JVM tries to exit. */
+        fun disposeActiveComposePanel() {
+            activeComposePanel?.let {
+                try {
+                    it.isVisible = false
+                    it.dispose()
+                } catch (_: Exception) {}
+                activeComposePanel = null
+            }
+        }
 
         private fun disposeComposePanel(container: java.awt.Container?) {
             if (container == null) return

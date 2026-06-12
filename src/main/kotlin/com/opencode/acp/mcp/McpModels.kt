@@ -57,3 +57,33 @@ enum class McpConnectionState {
     CONNECTED,     // MCP server registered and tools available
     ERROR          // Connection failed — user must retry manually
 }
+
+/**
+ * Permission level for a tool.
+ */
+enum class ToolPermission {
+    ALLOW,        // Tool is allowed without prompting
+    ASK,          // Tool requires user confirmation
+    DENY;         // Tool is blocked
+
+    /**
+     * Convert to the OpenCode config action string.
+     */
+    fun toActionString(): String = when (this) {
+        ALLOW -> "allow"
+        ASK -> "ask"
+        DENY -> "deny"
+    }
+
+    companion object {
+        /**
+         * Parse from an OpenCode config action string.
+         */
+        fun fromActionString(action: String): ToolPermission = when (action) {
+            "allow" -> ALLOW
+            "ask" -> ASK
+            "deny" -> DENY
+            else -> ALLOW
+        }
+    }
+}

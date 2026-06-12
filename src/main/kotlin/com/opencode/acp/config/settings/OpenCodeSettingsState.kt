@@ -84,6 +84,21 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      */
     var additionalMcpServers: String = ""
 
+    // ── Tool Permissions ──────────────────────────────────────────────
+    /**
+     * Tool permission states as JSON string.
+     * Format: {"toolName":{"enabled":true,"permission":"allow"},...}
+     * Stored as JSON string for XStream serialization compatibility.
+     */
+    var toolPermissions: String = ""
+
+    /**
+     * Discovered tools cache as JSON string.
+     * Format: [{"name":"bash","description":"...","source":"builtin","serverName":"builtin"},...]
+     * Allows showing previously discovered tools without re-discovery.
+     */
+    var discoveredToolsJson: String = ""
+
     /** Returns true if the given ToolKind should default to expanded. */
     fun isToolKindDefaultExpanded(kind: com.agentclientprotocol.model.ToolKind): Boolean {
         val expanded = expandedToolKinds.split(",").map { it.trim() }.toSet()
@@ -134,6 +149,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         enableIntellijMcp = state.enableIntellijMcp
         mcpServerUrl = state.mcpServerUrl
         additionalMcpServers = state.additionalMcpServers
+        toolPermissions = state.toolPermissions
+        discoveredToolsJson = state.discoveredToolsJson
     }
 
     companion object {

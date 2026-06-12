@@ -28,8 +28,14 @@
         <applicationConfigurable
             parentId="tools"
             instance="com.opencode.acp.config.settings.OpenCodeSettingsConfigurable"
-            id="com.opencode.acp.settings"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
             displayName="OpenCode"/>
+
+        <applicationConfigurable
+            parentId="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
+            instance="com.opencode.acp.config.settings.OpenCodeMcpConfigurable"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.mcp"
+            displayName="MCP"/>
 
         <toolWindow
             id="AI Coding Assistant - OpenCode"

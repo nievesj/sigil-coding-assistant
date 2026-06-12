@@ -4,7 +4,10 @@ import com.opencode.acp.chat.model.ChatConstants
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
@@ -176,6 +179,141 @@ class McpConfigWriter(
                 } catch (e: Exception) {
                     logger.warn(e) { "[ACP] McpConfigWriter: failed to parse additionalMcpServers JSON" }
                 }
+            }
+        }
+    }
+
+    /**
+     * Write tool permission rules to `.opencode/opencode.json`.
+     *
+     * Permission rules control which tools the LLM can use. They are written
+     * as per-agent permission rules in the config file. The permissions are
+     * merged with existing agent config, preserving other agent settings.
+     *
+     * @param permissions Map of tool name to permission (allow/deny/ask)
+     * @param agentName The agent to apply permissions to (default: "orchestrator")
+     * @return true if the config was written successfully, false otherwise
+     */
+    fun writeToolPermissions(permissions: Map<String, ToolPermission>, agentName: String = "orchestrator"): Boolean {
+        return try {
+            val opencodeDir = projectBasePath.resolve(".opencode")
+            Files.createDirectories(opencodeDir)
+
+            val configFile = opencodeDir.resolve("opencode.json")
+
+            // Read existing config or start with empty object
+            val existingConfig = if (Files.exists(configFile)) {
+                try {
+                    val content = Files.readString(configFile)
+                    if (content.isNotBlank()) {
+                        Json.parseToJsonElement(content).jsonObject
+                    } else {
+                        null
+                    }
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] McpConfigWriter: failed to parse existing config, starting fresh" }
+                    null
+                }
+            } else {
+                null
+            }
+
+            val config = existingConfig ?: buildJsonObject {}
+
+            // Get existing agent section or start with empty object
+            val existingAgents = config["agent"]?.jsonObject ?: buildJsonObject {}
+
+            // Get existing agent config or start with empty object
+            val existingAgentConfig = existingAgents[agentName]?.jsonObject ?: buildJsonObject {}
+
+            // Get existing permission section or start with empty object
+            val existingPermissions = existingAgentConfig["permission"]?.jsonObject ?: buildJsonObject {}
+
+            // Build new permission entries
+            val newPermissions = buildPermissionEntries(permissions, existingPermissions)
+
+            // Build updated agent config
+            val updatedAgentConfig = buildJsonObject {
+                // Copy all existing agent config keys except permission
+                for ((key, value) in existingAgentConfig) {
+                    if (key != "permission") {
+                        put(key, value)
+                    }
+                }
+                // Add/replace permission section
+                put("permission", newPermissions)
+            }
+
+            // Build updated agents section
+            val updatedAgents = buildJsonObject {
+                // Copy all existing agents except the one we're updating
+                for ((key, value) in existingAgents) {
+                    if (key != agentName) {
+                        put(key, value)
+                    }
+                }
+                // Add/replace the updated agent
+                put(agentName, updatedAgentConfig)
+            }
+
+            // Merge: start with existing config, replace/add agent section
+            val mergedConfig = buildJsonObject {
+                // Copy all existing keys except agent
+                for ((key, value) in config) {
+                    if (key != "agent" && key != "\$schema") {
+                        put(key, value)
+                    }
+                }
+                // Add $schema if not present
+                if (!config.containsKey("\$schema")) {
+                    put("\$schema", "https://opencode.ai/config.json")
+                }
+                // Add/replace agent section
+                put("agent", updatedAgents)
+            }
+
+            // Write atomically via temp file
+            val tempFile = Files.createTempFile(opencodeDir, "opencode.json.", ".tmp")
+            try {
+                val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
+                Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), mergedConfig))
+                Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                logger.info { "[ACP] McpConfigWriter: wrote tool permissions to $configFile" }
+                true
+            } catch (e: Exception) {
+                // Clean up temp file on failure
+                try { Files.deleteIfExists(tempFile) } catch (_: Exception) {}
+                throw e
+            }
+        } catch (e: Exception) {
+            logger.error(e) { "[ACP] McpConfigWriter: failed to write tool permissions" }
+            false
+        }
+    }
+
+    /**
+     * Build permission entries from a map of tool permissions.
+     *
+     * Merges new permissions with existing ones. New permissions override existing
+     * ones for the same tool name. Existing permissions for tools not in the new
+     * map are preserved.
+     *
+     * @param newPermissions Map of tool name to permission (allow/deny/ask)
+     * @param existingPermissions Existing permission JsonObject to merge with
+     * @return JsonObject with merged permissions
+     */
+    private fun buildPermissionEntries(
+        newPermissions: Map<String, ToolPermission>,
+        existingPermissions: JsonObject
+    ): JsonObject {
+        return buildJsonObject {
+            // Copy existing permissions
+            for ((key, value) in existingPermissions) {
+                put(key, value)
+            }
+            // Add/override with new permissions
+            for ((toolName, permission) in newPermissions) {
+                put(toolName, JsonPrimitive(permission.toActionString()))
             }
         }
     }
