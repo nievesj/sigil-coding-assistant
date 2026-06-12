@@ -73,6 +73,17 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      */
     var queueInsteadOfSteer: Boolean = true
 
+    // ── MCP integration ────────────────────────────────────────────────
+    /** Whether to enable IntelliJ MCP server integration. */
+    var enableIntellijMcp: Boolean = false
+    /** IntelliJ MCP server SSE URL. Copy from Settings → Tools → MCP Server → "Copy SSE Config". */
+    var mcpServerUrl: String = ""
+    /**
+     * Additional MCP servers as JSON array: [{"name":"github","url":"http://127.0.0.1:8080/sse"}].
+     * Stored as JSON string for XStream serialization compatibility.
+     */
+    var additionalMcpServers: String = ""
+
     /** Returns true if the given ToolKind should default to expanded. */
     fun isToolKindDefaultExpanded(kind: com.agentclientprotocol.model.ToolKind): Boolean {
         val expanded = expandedToolKinds.split(",").map { it.trim() }.toSet()
@@ -120,6 +131,9 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         expandedToolKinds = state.expandedToolKinds.ifBlank { "EXECUTE,EDIT,READ,THINK" }
         expandTaskPillsByDefault = state.expandTaskPillsByDefault
         queueInsteadOfSteer = state.queueInsteadOfSteer
+        enableIntellijMcp = state.enableIntellijMcp
+        mcpServerUrl = state.mcpServerUrl
+        additionalMcpServers = state.additionalMcpServers
     }
 
     companion object {

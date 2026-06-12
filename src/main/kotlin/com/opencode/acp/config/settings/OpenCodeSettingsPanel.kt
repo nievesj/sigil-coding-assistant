@@ -12,6 +12,8 @@ import com.intellij.util.ui.FormBuilder
 import java.awt.event.ActionListener
 import javax.swing.JButton
 import javax.swing.JPanel
+import javax.swing.JScrollPane
+import javax.swing.JTextArea
 
 class OpenCodeSettingsPanel {
 
@@ -106,6 +108,43 @@ class OpenCodeSettingsPanel {
             "When disabled, sending aborts the current response (legacy behavior)."
     }
 
+    // ── MCP Integration ────────────────────────────────────────────────────
+
+    /** Whether to enable IntelliJ MCP server integration. */
+    val enableIntellijMcpCheckbox: JBCheckBox = JBCheckBox("Enable IntelliJ MCP integration").apply {
+        toolTipText = "Connect to the IDE's built-in MCP server so the LLM can use IDE-native tools " +
+            "(refactoring, inspections, run configs, symbol search, etc.). " +
+            "Requires MCP Server to be enabled in Settings → Tools → MCP Server."
+        addActionListener {
+            updateMcpStatusLabel()
+        }
+    }
+
+    /** IntelliJ MCP server SSE URL. */
+    val mcpServerUrlField: JBTextField = JBTextField().apply {
+        toolTipText = "SSE URL from Settings → Tools → MCP Server (click 'Copy SSE Config'). " +
+            "Format: http://127.0.0.1:<port>/sse"
+        emptyText.text = "http://127.0.0.1:64342/sse"
+    }
+
+    /** Additional MCP servers as JSON array. */
+    val additionalMcpServersField: JTextArea = JTextArea(3, 40).apply {
+        toolTipText = "Additional MCP servers as JSON array. Format: [{\"name\":\"server-name\",\"url\":\"http://127.0.0.1:port/sse\"}]"
+    }
+
+    val additionalMcpServersScrollPane: JScrollPane = JScrollPane(additionalMcpServersField)
+
+    /** MCP connection status label (updated dynamically after connection attempt). */
+    val mcpStatusLabel: JBLabel = JBLabel("MCP integration: disabled").apply {
+        foreground = JBColor.GRAY
+    }
+
+    /** Retry MCP connection after error. */
+    val mcpRetryButton: JButton = JButton("Retry MCP Connection").apply {
+        toolTipText = "Retry connecting to configured MCP servers"
+        isVisible = false
+    }
+
     private fun toolKindLabel(kind: ToolKind): String = when (kind) {
         ToolKind.EXECUTE -> "Shell (Execute)"
         ToolKind.EDIT -> "Edit (Write)"
@@ -165,6 +204,13 @@ class OpenCodeSettingsPanel {
             }
             addComponent(expandTaskPillsCheckbox)
         }
+        .addSeparator(5)
+        .addTooltip("MCP Integration:")
+        .addComponent(enableIntellijMcpCheckbox)
+        .addLabeledComponent("IntelliJ MCP SSE URL:", mcpServerUrlField, 5)
+        .addLabeledComponent("Additional MCP servers:", additionalMcpServersScrollPane, 5)
+        .addComponent(mcpStatusLabel)
+        .addComponent(mcpRetryButton)
         .addComponent(statusLabel)
         .panel
 
@@ -184,6 +230,10 @@ class OpenCodeSettingsPanel {
             toolKindCheckboxes[kind]!!.isSelected = settings.isToolKindDefaultExpanded(kind)
         }
         expandTaskPillsCheckbox.isSelected = settings.expandTaskPillsByDefault
+        enableIntellijMcpCheckbox.isSelected = settings.enableIntellijMcp
+        mcpServerUrlField.text = settings.mcpServerUrl
+        additionalMcpServersField.text = settings.additionalMcpServers
+        updateMcpStatusLabel()
     }
 
     fun applyTo(settings: OpenCodeSettingsState) {
@@ -201,6 +251,21 @@ class OpenCodeSettingsPanel {
         val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }
         settings.expandedToolKinds = expandedKinds.joinToString(",")
         settings.expandTaskPillsByDefault = expandTaskPillsCheckbox.isSelected
+        settings.enableIntellijMcp = enableIntellijMcpCheckbox.isSelected
+        settings.mcpServerUrl = mcpServerUrlField.text.trim()
+        // Validate JSON before saving
+        val additionalJson = additionalMcpServersField.text.trim()
+        if (additionalJson.isNotBlank()) {
+            try {
+                kotlinx.serialization.json.Json.parseToJsonElement(additionalJson)
+                settings.additionalMcpServers = additionalJson
+            } catch (e: Exception) {
+                showStatus("Invalid JSON in additional MCP servers: ${e.message}", false)
+                // Keep the old value — don't save malformed JSON
+            }
+        } else {
+            settings.additionalMcpServers = ""
+        }
     }
 
     fun isModified(settings: OpenCodeSettingsState): Boolean {
@@ -217,7 +282,10 @@ class OpenCodeSettingsPanel {
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions ||
                 queueInsteadOfSteerCheckbox.isSelected != settings.queueInsteadOfSteer ||
                 expandedKinds != currentExpandedKinds ||
-                expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault
+                expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault ||
+                enableIntellijMcpCheckbox.isSelected != settings.enableIntellijMcp ||
+                mcpServerUrlField.text.trim() != settings.mcpServerUrl ||
+                additionalMcpServersField.text.trim() != settings.additionalMcpServers
     }
 
     private fun showStatus(msg: String, success: Boolean) {
@@ -227,6 +295,18 @@ class OpenCodeSettingsPanel {
             JBColor.namedColor("Component.successForeground", JBColor(0x499C54, 0x6BBE50))
         } else {
             JBColor.namedColor("Component.errorFocusColor", JBColor(0xDB4437, 0xE55341))
+        }
+    }
+
+    private fun updateMcpStatusLabel() {
+        if (enableIntellijMcpCheckbox.isSelected) {
+            mcpStatusLabel.text = "MCP integration: enabled (status shown in status bar)"
+            mcpStatusLabel.foreground = JBColor.namedColor("Component.successForeground", JBColor(0x499C54, 0x6BBE50))
+            mcpRetryButton.isVisible = true
+        } else {
+            mcpStatusLabel.text = "MCP integration: disabled"
+            mcpStatusLabel.foreground = JBColor.GRAY
+            mcpRetryButton.isVisible = false
         }
     }
 

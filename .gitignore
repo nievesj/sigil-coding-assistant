@@ -32,6 +32,7 @@ Thumbs.db
 
 # Plugin specific
 local.properties
+.opencode/
 /.idea
 /.agentbridge
 /.kotlin

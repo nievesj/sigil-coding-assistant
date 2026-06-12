@@ -13,6 +13,10 @@ import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.mcp.McpConfigWriter
+import com.opencode.acp.mcp.McpConnectionStatus
+import com.opencode.acp.mcp.McpManager
+import com.opencode.acp.mcp.McpToolDescriptor
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -37,7 +41,9 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     // ── Sub-components ─────────────────────────────────────────────────────
 
-    val connectionManager = ProcessManager(scope)
+    val connectionManager = ProcessManager(scope).apply {
+        onMcpReset = { resetMcpOnServerRestart() }
+    }
     val sessionManager = SessionManager(scope)
     val commandManager = CommandManager(
         clientProvider = { connectionManager.client },
@@ -66,6 +72,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     // ── Internal state ─────────────────────────────────────────────────────
 
     private var signalCollectionJob: Job? = null
+    private var mcpManager: McpManager? = null
 
     /**
      * Serializes sendMessage() calls.
@@ -144,8 +151,101 @@ class OpenCodeService(private val project: Project) : Disposable {
             is SessionListState.Loading -> { }
         }
 
+        // ── Initialize MCP integration ──────────────────────────────────────
+        initializeMcp()
+
         return true
     }
+
+    // ── MCP integration ────────────────────────────────────────────────────
+
+    /** Initialize MCP manager and register all enabled servers. */
+    private suspend fun initializeMcp() {
+        val settings = OpenCodeSettingsState.getInstance()
+        val client = connectionManager.client
+        if (client == null) {
+            logger.warn { "[ACP] MCP: skipping initialization — no client available" }
+            return
+        }
+        mcpManager = McpManager(client, settings, scope, client.mcpHttpClient)
+        val configs = mcpManager!!.resolveConfigs()
+        if (configs.isEmpty()) {
+            logger.info { "[ACP] MCP: no servers configured (enableIntellijMcp=${settings.enableIntellijMcp}, additionalMcpServers='${settings.additionalMcpServers.take(50)}')" }
+            return
+        }
+        logger.info { "[ACP] MCP: initializing ${configs.size} server(s): ${configs.map { it.name }}" }
+        mcpManager!!.initialize()
+    }
+
+    /**
+     * Disconnect all MCP servers. Called before re-initialization when settings change.
+     * Also called when the user toggles MCP off entirely.
+     */
+    suspend fun disconnectAllMcp() {
+        mcpManager?.let { mgr ->
+            val statuses = mgr.serverStatuses.value
+            for (name in statuses.keys) {
+                mgr.disconnect(name)
+            }
+        }
+    }
+
+    /**
+     * Re-initialize MCP with current settings. Called after settings change.
+     * Creates a fresh McpManager and runs discovery/registration.
+     */
+    suspend fun reinitializeMcp() {
+        initializeMcp()
+    }
+
+    /**
+     * Non-suspend wrapper for settings panel (runs on EDT).
+     * Launches disconnect + config write + reinitialize on the service scope.
+     */
+    fun reinitializeMcpFromSettings() {
+        scope.launch {
+            disconnectAllMcp()
+            val settings = OpenCodeSettingsState.getInstance()
+            // Write MCP config file — OpenCode reads it on next startup.
+            // For immediate effect (without restart), POST /mcp is also called
+            // by McpManager.initialize() below.
+            val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
+                ?: java.nio.file.Path.of(".")
+            val configWriter = McpConfigWriter(projectPath, settings)
+            if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
+                configWriter.write()
+                reinitializeMcp()
+            } else {
+                configWriter.clearAllEntries()
+            }
+        }
+    }
+
+    /** Reset MCP state on OpenCode server restart. Called by ProcessManager. */
+    fun resetMcpOnServerRestart() {
+        scope.launch {
+            mcpManager?.resetOnServerRestart()
+            // Re-write config file in case it was stale, then re-register via POST /mcp
+            val settings = OpenCodeSettingsState.getInstance()
+            val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
+                ?: java.nio.file.Path.of(".")
+            val configWriter = McpConfigWriter(projectPath, settings)
+            if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
+                configWriter.write()
+            }
+        }
+    }
+
+    private val emptyMcpStatuses = MutableStateFlow<Map<String, McpConnectionStatus>>(emptyMap())
+    private val emptyMcpTools = MutableStateFlow<Map<String, List<McpToolDescriptor>>>(emptyMap())
+
+    /** MCP server connection statuses (empty if MCP not initialized). */
+    val mcpServerStatuses: StateFlow<Map<String, McpConnectionStatus>>
+        get() = mcpManager?.serverStatuses ?: emptyMcpStatuses.asStateFlow()
+
+    /** MCP tool lists per server (empty if MCP not initialized). */
+    val mcpTools: StateFlow<Map<String, List<McpToolDescriptor>>>
+        get() = mcpManager?.tools ?: emptyMcpTools.asStateFlow()
 
     // ── Session management (delegated) ─────────────────────────────────────
 

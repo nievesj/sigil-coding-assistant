@@ -40,6 +40,10 @@
         <notificationGroup id="OpenCode"
                            displayType="BALLOON"
                            isLogByDefault="true"/>
+
+        <statusBarWidgetFactory id="OpenCodeMCP"
+                                implementation="com.opencode.acp.mcp.McpStatusBarWidgetFactory"
+                                order="first"/>
     </extensions>
 
     <actions>

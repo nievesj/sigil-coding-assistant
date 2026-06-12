@@ -4,6 +4,7 @@ import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.mcp.McpConfigWriter
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -44,6 +45,10 @@ class ProcessManager(private val scope: CoroutineScope) {
 
     /** The current OpenCode client. Null until [initialize] succeeds. */
     val client: OpenCodeClient? get() = openCodeClient
+
+    /** Callback invoked when the OpenCode process auto-restarts.
+     *  Used by OpenCodeService to reset MCP registration state. */
+    var onMcpReset: (() -> Unit)? = null
 
     // --- Initialization ---
 
@@ -94,6 +99,18 @@ class ProcessManager(private val scope: CoroutineScope) {
             authToken = authToken
         )
         openCodeClient = opencodeClient
+
+        // Write MCP config to .opencode/opencode.json BEFORE launching the binary.
+        // OpenCode reads opencode.json on startup, so MCP servers must be in the
+        // config file before the process starts.
+        if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
+            val configWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), settings)
+            configWriter.write()
+        } else {
+            // Clear plugin-managed entries when MCP is disabled
+            val configWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), settings)
+            configWriter.clearAllEntries()
+        }
 
         // Launch our own binary on the chosen port
         if (settings.binaryPath.isNotBlank()) {
@@ -230,6 +247,9 @@ class ProcessManager(private val scope: CoroutineScope) {
                 if (initialized) {
                     _connectionState.value = ConnectionState.RECONNECTING
                     initialized = false
+                    // Reset MCP registration state — the new server instance
+                    // won't have dynamic registrations from the previous instance.
+                    onMcpReset?.invoke()
                 }
             }
         }

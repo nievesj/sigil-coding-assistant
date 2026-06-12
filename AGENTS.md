@@ -805,3 +805,33 @@ custom sounds per notification group via Settings → Appearance & Behavior → 
 - [x] `SseEventListener` standalone parser now extracts `properties` wrapper for V1 bus events — `session.error` parsing was broken (read from top-level `obj` instead of `obj["properties"]`)
 - [x] `SessionState.replaceAllMessages()` and `removeMessageByServerId()` — support cache invalidation after compaction/message deletion
 - [x] Sidebar session pagination — `displayLimit` high-water mark on `SessionListState.Loaded`, `loadMoreSessions()` increments by 10, `resetDisplayLimit()` on init/switch, `clearAllSessions()` deletes all sessions except active, `ClearAllConfirmationDialog` with progress feedback, `SessionListFooter` with "X of Y sessions loaded" + "Load more" + "Clear all", `loadAllSessions` settings toggle
+
+---
+
+### MCP Integration — JetBrains MCP Server Discovery
+
+The JetBrains MCP Server plugin (bundled with IntelliJ IDEA 2025.2+) runs on its **own port** (default 64342), separate from the IDE's built-in web server (port 63342). `BuiltInServerManager.getPort()` returns the web server port, NOT the MCP server port — do NOT use it for MCP discovery.
+
+**Correct discovery flow:**
+1. User copies the SSE URL from Settings → Tools → MCP Server → "Copy SSE Config" (e.g., `http://127.0.0.1:64342/sse`)
+2. User pastes it into the OpenCode settings `mcpServerUrl` field
+3. `McpServerDiscovery` validates the URL format and verifies the endpoint by sending `GET` with `Accept: text/event-stream`
+4. A 200 response means the MCP server is running; 404 or connection refused means it's not
+
+**Key design decisions:**
+- No auto-detection of the MCP server port — it's on a separate port from the built-in web server
+- No `BuiltInServerManager` reflection — wrong port, classloader issues
+- No `/api/mcp/list_tools` REST endpoint — the JetBrains MCP Server uses SSE+JSON-RPC transport only
+- Verification is via SSE endpoint HTTP status, not a REST API call
+- Tool listing via `McpToolList` stores an empty list per server (registration confirmation only); OpenCode manages tool details internally
+- `DiscoverySource.BUILTIN_IDE` = URL from IntelliJ MCP settings, `DiscoverySource.MANUAL` = URL from additional servers config
+
+**MCP registration — dual approach (file + API):**
+- **Primary: `.opencode/opencode.json`** — `McpConfigWriter` writes MCP server configs to `<project>/.opencode/opencode.json` before the OpenCode binary launches. OpenCode reads this file on startup and connects to MCP servers persistently (survives restarts). The file is merged atomically — existing config (model, agent, provider, non-plugin MCP entries) is preserved.
+- **Supplement: `POST /mcp`** — `McpRegistrar` still calls `POST /mcp` for immediate registration without requiring a restart. This is called by `McpManager.initialize()` after the OpenCode server is healthy.
+- **On settings change:** `reinitializeMcpFromSettings()` writes the config file AND calls `POST /mcp` via `McpManager`.
+- **On server restart:** `resetMcpOnServerRestart()` re-writes the config file (in case it's stale) and resets `McpRegistrar` state.
+- **On disable:** When MCP is disabled, `McpConfigWriter.clearAllEntries()` removes plugin-managed entries from the config file.
+
+- **Files:** `McpServerDiscovery.kt`, `McpRegistrar.kt`, `McpConfigWriter.kt`, `McpToolList.kt`, `McpManager.kt`, `McpModels.kt`, `McpStatusBarWidget.kt`, `ChatConstants.kt`, `OpenCodeSettingsPanel.kt`, `OpenCodeSettingsState.kt`, `ProcessManager.kt`, `OpenCodeService.kt`
+- **TDD deviation log:** `docs/tdd/intellij-mcp-integration.md` has a detailed "Implementation Deviations" section at the top

@@ -14,4 +14,12 @@ object ChatConstants {
     const val SSE_HEALTH_CHECK_INTERVAL_MS = 60_000L
     /** Timeout (ms) for the SSE health-check probe HTTP request. */
     const val SSE_HEALTH_CHECK_TIMEOUT_MS = 10_000L
+
+    // ── MCP integration ────────────────────────────────────────────────
+    /** Timeout (ms) for verifying an MCP server is responding (SSE endpoint check). */
+    const val MCP_VERIFY_TIMEOUT_MS = 3_000L
+    /** Timeout (ms) for fetching the MCP tool list from a server. */
+    const val MCP_FETCH_TOOLS_TIMEOUT_MS = 5_000L
+    /** Server name for the built-in IntelliJ MCP server. */
+    const val MCP_SERVER_NAME_INTELLIJ = "intellij"
 }
