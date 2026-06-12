@@ -37,6 +37,12 @@
             id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.mcp"
             displayName="MCP"/>
 
+        <applicationConfigurable
+            parentId="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
+            instance="com.opencode.acp.config.settings.OpenCodeFollowConfigurable"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.follow"
+            displayName="Follow Agent"/>
+
         <toolWindow
             id="AI Coding Assistant - OpenCode"
             secondary="true"

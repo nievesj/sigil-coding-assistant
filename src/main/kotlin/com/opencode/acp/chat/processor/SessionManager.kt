@@ -7,6 +7,7 @@ import com.opencode.acp.adapter.OpenCodeSession
 import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.adapter.toSessionItem
 import com.opencode.acp.chat.model.*
+import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -31,7 +32,10 @@ import kotlin.concurrent.withLock
  * (O(1) map operations) and won't cause coroutine starvation.
  */
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-class SessionManager(private val scope: CoroutineScope) {
+class SessionManager(
+    private val scope: CoroutineScope,
+    private val project: Project,
+) {
 
     private val logger = KotlinLogging.logger {}
 
@@ -575,7 +579,7 @@ class SessionManager(private val scope: CoroutineScope) {
             emptyList()
         }
 
-        val state = SessionState(sessionId, scope, this)
+        val state = SessionState(sessionId, scope, this, project)
         messages.forEach { state.addMessage(it.toChatMessage()) }
 
         // Adopt the last assistant message as the streaming context so subsequent

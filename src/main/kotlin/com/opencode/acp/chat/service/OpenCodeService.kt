@@ -51,7 +51,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     val connectionManager = ProcessManager(scope).apply {
         onMcpReset = { resetMcpOnServerRestart() }
     }
-    val sessionManager = SessionManager(scope)
+    val sessionManager = SessionManager(scope, project)
     val commandManager = CommandManager(
         clientProvider = { connectionManager.client },
         sessionIdProvider = { sessionManager.activeSessionId.value }
