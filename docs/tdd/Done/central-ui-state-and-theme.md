@@ -2,7 +2,7 @@
 
 > **Status:** Draft
 > **Last Updated:** 2026-06-10
-> **Related docs:** [Mid-Generation Steering](mid-generation-steering.md), [AGENTS.md](../../AGENTS.md)
+> **Related docs:** [Mid-Generation Steering](mid-generation-steering.md), [AGENTS.md](../../../AGENTS.md)
 > **Review:** [First review](#10-document-history) found 20+ issues — all addressed in this revision.
 
 ---

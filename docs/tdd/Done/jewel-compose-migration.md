@@ -3,8 +3,8 @@
 > **Status:** Draft (Post-Adversarial Review)
 > **Last Updated:** 2026-06-02
 > **Related docs:**
-> - [Chat Interface TDD](./chat-interface.md)
-> - [Chat Display Revamp TDD](./chat-display-revamp.md)
+> - [Chat Interface TDD](chat-interface.md)
+> - [Chat Display Revamp TDD](chat-display-revamp.md)
 > - [Jewel GitHub](https://github.com/JetBrains/jewel)
 > - [Jewel Release Notes](https://github.com/JetBrains/intellij-community/blob/master/platform/jewel/RELEASE%20NOTES.md)
 

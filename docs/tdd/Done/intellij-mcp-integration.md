@@ -3,7 +3,7 @@
 > **Status:** Draft v4 (Revised)
 > **Author(s):** —
 > **Last Updated:** 2026-06-11
-> **Related docs:** [AGENTS.md](../../AGENTS.md)
+> **Related docs:** [AGENTS.md](../../../AGENTS.md)
 > **Revision notes:** v4 — Generalized from single-server `IntellijMcpManager` to multi-server `McpManager`. The orchestrator now manages a registry of MCP server configs, making it straightforward to add additional MCPs (GitHub, Slack, custom) via settings. Discovery strategies are extensible. All other design decisions unchanged.
 
 ---

@@ -4,7 +4,7 @@
 > **Author(s):** —
 > **Reviewer(s):** —
 > **Last Updated:** 2026-06-05
-> **Related docs:** [AGENTS.md](../../AGENTS.md)
+> **Related docs:** [AGENTS.md](../../../AGENTS.md)
 
 ---
 
@@ -945,6 +945,6 @@ User input text is NOT passed through `MarkdownSegmenter` — it's always a sing
 
 ## 11. Amendmant: Message Part Type Coverage
 
-> Extracted to dedicated TDD: [part-type-coverage.md](./part-type-coverage.md)
+> Extracted to dedicated TDD: [part-type-coverage.md](part-type-coverage.md)
 
 This section covers all 12 OpenCode message part types, the reasoning routing bug, patch implementation, subtask interaction model, and visual component specifications.

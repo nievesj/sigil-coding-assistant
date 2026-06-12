@@ -3,7 +3,7 @@
 > **Status:** Draft
 > **Last Updated:** 2026-06-02
 > **Related docs:**
-> - [OpenCode ACP Server TDD](./opencode-acp-server.md)
+> - [OpenCode ACP Server TDD](../opencode-acp-server.md)
 > - [OpenCode Server API](https://opencode.ai/docs/server/)
 > - [ACP Protocol v1](https://agentclientprotocol.com/protocol/v1/overview)
 
