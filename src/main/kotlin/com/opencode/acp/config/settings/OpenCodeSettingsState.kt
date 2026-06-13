@@ -73,6 +73,93 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      */
     var queueInsteadOfSteer: Boolean = true
 
+    // ── MCP integration ────────────────────────────────────────────────
+    /** Whether to enable IntelliJ MCP server integration. */
+    var enableIntellijMcp: Boolean = false
+    /** IntelliJ MCP server SSE URL. Copy from Settings → Tools → MCP Server → "Copy SSE Config". */
+    var mcpServerUrl: String = ""
+    /**
+     * Additional MCP servers as JSON array: [{"name":"github","url":"http://127.0.0.1:8080/sse"}].
+     * Stored as JSON string for XStream serialization compatibility.
+     */
+    var additionalMcpServers: String = ""
+
+    // ── Tool Permissions ──────────────────────────────────────────────
+    /**
+     * Tool permission states as JSON string.
+     * Format: {"toolName":{"enabled":true,"permission":"allow"},...}
+     * Stored as JSON string for XStream serialization compatibility.
+     */
+    var toolPermissions: String = ""
+
+    /**
+     * Discovered tools cache as JSON string.
+     * Format: [{"name":"bash","description":"...","source":"builtin","serverName":"builtin"},...]
+     * Allows showing previously discovered tools without re-discovery.
+     */
+    var discoveredToolsJson: String = ""
+
+    // ── Follow Agent ──────────────────────────────────────────────────
+    /**
+     * Whether Follow Agent is enabled (auto-opens files on tool calls).
+     * Default OFF — the feature is opt-in because it opens files in the
+     * editor on every read tool call, which can be jarring for users who
+     * have not opted in.
+     */
+    var followAgentEnabled: Boolean = false
+    /** Highlight color for READ tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    var followReadColor: String = "#5078C888"
+    /** Highlight color for EDIT tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    var followEditColor: String = "#50A05088"
+    /** Highlight color for SEARCH tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    var followSearchColor: String = "#C8B43C88"
+    /** Highlight color for EXECUTE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    var followExecuteColor: String = "#B4785088"
+    /** Highlight color for DELETE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    var followDeleteColor: String = "#C8505088"
+    /** Highlight color for MOVE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    var followMoveColor: String = "#A050C888"
+    /** Highlight color for FETCH tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    var followFetchColor: String = "#50A0C888"
+    /** Highlight color for OTHER tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    var followOtherColor: String = "#80808088"
+
+    /**
+     * Returns the persisted hex color for a [com.agentclientprotocol.model.ToolKind].
+     * THINK and SWITCH_MODE have no persisted color and fall back to OTHER.
+     */
+    fun getFollowColor(kind: com.agentclientprotocol.model.ToolKind): String = when (kind) {
+        com.agentclientprotocol.model.ToolKind.READ -> followReadColor
+        com.agentclientprotocol.model.ToolKind.EDIT -> followEditColor
+        com.agentclientprotocol.model.ToolKind.SEARCH -> followSearchColor
+        com.agentclientprotocol.model.ToolKind.EXECUTE -> followExecuteColor
+        com.agentclientprotocol.model.ToolKind.DELETE -> followDeleteColor
+        com.agentclientprotocol.model.ToolKind.MOVE -> followMoveColor
+        com.agentclientprotocol.model.ToolKind.FETCH -> followFetchColor
+        com.agentclientprotocol.model.ToolKind.THINK,
+        com.agentclientprotocol.model.ToolKind.SWITCH_MODE,
+        com.agentclientprotocol.model.ToolKind.OTHER -> followOtherColor
+    }
+
+    /**
+     * Persists the hex color for a [com.agentclientprotocol.model.ToolKind].
+     * THINK and SWITCH_MODE have no persisted color — no-op.
+     */
+    fun setFollowColor(kind: com.agentclientprotocol.model.ToolKind, hex: String) {
+        when (kind) {
+            com.agentclientprotocol.model.ToolKind.READ -> followReadColor = hex
+            com.agentclientprotocol.model.ToolKind.EDIT -> followEditColor = hex
+            com.agentclientprotocol.model.ToolKind.SEARCH -> followSearchColor = hex
+            com.agentclientprotocol.model.ToolKind.EXECUTE -> followExecuteColor = hex
+            com.agentclientprotocol.model.ToolKind.DELETE -> followDeleteColor = hex
+            com.agentclientprotocol.model.ToolKind.MOVE -> followMoveColor = hex
+            com.agentclientprotocol.model.ToolKind.FETCH -> followFetchColor = hex
+            com.agentclientprotocol.model.ToolKind.OTHER -> followOtherColor = hex
+            com.agentclientprotocol.model.ToolKind.THINK,
+            com.agentclientprotocol.model.ToolKind.SWITCH_MODE -> { /* no-op */ }
+        }
+    }
+
     /** Returns true if the given ToolKind should default to expanded. */
     fun isToolKindDefaultExpanded(kind: com.agentclientprotocol.model.ToolKind): Boolean {
         val expanded = expandedToolKinds.split(",").map { it.trim() }.toSet()
@@ -120,6 +207,20 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         expandedToolKinds = state.expandedToolKinds.ifBlank { "EXECUTE,EDIT,READ,THINK" }
         expandTaskPillsByDefault = state.expandTaskPillsByDefault
         queueInsteadOfSteer = state.queueInsteadOfSteer
+        enableIntellijMcp = state.enableIntellijMcp
+        mcpServerUrl = state.mcpServerUrl
+        additionalMcpServers = state.additionalMcpServers
+        toolPermissions = state.toolPermissions
+        discoveredToolsJson = state.discoveredToolsJson
+        followAgentEnabled = state.followAgentEnabled
+        followReadColor = state.followReadColor
+        followEditColor = state.followEditColor
+        followSearchColor = state.followSearchColor
+        followExecuteColor = state.followExecuteColor
+        followDeleteColor = state.followDeleteColor
+        followMoveColor = state.followMoveColor
+        followFetchColor = state.followFetchColor
+        followOtherColor = state.followOtherColor
     }
 
     companion object {

@@ -10,8 +10,9 @@ class OpenCodeSettingsConfigurable : Configurable {
     override fun getDisplayName(): String = "OpenCode"
 
     override fun createComponent(): JComponent {
+        val settings = OpenCodeSettingsState.getInstance()
         val settingsPanel = OpenCodeSettingsPanel()
-        settingsPanel.setState(OpenCodeSettingsState.getInstance())
+        settingsPanel.setState(settings)
         panel = settingsPanel
         return settingsPanel.panel
     }

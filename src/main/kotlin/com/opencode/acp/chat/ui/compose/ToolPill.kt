@@ -27,9 +27,11 @@ import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ToolCallPill
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.follow.EditorFollowManager
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.intOrNull
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
@@ -134,6 +136,48 @@ fun ToolPill(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f, fill = false),
             )
+
+            // Open-in-editor icon button (Follow Agent).
+            // Shown whenever the pill has a resolvable file path. Disabled (no-op)
+            // when Follow Agent is off — keeps the affordance discoverable while
+            // preventing accidental file opens from a feature the user hasn't opted into.
+            val followEnabled = remember {
+                OpenCodeSettingsState.getInstance().followAgentEnabled
+            }
+            val openInEditorPath = remember(pill.kind, pill.input) {
+                pill.input?.let { input ->
+                    val path = input.getString("file_path")
+                        ?: input.getString("filePath")
+                        ?: input.getString("path")
+                    path?.takeIf { it.isNotBlank() }
+                }
+            }
+            if (openInEditorPath != null) {
+                Spacer(Modifier.width(6.dp))
+                Icon(
+                    key = AllIconsKeys.Actions.EditSource,
+                    contentDescription = if (followEnabled) "Open in editor" else "Follow Agent disabled",
+                    modifier = Modifier
+                        .size(20.dp)
+                        .padding(2.dp)
+                        .clickable(enabled = followEnabled) {
+                            val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+                            if (project != null) {
+                                val line = try {
+                                    pill.input?.get("offset")?.jsonPrimitive?.intOrNull ?: 0
+                                } catch (_: Exception) { 0 }
+                                EditorFollowManager.getInstance(project).openFileAtLine(
+                                    project = project,
+                                    filePath = openInEditorPath,
+                                    line = line,
+                                    focus = true,
+                                )
+                            }
+                        },
+                    tint = if (followEnabled) ChatTheme.colors.component.taskRunning
+                           else ChatTheme.colors.component.taskPending,
+                )
+            }
 
             // Line delta (+N / -N)
             if (lineDelta != null) {

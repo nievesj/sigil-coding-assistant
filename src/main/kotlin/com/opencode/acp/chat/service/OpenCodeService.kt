@@ -13,9 +13,20 @@ import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.mcp.McpConfigWriter
+import com.opencode.acp.mcp.McpConnectionStatus
+import com.opencode.acp.mcp.McpManager
+import com.opencode.acp.mcp.McpToolDescriptor
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -37,8 +48,10 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     // ── Sub-components ─────────────────────────────────────────────────────
 
-    val connectionManager = ProcessManager(scope)
-    val sessionManager = SessionManager(scope)
+    val connectionManager = ProcessManager(scope).apply {
+        onMcpReset = { resetMcpOnServerRestart() }
+    }
+    val sessionManager = SessionManager(scope, project)
     val commandManager = CommandManager(
         clientProvider = { connectionManager.client },
         sessionIdProvider = { sessionManager.activeSessionId.value }
@@ -66,6 +79,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     // ── Internal state ─────────────────────────────────────────────────────
 
     private var signalCollectionJob: Job? = null
+    private var mcpManager: McpManager? = null
 
     /**
      * Serializes sendMessage() calls.
@@ -144,8 +158,225 @@ class OpenCodeService(private val project: Project) : Disposable {
             is SessionListState.Loading -> { }
         }
 
+        // ── Initialize MCP integration ──────────────────────────────────────
+        initializeMcp()
+
         return true
     }
+
+    // ── MCP integration ────────────────────────────────────────────────────
+
+    /** Initialize MCP manager and register all enabled servers. */
+    private suspend fun initializeMcp() {
+        val settings = OpenCodeSettingsState.getInstance()
+        val client = connectionManager.client
+        if (client == null) {
+            logger.warn { "[ACP] MCP: skipping initialization — no client available" }
+            return
+        }
+        mcpManager = McpManager(client, settings, scope, client.mcpHttpClient)
+        val configs = mcpManager!!.resolveConfigs()
+        if (configs.isEmpty()) {
+            logger.info { "[ACP] MCP: no servers configured (enableIntellijMcp=${settings.enableIntellijMcp}, additionalMcpServers='${settings.additionalMcpServers.take(50)}')" }
+            return
+        }
+        logger.info { "[ACP] MCP: initializing ${configs.size} server(s): ${configs.map { it.name }}" }
+        mcpManager!!.initialize()
+
+        // Pre-cache discovered tools in background so the settings panel loads instantly
+        refreshDiscoveredTools(settings)
+    }
+
+    /**
+     * Discover tools from OpenCode + MCP servers and cache the result.
+     * Runs in background — saves to OpenCodeSettingsState.discoveredToolsJson.
+     */
+    private suspend fun refreshDiscoveredTools(settings: OpenCodeSettingsState) {
+        try {
+            val port = settings.port
+            val baseUrl = "http://127.0.0.1:$port"
+            val tools = mutableMapOf<String, com.opencode.acp.config.settings.OpenCodeMcpPanel.ToolPermissionInfo>()
+
+            // Discover built-in tools
+            try {
+                val conn = java.net.URI("$baseUrl/experimental/tool/ids").toURL().openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 3000
+                conn.readTimeout = 5000
+                conn.requestMethod = "GET"
+                if (conn.responseCode == 200) {
+                    val body = conn.inputStream.bufferedReader().readText()
+                    conn.disconnect()
+                    val element = kotlinx.serialization.json.Json.parseToJsonElement(body)
+                    val array = if (element is kotlinx.serialization.json.JsonArray) element
+                        else element.jsonObject["value"]?.jsonArray ?: kotlinx.serialization.json.buildJsonArray {}
+                    val toolIds = array.mapNotNull { it.jsonPrimitive.contentOrNull }
+                    for (toolId in toolIds) {
+                        tools[toolId] = com.opencode.acp.config.settings.OpenCodeMcpPanel.ToolPermissionInfo(
+                            description = getBuiltinToolDescription(toolId),
+                            source = "builtin", serverName = "builtin",
+                            enabled = true, permission = "allow"
+                        )
+                    }
+                    logger.info { "[ACP] Tool cache: discovered ${toolIds.size} built-in tools" }
+                } else {
+                    conn.disconnect()
+                }
+            } catch (e: Exception) {
+                logger.debug(e) { "[ACP] Tool cache: failed to discover built-in tools" }
+            }
+
+            // Discover MCP tools from configured servers
+            val enableIntellijMcp = settings.enableIntellijMcp
+            val mcpServerUrl = settings.mcpServerUrl
+            val additionalMcpServers = settings.additionalMcpServers
+
+            if (enableIntellijMcp && mcpServerUrl.isNotBlank()) {
+                discoverAndCacheMcpTools(mcpServerUrl, "intellij", tools)
+            }
+            if (additionalMcpServers.isNotBlank()) {
+                try {
+                    val array = kotlinx.serialization.json.Json.parseToJsonElement(additionalMcpServers).jsonArray
+                    for (element in array) {
+                        val obj = element.jsonObject
+                        val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: continue
+                        val url = obj["url"]?.jsonPrimitive?.contentOrNull ?: continue
+                        if (name.isNotBlank() && url.isNotBlank()) {
+                            discoverAndCacheMcpTools(url, name, tools)
+                        }
+                    }
+                } catch (_: Exception) { }
+            }
+
+            // Save to cache
+            if (tools.isNotEmpty()) {
+                val entries = tools.entries.joinToString(",") { (toolName, info) ->
+                    val safeName = kotlinx.serialization.json.JsonPrimitive(toolName).toString()
+                    val safeDesc = kotlinx.serialization.json.JsonPrimitive(info.description).toString()
+                    val safeSource = kotlinx.serialization.json.JsonPrimitive(info.source).toString()
+                    val safeServer = kotlinx.serialization.json.JsonPrimitive(info.serverName).toString()
+                    "$safeName:{\"description\":$safeDesc,\"source\":$safeSource,\"serverName\":$safeServer}"
+                }
+                settings.discoveredToolsJson = "{$entries}"
+                logger.info { "[ACP] Tool cache: saved ${tools.size} tools to settings cache" }
+            }
+        } catch (e: Exception) {
+            logger.debug(e) { "[ACP] Tool cache: failed to refresh tool cache" }
+        }
+    }
+
+    private suspend fun discoverAndCacheMcpTools(
+        serverUrl: String, serverName: String,
+        tools: MutableMap<String, com.opencode.acp.config.settings.OpenCodeMcpPanel.ToolPermissionInfo>
+    ) {
+        try {
+            val client = io.ktor.client.HttpClient(io.ktor.client.engine.java.Java)
+            val discovery = com.opencode.acp.mcp.McpToolDiscovery(client)
+            val toolDescriptors = discovery.discoverTools(serverUrl)
+            for (tool in toolDescriptors) {
+                val fullToolName = "${serverName}_${tool.name}"
+                tools[fullToolName] = com.opencode.acp.config.settings.OpenCodeMcpPanel.ToolPermissionInfo(
+                    description = tool.description, source = "mcp",
+                    serverName = serverName, enabled = true, permission = "allow"
+                )
+            }
+            client.close()
+            logger.info { "[ACP] Tool cache: discovered ${toolDescriptors.size} MCP tools from $serverName" }
+        } catch (e: Exception) {
+            logger.debug(e) { "[ACP] Tool cache: failed to discover MCP tools from $serverUrl" }
+        }
+    }
+
+    private fun getBuiltinToolDescription(toolId: String): String = when (toolId) {
+        "bash" -> "Execute shell commands"
+        "read" -> "Read file contents"
+        "glob" -> "Find files by pattern"
+        "grep" -> "Search file contents with regex"
+        "edit" -> "Edit files with string replacement"
+        "write" -> "Write new files"
+        "task" -> "Launch specialized agents"
+        "webfetch" -> "Fetch URLs and extract content"
+        "todowrite" -> "Manage task lists"
+        "websearch" -> "Search the web"
+        "skill" -> "Load specialized workflows"
+        "apply_patch" -> "Apply patches to files"
+        "council_session" -> "Multi-LLM consensus engine"
+        "auto_continue" -> "Toggle auto-continuation"
+        "ast_grep_search" -> "AST-aware code search"
+        "ast_grep_replace" -> "AST-aware code replacement"
+        "subtask" -> "Run child worker sessions"
+        "read_session" -> "Read conversation transcripts"
+        else -> "Built-in tool: $toolId"
+    }
+
+    /**
+     * Disconnect all MCP servers. Called before re-initialization when settings change.
+     * Also called when the user toggles MCP off entirely.
+     */
+    suspend fun disconnectAllMcp() {
+        mcpManager?.let { mgr ->
+            val statuses = mgr.serverStatuses.value
+            for (name in statuses.keys) {
+                mgr.disconnect(name)
+            }
+        }
+    }
+
+    /**
+     * Re-initialize MCP with current settings. Called after settings change.
+     * Creates a fresh McpManager and runs discovery/registration.
+     */
+    suspend fun reinitializeMcp() {
+        initializeMcp()
+    }
+
+    /**
+     * Non-suspend wrapper for settings panel (runs on EDT).
+     * Launches disconnect + config write + reinitialize on the service scope.
+     */
+    fun reinitializeMcpFromSettings() {
+        scope.launch {
+            disconnectAllMcp()
+            val settings = OpenCodeSettingsState.getInstance()
+            // Write MCP config file — OpenCode reads it on next startup.
+            // For immediate effect (without restart), POST /mcp is also called
+            // by McpManager.initialize() below.
+            val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
+                ?: java.nio.file.Path.of(".")
+            val configWriter = McpConfigWriter(projectPath, settings)
+            if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
+                configWriter.write()
+                reinitializeMcp()
+            } else {
+                configWriter.clearAllEntries()
+            }
+        }
+    }
+
+    /** Reset MCP state on OpenCode server restart. Called by ProcessManager. */
+    fun resetMcpOnServerRestart() {
+        scope.launch {
+            mcpManager?.resetOnServerRestart()
+            // Re-write config file in case it was stale, then re-register via POST /mcp
+            val settings = OpenCodeSettingsState.getInstance()
+            val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
+                ?: java.nio.file.Path.of(".")
+            val configWriter = McpConfigWriter(projectPath, settings)
+            if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
+                configWriter.write()
+            }
+        }
+    }
+
+    private val emptyMcpStatuses = MutableStateFlow<Map<String, McpConnectionStatus>>(emptyMap())
+    private val emptyMcpTools = MutableStateFlow<Map<String, List<McpToolDescriptor>>>(emptyMap())
+
+    /** MCP server connection statuses (empty if MCP not initialized). */
+    val mcpServerStatuses: StateFlow<Map<String, McpConnectionStatus>>
+        get() = mcpManager?.serverStatuses ?: emptyMcpStatuses.asStateFlow()
+
+    /** MCP tool lists per server (empty if MCP not initialized). */
+    val mcpTools: StateFlow<Map<String, List<McpToolDescriptor>>>
+        get() = mcpManager?.tools ?: emptyMcpTools.asStateFlow()
 
     // ── Session management (delegated) ─────────────────────────────────────
 
@@ -662,16 +893,14 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     override fun dispose() {
         logger.info { "[ACP] OpenCodeService.dispose() called — project closing" }
-        // Cancel scope FIRST — stops all coroutines, releases locks naturally.
-        // This ensures sessionManager.close() can acquire locks without blocking.
+        connectionManager.shutdown()
         scope.cancel()
-        // Cancel SSE jobs explicitly (scope.cancel handles them too, but be explicit)
         sseJob = null
         sseReconnectJob = null
         sseHealthCheckJob = null
         permissionManager.dispose()
         sessionManager.close()
-        connectionManager.shutdown()
+        com.opencode.acp.chat.ChatToolWindowFactory.disposeActiveComposePanelAsync()
     }
 
     companion object {

@@ -2,7 +2,7 @@
 
 > **Status:** Open
 > **Created:** 2026-06-06
-> **Related docs:** [message-processor.md](./message-processor.md), [AGENTS.md](../../AGENTS.md)
+> **Related docs:** [message-processor.md](message-processor.md), [AGENTS.md](../../../AGENTS.md)
 
 ---
 

@@ -4,7 +4,7 @@
 > **Author(s):** —
 > **Reviewer(s):** AI orchestrator (critical review pass + review fixes)
 > **Last Updated:** 2026-06-08
-> **Related docs:** [session-manager.md](./session-manager.md), [AGENTS.md](../../AGENTS.md)
+> **Related docs:** [session-manager.md](../session-manager.md), [AGENTS.md](../../../AGENTS.md)
 
 ---
 

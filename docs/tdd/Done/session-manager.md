@@ -4,7 +4,7 @@
 > **Author(s):** —
 > **Reviewer(s):** —
 > **Last Updated:** 2026-06-07
-> **Related docs:** [message-processor.md](./message-processor.md), [chat-sessions-sidebar.md](./chat-sessions-sidebar.md), [AGENTS.md](../../AGENTS.md)
+> **Related docs:** [message-processor.md](message-processor.md), [chat-sessions-sidebar.md](chat-sessions-sidebar.md), [AGENTS.md](../../../AGENTS.md)
 
 ---
 

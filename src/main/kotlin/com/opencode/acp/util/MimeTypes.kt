@@ -118,6 +118,18 @@ object MimeTypes {
         put("makefile", "text/x-makefile")
         put("dockerfile", "text/x-dockerfile")
         put("lock", "text/plain")
+        put("log", "text/plain")
+        put("txt", "text/plain")
+        put("env", "text/plain")
+        put("gitignore", "text/plain")
+        put("gitattributes", "text/plain")
+        put("editorconfig", "text/plain")
+        put("eslintrc", "text/plain")
+        put("prettierrc", "text/plain")
+        put("babelrc", "text/plain")
+        put("env.local", "text/plain")
+        put("env.development", "text/plain")
+        put("env.production", "text/plain")
     }
 
     /**

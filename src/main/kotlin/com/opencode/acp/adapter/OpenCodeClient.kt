@@ -95,6 +95,23 @@ class OpenCodeClient(
         }
     }
 
+    /**
+     * Separate HttpClient for MCP server requests (discovery, verification, tool listing).
+     * This client does NOT need auth headers, SSE, or ContentNegotiation — it makes
+     * simple GET requests to localhost MCP servers. It's separate from [httpClient]
+     * because MCP servers are on different hosts than the OpenCode server.
+     * Lazy — only created when MCP is actually used, avoiding resource waste when disabled.
+     */
+    @Volatile
+    private var _mcpHttpClient: HttpClient? = null
+    val mcpHttpClient: HttpClient
+        get() = _mcpHttpClient ?: HttpClient(Java) {
+            install(HttpTimeout) {
+                requestTimeoutMillis = 5_000   // 5s for MCP verification/tool fetch
+                connectTimeoutMillis = 3_000   // 3s TCP connection timeout
+            }
+        }.also { _mcpHttpClient = it }
+
     // NOTE: Two separate Json instances are intentional — do NOT merge them.
     // 1. This instance-level Json has classDiscriminator = "type" for polymorphic deserialization
     //    used in manual json.decodeFromString<T>(body) and json.encodeToString(...) calls.
@@ -563,6 +580,33 @@ class OpenCodeClient(
         args: String
     ): OpenCodeMessage =
         postJson("/session/$sessionId/command", ExecuteCommandRequest(command = command, args = args), profile = TimeoutProfile.LONG)
+
+    // -------------------------------------------------------------------------
+    // MCP
+    // -------------------------------------------------------------------------
+
+    /**
+     * Register an MCP server dynamically with the OpenCode server.
+     * POST /mcp
+     *
+     * @param body the full JSON body including name and config (as JsonObject)
+     * @return true if the server responded with success
+     */
+    suspend fun addMcpServer(body: JsonObject): Boolean {
+        return try {
+            val response = httpClient.post("$baseUrl/mcp") {
+                applyAuth()
+                contentType(ContentType.Application.Json)
+                setBody(body.toString())
+            }
+            response.status.isSuccess()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] POST /mcp failed" }
+            false
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Permissions
@@ -1415,6 +1459,7 @@ class OpenCodeClient(
      * in flight — the SSE subscription should be cancelled before calling this.
      */
     override fun close() {
+        _mcpHttpClient?.close()
         httpClient.close()
     }
 

@@ -60,6 +60,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.ui.composed
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.window.Dialog
@@ -534,27 +535,6 @@ private fun SessionRow(
 
     val creatingDim = indicator == SessionIndicator.CREATING
 
-    // Shimmer animation state — sweeps a highlight band across the row
-    // Always create the transition unconditionally to keep composition slot
-    // table stable when the indicator flips between NONE and active states.
-    val transition = rememberInfiniteTransition(label = "shimmer")
-    val rawShimmerProgress by transition.animateFloat(
-        initialValue = -0.4f,
-        targetValue = 1.4f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1500, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "shimmerProgress"
-    )
-    val shimmerProgress = if (indicator != SessionIndicator.NONE) rawShimmerProgress else 0f
-
-    val shimmerColor = when (indicator) {
-        SessionIndicator.CREATING -> ChatTheme.colors.component.sidebarShimmerCreating   // amber
-        SessionIndicator.STREAMING -> ChatTheme.colors.component.sidebarShimmerStreaming  // green
-        SessionIndicator.NONE -> Color.Transparent
-    }
-
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -562,27 +542,7 @@ private fun SessionRow(
             .padding(horizontal = 4.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(bgColor)
-            .then(
-                if (indicator != SessionIndicator.NONE) {
-                    Modifier.drawBehind {
-                        val bandWidth = size.width * 0.5f
-                        val startX = shimmerProgress * size.width - bandWidth
-                        drawRect(
-                            brush = Brush.horizontalGradient(
-                                colors = listOf(
-                                    Color.Transparent,
-                                    shimmerColor.copy(alpha = 0.15f),
-                                    shimmerColor.copy(alpha = 0.35f),
-                                    shimmerColor.copy(alpha = 0.15f),
-                                    Color.Transparent
-                                ),
-                                startX = startX,
-                                endX = startX + bandWidth
-                            )
-                        )
-                    }
-                } else Modifier
-            )
+            .sessionShimmer(indicator)
             .border(
                 width = if (isSelected) 1.dp else 0.dp,
                 color = if (isSelected) retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.3f) else Color.Transparent,
@@ -715,6 +675,54 @@ private fun SessionRow(
                 }
             }
         }
+    }
+}
+
+// ── Shimmer Modifier ─────────────────────────────────────────────────────────
+
+/**
+ * Applies a horizontal-gradient shimmer band when [indicator] is CREATING or STREAMING.
+ * Uses [composed] so the infinite transition is only created when [indicator] is not
+ * [SessionIndicator.NONE] — no animation runs for idle sessions. The shimmer progress
+ * [State] is read inside [drawBehind] to avoid recomposition every animation frame.
+ */
+private fun Modifier.sessionShimmer(indicator: SessionIndicator): Modifier = composed {
+    if (indicator == SessionIndicator.NONE) return@composed Modifier
+
+    val shimmerColor = when (indicator) {
+        SessionIndicator.CREATING -> ChatTheme.colors.component.sidebarShimmerCreating
+        SessionIndicator.STREAMING -> ChatTheme.colors.component.sidebarShimmerStreaming
+        SessionIndicator.NONE -> Color.Transparent // unreachable, kept for exhaustiveness
+    }
+
+    val transition = rememberInfiniteTransition(label = "shimmer")
+    val shimmerProgressState = transition.animateFloat(
+        initialValue = -0.4f,
+        targetValue = 1.4f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmerProgress"
+    )
+
+    Modifier.drawBehind {
+        val progress = shimmerProgressState.value
+        val bandWidth = size.width * 0.5f
+        val startX = progress * size.width - bandWidth
+        drawRect(
+            brush = Brush.horizontalGradient(
+                colors = listOf(
+                    Color.Transparent,
+                    shimmerColor.copy(alpha = 0.15f),
+                    shimmerColor.copy(alpha = 0.35f),
+                    shimmerColor.copy(alpha = 0.15f),
+                    Color.Transparent
+                ),
+                startX = startX,
+                endX = startX + bandWidth
+            )
+        )
     }
 }
 

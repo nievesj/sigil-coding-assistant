@@ -9,7 +9,9 @@ import com.opencode.acp.chat.ui.compose.MarkdownSegment
 import com.opencode.acp.chat.ui.compose.MarkdownSegmenter
 import com.opencode.acp.chat.ui.compose.StreamHealer
 import com.opencode.acp.chat.util.EDT
+import com.opencode.acp.follow.EditorFollowManager
 import com.opencode.acp.chat.util.generateId
+import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -49,7 +51,8 @@ import kotlin.concurrent.withLock
 class SessionState(
     val sessionId: String,
     private val scope: CoroutineScope,
-    private val sessionManager: SessionManager
+    private val sessionManager: SessionManager,
+    private val project: Project,
 ) {
     private val logger = KotlinLogging.logger {}
     private val stateLock = ReentrantLock()
@@ -673,6 +676,30 @@ class SessionState(
                             msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                         } else msg
                     }
+                    // Follow Agent: if the duplicate ToolUse carries real input (running event)
+                    // that the first ToolUse (pending) didn't have, trigger follow navigation now.
+                    // The pending event typically has empty input; the running event has the actual
+                    // file paths and line numbers.
+                    if (event.input != null && event.input.isNotEmpty() &&
+                        (existingPill.input == null || existingPill.input.isEmpty())
+                    ) {
+                        val followFilePath = extractFilePath(event.input)
+                        if (followFilePath != null) {
+                            val updatedKind = if (existingPill.kind == ToolKind.OTHER) {
+                                ToolMapper.detectKindFromInput(event.input)
+                            } else existingPill.kind
+                            val (startLine, endLine) = extractLineRange(event.input)
+                            // Non-essential: if the project service isn't available (very rare —
+                            // dispose race) we skip silently. NEVER `?: return` here — that would
+                            // drop the rest of the ToolUse event processing.
+                            runCatching {
+                                EditorFollowManager.getInstance(project).followToolCall(
+                                    project, followFilePath, startLine, endLine, updatedKind
+                                )
+                            }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (duplicate-ToolUse path)" } }
+                        }
+                    }
+
                     // For task tools: proactively cache the child session if we just learned the sessionId
                     if (existingPill.toolName == "task" && existingPill.metadata?.get("sessionId") == null && event.metadata?.get("sessionId") != null) {
                         val childId = try { event.metadata["sessionId"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
@@ -711,6 +738,19 @@ class SessionState(
                 )
                 ctx.toolCallPills[event.toolCallId] = pill
                 ctx.toolCallIndex[event.toolCallId] = msgId
+
+                // Follow Agent: navigate editor to the file being worked on.
+                // Non-essential — if the project service isn't available, skip silently.
+                // NEVER `?: return` here — that would drop the rest of the ToolUse event.
+                val followFilePath = event.input?.let { extractFilePath(it) }
+                if (followFilePath != null) {
+                    val (startLine, endLine) = extractLineRange(event.input)
+                    runCatching {
+                        EditorFollowManager.getInstance(project).followToolCall(
+                            project, followFilePath, startLine, endLine, toolKind
+                        )
+                    }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolUse path)" } }
+                }
 
                 if (toolKind == ToolKind.EDIT && event.input != null) {
                     val filePath = extractFilePath(event.input)
@@ -790,6 +830,15 @@ class SessionState(
                         output = event.content,
                         metadata = event.metadata ?: existingPill.metadata,
                     )
+                    // Follow Agent: for search tools, navigate to the first match result.
+                    // Non-essential — skip silently if the project service isn't available.
+                    if (resolvedKind == ToolKind.SEARCH) {
+                        runCatching {
+                            EditorFollowManager.getInstance(project).followToolResult(
+                                project, event.toolCallId, event.content, ToolKind.SEARCH
+                            )
+                        }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolResult path)" } }
+                    }
                 } else {
                     // No prior ToolUse — create pill from scratch (fast sub-agents can complete in one event)
                     val newInput = event.input
@@ -1285,7 +1334,7 @@ class SessionState(
         _signals.tryEmit(UiSignal.StreamingCompleted(msgId, ctx.pendingFileChanges.toList()))
     }
 
-    private fun extractFilePath(input: JsonObject): String? {
+    internal fun extractFilePath(input: JsonObject): String? {
         for (key in listOf("file_path", "filePath", "path")) {
             val element = input[key] ?: continue
             val path = try {
@@ -1294,5 +1343,34 @@ class SessionState(
             if (!path.isNullOrEmpty()) return path
         }
         return null
+    }
+
+    /**
+     * Extract startLine/endLine from tool-specific input fields.
+     * Returns Pair(0, 0) when no line info is available (e.g. edit/write).
+     *
+     * Known field names:
+     * - `offset` (1-indexed start) + `limit` (max lines) → read tool
+     * - `start_line` / `end_line` → generic (not used by OpenCode's built-in tools)
+     */
+    internal fun extractLineRange(input: JsonObject?): Pair<Int, Int> {
+        if (input == null) return Pair(0, 0)
+        val startLine = when {
+            input.containsKey("offset") ->
+                input["offset"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+            input.containsKey("start_line") ->
+                input["start_line"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+            else -> 0
+        }
+        val endLine = when {
+            startLine > 0 && input.containsKey("limit") -> {
+                val limit = input["limit"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+                if (limit > 0) startLine + limit - 1 else 0
+            }
+            input.containsKey("end_line") ->
+                input["end_line"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+            else -> 0
+        }
+        return Pair(startLine, endLine)
     }
 }

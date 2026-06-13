@@ -28,7 +28,7 @@ import java.io.Closeable
  * Created per tool window — safe to dispose/recreate without losing state.
  */
 class ChatViewModel(
-    private val scope: CoroutineScope,
+    val scope: CoroutineScope,
     private val service: OpenCodeService,
     private val project: Project
 ) : Closeable {

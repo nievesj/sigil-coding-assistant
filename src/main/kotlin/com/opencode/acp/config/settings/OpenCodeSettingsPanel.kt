@@ -220,7 +220,7 @@ class OpenCodeSettingsPanel {
                 expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault
     }
 
-    private fun showStatus(msg: String, success: Boolean) {
+    fun showStatus(msg: String, success: Boolean) {
         statusLabel.text = msg
         statusLabel.isVisible = true
         statusLabel.foreground = if (success) {

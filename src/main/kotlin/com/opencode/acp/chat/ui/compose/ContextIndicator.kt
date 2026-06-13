@@ -23,7 +23,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,6 +59,34 @@ fun contextColorForPercent(percent: Float): Color {
     }
 }
 
+// ── Pulsing Alpha State ─────────────────────────────────────────────────────
+
+/**
+ * Returns a [State<Float>] that pulses between 1f and 0.5f when [isStreaming] is true,
+ * or a constant 1f when not streaming.
+ *
+ * The infinite transition is only created when streaming, avoiding unnecessary
+ * animation overhead. The state is read inside draw scopes to prevent
+ * recomposition on every animation frame.
+ */
+@Composable
+private fun rememberPulsingAlpha(isStreaming: Boolean, pulseMs: Int): State<Float> {
+    return if (isStreaming) {
+        val infiniteTransition = rememberInfiniteTransition(label = "contextPulse")
+        infiniteTransition.animateFloat(
+            initialValue = 1f,
+            targetValue = 0.5f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = pulseMs, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "contextPulseAlpha"
+        )
+    } else {
+        remember { mutableFloatStateOf(1f) }
+    }
+}
+
 // ── Context Indicator ──────────────────────────────────────────────────────
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -73,18 +103,6 @@ fun ContextIndicator(
     val fonts = ChatTheme.fonts
     val shapes = ChatTheme.shapes
     val animations = ChatTheme.animations
-
-    // Pulsing animation while streaming
-    val infiniteTransition = rememberInfiniteTransition(label = "contextPulse")
-    val pulseAlpha by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0.5f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = animations.contextPulseMs, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "contextPulseAlpha"
-    )
 
     val sizeDp = dims.contextIndicatorSize
 
@@ -109,7 +127,7 @@ fun ContextIndicator(
                     val fillFraction = if (ctx.contextLimit > 0L) {
                         (ctx.usagePercent / 100f).coerceIn(0f, 1f)
                     } else 0f
-                    val alpha = if (isStreaming) pulseAlpha else 1f
+                    val alphaState = rememberPulsingAlpha(isStreaming, animations.contextPulseMs)
 
                     // Outer ring for high usage
                     if (ctx.contextLimit > 0L && ctx.usagePercent >= 75f) {
@@ -121,7 +139,7 @@ fun ContextIndicator(
                             val outerDiameter = (sizeDp + 4.dp).toPx()
                             val ringRadius = outerDiameter / 2f - 2.dp.toPx()
                             drawCircle(
-                                color = color.copy(alpha = alpha),
+                                color = color.copy(alpha = alphaState.value),
                                 radius = ringRadius,
                                 center = center,
                                 style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
@@ -131,7 +149,8 @@ fun ContextIndicator(
 
                     DoughnutRing(
                         fillFraction = fillFraction,
-                        fillColor = color.copy(alpha = alpha),
+                        fillColor = color,
+                        alphaState = alphaState,
                         sizeDp = sizeDp,
                         modifier = Modifier.align(Alignment.Center)
                     )
@@ -183,6 +202,7 @@ private fun LoadingCircle(sizeDp: Dp) {
 private fun DoughnutRing(
     fillFraction: Float,
     fillColor: Color,
+    alphaState: State<Float>,
     sizeDp: Dp,
     modifier: Modifier = Modifier
 ) {
@@ -191,6 +211,7 @@ private fun DoughnutRing(
 
     Box(modifier = modifier.size(sizeDp), contentAlignment = Alignment.Center) {
         Canvas(modifier = Modifier.size(sizeDp)) {
+            val alpha = alphaState.value
             val diameter = sizeDp.toPx()
             val radius = diameter / 2f
             val stroke = 3.dp.toPx() // Thick stroke for doughnut effect
@@ -207,7 +228,7 @@ private fun DoughnutRing(
             // Progress arc (fills clockwise from top)
             if (fillFraction > 0f) {
                 drawArc(
-                    color = fillColor,
+                    color = fillColor.copy(alpha = alpha),
                     startAngle = -90f, // Start from top
                     sweepAngle = 360f * fillFraction.coerceIn(0f, 1f),
                     useCenter = false,

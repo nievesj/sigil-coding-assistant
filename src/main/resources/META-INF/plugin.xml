@@ -28,8 +28,20 @@
         <applicationConfigurable
             parentId="tools"
             instance="com.opencode.acp.config.settings.OpenCodeSettingsConfigurable"
-            id="com.opencode.acp.settings"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
             displayName="OpenCode"/>
+
+        <applicationConfigurable
+            parentId="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
+            instance="com.opencode.acp.config.settings.OpenCodeMcpConfigurable"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.mcp"
+            displayName="MCP"/>
+
+        <applicationConfigurable
+            parentId="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
+            instance="com.opencode.acp.config.settings.OpenCodeFollowConfigurable"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.follow"
+            displayName="Follow Agent"/>
 
         <toolWindow
             id="AI Coding Assistant - OpenCode"
@@ -40,7 +52,16 @@
         <notificationGroup id="OpenCode"
                            displayType="BALLOON"
                            isLogByDefault="true"/>
+
+        <statusBarWidgetFactory id="OpenCodeMCP"
+                                implementation="com.opencode.acp.mcp.McpStatusBarWidgetFactory"
+                                order="first"/>
     </extensions>
+
+    <applicationListeners>
+        <listener class="com.opencode.acp.chat.ShutdownListener"
+                  topic="com.intellij.ide.AppLifecycleListener"/>
+    </applicationListeners>
 
     <actions>
     </actions>

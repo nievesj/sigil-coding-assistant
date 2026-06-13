@@ -36,6 +36,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.readAction
 import com.intellij.diff.DiffManager
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffDialogHints
@@ -72,7 +74,7 @@ import org.jetbrains.jewel.ui.icons.AllIconsKeys
  *
  * ARCHITECTURE NOTE: The change listener and StateFlow are unified in a single
  * DisposableEffect to ensure the listener that emits events is the same one that's
- * registered. All VCS reads happen inside runReadAction on Dispatchers.IO.
+ * registered. All VCS reads happen inside runReadActionBlocking on Dispatchers.IO.
  * All UI mutations happen on EDT.
  *
  * PERFORMANCE: Uses Mutex to prevent concurrent refreshes, increased debounce
@@ -149,7 +151,7 @@ fun ReviewPanel(
         try {
             refreshMutex.withLock {
                 value = withContext(Dispatchers.IO) {
-                    ApplicationManager.getApplication().runReadAction<ReviewState> {
+                    readAction {
                         val files = gitService.getChangedFiles()
                         if (files.isEmpty()) ReviewState.Empty
                         else ReviewState.Loaded(files)
@@ -451,9 +453,9 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
     ApplicationManager.getApplication().invokeLater {
         try {
             val changeListManager = ChangeListManager.getInstance(project)
-            val currentChanges = ApplicationManager.getApplication().runReadAction<List<com.intellij.openapi.vcs.changes.Change>> {
+            val currentChanges = ReadAction.nonBlocking<List<com.intellij.openapi.vcs.changes.Change>> {
                 changeListManager.defaultChangeList.changes.toList()
-            }
+            }.executeSynchronously()
 
             val change = currentChanges.find {
                 getRelativePath(project, it) == filePath
@@ -463,12 +465,12 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
                 val fileName = change.virtualFile?.name ?: filePath.substringAfterLast('/')
                 // Resolve FileType from file name for syntax highlighting in diff viewer
                 val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
-                val beforeContent = ApplicationManager.getApplication().runReadAction<String?> {
+                val beforeContent = ReadAction.nonBlocking<String?> {
                     change.beforeRevision?.content
-                } ?: ""
-                val afterContent = ApplicationManager.getApplication().runReadAction<String?> {
+                }.executeSynchronously() ?: ""
+                val afterContent = ReadAction.nonBlocking<String?> {
                     change.afterRevision?.content
-                } ?: ""
+                }.executeSynchronously() ?: ""
 
                 val factory = DiffContentFactory.getInstance()
                 val request = SimpleDiffRequest(
