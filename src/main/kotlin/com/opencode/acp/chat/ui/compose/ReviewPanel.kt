@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.dp
 
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.readAction
 import com.intellij.diff.DiffManager
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffDialogHints
@@ -73,7 +74,7 @@ import org.jetbrains.jewel.ui.icons.AllIconsKeys
  *
  * ARCHITECTURE NOTE: The change listener and StateFlow are unified in a single
  * DisposableEffect to ensure the listener that emits events is the same one that's
- * registered. All VCS reads happen inside runReadAction on Dispatchers.IO.
+ * registered. All VCS reads happen inside runReadActionBlocking on Dispatchers.IO.
  * All UI mutations happen on EDT.
  *
  * PERFORMANCE: Uses Mutex to prevent concurrent refreshes, increased debounce
@@ -150,11 +151,11 @@ fun ReviewPanel(
         try {
             refreshMutex.withLock {
                 value = withContext(Dispatchers.IO) {
-                    ReadAction.nonBlocking<ReviewState> {
+                    readAction {
                         val files = gitService.getChangedFiles()
                         if (files.isEmpty()) ReviewState.Empty
                         else ReviewState.Loaded(files)
-                    }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
+                    }
                 }
             }
         } catch (e: Throwable) {

@@ -25,39 +25,38 @@ import org.jetbrains.jewel.bridge.addComposeTab
 class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
     companion object {
-        /** Reference to the active ComposePanel for cleanup during project disposal. */
         @Volatile
         var activeComposePanel: androidx.compose.ui.awt.ComposePanel? = null
-            private set
+            internal set
 
-        /** Dispose the active ComposePanel if it hasn't been disposed yet.
-         *  Called from OpenCodeService.dispose() to ensure Skiko's non-daemon
-         *  rendering thread is stopped before the JVM tries to exit. */
+        /** Synchronous dispose — for Content disposer (tool window close). */
         fun disposeActiveComposePanel() {
             activeComposePanel?.let {
-                try {
-                    it.isVisible = false
-                    it.dispose()
-                } catch (_: Exception) {}
+                try { it.isVisible = false; it.dispose() } catch (_: Exception) {}
                 activeComposePanel = null
             }
         }
 
-        private fun disposeComposePanel(container: java.awt.Container?) {
-            if (container == null) return
-            for (child in container.components) {
-                if (child is androidx.compose.ui.awt.ComposePanel) {
-                    try { child.dispose() } catch (_: Exception) { }
-                    return
-                }
-                if (child is java.awt.Container) {
-                    disposeComposePanel(child)
-                }
-            }
+        /** Async dispose — for OpenCodeService.dispose() during IDE restart.
+         *  ComposePanel.dispose() can block EDT if Skiko is mid-frame.
+         *  Daemon thread ensures EDT is NEVER blocked. */
+        fun disposeActiveComposePanelAsync() {
+            val panel = activeComposePanel ?: return
+            activeComposePanel = null
+            Thread({
+                try { panel.isVisible = false; panel.dispose() } catch (_: Exception) {}
+            }, "opencode-compose-dispose").apply { isDaemon = true; start() }
         }
+
     }
 
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
+        // Force Skiko software rendering BEFORE any ComposePanel is created.
+        // Skiko on Windows defaults to Direct3D (DirectX 12). The GPU context
+        // can hang during JVM exit if the render thread is mid-frame, preventing
+        // IDE restart after plugin update. Software rendering has no GPU resources.
+        System.setProperty("skiko.renderApi", "SOFTWARE")
+
         val service = project.service<OpenCodeService>()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val viewModel = ChatViewModel(scope, service, project)
@@ -71,14 +70,10 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         val content = toolWindow.contentManager.contents.firstOrNull()
         if (content != null) {
             val component = content.component
-
-            // Find and store the ComposePanel reference for shutdown cleanup.
             val composePanelRef = findComposePanel(component)
             activeComposePanel = composePanelRef
 
-            val pasteAction = DumbAwareAction.create {
-                viewModel.requestImagePaste()
-            }
+            val pasteAction = DumbAwareAction.create { viewModel.requestImagePaste() }
             val pasteShortcut = CustomShortcutSet(
                 KeyboardShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_V, KeyEvent.CTRL_DOWN_MASK), null),
                 KeyboardShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_V, KeyEvent.META_DOWN_MASK), null),
@@ -87,33 +82,33 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
             content.setDisposer(object : com.intellij.openapi.Disposable {
                 override fun dispose() {
+                    val logger = com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
+                    logger.info("[ACP] ContentDisposer: disposing tool window content")
                     scope.cancel()
                     viewModel.close()
-                    // Stop Skiko rendering before disposing. Setting isVisible=false
-                    // tells Skiko to skip rendering, letting the render thread finish
-                    // its current frame so dispose() completes quickly.
                     try { component.isVisible = false } catch (_: Exception) {}
-                    composePanelRef?.let {
-                        try { it.dispose() } catch (_: Exception) {}
-                    }
+                    // CRITICAL: Do NOT call ComposePanel.dispose() synchronously on EDT.
+                    // Skiko's render thread may be mid-frame, causing EDT to block → IDE lockup.
+                    // Use async dispose on a daemon thread (same pattern as disposeActiveComposePanelAsync).
+                    val panel = composePanelRef ?: activeComposePanel
                     activeComposePanel = null
+                    if (panel != null) {
+                        logger.info("[ACP] ContentDisposer: async disposing ComposePanel=$panel")
+                        Thread({
+                            try {
+                                panel.isVisible = false
+                                panel.dispose()
+                            } catch (e: Exception) {
+                                logger.warn("[ACP] ContentDisposer: ComposePanel.dispose() failed: ${e.message}")
+                            }
+                        }, "opencode-compose-dispose").apply { isDaemon = true; start() }
+                    } else {
+                        logger.warn("[ACP] ContentDisposer: composePanelRef is null!")
+                    }
+                    logger.info("[ACP] ContentDisposer: done")
                 }
             })
         }
-
-        // Register a JVM shutdown hook that disposes the ComposePanel if it
-        // hasn't been disposed yet. IntelliJ's restart sequence may NOT call
-        // Content.dispose() — it might just close projects and exit the JVM.
-        // Without this hook, Skiko's non-daemon rendering thread keeps running
-        // and prevents the JVM from exiting, blocking the restart.
-        // Safe for restart (JVM is exiting anyway) and only triggers if the
-        // Content disposer hasn't already cleaned up.
-        Runtime.getRuntime().addShutdownHook(Thread({
-            activeComposePanel?.let {
-                try { it.dispose() } catch (_: Exception) {}
-                activeComposePanel = null
-            }
-        }, "opencode-compose-shutdown").apply { isDaemon = true })
 
         val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance()
         if (settings.autoConnect) {

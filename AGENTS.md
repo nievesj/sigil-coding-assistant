@@ -1,4 +1,5 @@
-# AGENTS.md â€” Tracked Items & Future Work
+﻿# AGENTS.md â€
+ Tracked Items & Future Work
 
 This document tracks incomplete features, deferred decisions, and known gaps
 that are intentionally left for future implementation.
@@ -682,6 +683,89 @@ app) are left untouched since the plugin uses a different port.
 **Key files:** `OpenCodeSettingsState.kt` (`port` field), `OpenCodeSettingsPanel.kt`
 (port UI), `ProcessManager.kt` (`findAvailablePort`, connection logic)
 
+### ComposePanel.dispose() — EDT Hang on Tool Window Close / IDE Restart
+
+**Problem:** `ComposePanel.dispose()` blocks the EDT when Skiko's render thread is
+mid-frame, causing the entire IDE to lock up during tool window close or IDE restart.
+This is a known issue in Compose for Desktop / Jewel (see Jewel #454, CMP-5713).
+
+Three separate disposal paths raced to dispose the same `ComposePanel`:
+1. Content disposer (`ChatToolWindowFactory`) — ran synchronously on EDT
+2. `ShutdownListener` (`AppLifecycleListener.appWillBeClosed`) — ran synchronously on EDT
+3. Shutdown hook (`Runtime.addShutdownHook`) — ran on daemon thread, but leaked on every
+   `createToolWindowContent()` call (ClassLoader leak during dynamic plugin reload)
+
+**Solution:** All dispose paths now use `disposeActiveComposePanelAsync()`, which disposes
+the `ComposePanel` on a daemon thread. This prevents EDT blocking regardless of Skiko's
+render thread state.
+
+1. **Content disposer** — replaced synchronous `composePanelRef?.dispose()` with
+   `disposeActiveComposePanelAsync()`
+2. **ShutdownListener** — replaced synchronous `panel.dispose()` with
+   `disposeActiveComposePanelAsync()`
+3. **Shutdown hook removed** — was redundant (ShutdownListener already handles restart),
+   leaked ClassLoaders on dynamic plugin reload, and raced with the content disposer
+
+**Race condition safety:** `activeComposePanel` is `@Volatile` and
+`disposeActiveComposePanelAsync()` reads + nulls atomically. Whichever path runs first
+disposes; subsequent calls find `null` and skip.
+
+- **Files:** `ChatToolWindowFactory.kt` (content disposer, shutdown hook removed),
+  `ShutdownListener.kt` (async dispose)
+- **Warning:** Do NOT re-add synchronous `ComposePanel.dispose()` calls on EDT — they
+  block the IDE when Skiko is mid-frame.
+- **Reference:** Jewel `addComposeTab()` source uses `JewelComposePanel` which wraps
+  `ComposePanel`; the same async-dispose pattern is required for any `ComposePanel`
+  lifecycle management in IntelliJ plugins.
+
+### GDI nativeBlit Hang — Continuous Animation Frame Pressure (JDK-8301926)
+
+The EDT can hang in `GDIBlitLoops.nativeBlit()` (Windows GDI `BitBlt`) when
+DWM composition enters a bad state. This is a known JDK issue (suspected match:
+JDK-8301926, unverified). The hang occurs below the JVM, in `win32k.sys` /
+`dwm.dll`, and no plugin code change can prevent the native call from hanging.
+
+**Why this plugin triggers it disproportionately:**
+
+Three `rememberInfiniteTransition` animations (glow sweep in `InputArea.kt`,
+pulse in `ContextIndicator.kt`, shimmer in `SessionSidebar.kt`) generate
+continuous frame rendering at ~60fps. Each frame flows through Skiko SOFTWARE
+render → `BufferedImage` → Swing `RepaintManager.paintDoubleBuffered()` →
+`GDIBlitLoops.nativeBlit()` → GDI `BitBlt` → DWM composition. A static UI
+rarely hits `nativeBlit`; animations hit it 60 times per second, giving DWM
+60 chances per second to deadlock.
+
+**Fix applied (2026-06-13):** Moved animation state reads into the Compose draw
+phase and made animations conditional:
+
+- **InputArea glow:** `rotation` captured as `State<Float>`, color-stop
+  computation moved into `drawBehind { }`. Only exists when `isStreaming`.
+- **ContextIndicator pulse:** New `rememberPulsingAlpha()` returns
+  `mutableFloatStateOf(1f)` when idle (no transition created). `alphaState`
+  read inside `Canvas` draw scope and `DoughnutRing`.
+- **SessionSidebar shimmer:** `Modifier.sessionShimmer()` returns early when
+  `indicator == NONE` (no transition created). `shimmerProgressState.value`
+  read inside `drawBehind { }`.
+
+This eliminates per-frame recomposition and stops animation frame generation
+entirely when the UI is idle.
+
+**Key files:** `InputArea.kt` (lines 536-597), `ContextIndicator.kt`
+(lines 73-88, 130-156), `SessionSidebar.kt` (lines 689-726)
+
+**`skiko.renderApi=SOFTWARE` must be set as JVM argument**, not runtime
+`System.setProperty()`. Skiko selects its renderer at class-loading time;
+setting the property in `createToolWindowContent()` is likely a no-op.
+
+**Do NOT:**
+- Disable vsync (`skiko.vsync.enabled=false`) — increases frame rate
+- Use EDT watchdog — disposing ComposePanel from daemon thread while EDT is
+  stuck in native call risks JVM crashes
+- Rely on `-Dsun.java2d.opengl=true` as "definitive" — silently falls back
+  to GDI on incompatible hardware
+
+**Full investigation:** `docs/tdd/Done/ide-hang-investigation.md`
+
 ---
 
 ## Deferred Features
@@ -763,7 +847,7 @@ custom sounds per notification group via Settings â†’ Appearance & Behavior
 - [x] Slash command palette (`/clear`, `/cancel`) triggered by `/` prefix in input
 - [x] StreamHealer for inline markdown formatting during streaming
 - [x] Question/selection prompt wired to server (`question.asked` SSE â†’ `POST /question/:id/reply` or `/reject`)
-- [x] MIME type detection for file attachments â€” `MimeTypes.guessFromFileName()` replaces `URLConnection.guessContentTypeFromName()` (which returns `application/octet-stream` for most dev files)
+- [x] MIME type detection for file attachments â€” `MimeTypes.guessFromFileName()` replaces `URLConnection.guessContentTypeFromName()` (which returns `application/octet-stream` for most dev files); additional common extensions (.log, .env, .gitignore, etc.) added
 - [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
 - [x] SSE reconnection with exponential backoff (1sâ†’2sâ†’4sâ†’...â†’30s cap, Â±20% jitter, abort in-flight response, retryConnection for ERROR state)
 - [x] SSE idle detection â€” replaced with health-check probes (`launchHealthCheck`) that verify server liveness without killing healthy connections during user thinking time (see TDD Â§4.2.1)
@@ -789,7 +873,7 @@ custom sounds per notification group via Settings â†’ Appearance & Behavior
 - [x] `SseEventListener` now handles V2 event types (`session.next.*`) and passes `patterns` to `SseEvent.Permission`
 - [x] `addMessage()` FIFO eviction now rebuilds `toolCallIndex` alongside `messageIndex` â€” no stale entries after 500+ messages
 - [x] `pendingFileChanges` cleared on session switch via `resetSessionState()` â€” no memory leak across sessions
-- [x] `addShutdownHook` only registered once (stored in `shutdownHook` field) â€” no thread leak on re-initialization
+- [x] Shutdown hook removed entirely â€” was redundant with ShutdownListener, leaked ClassLoaders on dynamic plugin reload, and raced with content disposer
 - [x] `respondPermission`/`respondQuestion`/`rejectQuestion` in `OpenCodeClient` now throw on failure instead of swallowing â€” ViewModel catch blocks are reachable
 - [x] IDE-level notifications (response complete, question asked, permission needed) â€” `Notifications.kt`, focus detection via `WindowManager`, system beep, "Open" action to focus tool window
 - [x] `SessionItem.createdAt` renamed to `updatedAt` (was actually `time.updated`, not `time.created`)
@@ -805,6 +889,10 @@ custom sounds per notification group via Settings â†’ Appearance & Behavior
 - [x] `SseEventListener` standalone parser now extracts `properties` wrapper for V1 bus events â€” `session.error` parsing was broken (read from top-level `obj` instead of `obj["properties"]`)
 - [x] `SessionState.replaceAllMessages()` and `removeMessageByServerId()` â€” support cache invalidation after compaction/message deletion
 - [x] Sidebar session pagination â€” `displayLimit` high-water mark on `SessionListState.Loaded`, `loadMoreSessions()` increments by 10, `resetDisplayLimit()` on init/switch, `clearAllSessions()` deletes all sessions except active, `ClearAllConfirmationDialog` with progress feedback, `SessionListFooter` with "X of Y sessions loaded" + "Load more" + "Clear all", `loadAllSessions` settings toggle
+- [x] ComposePanel.dispose() EDT hang fixed — all dispose paths (content disposer, ShutdownListener) now use `disposeActiveComposePanelAsync()` instead of synchronous EDT dispose; shutdown hook removed
+- [x] ChatViewModel.scope exposed as public val â€” ChatScreen uses `viewModel.scope.launch` for all ViewModel calls instead of composition-scoped `rememberCoroutineScope` (fixes CancellationException on long-running HTTP requests)
+- [x] Additional MIME types added to MimeTypes.kt â€” `.log`, `.env`, `.gitignore`, `.gitattributes`, `.editorconfig`, `.eslintrc`, `.prettierrc`, `.babelrc` and other common extensions now map to correct MIME types instead of `application/octet-stream`
+
 
 ---
 

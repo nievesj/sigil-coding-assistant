@@ -893,19 +893,14 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     override fun dispose() {
         logger.info { "[ACP] OpenCodeService.dispose() called — project closing" }
-        // Dispose ComposePanel FIRST — stops Skiko's non-daemon rendering thread
-        // so the JVM can exit. This must happen before scope.cancel() because
-        // scope.cancel() alone doesn't stop Skiko. Without this, IDE restart
-        // after plugin update hangs because the JVM waits for Skiko's thread.
-        com.opencode.acp.chat.ChatToolWindowFactory.disposeActiveComposePanel()
-        // Cancel scope FIRST — stops all coroutines, releases locks naturally.
+        connectionManager.shutdown()
         scope.cancel()
         sseJob = null
         sseReconnectJob = null
         sseHealthCheckJob = null
         permissionManager.dispose()
         sessionManager.close()
-        connectionManager.shutdown()
+        com.opencode.acp.chat.ChatToolWindowFactory.disposeActiveComposePanelAsync()
     }
 
     companion object {

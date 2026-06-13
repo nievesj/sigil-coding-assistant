@@ -522,10 +522,20 @@ fun InputArea(
         Box(
             modifier = Modifier.fillMaxWidth()
         ) {
-            // Animated blue glow when LLM is streaming
+            // Animated blue glow when LLM is streaming.
+            //
+            // The sweep gradient goes 0°→360° (right → clockwise).  We shift
+            // the color-stop positions each frame to orbit the bright spot.
+            // The peak is centred at 0.50 with wide transparent margins
+            // (0.00–0.35 and 0.65–1.00) so the shifted peak — which is only
+            // 0.30 wide — can never cross the 0/1 seam, no matter the offset.
+            //
+            // Color-stop computation and rotation state read are kept inside
+            // drawBehind so that the composable body does not recompose on
+            // every animation frame — only the draw scope re-executes.
             if (isStreaming) {
                 val infiniteTransition = rememberInfiniteTransition(label = "glow")
-                val rotation by infiniteTransition.animateFloat(
+                val rotation = infiniteTransition.animateFloat(
                     initialValue = 0f,
                     targetValue = 360f,
                     animationSpec = infiniteRepeatable(
@@ -536,15 +546,6 @@ fun InputArea(
                 val density = LocalDensity.current
                 val cornerRadiusPx = with(density) { ChatTheme.dims.inputCornerRadius.toPx() }
                 val glowPath = remember { androidx.compose.ui.graphics.Path() }
-
-                // Animated blue glow when LLM is streaming.
-                //
-                // The sweep gradient goes 0°→360° (right → clockwise).  We shift
-                // the color-stop positions each frame to orbit the bright spot.
-                // The peak is centred at 0.50 with wide transparent margins
-                // (0.00–0.35 and 0.65–1.00) so the shifted peak — which is only
-                // 0.30 wide — can never cross the 0/1 seam, no matter the offset.
-                val offset = rotation / 360f
                 val baseStops = floatArrayOf(
                     0.00f, 0.35f, 0.42f, 0.46f, 0.50f, 0.54f, 0.58f, 0.65f, 1.00f
                 )
@@ -559,16 +560,20 @@ fun InputArea(
                     ChatTheme.colors.component.glowTransparent,               // 0.65
                     ChatTheme.colors.component.glowTransparent,               // 1.00
                 )
-                val shiftedStops = FloatArray(baseStops.size) { i ->
-                    (baseStops[i] + offset) % 1f
-                }
-                val paired = shiftedStops.indices.map { shiftedStops[it] to baseColors[it] }
-                val sorted = paired.sortedBy { it.first }
 
                 Box(
                     modifier = Modifier
                         .matchParentSize()
                         .drawBehind {
+                            // Read the animated value only inside the draw scope
+                            // to avoid triggering recomposition each frame.
+                            val offset = rotation.value / 360f
+                            val shiftedStops = FloatArray(baseStops.size) { i ->
+                                (baseStops[i] + offset) % 1f
+                            }
+                            val paired = shiftedStops.indices.map { shiftedStops[it] to baseColors[it] }
+                            val sorted = paired.sortedBy { it.first }
+
                             val glowPx = 3.dp.toPx()
                             glowPath.reset()
                             glowPath.addRoundRect(

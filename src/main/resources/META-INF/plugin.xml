@@ -58,6 +58,11 @@
                                 order="first"/>
     </extensions>
 
+    <applicationListeners>
+        <listener class="com.opencode.acp.chat.ShutdownListener"
+                  topic="com.intellij.ide.AppLifecycleListener"/>
+    </applicationListeners>
+
     <actions>
     </actions>
 </idea-plugin>

@@ -27,7 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
-import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.readAction
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -174,9 +174,7 @@ fun
         // executeSynchronously() which wraps in a non-cancellable runReadAction
         // that blocks write actions (settings dialog, plugin updater).
         val initial = withContext(Dispatchers.IO) {
-            ReadAction.nonBlocking<List<RecentFile>> {
-                computeRecentFiles(project)
-            }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
+            readAction { computeRecentFiles(project) }
         }
         recentFiles.clear()
         recentFiles.addAll(initial)
@@ -187,9 +185,7 @@ fun
             override fun fileOpened(source: FileEditorManager, file: VirtualFile) {
                 scope.launch {
                     val updated = withContext(Dispatchers.IO) {
-                        ReadAction.nonBlocking<List<RecentFile>> {
-                            computeRecentFiles(project)
-                        }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
+                        readAction { computeRecentFiles(project) }
                     }
                     recentFiles.clear()
                     recentFiles.addAll(updated)
@@ -199,9 +195,7 @@ fun
             override fun fileClosed(source: FileEditorManager, file: VirtualFile) {
                 scope.launch {
                     val updated = withContext(Dispatchers.IO) {
-                        ReadAction.nonBlocking<List<RecentFile>> {
-                            computeRecentFiles(project)
-                        }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
+                        readAction { computeRecentFiles(project) }
                     }
                     recentFiles.clear()
                     recentFiles.addAll(updated)
@@ -285,9 +279,7 @@ fun
         } else {
             scope.launch {
                 val results = withContext(Dispatchers.IO) {
-                    ReadAction.nonBlocking<List<RecentFile>> {
-                        searchProjectFiles(project, query)
-                    }.submit(java.util.concurrent.Executors.newCachedThreadPool()).get()
+                    readAction { searchProjectFiles(project, query) }
                 }
                 searchResults.clear()
                 searchResults.addAll(results)
@@ -301,10 +293,10 @@ fun
             ConnectionSplashScreen(
                 connectionState = connectionState,
                 onConnect = { 
-                    scope.launch { viewModel.connect(project.basePath) }
+                    viewModel.scope.launch { viewModel.connect(project.basePath) }
                 },
                 onRetry = { 
-                    scope.launch { viewModel.retryConnection(project.basePath) }
+                    viewModel.scope.launch { viewModel.retryConnection(project.basePath) }
                 },
                 onStop = { 
                     viewModel.stopConnection()
@@ -337,10 +329,10 @@ fun
                         contextState = sessionContextState,
                         selectedTab = selectedSidebarTab,
                         onTabSelected = { selectedSidebarTab = it },
-                        onNewSession = { scope.launch { viewModel.createAndSwitchSession() } },
-                        onSessionSelected = { scope.launch { viewModel.switchSession(it) } },
-                        onSessionArchived = { scope.launch { viewModel.archiveSession(it) } },
-                        onRetry = { scope.launch { viewModel.loadSessions() } },
+                        onNewSession = { viewModel.scope.launch { viewModel.createAndSwitchSession() } },
+                        onSessionSelected = { viewModel.scope.launch { viewModel.switchSession(it) } },
+                        onSessionArchived = { viewModel.scope.launch { viewModel.archiveSession(it) } },
+                        onRetry = { viewModel.scope.launch { viewModel.loadSessions() } },
                         onContextRetry = { viewModel.retryContextFetch() },
                         onShowDetails = { /* Context tab is already showing */ },
                         onLoadMore = { viewModel.loadMoreSessions() },
@@ -366,7 +358,7 @@ fun
                         // Connection banner (shows/hides based on state)
                         ConnectionBanner(
                             state = connectionState,
-                            onRetry = { scope.launch { viewModel.retryConnection(project.basePath) } }
+                            onRetry = { viewModel.scope.launch { viewModel.retryConnection(project.basePath) } }
                         )
 
                         // Message list (fills remaining space)
@@ -388,7 +380,7 @@ fun
                     PermissionPrompt(
                         prompt = prompt,
                         onRespond = { response ->
-                            scope.launch { viewModel.respondPermission(response) }
+                            viewModel.scope.launch { viewModel.respondPermission(response) }
                         }
                     )
                 }
@@ -415,7 +407,7 @@ fun
                     // would find an empty list by the time it runs.
                     val fileSnapshot = files.toList()
                     attachedFiles.clear()
-                    scope.launch {
+                    viewModel.scope.launch {
                         if (isStreaming) {
                             val queueMode = OpenCodeSettingsState.getInstance().queueInsteadOfSteer
                             if (queueMode) {
@@ -430,7 +422,7 @@ fun
                         }
                     }
                 },
-                onCancel = { scope.launch { viewModel.cancel() } },
+                onCancel = { viewModel.scope.launch { viewModel.cancel() } },
                 onAgentChanged = { viewModel.selectAgent(it) },
                 onModelChanged = { viewModel.selectModel(it) },
                 onThinkingChanged = { viewModel.selectThinkingEffort(it) },
@@ -453,7 +445,7 @@ fun
                 onImage = onImage,
                 onRecentFileClick = onRecentFileClick,
                 onSlashCommand = { command ->
-                    scope.launch {
+                    viewModel.scope.launch {
                         when (command.name) {
                             "clear" -> viewModel.createAndSwitchSession()
                             "cancel" -> viewModel.cancel()
@@ -510,7 +502,7 @@ fun
             val countToDelete = (loaded?.topLevelSessions?.size ?: 0) - 1  // exclude active
             ClearAllConfirmationDialog(
                 sessionCount = countToDelete.coerceAtLeast(0),
-                onConfirm = { scope.launch { viewModel.clearAllSessions() } },
+                onConfirm = { viewModel.scope.launch { viewModel.clearAllSessions() } },
                 onDismiss = { showClearAllDialog = false },
             )
         }
