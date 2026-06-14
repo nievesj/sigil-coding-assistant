@@ -8,7 +8,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsDraggedAsState
 
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -36,11 +35,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.withFrameNanos
 
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshotFlow
 
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.foundation.layout.PaddingValues
@@ -62,6 +62,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -103,56 +105,54 @@ fun MessageList(
     onCancelQueuedMessage: ((String) -> Unit)? = null,
 ) {
     val listState = rememberLazyListState()
-    val scope = rememberCoroutineScope()
-
-    suspend fun scrollToEnd() {
-        val totalItems = messages.size + queuedMessages.size + if (queuedMessages.isNotEmpty() && messages.isNotEmpty()) 1 else 0
-        if (totalItems == 0) return
-        listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
-    }
 
     // Auto-scroll state: starts ON, stays ON until user manually scrolls up.
     // Re-enabled by clicking jump-to-bottom button OR by sending a new message.
     var autoScrollEnabled by remember { mutableStateOf(true) }
 
-    // Detect user drag — disable auto-scroll
-    val isDragged by listState.interactionSource.collectIsDraggedAsState()
+    // True while we are performing a programmatic scroll. Prevents the disable
+    // detector from misinterpreting our own scrolls as user input. A Mutex is
+    // used so only one programmatic scroll runs at a time and so the flag is
+    // cleared only after the scroll has fully settled.
+    val scrollMutex = remember { Mutex() }
 
-    // Track previous firstVisibleItemIndex to detect wheel/scrollbar scroll direction
-    var prevFirstVisibleIndex by remember { mutableStateOf(0) }
+    // Incremented to request a programmatic scroll. Multiple triggers (new
+    // message, streaming content growth, jump-to-bottom click) all bump this.
+    var scrollRequest by remember { mutableIntStateOf(0) }
 
-    // Detect any user scroll that moves toward older messages (up):
+    // Detect user scroll toward older messages (up). previousScrollIndex/Offset
+    // are plain local vars (not Compose state) to avoid recompositions.
     LaunchedEffect(Unit) {
-        snapshotFlow { listState.firstVisibleItemIndex }
-            .collect { currentIndex ->
-                if (currentIndex < prevFirstVisibleIndex && !isDragged) {
+        var previousScrollIndex = listState.firstVisibleItemIndex
+        var previousScrollOffset = listState.firstVisibleItemScrollOffset
+        snapshotFlow {
+            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        }.collect { (index, offset) ->
+            if (scrollMutex.isLocked) {
+                // Programmatic scroll in progress — ignore.
+                previousScrollIndex = index
+                previousScrollOffset = offset
+                return@collect
+            }
+            // Only disable when the user has actually moved up and is NOT at the
+            // bottom. Layout changes during streaming can shift the first visible
+            // item temporarily; those are not user scrolls.
+            val isAtBottom = !listState.canScrollForward
+            if (isAtBottom) {
+                autoScrollEnabled = true
+            } else {
+                val movedUp = index < previousScrollIndex ||
+                    (index == previousScrollIndex && offset < previousScrollOffset)
+                if (movedUp) {
                     autoScrollEnabled = false
                 }
-                prevFirstVisibleIndex = currentIndex
             }
-    }
-
-    LaunchedEffect(isDragged) {
-        if (isDragged && listState.canScrollBackward && autoScrollEnabled) {
-            autoScrollEnabled = false
+            previousScrollIndex = index
+            previousScrollOffset = offset
         }
     }
 
-    // Auto-scroll: when enabled, scroll to bottom whenever content extends below viewport.
-    // This handles both new messages AND streaming content growth.
-    LaunchedEffect(autoScrollEnabled) {
-        if (!autoScrollEnabled) return@LaunchedEffect
-        snapshotFlow { listState.canScrollForward }
-            .collect { canForward ->
-                if (canForward && autoScrollEnabled) {
-                    scrollToEnd()
-                }
-            }
-    }
-
-    // Sticky scroll: re-enable auto-scroll when user scrolls back to the bottom.
-    // This runs independently of autoScrollEnabled — the existing LaunchedEffect above
-    // exits early when autoScrollEnabled is false, so it can't detect the re-arrival at bottom.
+    // Re-enable auto-scroll when user scrolls back to the very bottom.
     LaunchedEffect(Unit) {
         snapshotFlow { !listState.canScrollForward }
             .collect { isAtBottom ->
@@ -160,27 +160,58 @@ fun MessageList(
             }
     }
 
-    // Scroll on new messages or queued messages. If the last message is from the user (Enter pressed),
-    // force auto-scroll on even if the user had scrolled up.
+    // Trigger scroll on content growth during streaming (message size is constant
+    // while the assistant message grows in-place).
+    LaunchedEffect(Unit) {
+        snapshotFlow { listState.canScrollForward }
+            .collect { canForward ->
+                if (canForward && autoScrollEnabled) {
+                    scrollRequest++
+                }
+            }
+    }
+
+    // Trigger scroll on new messages / queued messages.
     LaunchedEffect(messages.size, queuedMessages.size) {
-        if (messages.isEmpty() && queuedMessages.isEmpty()) return@LaunchedEffect
-        val lastIsUser = messages.lastOrNull()?.role == MessageRole.USER
-        val hasQueued = queuedMessages.isNotEmpty()
-        if (lastIsUser || hasQueued) {
-            autoScrollEnabled = true
-        }
-        if (autoScrollEnabled) {
-            scrollToEnd()
+        if (messages.isNotEmpty() || queuedMessages.isNotEmpty()) {
+            val lastIsUser = messages.lastOrNull()?.role == MessageRole.USER
+            val hasQueued = queuedMessages.isNotEmpty()
+            if (lastIsUser || hasQueued) {
+                autoScrollEnabled = true
+            }
+            if (autoScrollEnabled) {
+                scrollRequest++
+            }
         }
     }
 
-    // On initial load, always scroll to bottom
-    LaunchedEffect(Unit) {
-        if (messages.isNotEmpty()) {
-            snapshotFlow { listState.layoutInfo.totalItemsCount }
-                .first { it > 0 }
-            scrollToEnd()
+    // Single scroll coordinator. Serializes all programmatic scrolls and keeps
+    // the scroll guard active until the list has fully settled.
+    LaunchedEffect(scrollRequest) {
+        if (!autoScrollEnabled) return@LaunchedEffect
+        val totalItems = messages.size + queuedMessages.size + if (queuedMessages.isNotEmpty() && messages.isNotEmpty()) 1 else 0
+        if (totalItems <= 0) return@LaunchedEffect
+        scrollMutex.withLock {
+            try {
+                // Int.MAX_VALUE as offset forces scroll to the very bottom of the
+                // last item. Required with Arrangement.Bottom: scrollToItem(index)
+                // alone would position the item at the top, leaving empty space
+                // below. Compose clamps the offset internally to a valid range.
+                listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
+            } catch (_: Exception) {
+                // Fallback in case the offset is rejected.
+                listState.scrollToItem(totalItems - 1)
+            }
+            // Wait for the scroll to fully settle before releasing the mutex.
+            // This prevents the disable detector from seeing isScrollInProgress
+            // with the guard already cleared.
+            snapshotFlow { listState.isScrollInProgress }
+                .first { !it }
         }
+        // Wait one more frame after the scroll settles so the disable detector
+        // sees the settled state with the guard still active. This is what
+        // prevents programmatic scrolls from being misinterpreted as user input.
+        withFrameNanos { }
     }
 
     Box(modifier = modifier) {
@@ -262,9 +293,7 @@ fun MessageList(
                     )
                     .clickable {
                         autoScrollEnabled = true
-                        scope.launch {
-                            scrollToEnd()
-                        }
+                        scrollRequest++
                     },
                 contentAlignment = Alignment.Center
             ) {
