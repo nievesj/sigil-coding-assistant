@@ -127,23 +127,8 @@ sealed interface OpenCodePart {
     data class File(
         val mime: String,
         val url: String,
-        val filename: String? = null,
-        val source: FileSource? = null
+        val filename: String? = null
     ) : OpenCodePart
-
-    @Serializable
-    data class FileSource(
-        val type: String = "file",
-        val path: String,
-        val text: FileSourceText? = null
-    )
-
-    @Serializable
-    data class FileSourceText(
-        val value: String,
-        val start: Int = 0,
-        val end: Int? = null
-    )
 
     @Serializable
     @SerialName("tool_use")
@@ -290,19 +275,6 @@ object OpenCodePartSerializer : KSerializer<OpenCodePart> {
                 put("mime", kotlinx.serialization.json.JsonPrimitive(value.mime))
                 put("url", kotlinx.serialization.json.JsonPrimitive(value.url))
                 value.filename?.let { put("filename", kotlinx.serialization.json.JsonPrimitive(it)) }
-                value.source?.let { src ->
-                    put("source", kotlinx.serialization.json.buildJsonObject {
-                        put("type", kotlinx.serialization.json.JsonPrimitive(src.type))
-                        put("path", kotlinx.serialization.json.JsonPrimitive(src.path))
-                        src.text?.let { txt ->
-                            put("text", kotlinx.serialization.json.buildJsonObject {
-                                put("value", kotlinx.serialization.json.JsonPrimitive(txt.value))
-                                put("start", kotlinx.serialization.json.JsonPrimitive(txt.start))
-                                put("end", kotlinx.serialization.json.JsonPrimitive(txt.end ?: txt.value.length))
-                            })
-                        }
-                    })
-                }
             }
             is OpenCodePart.Image -> kotlinx.serialization.json.buildJsonObject {
                 put("type", kotlinx.serialization.json.JsonPrimitive("image"))

@@ -593,10 +593,8 @@ class ChatViewModel(
         val current = _commandHistory.value.toMutableList()
         current.removeAll { existing ->
             existing.text == text &&
-                existing.attachedFilePaths.size == files.size &&
-                existing.attachedFilePaths.zip(files.map { it.path }).all { (a, b) -> a == b } &&
-                existing.attachedFileDataUris.size == files.size &&
-                existing.attachedFileDataUris.zip(files.map { it.dataUri }).all { (a, b) -> a == b }
+                existing.attachedFileNames == files.map { it.name } &&
+                existing.attachedFilePaths == files.map { it.path }
         }
         current.add(0, entry)
         val trimmed = if (current.size > maxSize) current.take(maxSize) else current

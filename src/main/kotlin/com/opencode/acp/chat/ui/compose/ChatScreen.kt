@@ -39,6 +39,7 @@ import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
+import com.opencode.acp.util.decodeFileToBitmap
 import com.opencode.acp.chat.model.QueuedMessage
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.ui.theme.ChatTheme
@@ -159,7 +160,7 @@ fun
     val allSlashCommands = localCommands + availableCommands
     val scope = rememberCoroutineScope()
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
-    var previewImageUri by remember { mutableStateOf<String?>(null) }
+    var previewImagePath by remember { mutableStateOf<String?>(null) }
 
     // Recent files — reactive state that updates when files open/close
     val recentFiles = remember { mutableStateListOf<RecentFile>() }
@@ -218,7 +219,7 @@ fun
     // for images, files, or text and handles each case.
     LaunchedEffect(viewModel) {
         viewModel.pasteImageSignal.collectLatest {
-            when (val result = readClipboardContent()) {
+            when (val result = readClipboardContent(project)) {
                 is ClipboardResult.FileResult -> {
                     attachedFiles.add(result.file)
                 }
@@ -366,7 +367,7 @@ fun
                             messages = messages.values.toList(),
                             modifier = Modifier.weight(1f).fillMaxWidth(),
                             project = project,
-                            onImagePreview = { uri -> previewImageUri = uri },
+                            onImagePreview = { path -> previewImagePath = path },
                             getStreamingText = { sessionId -> viewModel.getStreamingText(sessionId) },
                             queuedMessages = queuedMessages,
                             onCancelQueuedMessage = { msgId -> viewModel.removeQueuedMessage(msgId) },
@@ -436,7 +437,7 @@ fun
                 onAttachFile = { file -> attachedFiles.add(file) },
                 onRemoveFile = onRemoveFile,
                 onImagePasted = { file -> attachedFiles.add(file) },
-                onImagePreview = { uri -> previewImageUri = uri },
+                onImagePreview = { path -> previewImagePath = path },
                 pasteTextSignal = viewModel.pasteTextSignal,
                 recentFiles = recentFiles,
                 searchResults = searchResults,
@@ -460,14 +461,18 @@ fun
                     attachedFiles.clear()
                     attachedFiles.addAll(entry.toAttachedFiles())
                 },
+                project = project,
             )
             }
         }
 
         // Image preview overlay — centered in the entire plugin window.
         // Only the dark background dismisses the preview; clicking the image itself does not.
-        previewImageUri?.let { uri ->
-            val bitmap = remember(uri) { decodeDataUriToBitmap(uri) }
+        previewImagePath?.let { path ->
+            var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+            LaunchedEffect(path) {
+                bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(path) }
+            }
             if (bitmap != null) {
                 Box(
                     modifier = Modifier
@@ -476,11 +481,11 @@ fun
                         .clickable(
                             interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
                             indication = null,
-                        ) { previewImageUri = null },
+                        ) { previewImagePath = null },
                     contentAlignment = Alignment.Center,
                 ) {
                     ComposeImage(
-                        bitmap = bitmap,
+                        bitmap = bitmap!!,
                         contentDescription = "Preview",
                         modifier = Modifier
                             .fillMaxWidth(0.85f)
@@ -517,12 +522,9 @@ private fun addFileAttachment(
     attachedFiles: MutableList<AttachedFile>
 ) {
     try {
-        val bytes = file.contentsToByteArray()
-        val base64 = java.util.Base64.getEncoder().encodeToString(bytes)
         val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(file.name)
-        val dataUri = "data:$mime;base64,$base64"
-        attachedFiles.add(AttachedFile(name = file.name, path = file.path, mime = mime, dataUri = dataUri))
+        attachedFiles.add(AttachedFile(name = file.name, path = file.path, mime = mime))
     } catch (_: Exception) {
-        // Skip files that can't be read
+        // Skip files that can't be read (e.g., deleted between picker and confirm)
     }
 }

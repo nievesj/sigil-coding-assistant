@@ -64,6 +64,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -93,6 +95,7 @@ import org.jetbrains.jewel.ui.component.VerticalScrollbar
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 import com.opencode.acp.chat.ui.theme.ChatTheme
+import com.opencode.acp.util.decodeFileToBitmap
 
 @Composable
 fun MessageList(
@@ -330,7 +333,10 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
             ) {
                 message.attachedFiles.forEach { file ->
                     if (file.mime.startsWith("image/")) {
-                        val bitmap = remember(file.dataUri) { decodeDataUriToBitmap(file.dataUri) }
+                        var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+                        LaunchedEffect(file.path) {
+                            bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
+                        }
                         if (bitmap != null) {
                             Box(
                                 modifier = Modifier
@@ -340,10 +346,10 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
                                     .clickable(
                                         interactionSource = remember { MutableInteractionSource() },
                                         indication = null,
-                                    ) { onImagePreview?.invoke(file.dataUri) }
+                                    ) { onImagePreview?.invoke(file.path) }
                             ) {
                                 ComposeImage(
-                                    bitmap = bitmap,
+                                    bitmap = bitmap!!,
                                     contentDescription = file.name,
                                     modifier = Modifier
                                         .size(100.dp)
@@ -1221,7 +1227,10 @@ private fun QueuedMessageBubble(
             ) {
                 message.files.forEach { file ->
                     if (file.mime.startsWith("image/")) {
-                        val bitmap = remember(file.dataUri) { decodeDataUriToBitmap(file.dataUri) }
+                        var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+                        LaunchedEffect(file.path) {
+                            bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
+                        }
                         if (bitmap != null) {
                             Box(
                                 modifier = Modifier
@@ -1230,7 +1239,7 @@ private fun QueuedMessageBubble(
                                     .background(ChatTheme.colors.border.default.copy(alpha = 0.5f))
                             ) {
                                 ComposeImage(
-                                    bitmap = bitmap,
+                                    bitmap = bitmap!!,
                                     contentDescription = file.name,
                                     modifier = Modifier
                                         .size(60.dp)

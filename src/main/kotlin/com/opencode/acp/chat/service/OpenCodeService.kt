@@ -11,6 +11,7 @@ import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
+import com.opencode.acp.chat.util.normalizeAttachmentMime
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.mcp.McpConfigWriter
@@ -692,23 +693,27 @@ class OpenCodeService(private val project: Project) : Disposable {
         try {
             val parts = mutableListOf<com.opencode.acp.adapter.OpenCodePart>(com.opencode.acp.adapter.OpenCodePart.Text(text = text))
             files.forEach { file ->
-                // source is only included when we have a valid file path AND readable content.
-                // Server requires source.text when source is present, but source itself is optional.
-                // Clipboard images have path="" — skip source entirely.
-                val source = if (file.path.isNotBlank()) {
-                    val fileText = try {
-                        java.io.File(file.path).readText(Charsets.UTF_8)
-                    } catch (_: Exception) { null }
-                    val sourceText = fileText?.let { txt ->
-                        com.opencode.acp.adapter.OpenCodePart.FileSourceText(value = txt, start = 0, end = txt.length)
-                    }
-                    if (sourceText != null) {
-                        com.opencode.acp.adapter.OpenCodePart.FileSource(path = file.path, text = sourceText)
-                    } else null
-                } else null
+                if (file.path.isBlank()) {
+                    // Pre-rev2 history entries: clipboard images stored path="".
+                    // Cannot send an empty URL — skip this file and log a warning.
+                    logger.warn { "[ACP] Skipping attached file '${file.name}' with blank path (pre-rev2 legacy)" }
+                    return@forEach
+                }
+                val fileObj = java.io.File(file.path)
+                if (!fileObj.exists() || !fileObj.canRead()) {
+                    // File was deleted or unreadable (e.g., auto-cleaned clipboard image).
+                    // Skip with warning instead of sending a file:// URL the server can't read.
+                    logger.warn { "[ACP] Skipping attached file '${file.name}' — file not found or unreadable: ${file.path}" }
+                    return@forEach
+                }
+                val url = com.opencode.acp.util.pathToFileUrl(file.path)
+                if (url == null) {
+                    logger.warn { "[ACP] Skipping attached file '${file.name}' — pathToFileUrl returned null for: ${file.path}" }
+                    return@forEach
+                }
+                val wireMime = normalizeAttachmentMime(file.mime)
                 parts.add(com.opencode.acp.adapter.OpenCodePart.File(
-                    mime = file.mime, url = file.dataUri, filename = file.name,
-                    source = source
+                    mime = wireMime, url = url, filename = file.name
                 ))
             }
             logger.info { "[ACP] sendMessage: ${parts.size} parts (text + ${files.size} file attachments: ${files.joinToString { it.name }})" }

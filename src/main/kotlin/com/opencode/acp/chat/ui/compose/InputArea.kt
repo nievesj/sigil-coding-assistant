@@ -43,9 +43,7 @@ import androidx.compose.ui.draganddrop.dragData
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -88,12 +86,13 @@ import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
 import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
-import java.util.Base64
-import javax.imageio.ImageIO
+import com.opencode.acp.util.decodeFileToBitmap
+import com.opencode.acp.util.saveClipboardImageToDisk
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private val logger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
 /** Result of reading the clipboard — either an image/file attachment or plain text. */
 sealed class ClipboardResult {
@@ -106,8 +105,11 @@ sealed class ClipboardResult {
  * Returns [ClipboardResult] if content is present, null otherwise.
  *
  * AWT clipboard access MUST happen on the Event Dispatch Thread.
+ *
+ * @param project Used to determine the save location for clipboard images.
+ *   If null, images are saved to `user.home` (will not be auto-cleaned).
  */
-suspend fun readClipboardContent(): ClipboardResult? {
+suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? = null): ClipboardResult? {
     val clipResult: Any? = if (java.awt.EventQueue.isDispatchThread()) {
         readClipboardOnEdt()
     } else {
@@ -129,13 +131,14 @@ suspend fun readClipboardContent(): ClipboardResult? {
             when (clipResult) {
                 is java.awt.Image -> {
                     val bufferedImage = clipResult.toBufferedImage()
-                    val baos = ByteArrayOutputStream()
-                    ImageIO.write(bufferedImage, "png", baos)
-                    val bytes = baos.toByteArray()
-                    val base64 = Base64.getEncoder().encodeToString(bytes)
-                    val dataUri = "data:image/png;base64,$base64"
-
-                    ClipboardResult.FileResult(AttachedFile(name = "clipboard-image.png", path = "", mime = "image/png", dataUri = dataUri))
+                    val savedPath = saveClipboardImageToDisk(bufferedImage, project)
+                    if (savedPath != null) {
+                        val filename = java.io.File(savedPath).name
+                        ClipboardResult.FileResult(AttachedFile(name = filename, path = savedPath, mime = "image/png"))
+                    } else {
+                        logger.warn { "[ACP] Clipboard image save failed; skipping attachment" }
+                        null
+                    }
                 }
                 is List<*> -> {
                     val files = clipResult.filterIsInstance<java.io.File>()
@@ -317,6 +320,7 @@ fun InputArea(
     todos: List<TodoItem> = emptyList(),
     commandHistory: List<CommandHistoryEntry> = emptyList(),
     onLoadHistoryEntry: (CommandHistoryEntry) -> Unit = {},
+    project: com.intellij.openapi.project.Project? = null,
     ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
@@ -406,19 +410,17 @@ fun InputArea(
                             val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
                             if (image != null) {
                                 val bufferedImage = image.toBufferedImage()
-                                val baos = ByteArrayOutputStream()
-                                ImageIO.write(bufferedImage, "png", baos)
-                                val bytes = baos.toByteArray()
-                                val base64 = Base64.getEncoder().encodeToString(bytes)
-                                val dataUri = "data:image/png;base64,$base64"
-                                val attached = AttachedFile(
-                                    name = "dropped-image.png",
-                                    path = "",
-                                    mime = "image/png",
-                                    dataUri = dataUri,
-                                )
-                                onImagePasted(attached)
-                                return true
+                                val savedPath = saveClipboardImageToDisk(bufferedImage, project)
+                                if (savedPath != null) {
+                                    val filename = java.io.File(savedPath).name
+                                    val attached = AttachedFile(
+                                        name = filename,
+                                        path = savedPath,
+                                        mime = "image/png",
+                                    )
+                                    onImagePasted(attached)
+                                    return true
+                                }
                             }
                         } catch (e: Exception) {
 
@@ -627,20 +629,21 @@ fun InputArea(
                             val isImage = file.mime.startsWith("image/")
                             if (isImage) {
                                 // Image thumbnail with click-to-preview
-                                val bitmap = remember(file.dataUri) {
-                                    decodeDataUriToBitmap(file.dataUri)
+                                var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+                                LaunchedEffect(file.path) {
+                                    bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
                                 }
                                 Box(
                                     modifier = Modifier
                                         .size(ChatTheme.dims.attachmentThumbnailSize)
                                         .clip(ChatTheme.shapes.attachmentCornerRadius)
                                         .background(ChatTheme.colors.component.attachmentBg)
-                                        .clickable { onImagePreview(file.dataUri) },
+                                        .clickable { onImagePreview(file.path) },
                                     contentAlignment = Alignment.Center,
                                 ) {
                                     if (bitmap != null) {
                                         ComposeImage(
-                                            bitmap = bitmap,
+                                            bitmap = bitmap!!,
                                             contentDescription = file.name,
                                             modifier = Modifier
                                                 .size(ChatTheme.dims.attachmentThumbnailSize)
@@ -1022,35 +1025,10 @@ fun InputArea(
 }
 
 /**
- * Decodes a data URI string into an AWT [BufferedImage], or returns null if decoding fails.
- * Supports data URIs in the format: data:<mime>;base64,<encoded>
- */
-internal fun decodeDataUriToImage(dataUri: String): BufferedImage? {
-    try {
-        val base64Data = if (dataUri.contains(",")) dataUri.substringAfter(",") else dataUri
-        val bytes = Base64.getDecoder().decode(base64Data)
-        val inputStream = bytes.inputStream()
-        return ImageIO.read(inputStream)
-    } catch (e: Exception) {
-        return null
-    }
-}
-
-/**
- * Decodes a data URI into a Compose [ImageBitmap], or null if not an image or decoding fails.
- */
-internal fun decodeDataUriToBitmap(dataUri: String): ImageBitmap? {
-    val bufferedImage = decodeDataUriToImage(dataUri) ?: return null
-    return bufferedImage.toComposeImageBitmap()
-}
-
-/**
- * Converts a java.io.File into an AttachedFile by reading its bytes and encoding as a data URI.
+ * Converts a java.io.File into an AttachedFile by reading its MIME type from the filename.
+ * No bytes are read — the file content is referenced by path on the wire.
  */
 private fun java.io.File.toAttachedFile(): AttachedFile {
-    val bytes = readBytes()
-    val base64 = Base64.getEncoder().encodeToString(bytes)
     val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(name)
-    val dataUri = "data:$mime;base64,$base64"
-    return AttachedFile(name = name, path = absolutePath, mime = mime, dataUri = dataUri)
+    return AttachedFile(name = name, path = absolutePath, mime = mime)
 }
