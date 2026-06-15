@@ -74,7 +74,9 @@ class EditorFollowManager(private val project: Project) : Disposable {
     @Volatile private var pendingFollow: PendingFollow? = null
 
     private data class PendingFollow(
-        val filePath: String, val startLine: Int, val endLine: Int, val kind: ToolKind
+        val filePath: String, val startLine: Int, val endLine: Int, val kind: ToolKind,
+        val agentName: String? = null, val modelName: String? = null,
+        val input: JsonObject? = null, val startTimeMs: Long? = null,
     )
 
     // Job handle for the in-flight throttle wait. Cancelled and replaced on each
@@ -128,13 +130,17 @@ class EditorFollowManager(private val project: Project) : Disposable {
         startLine: Int,
         endLine: Int,
         kind: ToolKind,
+        agentName: String? = null,
+        modelName: String? = null,
+        input: JsonObject? = null,
+        startTimeMs: Long? = null,
     ) {
         if (!isFollowEnabled()) return
         val color = FollowColorProvider.getColor(kind) ?: return
-        val label = FollowColorProvider.getInlayLabel(kind) ?: return
+        val label = FollowColorProvider.composeInlayLabel(kind, agentName, modelName, input, startTimeMs)
 
         if (!throttleCheck()) {
-            pendingFollow = PendingFollow(filePath, startLine, endLine, kind)
+            pendingFollow = PendingFollow(filePath, startLine, endLine, kind, agentName, modelName, input, startTimeMs)
             logger.debug { "[ACP] Follow Agent: queued $filePath (throttled)" }
             schedulePendingFollow()
             return
@@ -231,20 +237,16 @@ class EditorFollowManager(private val project: Project) : Disposable {
     }
 
     private fun schedulePendingFollow() {
-        // Cancel the previous pending wait (if any) so we don't pile up N
-        // coroutines that all race to read pendingFollow. The latest call
-        // wins — the user's most recent file is the one that gets shown.
         pendingJob?.cancel()
         pendingJob = scope.launch {
             delay(FOLLOW_FILE_COOLDOWN_MS)
             if (project.isDisposed) return@launch
-            // Atomic read-and-clear on the volatile field. On EDT this is
-            // single-threaded so no lock is needed; on a multi-threaded
-            // dispatcher we would need a CAS or synchronization here.
             val pending = pendingFollow ?: return@launch
             pendingFollow = null
             val color = FollowColorProvider.getColor(pending.kind) ?: return@launch
-            val label = FollowColorProvider.getInlayLabel(pending.kind) ?: return@launch
+            val label = FollowColorProvider.composeInlayLabel(
+                pending.kind, pending.agentName, pending.modelName, pending.input, pending.startTimeMs
+            )
             lastFollowFileMs = System.currentTimeMillis()
             navigateOnEdt(project, pending.filePath, pending.startLine, pending.endLine, color, label, focus = false)
         }

@@ -105,6 +105,7 @@ data class ToolCallPill(
     val input: kotlinx.serialization.json.JsonObject? = null,
     val output: List<kotlinx.serialization.json.JsonObject>? = null,
     val metadata: kotlinx.serialization.json.JsonObject? = null,
+    val startTimeMs: Long? = null,
 )
 
 /** A file modified by a tool call, displayed in the assistant message. */
