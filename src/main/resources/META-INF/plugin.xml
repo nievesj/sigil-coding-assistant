@@ -61,6 +61,8 @@
     <applicationListeners>
         <listener class="com.opencode.acp.chat.ShutdownListener"
                   topic="com.intellij.ide.AppLifecycleListener"/>
+        <listener class="com.opencode.acp.chat.AttachmentCleanupListener"
+                  topic="com.intellij.openapi.project.ProjectManagerListener"/>
     </applicationListeners>
 
     <actions>

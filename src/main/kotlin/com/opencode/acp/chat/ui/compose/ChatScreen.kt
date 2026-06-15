@@ -33,12 +33,15 @@ import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ChatInputState
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.model.ReadyState
 import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
+import com.opencode.acp.util.decodeFileToBitmap
 import com.opencode.acp.chat.model.QueuedMessage
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.ui.theme.ChatTheme
@@ -132,6 +135,7 @@ fun
 ) {
     val messages by viewModel.messages.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
+    val readyState by viewModel.readyState.collectAsState()
     val controlState by viewModel.controlState.collectAsState()
     val inputState by viewModel.inputState.collectAsState()
     val isStreaming = inputState is ChatInputState.Streaming
@@ -146,6 +150,7 @@ fun
     val availableCommands by viewModel.availableCommands.collectAsState()
     val commandHistory by viewModel.commandHistory.collectAsState()
     val queuedMessages by viewModel.queuedMessages.collectAsState()
+    val followAgentEnabled by viewModel.followAgentEnabled.collectAsState()
     var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
 
     // Local (non-server) slash commands — always shown first
@@ -159,7 +164,7 @@ fun
     val allSlashCommands = localCommands + availableCommands
     val scope = rememberCoroutineScope()
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
-    var previewImageUri by remember { mutableStateOf<String?>(null) }
+    var previewImagePath by remember { mutableStateOf<String?>(null) }
 
     // Recent files — reactive state that updates when files open/close
     val recentFiles = remember { mutableStateListOf<RecentFile>() }
@@ -218,7 +223,7 @@ fun
     // for images, files, or text and handles each case.
     LaunchedEffect(viewModel) {
         viewModel.pasteImageSignal.collectLatest {
-            when (val result = readClipboardContent()) {
+            when (val result = readClipboardContent(project)) {
                 is ClipboardResult.FileResult -> {
                     attachedFiles.add(result.file)
                 }
@@ -288,10 +293,12 @@ fun
     }
 
     Box(Modifier.fillMaxSize()) {
-        // Show splash screen when not connected
-        if (connectionState != ConnectionState.CONNECTED) {
+        // Show splash screen when not fully ready
+        val isFullyReady = connectionState == ConnectionState.CONNECTED && readyState == ReadyState.READY
+        if (!isFullyReady) {
             ConnectionSplashScreen(
                 connectionState = connectionState,
+                readyState = readyState,
                 onConnect = { 
                     viewModel.scope.launch { viewModel.connect(project.basePath) }
                 },
@@ -301,8 +308,8 @@ fun
                 onStop = { 
                     viewModel.stopConnection()
                 },
-                onAutoConnectChanged = { enabled ->
-                    // Auto-connect setting is persisted in the settings
+                onCancel = {
+                    viewModel.cancelInitialization()
                 },
                 modifier = Modifier.fillMaxSize()
             )
@@ -366,7 +373,7 @@ fun
                             messages = messages.values.toList(),
                             modifier = Modifier.weight(1f).fillMaxWidth(),
                             project = project,
-                            onImagePreview = { uri -> previewImageUri = uri },
+                            onImagePreview = { path -> previewImagePath = path },
                             getStreamingText = { sessionId -> viewModel.getStreamingText(sessionId) },
                             queuedMessages = queuedMessages,
                             onCancelQueuedMessage = { msgId -> viewModel.removeQueuedMessage(msgId) },
@@ -436,7 +443,7 @@ fun
                 onAttachFile = { file -> attachedFiles.add(file) },
                 onRemoveFile = onRemoveFile,
                 onImagePasted = { file -> attachedFiles.add(file) },
-                onImagePreview = { uri -> previewImageUri = uri },
+                onImagePreview = { path -> previewImagePath = path },
                 pasteTextSignal = viewModel.pasteTextSignal,
                 recentFiles = recentFiles,
                 searchResults = searchResults,
@@ -460,14 +467,39 @@ fun
                     attachedFiles.clear()
                     attachedFiles.addAll(entry.toAttachedFiles())
                 },
+                project = project,
+                isConnected = connectionState == ConnectionState.CONNECTED,
+                isReconnecting = connectionState == ConnectionState.RECONNECTING,
+                isFollowEnabled = followAgentEnabled,
+                onDisconnect = {
+                    if (OpenCodeSettingsState.getInstance().showDisconnectConfirmation) {
+                        val result = Messages.showOkCancelDialog(
+                            project,
+                            "This will disconnect from the OpenCode server. The server process will keep running so you can reconnect quickly. Any in-progress responses will be aborted.",
+                            "Disconnect from OpenCode?",
+                            "Disconnect",
+                            "Cancel",
+                            Messages.getQuestionIcon(),
+                        )
+                        if (result == Messages.OK) {
+                            viewModel.stopConnection()
+                        }
+                    } else {
+                        viewModel.stopConnection()
+                    }
+                },
+                onToggleFollow = { viewModel.toggleFollowAgent() },
             )
             }
         }
 
         // Image preview overlay — centered in the entire plugin window.
         // Only the dark background dismisses the preview; clicking the image itself does not.
-        previewImageUri?.let { uri ->
-            val bitmap = remember(uri) { decodeDataUriToBitmap(uri) }
+        previewImagePath?.let { path ->
+            var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+            LaunchedEffect(path) {
+                bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(path) }
+            }
             if (bitmap != null) {
                 Box(
                     modifier = Modifier
@@ -476,11 +508,11 @@ fun
                         .clickable(
                             interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
                             indication = null,
-                        ) { previewImageUri = null },
+                        ) { previewImagePath = null },
                     contentAlignment = Alignment.Center,
                 ) {
                     ComposeImage(
-                        bitmap = bitmap,
+                        bitmap = bitmap!!,
                         contentDescription = "Preview",
                         modifier = Modifier
                             .fillMaxWidth(0.85f)
@@ -517,12 +549,9 @@ private fun addFileAttachment(
     attachedFiles: MutableList<AttachedFile>
 ) {
     try {
-        val bytes = file.contentsToByteArray()
-        val base64 = java.util.Base64.getEncoder().encodeToString(bytes)
         val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(file.name)
-        val dataUri = "data:$mime;base64,$base64"
-        attachedFiles.add(AttachedFile(name = file.name, path = file.path, mime = mime, dataUri = dataUri))
+        attachedFiles.add(AttachedFile(name = file.name, path = file.path, mime = mime))
     } catch (_: Exception) {
-        // Skip files that can't be read
+        // Skip files that can't be read (e.g., deleted between picker and confirm)
     }
 }

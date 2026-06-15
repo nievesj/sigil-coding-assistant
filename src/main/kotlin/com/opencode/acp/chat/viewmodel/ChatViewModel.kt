@@ -12,12 +12,19 @@ import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.OpenCodeNotifications
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.follow.EditorFollowManager
+import com.opencode.acp.mcp.ToolPermission
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.Closeable
 
 /**
@@ -77,9 +84,22 @@ class ChatViewModel(
     private val _clearAllState = MutableStateFlow<ClearAllState>(ClearAllState.Idle)
     val clearAllState: StateFlow<ClearAllState> = _clearAllState.asStateFlow()
 
+    /** Follow Agent enabled state — synced with [EditorFollowManager]. */
+    private val _followAgentEnabled = MutableStateFlow(
+        EditorFollowManager.getInstance(project).isFollowEnabled()
+    )
+    val followAgentEnabled: StateFlow<Boolean> = _followAgentEnabled.asStateFlow()
+
     /** Messages waiting to be sent when the current response completes (queue mode). */
     private val _queuedMessages = MutableStateFlow<List<QueuedMessage>>(emptyList())
     val queuedMessages: StateFlow<List<QueuedMessage>> = _queuedMessages.asStateFlow()
+
+    private val _readyState = MutableStateFlow(ReadyState.NOT_STARTED)
+    val readyState: StateFlow<ReadyState> = _readyState.asStateFlow()
+
+    private val initMutex = Mutex()
+    private var initJob: Job? = null
+    private var connectionObserverJob: Job? = null
 
     // --- Computed input state (exhaustive state machine) ---
     /**
@@ -89,12 +109,14 @@ class ChatViewModel(
      */
     val inputState: StateFlow<ChatInputState> = combine(
         connectionState,
+        readyState,
         permissionPrompt,
         selectionPrompt,
         isStreaming,
-    ) { conn, perm, sel, streaming ->
+    ) { conn, ready, perm, sel, streaming ->
         when {
             conn != ConnectionState.CONNECTED -> ChatInputState.Disabled
+            ready != ReadyState.READY -> ChatInputState.Disabled
             perm != null -> ChatInputState.AwaitingPermission(perm)
             sel != null -> ChatInputState.AwaitingSelection(sel)
             streaming -> ChatInputState.Streaming
@@ -149,27 +171,18 @@ class ChatViewModel(
                         _selectionPrompt.value = signal.prompt
                         OpenCodeNotifications.notifyQuestionAsked(project)
                     }
-                    is UiSignal.Error -> {
-                        // Error already handled by processor (added as Error part)
-                    }
-                    is UiSignal.TodoUpdated -> {
-                        // Todo updates come via SSE, processor handles them
-                    }
-                    is UiSignal.SessionCreated -> {
-                        // Should not arrive on activeSignals (routed to globalSignals)
-                    }
-                    is UiSignal.SessionIdle -> {
-                        // Should not arrive on activeSignals (routed to globalSignals)
-                    }
-                    is UiSignal.SessionError -> {
-                        // Should not arrive on activeSignals (routed to globalSignals)
-                    }
-                    is UiSignal.SessionCompacted -> {
-                        // Should not arrive on activeSignals (routed to globalSignals)
-                    }
+                    // Informational signals — processor handles state updates directly
+                    is UiSignal.Error -> Unit
+                    is UiSignal.TodoUpdated -> Unit
                     is UiSignal.FileChanged -> {
                         _fileChangeSignal.tryEmit(Unit)
                     }
+                    // Global-only signals — should not arrive on activeSignals,
+                    // but must be present for exhaustive when.
+                    is UiSignal.SessionCreated -> Unit
+                    is UiSignal.SessionIdle -> Unit
+                    is UiSignal.SessionError -> Unit
+                    is UiSignal.SessionCompacted -> Unit
                 }
             }
         }
@@ -205,94 +218,176 @@ class ChatViewModel(
         // Load persisted command history
         val settings = OpenCodeSettingsState.getInstance()
         _commandHistory.value = ArrayList(settings.commandHistory)
+
+        // Observe connectionState and reset readyState on disconnect/reconnect/error.
+        // On auto-reconnect (CONNECTED after NOT_STARTED), re-run initialize().
+        connectionObserverJob = scope.launch {
+            connectionState.collect { state ->
+                when (state) {
+                    ConnectionState.DISCONNECTED,
+                    ConnectionState.RECONNECTING,
+                    ConnectionState.ERROR -> {
+                        if (_readyState.value != ReadyState.NOT_STARTED) {
+                            logger.info { "[ACP] ReadyState: ${_readyState.value} → NOT_STARTED (connectionState=$state)" }
+                            _readyState.value = ReadyState.NOT_STARTED
+                        }
+                    }
+                    ConnectionState.CONNECTED -> {
+                        // Auto-reconnect: if readyState is NOT_STARTED after a reconnect,
+                        // re-run initialization to reload agents/providers/MCP tools.
+                        if (_readyState.value == ReadyState.NOT_STARTED && initJob?.isActive != true) {
+                            logger.info { "[ACP] Auto-reconnect detected — re-running initialize()" }
+                            initialize(projectBasePath = null)
+                        }
+                    }
+                    else -> { /* CONNECTING — no action */ }
+                }
+            }
+        }
     }
 
     // --- Initialization ---
 
+    fun resetReadyState() {
+        _readyState.value = ReadyState.NOT_STARTED
+    }
+
     suspend fun initialize(projectBasePath: String?) {
-        val success = service.initialize(projectBasePath)
-        if (!success) {
-            logger.warn { "Service initialization failed" }
+        // Guard against concurrent initialization
+        if (!initMutex.tryLock()) {
+            logger.warn { "[ACP] initialize() already in progress — skipping" }
             return
         }
 
-        // Load agents for control bar
         try {
-            val allAgents = service.listAgents()
-            logger.info { "[ACP] ChatViewModel.initialize: got ${allAgents.size} agents from server" }
-            val agents = allAgents.filter { it.mode != "subagent" && it.hidden != true }
-            _controlState.value = _controlState.value.copy(
-                agents = agents.map { info ->
-                    OpenCodeAgentInfo(id = info.id, name = info.name, description = info.description)
-                }
-            )
-            val defaultAgent = agents.firstOrNull { it.name == "orchestrator" }?.name
-                ?: agents.firstOrNull()?.name
-            if (defaultAgent != null) {
-                val agentInfo = _controlState.value.agents.find { it.id == defaultAgent }
-                if (agentInfo != null) {
-                    _controlState.value = _controlState.value.copy(selectedAgent = agentInfo)
-                }
-            }
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to load agents (non-fatal)" }
-        }
+            initJob = scope.launch {
+                _readyState.value = ReadyState.NOT_STARTED
 
-        // Load providers and models
-        try {
-            val providerResponse = service.listProviders()
-            logger.info { "[ACP] ChatViewModel.initialize: providerResponse = ${providerResponse?.all?.size} providers" }
-            if (providerResponse != null) {
-                val connectedIds = providerResponse.connected.toSet()
-                val models = providerResponse.all
-                    .filter { it.id in connectedIds }
-                    .flatMap { provider ->
-                        provider.models.map { (_, modelData) ->
-                            ProviderModel(
-                                providerID = provider.id,
-                                modelID = modelData.id,
-                                displayName = "${provider.name} / ${modelData.name}",
-                                reasoning = modelData.reasoning,
-                                contextWindow = modelData.limit?.context ?: 0,
-                                providerIconId = provider.id,
-                                variants = modelData.variants?.keys?.toList() ?: emptyList()
-                            )
-                        }
-                    }
-                val allModels = providerResponse.all
-                    .flatMap { provider ->
-                        provider.models.map { (_, modelData) ->
-                            ProviderModel(
-                                providerID = provider.id,
-                                modelID = modelData.id,
-                                displayName = "${provider.name} / ${modelData.name}",
-                                reasoning = modelData.reasoning,
-                                contextWindow = modelData.limit?.context ?: 0,
-                                providerIconId = provider.id,
-                                variants = modelData.variants?.keys?.toList() ?: emptyList()
-                            )
-                        }
-                    }
-                val savedKey = OpenCodeSettingsState.getInstance().lastSelectedModelKey
-                val restoredModel = if (savedKey.isNotEmpty()) {
-                    models.find {
-                        OpenCodeSettingsState.modelKey(it.providerID, it.modelID) == savedKey
-                    }
-                } else null
-                _controlState.value = _controlState.value.copy(
-                    models = models,
-                    allModels = allModels,
-                    selectedModel = restoredModel ?: models.firstOrNull()
-                )
-            }
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to load providers (non-fatal)" }
-        }
+                _readyState.value = ReadyState.INITIALIZING_SERVICE
+                val success = service.initialize(projectBasePath)
+                if (!success) {
+                    _readyState.value = ReadyState.NOT_STARTED
+                    return@launch
+                }
 
-        // Fetch initial context and commands
-        computeSessionContext()
-        fetchTodos()
-        fetchAvailableCommands()
+                _readyState.value = ReadyState.LOADING_AGENTS
+                try {
+                    val agents = withTimeoutOrNull(30_000) { service.listAgents() }
+                    if (agents == null) {
+                        logger.warn { "[ACP] Agent loading timed out after 30s" }
+                    } else {
+                        val filtered = agents.filter { it.mode != "subagent" && it.hidden != true }
+                        _controlState.value = _controlState.value.copy(
+                            agents = filtered.map { info ->
+                                OpenCodeAgentInfo(id = info.id, name = info.name, description = info.description)
+                            }
+                        )
+                        val defaultAgent = filtered.firstOrNull { it.name == "orchestrator" }?.name
+                            ?: filtered.firstOrNull()?.name
+                        if (defaultAgent != null) {
+                            val agentInfo = _controlState.value.agents.find { it.id == defaultAgent }
+                            if (agentInfo != null) {
+                                _controlState.value = _controlState.value.copy(selectedAgent = agentInfo)
+                            }
+                        }
+                        logger.info { "[ACP] ReadyState: LOADING_AGENTS → LOADING_PROVIDERS (agents=${filtered.size} loaded)" }
+                    }
+                } catch (e: Exception) {
+                    logger.warn { "[ACP] Agent loading failed: ${e.message}" }
+                }
+
+                _readyState.value = ReadyState.LOADING_PROVIDERS
+                try {
+                    val providers = withTimeoutOrNull(30_000) { service.listProviders() }
+                    if (providers == null) {
+                        logger.warn { "[ACP] Provider loading timed out after 30s" }
+                    } else {
+                        val connectedIds = providers.connected.toSet()
+                        val models = providers.all
+                            .filter { it.id in connectedIds }
+                            .flatMap { provider ->
+                                provider.models.map { (_, modelData) ->
+                                    ProviderModel(
+                                        providerID = provider.id,
+                                        modelID = modelData.id,
+                                        displayName = "${provider.name} / ${modelData.name}",
+                                        reasoning = modelData.reasoning,
+                                        contextWindow = modelData.limit?.context ?: 0,
+                                        providerIconId = provider.id,
+                                        variants = modelData.variants?.keys?.toList() ?: emptyList()
+                                    )
+                                }
+                            }
+                        val allModels = providers.all
+                            .flatMap { provider ->
+                                provider.models.map { (_, modelData) ->
+                                    ProviderModel(
+                                        providerID = provider.id,
+                                        modelID = modelData.id,
+                                        displayName = "${provider.name} / ${modelData.name}",
+                                        reasoning = modelData.reasoning,
+                                        contextWindow = modelData.limit?.context ?: 0,
+                                        providerIconId = provider.id,
+                                        variants = modelData.variants?.keys?.toList() ?: emptyList()
+                                    )
+                                }
+                            }
+                        val savedKey = OpenCodeSettingsState.getInstance().lastSelectedModelKey
+                        val restoredModel = if (savedKey.isNotEmpty()) {
+                            models.find {
+                                OpenCodeSettingsState.modelKey(it.providerID, it.modelID) == savedKey
+                            }
+                        } else null
+                        _controlState.value = _controlState.value.copy(
+                            models = models,
+                            allModels = allModels,
+                            selectedModel = restoredModel ?: models.firstOrNull()
+                        )
+                        logger.info { "[ACP] ReadyState: LOADING_PROVIDERS → LOADING_MCP (providers=${providers.all.size} loaded)" }
+                    }
+                } catch (e: Exception) {
+                    logger.warn { "[ACP] Provider loading failed: ${e.message}" }
+                }
+
+                _readyState.value = ReadyState.LOADING_MCP
+                try {
+                    val registry = service.toolRegistry
+                    if (registry != null) {
+                        val baseUrl = "http://127.0.0.1:${service.connectionManager.port}"
+                        val mcpUrls = service.mcpManager?.getServerUrls() ?: emptyMap()
+                        withTimeoutOrNull(60_000) {
+                            registry.discoverAll(baseUrl, mcpUrls)
+                            // Merge persisted permissions after discovery
+                            val persisted = loadPersistedPermissions()
+                            if (persisted.isNotEmpty()) {
+                                registry.loadPermissions(persisted)
+                            }
+                            // Update McpManager tool counts from discovered tools
+                            service.mcpManager?.updateToolCounts(registry)
+                        } ?: logger.warn { "[ACP] MCP tool discovery timed out after 60s" }
+                    }
+                } catch (e: Exception) {
+                    logger.warn { "[ACP] MCP tool discovery failed: ${e.message}" }
+                }
+
+                computeSessionContext()
+                fetchTodos()
+                fetchAvailableCommands()
+
+                logger.info { "[ACP] ReadyState: LOADING_MCP → READY" }
+                _readyState.value = ReadyState.READY
+            }
+            initJob?.join()
+        } finally {
+            initMutex.unlock()
+        }
+    }
+
+    fun cancelInitialization() {
+        initJob?.cancel()
+        initJob = null
+        _readyState.value = ReadyState.NOT_STARTED
+        service.stopConnection()
     }
 
     // --- Control bar actions ---
@@ -593,10 +688,8 @@ class ChatViewModel(
         val current = _commandHistory.value.toMutableList()
         current.removeAll { existing ->
             existing.text == text &&
-                existing.attachedFilePaths.size == files.size &&
-                existing.attachedFilePaths.zip(files.map { it.path }).all { (a, b) -> a == b } &&
-                existing.attachedFileDataUris.size == files.size &&
-                existing.attachedFileDataUris.zip(files.map { it.dataUri }).all { (a, b) -> a == b }
+                existing.attachedFileNames == files.map { it.name } &&
+                existing.attachedFilePaths == files.map { it.path }
         }
         current.add(0, entry)
         val trimmed = if (current.size > maxSize) current.take(maxSize) else current
@@ -613,7 +706,9 @@ class ChatViewModel(
     // --- Retry ---
 
     suspend fun retryConnection(projectBasePath: String?) {
-        service.initialize(projectBasePath)
+        service.connectionManager.resetForRetry()
+        resetReadyState()
+        initialize(projectBasePath)
     }
 
     suspend fun connect(projectBasePath: String?) {
@@ -621,16 +716,46 @@ class ChatViewModel(
             connectionState.value == ConnectionState.CONNECTING) {
             return
         }
-        service.initialize(projectBasePath)
+        initialize(projectBasePath)
     }
 
     fun stopConnection() {
         service.stopConnection()
     }
 
+    // --- Follow Agent toggle ---
+
+    fun toggleFollowAgent() {
+        val newValue = !_followAgentEnabled.value
+        EditorFollowManager.getInstance(project).setFollowEnabled(newValue)
+        _followAgentEnabled.value = newValue
+        logger.info { "[ACP] Follow agent toggled: $newValue" }
+    }
+
+    // --- Permission persistence ---
+
+    private fun loadPersistedPermissions(): Map<String, ToolPermission> {
+        val settings = OpenCodeSettingsState.getInstance()
+        val permsJson = settings.toolPermissions
+        if (permsJson.isBlank()) return emptyMap()
+        return try {
+            val obj = Json.parseToJsonElement(permsJson).jsonObject
+            obj.entries.associate { (toolName, element) ->
+                val toolObj = element.jsonObject
+                val permStr = toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow"
+                toolName to ToolPermission.fromActionString(permStr)
+            }
+        } catch (e: Exception) {
+            logger.warn { "[ACP] Failed to parse persisted tool permissions: ${e.message}" }
+            emptyMap()
+        }
+    }
+
     // --- Cleanup ---
 
     override fun close() {
+        connectionObserverJob?.cancel()
+        initJob?.cancel()
         service.permissionManager.cancelPermissionTimeout()
     }
 
@@ -638,10 +763,5 @@ class ChatViewModel(
 
     companion object {
         private const val MAX_STEER_WAIT_MS = 10_000L
-
-        /** Load persisted command history from settings. */
-        private fun loadCommandHistory(): List<CommandHistoryEntry> {
-            return ArrayList(OpenCodeSettingsState.getInstance().commandHistory)
-        }
     }
 }

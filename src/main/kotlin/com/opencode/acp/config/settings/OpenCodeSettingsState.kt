@@ -99,6 +99,9 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      */
     var discoveredToolsJson: String = ""
 
+    /** Whether to show a confirmation dialog before disconnecting from the server. */
+    var showDisconnectConfirmation: Boolean = true
+
     // ── Follow Agent ──────────────────────────────────────────────────
     /**
      * Whether Follow Agent is enabled (auto-opens files on tool calls).
@@ -221,6 +224,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         followMoveColor = state.followMoveColor
         followFetchColor = state.followFetchColor
         followOtherColor = state.followOtherColor
+        showDisconnectConfirmation = state.showDisconnectConfirmation
     }
 
     companion object {

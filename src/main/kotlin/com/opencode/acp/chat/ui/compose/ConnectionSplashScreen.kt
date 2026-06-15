@@ -29,6 +29,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.intellij.openapi.project.Project
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.model.ReadyState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.ui.theme.ChatTheme
@@ -44,10 +45,11 @@ import org.jetbrains.jewel.ui.icon.IconKey
 @Composable
 fun ConnectionSplashScreen(
     connectionState: ConnectionState,
-    onConnect: () -> Unit,
-    onRetry: () -> Unit,
-    onStop: () -> Unit,
-    onAutoConnectChanged: (Boolean) -> Unit,
+    readyState: ReadyState = ReadyState.NOT_STARTED,
+    onConnect: () -> Unit = {},
+    onRetry: () -> Unit = {},
+    onStop: () -> Unit = {},
+    onCancel: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val settings = remember { OpenCodeSettingsState.getInstance() }
@@ -85,18 +87,27 @@ fun ConnectionSplashScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             // Status message
-            val statusMessage = when (connectionState) {
-                ConnectionState.DISCONNECTED -> "Not connected to OpenCode server"
-                ConnectionState.CONNECTING -> "Connecting to OpenCode server..."
-                ConnectionState.CONNECTED -> "Connected"
-                ConnectionState.RECONNECTING -> "Reconnecting..."
-                ConnectionState.ERROR -> "Connection failed"
+            val statusMessage = when {
+                connectionState == ConnectionState.DISCONNECTED -> "Not connected to OpenCode server"
+                connectionState == ConnectionState.CONNECTING -> "Connecting to OpenCode server..."
+                connectionState == ConnectionState.CONNECTED && readyState == ReadyState.READY -> "Connected"
+                connectionState == ConnectionState.CONNECTED -> when (readyState) {
+                    ReadyState.INITIALIZING_SERVICE -> "Starting OpenCode service..."
+                    ReadyState.LOADING_AGENTS -> "Loading agents..."
+                    ReadyState.LOADING_PROVIDERS -> "Loading models..."
+                    ReadyState.LOADING_MCP -> "Discovering MCP tools..."
+                    else -> "Initializing..."
+                }
+                connectionState == ConnectionState.RECONNECTING -> "Reconnecting..."
+                connectionState == ConnectionState.ERROR -> "Connection failed"
+                else -> "Connecting..."
             }
 
-            val statusColor = when (connectionState) {
-                ConnectionState.CONNECTED -> ChatTheme.colors.component.splashConnected
-                ConnectionState.ERROR -> ChatTheme.colors.component.splashError
-                ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> ChatTheme.colors.component.sidebarShimmerCreating
+            val statusColor = when {
+                connectionState == ConnectionState.CONNECTED && readyState == ReadyState.READY -> ChatTheme.colors.component.splashConnected
+                connectionState == ConnectionState.CONNECTED -> ChatTheme.colors.component.sidebarShimmerCreating
+                connectionState == ConnectionState.ERROR -> ChatTheme.colors.component.splashError
+                connectionState == ConnectionState.CONNECTING || connectionState == ConnectionState.RECONNECTING -> ChatTheme.colors.component.sidebarShimmerCreating
                 else -> ChatTheme.colors.text.muted
             }
 
@@ -110,9 +121,8 @@ fun ConnectionSplashScreen(
             Spacer(modifier = Modifier.height(32.dp))
 
             // Action buttons
-            when (connectionState) {
-                ConnectionState.DISCONNECTED -> {
-                    // Connect button
+            when {
+                connectionState == ConnectionState.DISCONNECTED -> {
                     ActionButton(
                         text = "Connect",
                         icon = AllIconsKeys.Actions.Execute,
@@ -120,8 +130,7 @@ fun ConnectionSplashScreen(
                         backgroundColor = ChatTheme.colors.component.splashConnected
                     )
                 }
-                ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> {
-                    // Stop button
+                connectionState == ConnectionState.CONNECTING || connectionState == ConnectionState.RECONNECTING -> {
                     ActionButton(
                         text = "Stop",
                         icon = AllIconsKeys.Actions.Suspend,
@@ -129,8 +138,7 @@ fun ConnectionSplashScreen(
                         backgroundColor = ChatTheme.colors.component.splashError
                     )
                 }
-                ConnectionState.ERROR -> {
-                    // Retry button
+                connectionState == ConnectionState.ERROR -> {
                     ActionButton(
                         text = "Retry",
                         icon = AllIconsKeys.Actions.Refresh,
@@ -138,8 +146,16 @@ fun ConnectionSplashScreen(
                         backgroundColor = ChatTheme.colors.component.splashRetry
                     )
                 }
-                ConnectionState.CONNECTED -> {
-                    // Connected - no button needed
+                connectionState == ConnectionState.CONNECTED && readyState != ReadyState.READY -> {
+                    ActionButton(
+                        text = "Cancel",
+                        icon = AllIconsKeys.Actions.Close,
+                        onClick = onCancel,
+                        backgroundColor = ChatTheme.colors.component.splashError
+                    )
+                }
+                else -> {
+                    // Connected and ready — no button
                 }
             }
 
@@ -153,7 +169,6 @@ fun ConnectionSplashScreen(
                     .clickable {
                         autoConnect = !autoConnect
                         settings.autoConnect = autoConnect
-                        onAutoConnectChanged(autoConnect)
                     }
                     .padding(8.dp)
             ) {

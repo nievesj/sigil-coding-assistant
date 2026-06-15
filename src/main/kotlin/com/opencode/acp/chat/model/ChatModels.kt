@@ -8,23 +8,31 @@ import java.util.LinkedHashMap
 data class AttachedFile(
     val name: String,
     val path: String,
-    val mime: String,
-    val dataUri: String
+    val mime: String
 )
 
 /**
  * A single entry in the input command history.
  *
- * Stores the message text plus its attachments (with full data URI) so that
- * recalling an entry re-populates the input area with the exact same content
- * the user previously sent — including clipboard images (which have no
- * on-disk path and must be restored from the stored dataUri).
+ * Stores the message text plus its attachments so that recalling an entry
+ * re-populates the input area with the same content the user previously sent.
+ *
+ * Rev 2+: `attachedFileDataUris` is no longer populated — `AttachedFile.dataUri`
+ * was removed. The field is retained (XStream ignores `@Deprecated`) for
+ * backward compatibility with pre-rev2 serialized entries.
  */
 class CommandHistoryEntry {
     var text: String = ""
     var attachedFileNames: ArrayList<String> = ArrayList()
     var attachedFilePaths: ArrayList<String> = ArrayList()
     var attachedFileMimes: ArrayList<String> = ArrayList()
+
+    /**
+     * No longer populated as of rev 2 (AttachedFile.dataUri was removed).
+     * Retained for XStream backward compat with pre-rev2 entries.
+     * Deserialization reads it but does nothing with it; serialization writes an empty list.
+     */
+    @Deprecated("Removed in rev 2; retained for XStream backward compat")
     var attachedFileDataUris: ArrayList<String> = ArrayList()
 
     /** No-arg constructor required for XStream deserialization. */
@@ -36,20 +44,18 @@ class CommandHistoryEntry {
             attachedFileNames.add(f.name)
             attachedFilePaths.add(f.path)
             attachedFileMimes.add(f.mime)
-            attachedFileDataUris.add(f.dataUri)
         }
     }
 
     /** Reconstruct the original [AttachedFile] list. */
     fun toAttachedFiles(): List<AttachedFile> = buildList {
-        val n = attachedFileNames.size
+        val n = minOf(attachedFileNames.size, attachedFilePaths.size, attachedFileMimes.size)
         for (i in 0 until n) {
             add(
                 AttachedFile(
                     name = attachedFileNames[i],
                     path = attachedFilePaths[i],
                     mime = attachedFileMimes[i],
-                    dataUri = attachedFileDataUris[i],
                 )
             )
         }
@@ -99,6 +105,7 @@ data class ToolCallPill(
     val input: kotlinx.serialization.json.JsonObject? = null,
     val output: List<kotlinx.serialization.json.JsonObject>? = null,
     val metadata: kotlinx.serialization.json.JsonObject? = null,
+    val startTimeMs: Long? = null,
 )
 
 /** A file modified by a tool call, displayed in the assistant message. */
@@ -209,6 +216,20 @@ enum class ConnectionState {
     CONNECTED,
     RECONNECTING,
     ERROR
+}
+
+/**
+ * Readiness state for the UI transition to chat.
+ * Owned by ChatViewModel — gates the splash → chat transition
+ * alongside ConnectionState.CONNECTED.
+ */
+enum class ReadyState {
+    NOT_STARTED,           // initialization hasn't started
+    INITIALIZING_SERVICE,  // service.initialize() running (includes SSE start, MCP registration)
+    LOADING_AGENTS,        // fetching agent list
+    LOADING_PROVIDERS,     // fetching provider/model list
+    LOADING_MCP,           // discovering MCP tools via ToolRegistry
+    READY                  // everything loaded, UI can show
 }
 
 /** Permission response options (strongly typed). */

@@ -1,6 +1,7 @@
 package com.opencode.acp.chat.ui.compose
 
 import androidx.compose.foundation.Image as ComposeImage
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -43,14 +44,13 @@ import androidx.compose.ui.draganddrop.dragData
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.RoundRect
@@ -84,16 +84,18 @@ import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
+import androidx.compose.foundation.TooltipArea
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
 import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
-import java.util.Base64
-import javax.imageio.ImageIO
+import com.opencode.acp.util.decodeFileToBitmap
+import com.opencode.acp.util.saveClipboardImageToDisk
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private val logger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
 /** Result of reading the clipboard — either an image/file attachment or plain text. */
 sealed class ClipboardResult {
@@ -106,8 +108,11 @@ sealed class ClipboardResult {
  * Returns [ClipboardResult] if content is present, null otherwise.
  *
  * AWT clipboard access MUST happen on the Event Dispatch Thread.
+ *
+ * @param project Used to determine the save location for clipboard images.
+ *   If null, images are saved to `user.home` (will not be auto-cleaned).
  */
-suspend fun readClipboardContent(): ClipboardResult? {
+suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? = null): ClipboardResult? {
     val clipResult: Any? = if (java.awt.EventQueue.isDispatchThread()) {
         readClipboardOnEdt()
     } else {
@@ -129,13 +134,14 @@ suspend fun readClipboardContent(): ClipboardResult? {
             when (clipResult) {
                 is java.awt.Image -> {
                     val bufferedImage = clipResult.toBufferedImage()
-                    val baos = ByteArrayOutputStream()
-                    ImageIO.write(bufferedImage, "png", baos)
-                    val bytes = baos.toByteArray()
-                    val base64 = Base64.getEncoder().encodeToString(bytes)
-                    val dataUri = "data:image/png;base64,$base64"
-
-                    ClipboardResult.FileResult(AttachedFile(name = "clipboard-image.png", path = "", mime = "image/png", dataUri = dataUri))
+                    val savedPath = saveClipboardImageToDisk(bufferedImage, project)
+                    if (savedPath != null) {
+                        val filename = java.io.File(savedPath).name
+                        ClipboardResult.FileResult(AttachedFile(name = filename, path = savedPath, mime = "image/png"))
+                    } else {
+                        logger.warn { "[ACP] Clipboard image save failed; skipping attachment" }
+                        null
+                    }
                 }
                 is List<*> -> {
                     val files = clipResult.filterIsInstance<java.io.File>()
@@ -317,6 +323,12 @@ fun InputArea(
     todos: List<TodoItem> = emptyList(),
     commandHistory: List<CommandHistoryEntry> = emptyList(),
     onLoadHistoryEntry: (CommandHistoryEntry) -> Unit = {},
+    project: com.intellij.openapi.project.Project? = null,
+    isConnected: Boolean = false,                    // NEW: connectionState == CONNECTED
+    isReconnecting: Boolean = false,                 // NEW: connectionState == RECONNECTING
+    isFollowEnabled: Boolean = false,                // NEW
+    onDisconnect: () -> Unit = {},                   // NEW
+    onToggleFollow: () -> Unit = {},                 // NEW
     ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
@@ -406,19 +418,17 @@ fun InputArea(
                             val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
                             if (image != null) {
                                 val bufferedImage = image.toBufferedImage()
-                                val baos = ByteArrayOutputStream()
-                                ImageIO.write(bufferedImage, "png", baos)
-                                val bytes = baos.toByteArray()
-                                val base64 = Base64.getEncoder().encodeToString(bytes)
-                                val dataUri = "data:image/png;base64,$base64"
-                                val attached = AttachedFile(
-                                    name = "dropped-image.png",
-                                    path = "",
-                                    mime = "image/png",
-                                    dataUri = dataUri,
-                                )
-                                onImagePasted(attached)
-                                return true
+                                val savedPath = saveClipboardImageToDisk(bufferedImage, project)
+                                if (savedPath != null) {
+                                    val filename = java.io.File(savedPath).name
+                                    val attached = AttachedFile(
+                                        name = filename,
+                                        path = savedPath,
+                                        mime = "image/png",
+                                    )
+                                    onImagePasted(attached)
+                                    return true
+                                }
                             }
                         } catch (e: Exception) {
 
@@ -627,20 +637,21 @@ fun InputArea(
                             val isImage = file.mime.startsWith("image/")
                             if (isImage) {
                                 // Image thumbnail with click-to-preview
-                                val bitmap = remember(file.dataUri) {
-                                    decodeDataUriToBitmap(file.dataUri)
+                                var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+                                LaunchedEffect(file.path) {
+                                    bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
                                 }
                                 Box(
                                     modifier = Modifier
                                         .size(ChatTheme.dims.attachmentThumbnailSize)
                                         .clip(ChatTheme.shapes.attachmentCornerRadius)
                                         .background(ChatTheme.colors.component.attachmentBg)
-                                        .clickable { onImagePreview(file.dataUri) },
+                                        .clickable { onImagePreview(file.path) },
                                     contentAlignment = Alignment.Center,
                                 ) {
                                     if (bitmap != null) {
                                         ComposeImage(
-                                            bitmap = bitmap,
+                                            bitmap = bitmap!!,
                                             contentDescription = file.name,
                                             modifier = Modifier
                                                 .size(ChatTheme.dims.attachmentThumbnailSize)
@@ -1010,6 +1021,26 @@ fun InputArea(
 
             Spacer(modifier = Modifier.weight(1f))
 
+            // NEW: Follow checkbox — always visible (local setting)
+            FollowAgentCheckbox(
+                enabled = isFollowEnabled,
+                onToggle = onToggleFollow,
+            )
+
+            // NEW: Separator + disconnect (only when connected or reconnecting)
+            if (isConnected || isReconnecting) {
+                Box(
+                    modifier = Modifier
+                        .width(1.dp)
+                        .height(16.dp)
+                        .background(ChatTheme.colors.component.inputText.copy(alpha = 0.3f))
+                )
+                DisconnectButton(
+                    isReconnecting = isReconnecting,
+                    onClick = onDisconnect,
+                )
+            }
+
             // Context indicator — fillable circle showing context usage
             ContextIndicator(
                 state = contextState,
@@ -1022,35 +1053,125 @@ fun InputArea(
 }
 
 /**
- * Decodes a data URI string into an AWT [BufferedImage], or returns null if decoding fails.
- * Supports data URIs in the format: data:<mime>;base64,<encoded>
+ * Green dot + "Connected" text (connected) or amber dot + "Reconnecting…" text (reconnecting).
+ * Click to disconnect from the OpenCode server. Hidden when disconnected.
  */
-internal fun decodeDataUriToImage(dataUri: String): BufferedImage? {
-    try {
-        val base64Data = if (dataUri.contains(",")) dataUri.substringAfter(",") else dataUri
-        val bytes = Base64.getDecoder().decode(base64Data)
-        val inputStream = bytes.inputStream()
-        return ImageIO.read(inputStream)
-    } catch (e: Exception) {
-        return null
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun DisconnectButton(isReconnecting: Boolean, onClick: () -> Unit) {
+    val dotColor = if (isReconnecting) {
+        ChatTheme.colors.accent.yellow
+    } else {
+        ChatTheme.colors.accent.green
+    }
+    val labelText = if (isReconnecting) "Reconnecting…" else "Connected"
+
+    TooltipArea(
+        tooltip = {
+            Box(
+                modifier = Modifier
+                    .background(ChatTheme.colors.component.tooltipBg, RoundedCornerShape(4.dp))
+                    .border(1.dp, ChatTheme.colors.component.tooltipBorder, RoundedCornerShape(4.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    "Disconnect from OpenCode",
+                    color = ChatTheme.colors.component.tooltipText,
+                    fontSize = ChatTheme.fonts.selectorChip,
+                )
+            }
+        },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier
+                .clip(ChatTheme.shapes.chipCornerRadius)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+        ) {
+            Canvas(modifier = Modifier.size(8.dp)) {
+                drawCircle(color = dotColor)
+            }
+            Text(
+                text = labelText,
+                fontSize = ChatTheme.fonts.selectorChip,
+                color = ChatTheme.colors.text.secondary,
+            )
+        }
     }
 }
 
 /**
- * Decodes a data URI into a Compose [ImageBitmap], or null if not an image or decoding fails.
+ * Follow agent checkbox — always visible (local setting, not connection-dependent).
+ * When checked, the editor follows the agent's tool calls (opens files and scrolls).
+ * Font matches SelectorChip for visual consistency with other selector-row controls.
  */
-internal fun decodeDataUriToBitmap(dataUri: String): ImageBitmap? {
-    val bufferedImage = decodeDataUriToImage(dataUri) ?: return null
-    return bufferedImage.toComposeImageBitmap()
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FollowAgentCheckbox(enabled: Boolean, onToggle: () -> Unit) {
+    TooltipArea(
+        tooltip = {
+            Box(
+                modifier = Modifier
+                    .background(ChatTheme.colors.component.tooltipBg, RoundedCornerShape(4.dp))
+                    .border(1.dp, ChatTheme.colors.component.tooltipBorder, RoundedCornerShape(4.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    "When enabled, the editor follows the agent's tool calls — opens files and scrolls to active lines",
+                    color = ChatTheme.colors.component.tooltipText,
+                    fontSize = ChatTheme.fonts.selectorChip,
+                )
+            }
+        },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clip(ChatTheme.shapes.chipCornerRadius)
+                .clickable(enabled = true) { onToggle() }
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(14.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(
+                        if (enabled) ChatTheme.colors.accent.blue
+                        else Color.Transparent
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (enabled) ChatTheme.colors.accent.blue
+                                else ChatTheme.colors.component.inputText.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(3.dp),
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (enabled) {
+                    Text(
+                        text = "\u2713",
+                        fontSize = 10.sp,
+                        color = ChatTheme.colors.text.inverse,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = "Follow Agent",
+                fontSize = ChatTheme.fonts.selectorChip,
+                color = ChatTheme.colors.component.inputText,
+            )
+        }
+    }
 }
 
 /**
- * Converts a java.io.File into an AttachedFile by reading its bytes and encoding as a data URI.
+ * Converts a java.io.File into an AttachedFile by reading its MIME type from the filename.
+ * No bytes are read — the file content is referenced by path on the wire.
  */
 private fun java.io.File.toAttachedFile(): AttachedFile {
-    val bytes = readBytes()
-    val base64 = Base64.getEncoder().encodeToString(bytes)
     val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(name)
-    val dataUri = "data:$mime;base64,$base64"
-    return AttachedFile(name = name, path = absolutePath, mime = mime, dataUri = dataUri)
+    return AttachedFile(name = name, path = absolutePath, mime = mime)
 }

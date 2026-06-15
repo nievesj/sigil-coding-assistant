@@ -42,13 +42,10 @@ class McpManager(
 ) {
     private val discovery = McpServerDiscovery(httpClient)
     private val registrar = McpRegistrar(client)
-    private val toolList = McpToolList(scope, client)
 
     private val _serverStatuses = MutableStateFlow<Map<String, McpConnectionStatus>>(emptyMap())
     /** Per-server connection status. Key = server name. */
     val serverStatuses: StateFlow<Map<String, McpConnectionStatus>> = _serverStatuses.asStateFlow()
-    /** Per-server tool lists. Key = server name. */
-    val tools: StateFlow<Map<String, List<McpToolDescriptor>>> = toolList.tools
 
     /**
      * Build the list of enabled server configs from settings.
@@ -98,6 +95,31 @@ class McpManager(
     }
 
     /**
+     * Expose connected server URLs for ToolRegistry discovery.
+     * Returns a map of serverName → SSE URL for all connected MCP servers.
+     * Uses a unique key per server to prevent collisions.
+     */
+    fun getServerUrls(): Map<String, String> {
+        return _serverStatuses.value.values
+            .filter { it.state == McpConnectionState.CONNECTED }
+            .mapNotNull { status ->
+                status.serverInfo?.let { info ->
+                    val key = info.name.ifEmpty { "mcp_${status.name}" }
+                    key to info.url
+                }
+            }
+            .groupBy { it.first }
+            .flatMap { (name, entries) ->
+                if (entries.size > 1) {
+                    entries.mapIndexed { idx, entry -> "${name}_$idx" to entry.second }
+                } else {
+                    entries
+                }
+            }
+            .toMap()
+    }
+
+    /**
      * Initialize all enabled MCP servers.
      * Called after ProcessManager.initialize() succeeds.
      * Discovers, verifies, and registers each server independently.
@@ -143,12 +165,10 @@ class McpManager(
             return
         }
 
-        // Fetch tool list for display
-        toolList.fetch(serverInfo)
-
+        // No toolList.fetch() — tool count comes from ToolRegistry after discoverAll()
         updateState(config.name, McpConnectionState.CONNECTED,
-            serverInfo = serverInfo, toolCount = toolList.tools.value[config.name]?.size ?: 0)
-        logger.info { "[ACP] MCP: registered '${config.name}' with OpenCode (${toolList.tools.value[config.name]?.size ?: 0} tools available)" }
+            serverInfo = serverInfo, toolCount = 0)
+        logger.info { "[ACP] MCP: registered '${config.name}' with OpenCode" }
     }
 
     /**
@@ -157,16 +177,8 @@ class McpManager(
      */
     suspend fun disconnect(name: String) {
         registrar.markUnregistered(name)
-        toolList.removeTools(name)
         updateState(name, McpConnectionState.DISCONNECTED)
         logger.info { "[ACP] MCP: disconnected '$name' (server-side registration persists until OpenCode restart)" }
-    }
-
-    /**
-     * Disconnect the IntelliJ MCP server (convenience method).
-     */
-    suspend fun disconnectIntellij() {
-        disconnect(ChatConstants.MCP_SERVER_NAME_INTELLIJ)
     }
 
     /**
@@ -180,10 +192,19 @@ class McpManager(
     }
 
     /**
-     * Retry the IntelliJ MCP server (convenience method).
+     * Update tool counts in serverStatuses from ToolRegistry after discovery.
      */
-    suspend fun retryIntellij(): Boolean {
-        return retry(ChatConstants.MCP_SERVER_NAME_INTELLIJ)
+    fun updateToolCounts(registry: ToolRegistry?) {
+        if (registry == null) return
+        val currentStatuses = _serverStatuses.value.toMutableMap()
+        val mcpToolsByServer = registry.getMcpToolsByServer()
+        for ((name, status) in currentStatuses) {
+            if (status.state == McpConnectionState.CONNECTED) {
+                val toolCount = mcpToolsByServer[name]?.size ?: 0
+                currentStatuses[name] = status.copy(toolCount = toolCount)
+            }
+        }
+        _serverStatuses.value = currentStatuses
     }
 
     /**
@@ -191,7 +212,6 @@ class McpManager(
      */
     suspend fun resetOnServerRestart() {
         registrar.resetOnServerRestart()
-        toolList.reset()
         _serverStatuses.value = emptyMap()
     }
 

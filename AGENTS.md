@@ -891,7 +891,15 @@ custom sounds per notification group via Settings â†’ Appearance & Behavior
 - [x] Sidebar session pagination â€” `displayLimit` high-water mark on `SessionListState.Loaded`, `loadMoreSessions()` increments by 10, `resetDisplayLimit()` on init/switch, `clearAllSessions()` deletes all sessions except active, `ClearAllConfirmationDialog` with progress feedback, `SessionListFooter` with "X of Y sessions loaded" + "Load more" + "Clear all", `loadAllSessions` settings toggle
 - [x] ComposePanel.dispose() EDT hang fixed — all dispose paths (content disposer, ShutdownListener) now use `disposeActiveComposePanelAsync()` instead of synchronous EDT dispose; shutdown hook removed
 - [x] ChatViewModel.scope exposed as public val â€” ChatScreen uses `viewModel.scope.launch` for all ViewModel calls instead of composition-scoped `rememberCoroutineScope` (fixes CancellationException on long-running HTTP requests)
-- [x] Additional MIME types added to MimeTypes.kt â€” `.log`, `.env`, `.gitignore`, `.gitattributes`, `.editorconfig`, `.eslintrc`, `.prettierrc`, `.babelrc` and other common extensions now map to correct MIME types instead of `application/octet-stream`
+- [x] Additional MIME types added to MimeTypes.kt — `.log`, `.env`, `.gitignore`, `.gitattributes`, `.editorconfig`, `.eslintrc`, `.prettierrc`, `.babelrc` and other common extensions now map to correct MIME types instead of `application/octet-stream`
+- [x] `McpStatusBarWidget.McpIcon.paintIcon()` — removed `g2.dispose()` call that corrupted Swing rendering (the Graphics object is owned by the framework)
+- [x] `OpenCodeMcpPanel.generateToolPermissionsJson()` / `generateDiscoveredToolsJson()` — replaced hand-rolled string-concatenation JSON with `buildJsonObject` + `encodeToString` (prevents malformed JSON on special characters)
+- [x] `ToolRegistry.setToolEnabled()` — decoupled `enabled` from `permission` (disabling a tool no longer forces `DENY`; preserves `ASK` for re-enable)
+- [x] Removed dead code: `ChatViewModel.loadCommandHistory()`, `McpManager._deprecatedTools` + deprecated `tools` property, `OpenCodeService.emptyMcpTools` + deprecated `mcpTools`, `ProcessManager.close()`, `McpManager.disconnectIntellij()` + `retryIntellij()`
+- [x] Removed no-op `onAutoConnectChanged` callback from `ConnectionSplashScreen` + `ChatScreen` (setting is persisted directly by the splash screen)
+- [x] Cleaned up dead signal handler branches in `ChatViewModel` (Error, TodoUpdated, SessionCreated, SessionIdle, SessionError, SessionCompacted — informational/exhaustiveness-only)
+- [x] `McpConfigWriter` — extracted shared `writeConfig()` method to eliminate ~60 lines of duplicated read-modify-write boilerplate between `write()`, `writeToolPermissions()`, and `clearAllEntries()`
+- [x] Unified `ToolPermissionInfo` with `ToolInfo` — removed `ToolPermissionInfo` data class from `OpenCodeMcpPanel`; panel now uses `ToolInfo` + `ToolPermission` + `ToolSource` from `ToolRegistry` directly â€” `.log`, `.env`, `.gitignore`, `.gitattributes`, `.editorconfig`, `.eslintrc`, `.prettierrc`, `.babelrc` and other common extensions now map to correct MIME types instead of `application/octet-stream`
 
 
 ---
@@ -930,7 +938,7 @@ The tool permissions feature (TDD Â§10) is partially implemented. What works: 
 
 **Known gaps:**
 - `OpenCodeSettingsConfigurable.discoverMcpTools()` is a **stub** returning `emptyMap()` â€” the existing `McpToolDiscovery` class is NOT wired into the settings flow
-- Two parallel data models: `ToolInfo` (in `ToolRegistry.kt`) vs `ToolPermissionInfo` (inner class of `OpenCodeSettingsPanel.kt`) â€” these should be unified
+- **FIXED** ~~Two parallel data models~~: `ToolPermissionInfo` removed; `OpenCodeMcpPanel` uses `ToolInfo` directly: `ToolInfo` (in `ToolRegistry.kt`) vs `ToolPermissionInfo` (inner class of `OpenCodeSettingsPanel.kt`) â€” these should be unified
 - Missing UI features: Enable All/Disable All buttons, filter/search bar, source dropdown, "N/M enabled" counter, per-server grouping headers (e.g., "MCP: intellij (12 tools)"), restart warning
 - Tool states are NOT persisted in `OpenCodeSettingsState` â€” must re-discover on each settings panel open
 - `McpManager` does not expose connected server SSE URLs for `McpToolDiscovery` to use

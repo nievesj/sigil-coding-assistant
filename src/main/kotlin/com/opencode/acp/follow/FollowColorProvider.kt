@@ -2,6 +2,10 @@
 
 import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Maps ToolKind → highlight color and inlay label via a registry pattern.
@@ -78,6 +82,108 @@ object FollowColorProvider {
 
     fun getInlayLabel(kind: ToolKind): String? {
         return colorConfigs[kind]?.inlayLabel
+    }
+
+    /**
+     * Compose a rich inlay label with agent name, model name, action context, and duration.
+     *
+     * Format: "Agent · Reading file.kt lines 42-58 (0.3s)"
+     * Falls back to the static inlayLabel when no extra context is available.
+     */
+    fun composeInlayLabel(
+        kind: ToolKind,
+        agentName: String? = null,
+        modelName: String? = null,
+        input: JsonObject? = null,
+        startTimeMs: Long? = null,
+        currentTimeMs: Long = System.currentTimeMillis(),
+    ): String {
+        val action = when (kind) {
+            ToolKind.READ -> "Reading"
+            ToolKind.EDIT -> "Editing"
+            ToolKind.SEARCH -> "Searching"
+            ToolKind.EXECUTE -> "Running"
+            ToolKind.DELETE -> "Deleting"
+            ToolKind.MOVE -> "Moving"
+            ToolKind.FETCH -> "Fetching"
+            ToolKind.OTHER -> "Working"
+            else -> return getInlayLabel(kind) ?: ""
+        }
+
+        // Build context suffix from input
+        val context = when (kind) {
+            ToolKind.READ, ToolKind.EDIT -> {
+                val path = input?.getString("filePath")
+                    ?: input?.getString("file_path")
+                    ?: input?.getString("path")
+                val fileName = path?.substringAfterLast('/')?.substringAfterLast('\\')
+                val startLine = input?.get("startLine")?.jsonPrimitive?.intOrNull
+                val endLine = input?.get("endLine")?.jsonPrimitive?.intOrNull
+                // For edits, compute delta
+                val delta = if (kind == ToolKind.EDIT) computeEditDelta(input) else null
+                buildString {
+                    if (fileName != null) append(fileName)
+                    if (startLine != null && endLine != null && startLine > 0) {
+                        append(" L$startLine-$endLine")
+                    }
+                    if (delta != null) append(" $delta")
+                }.takeIf { it.isNotEmpty() }
+            }
+            ToolKind.SEARCH -> {
+                val query = input?.getString("pattern") ?: input?.getString("query")
+                query?.let { "\"${it.take(40)}\"" }
+            }
+            ToolKind.EXECUTE -> {
+                val command = input?.getString("command")?.take(40)
+                command?.let { "`$it`" }
+            }
+            else -> null
+        }
+
+        // Build duration suffix
+        val duration = if (startTimeMs != null && kind != ToolKind.EXECUTE) {
+            val elapsed = (currentTimeMs - startTimeMs) / 1000.0
+            if (elapsed >= 0.1) "(%.1fs)".format(elapsed) else null
+        } else null
+
+        // Compose: "Agent · Action" or "Agent · Action context" or "Agent · Action (0.3s)"
+        val who = agentName ?: "Agent"
+        val model = modelName?.let { " · $it" } ?: ""
+        return buildString {
+            append(who)
+            append(model)
+            append(" · ")
+            append(action)
+            if (context != null) append(" $context")
+            if (duration != null) append(" $duration")
+        }
+    }
+
+    /** Extract edit delta string like "(+12 -3 lines)" from tool input. */
+    private fun computeEditDelta(input: JsonObject?): String? {
+        if (input == null) return null
+        val oldString = input.getString("oldString")
+            ?: input.getString("old_string")
+            ?: input.getString("old")
+        val newString = input.getString("newString")
+            ?: input.getString("new_string")
+            ?: input.getString("new")
+        return if (oldString != null && newString != null) {
+            val additions = newString.lines().size
+            val deletions = oldString.lines().size
+            "(+${additions} -${deletions} lines)"
+        } else {
+            val content = input.getString("content")
+            if (content != null) "(+${content.lines().size} lines)" else null
+        }
+    }
+
+    private fun JsonObject.getString(key: String): String? {
+        return try {
+            this[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** Returns all highlightable ToolKind entries (those with non-null configs). */

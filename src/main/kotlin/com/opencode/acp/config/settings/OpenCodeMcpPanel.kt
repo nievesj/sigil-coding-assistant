@@ -1,11 +1,13 @@
 ﻿package com.opencode.acp.config.settings
 
-import com.agentclientprotocol.model.ToolKind
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.FormBuilder
+import com.opencode.acp.mcp.ToolInfo
+import com.opencode.acp.mcp.ToolPermission
+import com.opencode.acp.mcp.ToolSource
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
@@ -18,16 +20,23 @@ import javax.swing.JComboBox
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 
 /**
  * MCP Integration and Tool Permissions settings panel.
  * Displayed as a child page under "OpenCode" in the Settings tree.
  */
 class OpenCodeMcpPanel {
+
+    private val json = Json { ignoreUnknownKeys = true }
 
     // ── MCP Integration ────────────────────────────────────────────────────
 
@@ -131,7 +140,7 @@ class OpenCodeMcpPanel {
     private var currentSourceFilter: String = "All tools"
 
     /** All discovered tools data. */
-    private val allToolsData: MutableMap<String, ToolPermissionInfo> = mutableMapOf()
+    private val allToolsData: MutableMap<String, ToolInfo> = mutableMapOf()
 
     /** Snapshot of persisted tool permissions JSON from setState(), used by isModified(). */
     var savedToolPermissionsJson: String = ""
@@ -184,7 +193,7 @@ class OpenCodeMcpPanel {
             val visibleTools = toolRowPanels.keys.toSet()
             for (toolName in visibleTools) {
                 val current = allToolsData[toolName] ?: continue
-                val newPermission = if (current.permission == "deny") "allow" else current.permission
+                val newPermission = if (current.permission == ToolPermission.DENY) ToolPermission.ALLOW else current.permission
                 allToolsData[toolName] = current.copy(enabled = true, permission = newPermission)
             }
             applyFilters()
@@ -195,7 +204,7 @@ class OpenCodeMcpPanel {
             val visibleTools = toolRowPanels.keys.toSet()
             for (toolName in visibleTools) {
                 val current = allToolsData[toolName] ?: continue
-                allToolsData[toolName] = current.copy(enabled = false, permission = "deny")
+                allToolsData[toolName] = current.copy(enabled = false, permission = ToolPermission.DENY)
             }
             applyFilters()
             updateToolCountLabel()
@@ -253,7 +262,7 @@ class OpenCodeMcpPanel {
         }
     }
 
-    fun updateToolPermissions(tools: Map<String, ToolPermissionInfo>) {
+    fun updateToolPermissions(tools: Map<String, ToolInfo>) {
         allToolsData.clear()
         allToolsData.putAll(tools)
         updateSourceFilterDropdown(tools)
@@ -261,12 +270,12 @@ class OpenCodeMcpPanel {
         updateToolCountLabel()
     }
 
-    private fun updateSourceFilterDropdown(tools: Map<String, ToolPermissionInfo>) {
+    private fun updateSourceFilterDropdown(tools: Map<String, ToolInfo>) {
         val previousSelection = sourceFilterCombo.selectedItem?.toString() ?: "All tools"
         sourceFilterCombo.removeAllItems()
         sourceFilterCombo.addItem("All tools")
         sourceFilterCombo.addItem("Built-in only")
-        val mcpServers = tools.filter { it.value.source == "mcp" }
+        val mcpServers = tools.filter { it.value.source == ToolSource.MCP }
             .map { it.value.serverName }.distinct().sorted()
         for (server in mcpServers) {
             sourceFilterCombo.addItem("MCP: $server")
@@ -286,10 +295,10 @@ class OpenCodeMcpPanel {
         val filteredTools = allToolsData.entries.filter { (toolName, info) ->
             val sourceMatch = when (currentSourceFilter) {
                 "All tools" -> true
-                "Built-in only" -> info.source == "builtin"
+                "Built-in only" -> info.source == ToolSource.BUILTIN
                 else -> {
                     val serverFilter = currentSourceFilter.removePrefix("MCP: ")
-                    info.source == "mcp" && info.serverName == serverFilter
+                    info.source == ToolSource.MCP && info.serverName == serverFilter
                 }
             }
             val queryMatch = currentFilterQuery.isBlank() ||
@@ -298,8 +307,8 @@ class OpenCodeMcpPanel {
             sourceMatch && queryMatch
         }.associate { it.key to it.value }
 
-        val builtinTools = filteredTools.filter { it.value.source == "builtin" }
-        val mcpTools = filteredTools.filter { it.value.source == "mcp" }
+        val builtinTools = filteredTools.filter { it.value.source == ToolSource.BUILTIN }
+        val mcpTools = filteredTools.filter { it.value.source == ToolSource.MCP }
 
         if (builtinTools.isNotEmpty()) {
             toolPermissionsPanel.add(createToolSection("Built-in Tools (${builtinTools.size})", builtinTools))
@@ -319,7 +328,7 @@ class OpenCodeMcpPanel {
         toolCountLabel.text = "$enabledCount / $totalCount tools enabled"
     }
 
-    private fun createToolSection(title: String, tools: Map<String, ToolPermissionInfo>): JPanel {
+    private fun createToolSection(title: String, tools: Map<String, ToolInfo>): JPanel {
         val sectionPanel = JPanel(BorderLayout()).apply {
             border = BorderFactory.createTitledBorder(title)
         }
@@ -333,7 +342,7 @@ class OpenCodeMcpPanel {
         return sectionPanel
     }
 
-    private fun createToolRow(toolName: String, info: ToolPermissionInfo): JPanel {
+    private fun createToolRow(toolName: String, info: ToolInfo): JPanel {
         val row = JPanel(GridBagLayout()).apply {
             maximumSize = Dimension(Int.MAX_VALUE, 45)
             border = BorderFactory.createEmptyBorder(2, 5, 2, 5)
@@ -349,7 +358,7 @@ class OpenCodeMcpPanel {
                 val enabled = isSelected
                 toolEnabledCheckboxes[toolName]?.isSelected = enabled
                 allToolsData[toolName]?.let { old ->
-                    allToolsData[toolName] = old.copy(enabled = enabled, permission = if (enabled) "allow" else "deny")
+                    allToolsData[toolName] = old.copy(enabled = enabled, permission = if (enabled) ToolPermission.ALLOW else ToolPermission.DENY)
                 }
                 toolPermissionComboBoxes[toolName]?.let { combo -> combo.selectedItem = if (enabled) "allow" else "deny" }
                 updateToolCountLabel()
@@ -364,12 +373,12 @@ class OpenCodeMcpPanel {
         textPanel.add(descLabel)
 
         val permissionCombo = JComboBox(arrayOf("allow", "ask", "deny")).apply {
-            selectedItem = info.permission
+            selectedItem = info.permission.toActionString()
             preferredSize = Dimension(80, 25)
             toolTipText = "Permission level for $toolName"
             addActionListener {
-                val permission = selectedItem?.toString() ?: "allow"
-                val enabled = permission != "deny"
+                val permission = ToolPermission.fromActionString(selectedItem?.toString() ?: "allow")
+                val enabled = permission != ToolPermission.DENY
                 allToolsData[toolName]?.let { old ->
                     allToolsData[toolName] = old.copy(permission = permission, enabled = enabled)
                 }
@@ -385,7 +394,7 @@ class OpenCodeMcpPanel {
         return row
     }
 
-    fun getAllToolPermissions(): Map<String, Pair<Boolean, String>> {
+    fun getAllToolPermissions(): Map<String, Pair<Boolean, ToolPermission>> {
         return allToolsData.mapValues { (_, info) -> Pair(info.enabled, info.permission) }
     }
 
@@ -409,30 +418,25 @@ class OpenCodeMcpPanel {
         }
     }
 
-    data class ToolPermissionInfo(
-        val description: String,
-        val source: String,
-        val serverName: String = "builtin",
-        val enabled: Boolean,
-        val permission: String
-    )
-
-    private fun loadToolPermissionsFromSettings(json: String) {
-        if (json.isBlank()) return
+    private fun loadToolPermissionsFromSettings(jsonStr: String) {
+        if (jsonStr.isBlank()) return
         try {
-            val obj = kotlinx.serialization.json.Json.parseToJsonElement(json).jsonObject
+            val obj = kotlinx.serialization.json.Json.parseToJsonElement(jsonStr).jsonObject
             for ((toolName, element) in obj) {
                 val toolObj = element.jsonObject
                 val enabled = toolObj["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
-                val permission = toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow"
+                val permission = ToolPermission.fromActionString(toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow")
                 val existing = allToolsData[toolName]
                 if (existing != null) {
                     allToolsData[toolName] = existing.copy(enabled = enabled, permission = permission)
                 } else {
-                    allToolsData[toolName] = ToolPermissionInfo(
+                    val inferredSource = if (toolName.contains("_")) ToolSource.MCP else ToolSource.BUILTIN
+                    val inferredServer = toolName.substringBefore("_", "builtin")
+                    allToolsData[toolName] = ToolInfo.create(
+                        name = toolName,
                         description = toolName,
-                        source = if (toolName.contains("_")) "mcp" else "builtin",
-                        serverName = toolName.substringBefore("_", "builtin"),
+                        source = inferredSource,
+                        serverName = inferredServer,
                         enabled = enabled,
                         permission = permission
                     )
@@ -445,11 +449,15 @@ class OpenCodeMcpPanel {
 
     fun generateToolPermissionsJson(): String {
         if (allToolsData.isEmpty()) return ""
-        val entries = allToolsData.entries.joinToString(",") { (toolName, info) ->
-            val safeName = kotlinx.serialization.json.JsonPrimitive(toolName).toString()
-            "$safeName:{\"enabled\":${info.enabled},\"permission\":\"${info.permission}\"}"
+        val root = buildJsonObject {
+            for ((toolName, info) in allToolsData) {
+                put(toolName, buildJsonObject {
+                    put("enabled", info.enabled)
+                    put("permission", info.permission.toActionString())
+                })
+            }
         }
-        return "{$entries}"
+        return json.encodeToString(JsonObject.serializer(), root)
     }
 
     /**
@@ -457,36 +465,40 @@ class OpenCodeMcpPanel {
      */
     fun generateDiscoveredToolsJson(): String {
         if (allToolsData.isEmpty()) return ""
-        val entries = allToolsData.entries.map { (toolName, info) ->
-            val safeName = kotlinx.serialization.json.JsonPrimitive(toolName).toString()
-            val safeDesc = kotlinx.serialization.json.JsonPrimitive(info.description).toString()
-            val safeSource = kotlinx.serialization.json.JsonPrimitive(info.source).toString()
-            val safeServer = kotlinx.serialization.json.JsonPrimitive(info.serverName).toString()
-            "$safeName:{\"description\":$safeDesc,\"source\":$safeSource,\"serverName\":$safeServer}"
+        val root = buildJsonObject {
+            for ((toolName, info) in allToolsData) {
+                put(toolName, buildJsonObject {
+                    put("description", info.description)
+                    put("source", info.source.name.lowercase())
+                    put("serverName", info.serverName)
+                })
+            }
         }
-        return "{${entries.joinToString(",")}}"
+        return json.encodeToString(JsonObject.serializer(), root)
     }
 
     /**
      * Load tools from discovered tools cache JSON.
      */
-    private fun loadDiscoveredToolsCache(json: String) {
-        if (json.isBlank()) return
+    private fun loadDiscoveredToolsCache(jsonStr: String) {
+        if (jsonStr.isBlank()) return
         try {
-            val obj = kotlinx.serialization.json.Json.parseToJsonElement(json).jsonObject
+            val obj = kotlinx.serialization.json.Json.parseToJsonElement(jsonStr).jsonObject
             for ((toolName, element) in obj) {
                 val toolObj = element.jsonObject
                 val description = toolObj["description"]?.jsonPrimitive?.contentOrNull ?: toolName
-                val source = toolObj["source"]?.jsonPrimitive?.contentOrNull ?: "builtin"
+                val sourceStr = toolObj["source"]?.jsonPrimitive?.contentOrNull ?: "builtin"
+                val source = if (sourceStr == "mcp") ToolSource.MCP else ToolSource.BUILTIN
                 val serverName = toolObj["serverName"]?.jsonPrimitive?.contentOrNull ?: "builtin"
                 // Don't overwrite if already in allToolsData (from live discovery)
                 if (!allToolsData.containsKey(toolName)) {
-                    allToolsData[toolName] = ToolPermissionInfo(
+                    allToolsData[toolName] = ToolInfo.create(
+                        name = toolName,
                         description = description,
                         source = source,
                         serverName = serverName,
                         enabled = true,
-                        permission = "allow"
+                        permission = ToolPermission.ALLOW
                     )
                 }
             }

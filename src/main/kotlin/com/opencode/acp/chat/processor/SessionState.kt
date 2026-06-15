@@ -694,7 +694,11 @@ class SessionState(
                             // drop the rest of the ToolUse event processing.
                             runCatching {
                                 EditorFollowManager.getInstance(project).followToolCall(
-                                    project, followFilePath, startLine, endLine, updatedKind
+                                    project, followFilePath, startLine, endLine, updatedKind,
+                                    agentName = ctx.activeAgentName,
+                                    modelName = ctx.modelID,
+                                    input = event.input,
+                                    startTimeMs = existingPill.startTimeMs,
                                 )
                             }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (duplicate-ToolUse path)" } }
                         }
@@ -735,6 +739,7 @@ class SessionState(
                     status = ToolCallStatus.IN_PROGRESS,
                     input = event.input,
                     metadata = event.metadata,
+                    startTimeMs = System.currentTimeMillis(),
                 )
                 ctx.toolCallPills[event.toolCallId] = pill
                 ctx.toolCallIndex[event.toolCallId] = msgId
@@ -747,7 +752,11 @@ class SessionState(
                     val (startLine, endLine) = extractLineRange(event.input)
                     runCatching {
                         EditorFollowManager.getInstance(project).followToolCall(
-                            project, followFilePath, startLine, endLine, toolKind
+                            project, followFilePath, startLine, endLine, toolKind,
+                            agentName = ctx.activeAgentName,
+                            modelName = ctx.modelID,
+                            input = event.input,
+                            startTimeMs = pill.startTimeMs,
                         )
                     }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolUse path)" } }
                 }
