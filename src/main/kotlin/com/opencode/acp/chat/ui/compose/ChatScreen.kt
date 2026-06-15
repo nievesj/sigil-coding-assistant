@@ -36,6 +36,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ChatInputState
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.model.ReadyState
 import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.model.SidebarTab
 import com.opencode.acp.chat.model.AttachedFile
@@ -133,6 +134,7 @@ fun
 ) {
     val messages by viewModel.messages.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
+    val readyState by viewModel.readyState.collectAsState()
     val controlState by viewModel.controlState.collectAsState()
     val inputState by viewModel.inputState.collectAsState()
     val isStreaming = inputState is ChatInputState.Streaming
@@ -289,10 +291,12 @@ fun
     }
 
     Box(Modifier.fillMaxSize()) {
-        // Show splash screen when not connected
-        if (connectionState != ConnectionState.CONNECTED) {
+        // Show splash screen when not fully ready
+        val isFullyReady = connectionState == ConnectionState.CONNECTED && readyState == ReadyState.READY
+        if (!isFullyReady) {
             ConnectionSplashScreen(
                 connectionState = connectionState,
+                readyState = readyState,
                 onConnect = { 
                     viewModel.scope.launch { viewModel.connect(project.basePath) }
                 },
@@ -301,6 +305,9 @@ fun
                 },
                 onStop = { 
                     viewModel.stopConnection()
+                },
+                onCancel = {
+                    viewModel.cancelInitialization()
                 },
                 onAutoConnectChanged = { enabled ->
                     // Auto-connect setting is persisted in the settings

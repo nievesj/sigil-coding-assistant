@@ -7,27 +7,14 @@ import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.project.ProjectManager
 import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.mcp.McpConfigWriter
-import com.opencode.acp.mcp.McpToolDiscovery
 import com.opencode.acp.mcp.ToolPermission
 import io.github.oshai.kotlinlogging.KotlinLogging
-import io.ktor.client.HttpClient
-import io.ktor.client.engine.java.Java
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.plugins.HttpTimeout
-import io.ktor.client.plugins.timeout
-import io.ktor.serialization.kotlinx.json.json
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
 import java.nio.file.Path
 import java.nio.file.Paths
 import javax.swing.JComponent
@@ -155,50 +142,83 @@ class OpenCodeMcpConfigurable : Configurable {
     }
 
     /**
-     * Discover available tools from OpenCode and MCP servers.
+     * Discover available tools using ToolRegistry (single discovery path).
      */
     private fun discoverTools() {
         val settings = OpenCodeSettingsState.getInstance()
         val p = this.panel ?: return
         if (p.isDiscovering) return
 
-        logger.info { "[ACP] Starting tool discovery on port ${settings.port}" }
+        // Find the OpenCodeService to access toolRegistry
+        val project = ProjectManager.getInstance().openProjects.firstOrNull()
+        if (project == null) {
+            p.showToolPermissionsStatus("No open project found.", false)
+            return
+        }
+        val service = try {
+            project.service<OpenCodeService>()
+        } catch (e: Exception) {
+            p.showToolPermissionsStatus("OpenCode service not available.", false)
+            return
+        }
+
+        val registry = service.toolRegistry
+        if (registry == null) {
+            p.showToolPermissionsStatus("OpenCode server is not running. Start it first.", false)
+            return
+        }
+
+        logger.info { "[ACP] Starting tool discovery via ToolRegistry" }
         p.isDiscovering = true
         p.discoverToolsButton.isEnabled = false
         p.discoverToolsButton.text = "Discovering..."
 
-        val port = settings.port
-        val enableIntellijMcp = settings.enableIntellijMcp
-        val mcpServerUrl = settings.mcpServerUrl
-        val additionalMcpServers = settings.additionalMcpServers
-        val toolPermissions = settings.toolPermissions
-        // Capture panel ref and modality at click time — safe for cross-thread use
         val panelRef = p
         val modality = ModalityState.stateForComponent(panelRef.panel)
 
-        ApplicationManager.getApplication().executeOnPooledThread {
+        service.scope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
-                val (tools, errors) = discoverToolsWithHttp(port, enableIntellijMcp, mcpServerUrl, additionalMcpServers, toolPermissions)
+                val baseUrl = "http://127.0.0.1:${service.connectionManager.port}"
+                val mcpUrls = service.mcpManager?.getServerUrls() ?: emptyMap()
+                val tools = registry.discoverAll(baseUrl, mcpUrls)
+
+                // Merge persisted permissions after discovery
+                val persisted = parsePersistedToolPermissions(settings.toolPermissions)
+                if (persisted.isNotEmpty()) {
+                    registry.loadPermissions(persisted.mapValues { (_, pair) ->
+                        val (_, permissionStr) = pair
+                        ToolPermission.fromActionString(permissionStr)
+                    })
+                }
+
+                val allTools = registry.getAllTools()
+
                 ApplicationManager.getApplication().invokeLater({
-                    logger.info { "[ACP] Tool discovery UI update: ${tools.size} tools, ${errors.size} errors" }
-                    panelRef.updateToolPermissions(tools)
+                    // Convert ToolInfo to the format the panel expects
+                    val toolPermissionMap = allTools.associate { tool ->
+                        tool.name to OpenCodeMcpPanel.ToolPermissionInfo(
+                            description = tool.description,
+                            source = tool.source.name.lowercase(),
+                            serverName = tool.serverName,
+                            enabled = tool.enabled,
+                            permission = tool.permission.toActionString()
+                        )
+                    }
+                    panelRef.updateToolPermissions(toolPermissionMap)
                     panelRef.discoverToolsButton.isEnabled = true
                     panelRef.discoverToolsButton.text = "Discover Tools"
                     panelRef.isDiscovering = false
                     // Cache discovered tools for next settings dialog open
                     settings.discoveredToolsJson = panelRef.generateDiscoveredToolsJson()
-                    if (tools.isEmpty() && errors.isEmpty()) {
+                    if (allTools.isEmpty()) {
                         panelRef.showToolPermissionsStatus(
-                            "No tools found. Ensure the OpenCode server is running on port $port.", false)
-                    } else if (errors.isNotEmpty()) {
-                        panelRef.showToolPermissionsStatus(
-                            "Discovered ${tools.size} tools. Errors: ${errors.joinToString("; ")}", tools.isNotEmpty())
+                            "No tools found. Ensure the OpenCode server is running on port ${settings.port}.", false)
                     } else {
-                        panelRef.showToolPermissionsStatus("Discovered ${tools.size} tools successfully.", true)
+                        panelRef.showToolPermissionsStatus("Discovered ${allTools.size} tools successfully.", true)
                     }
                 }, modality)
             } catch (e: Exception) {
-                logger.error(e) { "[ACP] Failed to discover tools" }
+                logger.error(e) { "[ACP] Failed to discover tools via ToolRegistry" }
                 ApplicationManager.getApplication().invokeLater({
                     panelRef.discoverToolsButton.isEnabled = true
                     panelRef.discoverToolsButton.text = "Discover Tools"
@@ -206,143 +226,6 @@ class OpenCodeMcpConfigurable : Configurable {
                     panelRef.showToolPermissionsStatus("Failed to discover tools: ${e.message}", false)
                 }, modality)
             }
-        }
-    }
-
-    /**
-     * Discover tools using plain java.net.HttpURLConnection for built-in tools
-     * and Ktor for MCP tools.
-     */
-    private fun discoverToolsWithHttp(
-        port: Int,
-        enableIntellijMcp: Boolean,
-        mcpServerUrl: String,
-        additionalMcpServers: String,
-        toolPermissions: String
-    ): Pair<Map<String, OpenCodeMcpPanel.ToolPermissionInfo>, List<String>> {
-        val tools = mutableMapOf<String, OpenCodeMcpPanel.ToolPermissionInfo>()
-        val errors = mutableListOf<String>()
-        val baseUrl = "http://127.0.0.1:$port"
-        val persisted = parsePersistedToolPermissions(toolPermissions)
-
-        // Discover built-in tools from OpenCode
-        try {
-            logger.info { "[ACP] Fetching built-in tools from $baseUrl/experimental/tool/ids" }
-            val conn = java.net.URI("$baseUrl/experimental/tool/ids").toURL().openConnection() as HttpURLConnection
-            conn.connectTimeout = 3000
-            conn.readTimeout = 5000
-            conn.requestMethod = "GET"
-
-            val responseCode = conn.responseCode
-            logger.info { "[ACP] OpenCode server responded with HTTP $responseCode" }
-
-            if (responseCode == 200) {
-                val reader = BufferedReader(InputStreamReader(conn.inputStream))
-                val body = reader.readText()
-                reader.close()
-
-                val toolIds = try {
-                    val element = json.parseToJsonElement(body)
-                    // The server returns a bare JSON array: ["bash", "read", ...]
-                    val array = if (element is JsonArray) {
-                        element
-                    } else {
-                        // Fallback: wrapped format {"value": [...]}
-                        element.jsonObject["value"]?.jsonArray ?: buildJsonArray {}
-                    }
-                    array.mapNotNull { it.jsonPrimitive.contentOrNull }
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] Failed to parse tool IDs response" }
-                    emptyList()
-                }
-
-                for (toolId in toolIds) {
-                    val prev = persisted[toolId]
-                    tools[toolId] = OpenCodeMcpPanel.ToolPermissionInfo(
-                        description = getBuiltinToolDescription(toolId),
-                        source = "builtin",
-                        serverName = "builtin",
-                        enabled = prev?.first ?: true,
-                        permission = prev?.second ?: "allow"
-                    )
-                }
-                logger.info { "[ACP] Discovered ${toolIds.size} built-in tools" }
-            } else {
-                errors.add("Built-in tools: HTTP $responseCode (expected 200)")
-            }
-            conn.disconnect()
-        } catch (e: Exception) {
-            logger.warn(e) { "[ACP] Failed to connect to OpenCode server at $baseUrl" }
-            errors.add("Cannot connect to OpenCode server at $baseUrl: ${e.message}")
-        }
-
-        // Discover MCP tools if enabled
-        if (enableIntellijMcp && mcpServerUrl.isNotBlank()) {
-            val (mcpTools, mcpError) = discoverMcpToolsWithHttp(mcpServerUrl, "intellij", persisted)
-            tools.putAll(mcpTools)
-            if (mcpError != null) errors.add(mcpError)
-        }
-
-        // Discover additional MCP servers
-        if (additionalMcpServers.isNotBlank()) {
-            try {
-                val array = Json.parseToJsonElement(additionalMcpServers).jsonArray
-                for (element in array) {
-                    val obj = element.jsonObject
-                    val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: continue
-                    val url = obj["url"]?.jsonPrimitive?.contentOrNull ?: continue
-                    if (name.isNotBlank() && url.isNotBlank()) {
-                        val (mcpTools, mcpError) = discoverMcpToolsWithHttp(url, name, persisted)
-                        tools.putAll(mcpTools)
-                        if (mcpError != null) errors.add(mcpError)
-                    }
-                }
-            } catch (e: Exception) {
-                errors.add("Additional MCP servers: ${e.message}")
-            }
-        }
-
-        return Pair(tools, errors)
-    }
-
-    /**
-     * Discover MCP tools using Ktor + McpToolDiscovery.
-     */
-    private fun discoverMcpToolsWithHttp(
-        serverUrl: String,
-        serverName: String,
-        persisted: Map<String, Pair<Boolean, String>>
-    ): Pair<Map<String, OpenCodeMcpPanel.ToolPermissionInfo>, String?> {
-        return try {
-            val client = HttpClient(Java) {
-                install(ContentNegotiation) {
-                    json(Json { ignoreUnknownKeys = true })
-                }
-                install(HttpTimeout) {
-                    connectTimeoutMillis = 3000
-                    requestTimeoutMillis = 5000
-                    socketTimeoutMillis = 5000
-                }
-            }
-            val discovery = McpToolDiscovery(client)
-            val toolDescriptors = runBlocking { discovery.discoverTools(serverUrl) }
-            val result = mutableMapOf<String, OpenCodeMcpPanel.ToolPermissionInfo>()
-            for (tool in toolDescriptors) {
-                val fullToolName = "${serverName}_${tool.name}"
-                val prev = persisted[fullToolName]
-                result[fullToolName] = OpenCodeMcpPanel.ToolPermissionInfo(
-                    description = tool.description,
-                    source = "mcp",
-                    serverName = serverName,
-                    enabled = prev?.first ?: true,
-                    permission = prev?.second ?: "allow"
-                )
-            }
-            client.close()
-            Pair(result, null)
-        } catch (e: Exception) {
-            logger.warn(e) { "[ACP] Failed to discover MCP tools from $serverUrl" }
-            Pair(emptyMap(), "MCP $serverName: ${e.message}")
         }
     }
 
@@ -361,33 +244,6 @@ class OpenCodeMcpConfigurable : Configurable {
             }
         } catch (e: Exception) {
             emptyMap()
-        }
-    }
-
-    /**
-     * Get a human-readable description for a built-in tool.
-     */
-    private fun getBuiltinToolDescription(toolId: String): String {
-        return when (toolId) {
-            "bash" -> "Execute shell commands"
-            "read" -> "Read file contents"
-            "glob" -> "Find files by pattern"
-            "grep" -> "Search file contents with regex"
-            "edit" -> "Edit files with string replacement"
-            "write" -> "Write new files"
-            "task" -> "Launch specialized agents"
-            "webfetch" -> "Fetch URLs and extract content"
-            "todowrite" -> "Manage task lists"
-            "websearch" -> "Search the web"
-            "skill" -> "Load specialized workflows"
-            "apply_patch" -> "Apply patches to files"
-            "council_session" -> "Multi-LLM consensus engine"
-            "auto_continue" -> "Toggle auto-continuation"
-            "ast_grep_search" -> "AST-aware code search"
-            "ast_grep_replace" -> "AST-aware code replacement"
-            "subtask" -> "Run child worker sessions"
-            "read_session" -> "Read conversation transcripts"
-            else -> "Built-in tool: $toolId"
         }
     }
 

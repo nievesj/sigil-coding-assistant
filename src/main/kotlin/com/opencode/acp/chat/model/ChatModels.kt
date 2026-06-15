@@ -218,6 +218,20 @@ enum class ConnectionState {
     ERROR
 }
 
+/**
+ * Readiness state for the UI transition to chat.
+ * Owned by ChatViewModel — gates the splash → chat transition
+ * alongside ConnectionState.CONNECTED.
+ */
+enum class ReadyState {
+    NOT_STARTED,           // initialization hasn't started
+    INITIALIZING_SERVICE,  // service.initialize() running (includes SSE start, MCP registration)
+    LOADING_AGENTS,        // fetching agent list
+    LOADING_PROVIDERS,     // fetching provider/model list
+    LOADING_MCP,           // discovering MCP tools via ToolRegistry
+    READY                  // everything loaded, UI can show
+}
+
 /** Permission response options (strongly typed). */
 enum class PermissionResponse(val optionId: String) {
     ALLOW_ONCE("once"),

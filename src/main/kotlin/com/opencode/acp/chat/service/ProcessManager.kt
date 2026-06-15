@@ -338,6 +338,24 @@ class ProcessManager(private val scope: CoroutineScope) {
     }
 
     /**
+     * Reset state for retry. Kills the running process and clears the
+     * initialized flag so the next initialize() call actually re-initializes.
+     * Used by ChatViewModel.retryConnection() to bypass the initialized guard.
+     */
+    fun resetForRetry() {
+        logger.info { "[ACP] ProcessManager.resetForRetry() called" }
+        val processToKill = openCodeProcess
+        openCodeProcess = null
+        if (processToKill != null) {
+            Thread({
+                killProcess(processToKill)
+            }, "opencode-kill-retry").apply { isDaemon = true; start() }
+        }
+        initialized = false
+        _connectionState.value = ConnectionState.DISCONNECTED
+    }
+
+    /**
      * Full shutdown: disconnect AND kill the opencode process.
      * Use this only for IDE shutdown (dispose) where we own the process
      * and should clean it up.
