@@ -40,11 +40,16 @@ class McpConfigWriter(
 ) {
 
     /**
-     * Write MCP server configurations to `.opencode/opencode.json`.
+     * Read-modify-write the opencode.json config file atomically.
      *
-     * @return true if the config was written successfully, false otherwise
+     * Handles the full lifecycle: ensure directory exists, read existing config
+     * (or start with empty object), apply the transform, add `$schema` if missing,
+     * and write atomically via temp file + rename.
+     *
+     * @param transform Receives the existing config JsonObject, returns the new config to write.
+     * @return true if written successfully, false on error.
      */
-    fun write(): Boolean {
+    private fun writeConfig(transform: (JsonObject) -> JsonObject): Boolean {
         return try {
             val opencodeDir = projectBasePath.resolve(".opencode")
             Files.createDirectories(opencodeDir)
@@ -70,35 +75,27 @@ class McpConfigWriter(
 
             val config = existingConfig ?: buildJsonObject {}
 
-            // Get the existing mcp section or start with empty object
-            val existingMcp = config["mcp"]?.jsonObject ?: buildJsonObject {}
+            // Apply the caller's transform to produce the new config
+            val newConfig = transform(config)
 
-            // Build new mcp entries from settings
-            val newMcp = buildMcpEntries(existingMcp)
-
-            // Merge: start with existing config, replace/add mcp section
-            val mergedConfig = buildJsonObject {
-                // Copy all existing keys except mcp
-                for ((key, value) in config) {
-                    if (key != "mcp" && key != "\$schema") {
+            // Add $schema if not present
+            val finalConfig = if (!newConfig.containsKey("\$schema")) {
+                buildJsonObject {
+                    for ((key, value) in newConfig) {
                         put(key, value)
                     }
-                }
-                // Add $schema if not present
-                if (!config.containsKey("\$schema")) {
                     put("\$schema", "https://opencode.ai/config.json")
                 }
-                // Add/replace mcp section
-                put("mcp", newMcp)
+            } else {
+                newConfig
             }
 
             // Write atomically via temp file
             val tempFile = Files.createTempFile(opencodeDir, "opencode.json.", ".tmp")
             try {
                 val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
-                Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), mergedConfig))
+                Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), finalConfig))
                 Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-                logger.info { "[ACP] McpConfigWriter: wrote MCP config to $configFile" }
                 true
             } catch (e: Exception) {
                 // Clean up temp file on failure
@@ -106,9 +103,40 @@ class McpConfigWriter(
                 throw e
             }
         } catch (e: Exception) {
-            logger.error(e) { "[ACP] McpConfigWriter: failed to write MCP config" }
+            logger.error(e) { "[ACP] McpConfigWriter: failed to write config" }
             false
         }
+    }
+
+    /**
+     * Write MCP server configurations to `.opencode/opencode.json`.
+     *
+     * @return true if the config was written successfully, false otherwise
+     */
+    fun write(): Boolean {
+        val success = writeConfig { config ->
+            // Get the existing mcp section or start with empty object
+            val existingMcp = config["mcp"]?.jsonObject ?: buildJsonObject {}
+
+            // Build new mcp entries from settings
+            val newMcp = buildMcpEntries(existingMcp)
+
+            // Merge: start with existing config, replace/add mcp section
+            buildJsonObject {
+                // Copy all existing keys except mcp and $schema
+                for ((key, value) in config) {
+                    if (key != "mcp" && key != "\$schema") {
+                        put(key, value)
+                    }
+                }
+                // Add/replace mcp section
+                put("mcp", newMcp)
+            }
+        }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: wrote MCP config" }
+        }
+        return success
     }
 
     /**
@@ -195,31 +223,7 @@ class McpConfigWriter(
      * @return true if the config was written successfully, false otherwise
      */
     fun writeToolPermissions(permissions: Map<String, ToolPermission>, agentName: String = "orchestrator"): Boolean {
-        return try {
-            val opencodeDir = projectBasePath.resolve(".opencode")
-            Files.createDirectories(opencodeDir)
-
-            val configFile = opencodeDir.resolve("opencode.json")
-
-            // Read existing config or start with empty object
-            val existingConfig = if (Files.exists(configFile)) {
-                try {
-                    val content = Files.readString(configFile)
-                    if (content.isNotBlank()) {
-                        Json.parseToJsonElement(content).jsonObject
-                    } else {
-                        null
-                    }
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] McpConfigWriter: failed to parse existing config, starting fresh" }
-                    null
-                }
-            } else {
-                null
-            }
-
-            val config = existingConfig ?: buildJsonObject {}
-
+        val success = writeConfig { config ->
             // Get existing agent section or start with empty object
             val existingAgents = config["agent"]?.jsonObject ?: buildJsonObject {}
 
@@ -257,38 +261,21 @@ class McpConfigWriter(
             }
 
             // Merge: start with existing config, replace/add agent section
-            val mergedConfig = buildJsonObject {
-                // Copy all existing keys except agent
+            buildJsonObject {
+                // Copy all existing keys except agent and $schema
                 for ((key, value) in config) {
                     if (key != "agent" && key != "\$schema") {
                         put(key, value)
                     }
                 }
-                // Add $schema if not present
-                if (!config.containsKey("\$schema")) {
-                    put("\$schema", "https://opencode.ai/config.json")
-                }
                 // Add/replace agent section
                 put("agent", updatedAgents)
             }
-
-            // Write atomically via temp file
-            val tempFile = Files.createTempFile(opencodeDir, "opencode.json.", ".tmp")
-            try {
-                val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
-                Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), mergedConfig))
-                Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-                logger.info { "[ACP] McpConfigWriter: wrote tool permissions to $configFile" }
-                true
-            } catch (e: Exception) {
-                // Clean up temp file on failure
-                try { Files.deleteIfExists(tempFile) } catch (_: Exception) {}
-                throw e
-            }
-        } catch (e: Exception) {
-            logger.error(e) { "[ACP] McpConfigWriter: failed to write tool permissions" }
-            false
         }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: wrote tool permissions" }
+        }
+        return success
     }
 
     /**
@@ -325,21 +312,14 @@ class McpConfigWriter(
      * @return true if the config was written successfully, false otherwise
      */
     fun clearAllEntries(): Boolean {
-        return try {
-            val opencodeDir = projectBasePath.resolve(".opencode")
-            val configFile = opencodeDir.resolve("opencode.json")
+        // If no config file exists, nothing to clear
+        val configFile = projectBasePath.resolve(".opencode").resolve("opencode.json")
+        if (!Files.exists(configFile)) {
+            return true
+        }
 
-            if (!Files.exists(configFile)) {
-                return true
-            }
-
-            val content = Files.readString(configFile)
-            if (content.isBlank()) {
-                return true
-            }
-
-            val config = Json.parseToJsonElement(content).jsonObject
-            val existingMcp = config["mcp"]?.jsonObject ?: return true
+        val success = writeConfig { config ->
+            val existingMcp = config["mcp"]?.jsonObject ?: return@writeConfig config
 
             // Determine plugin-managed keys (same logic as write())
             val pluginManagedKeys = mutableSetOf(ChatConstants.MCP_SERVER_NAME_INTELLIJ)
@@ -364,7 +344,7 @@ class McpConfigWriter(
             }
 
             // Rebuild config with cleaned mcp
-            val cleanedConfig = buildJsonObject {
+            buildJsonObject {
                 for ((key, value) in config) {
                     if (key != "mcp") {
                         put(key, value)
@@ -372,21 +352,10 @@ class McpConfigWriter(
                 }
                 put("mcp", cleanedMcp)
             }
-
-            val tempFile = Files.createTempFile(opencodeDir, "opencode.json.", ".tmp")
-            try {
-                val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
-                Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), cleanedConfig))
-                Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-                logger.info { "[ACP] McpConfigWriter: cleared plugin MCP entries from $configFile" }
-                true
-            } catch (e: Exception) {
-                try { Files.deleteIfExists(tempFile) } catch (_: Exception) {}
-                throw e
-            }
-        } catch (e: Exception) {
-            logger.error(e) { "[ACP] McpConfigWriter: failed to clear MCP config" }
-            false
         }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: cleared plugin MCP entries" }
+        }
+        return success
     }
 }

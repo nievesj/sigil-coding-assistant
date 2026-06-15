@@ -46,11 +46,6 @@ class McpManager(
     private val _serverStatuses = MutableStateFlow<Map<String, McpConnectionStatus>>(emptyMap())
     /** Per-server connection status. Key = server name. */
     val serverStatuses: StateFlow<Map<String, McpConnectionStatus>> = _serverStatuses.asStateFlow()
-    /** @deprecated Use ToolRegistry.tools instead. */
-    @Deprecated("Use ToolRegistry.tools instead", level = DeprecationLevel.WARNING)
-    val tools: StateFlow<Map<String, List<McpToolDescriptor>>>
-        get() = _deprecatedTools.asStateFlow()
-    private val _deprecatedTools = MutableStateFlow<Map<String, List<McpToolDescriptor>>>(emptyMap())
 
     /**
      * Build the list of enabled server configs from settings.
@@ -187,13 +182,6 @@ class McpManager(
     }
 
     /**
-     * Disconnect the IntelliJ MCP server (convenience method).
-     */
-    suspend fun disconnectIntellij() {
-        disconnect(ChatConstants.MCP_SERVER_NAME_INTELLIJ)
-    }
-
-    /**
      * Retry a specific server after error.
      */
     suspend fun retry(name: String): Boolean {
@@ -201,13 +189,6 @@ class McpManager(
         val config = configs.find { it.name == name } ?: return false
         registerServer(config)
         return _serverStatuses.value[name]?.state == McpConnectionState.CONNECTED
-    }
-
-    /**
-     * Retry the IntelliJ MCP server (convenience method).
-     */
-    suspend fun retryIntellij(): Boolean {
-        return retry(ChatConstants.MCP_SERVER_NAME_INTELLIJ)
     }
 
     /**

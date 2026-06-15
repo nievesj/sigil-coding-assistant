@@ -12,6 +12,7 @@ import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.OpenCodeNotifications
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.follow.EditorFollowManager
 import com.opencode.acp.mcp.ToolPermission
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -82,6 +83,12 @@ class ChatViewModel(
 
     private val _clearAllState = MutableStateFlow<ClearAllState>(ClearAllState.Idle)
     val clearAllState: StateFlow<ClearAllState> = _clearAllState.asStateFlow()
+
+    /** Follow Agent enabled state — synced with [EditorFollowManager]. */
+    private val _followAgentEnabled = MutableStateFlow(
+        EditorFollowManager.getInstance(project).isFollowEnabled()
+    )
+    val followAgentEnabled: StateFlow<Boolean> = _followAgentEnabled.asStateFlow()
 
     /** Messages waiting to be sent when the current response completes (queue mode). */
     private val _queuedMessages = MutableStateFlow<List<QueuedMessage>>(emptyList())
@@ -164,27 +171,18 @@ class ChatViewModel(
                         _selectionPrompt.value = signal.prompt
                         OpenCodeNotifications.notifyQuestionAsked(project)
                     }
-                    is UiSignal.Error -> {
-                        // Error already handled by processor (added as Error part)
-                    }
-                    is UiSignal.TodoUpdated -> {
-                        // Todo updates come via SSE, processor handles them
-                    }
-                    is UiSignal.SessionCreated -> {
-                        // Should not arrive on activeSignals (routed to globalSignals)
-                    }
-                    is UiSignal.SessionIdle -> {
-                        // Should not arrive on activeSignals (routed to globalSignals)
-                    }
-                    is UiSignal.SessionError -> {
-                        // Should not arrive on activeSignals (routed to globalSignals)
-                    }
-                    is UiSignal.SessionCompacted -> {
-                        // Should not arrive on activeSignals (routed to globalSignals)
-                    }
+                    // Informational signals — processor handles state updates directly
+                    is UiSignal.Error -> Unit
+                    is UiSignal.TodoUpdated -> Unit
                     is UiSignal.FileChanged -> {
                         _fileChangeSignal.tryEmit(Unit)
                     }
+                    // Global-only signals — should not arrive on activeSignals,
+                    // but must be present for exhaustive when.
+                    is UiSignal.SessionCreated -> Unit
+                    is UiSignal.SessionIdle -> Unit
+                    is UiSignal.SessionError -> Unit
+                    is UiSignal.SessionCompacted -> Unit
                 }
             }
         }
@@ -725,6 +723,15 @@ class ChatViewModel(
         service.stopConnection()
     }
 
+    // --- Follow Agent toggle ---
+
+    fun toggleFollowAgent() {
+        val newValue = !_followAgentEnabled.value
+        EditorFollowManager.getInstance(project).setFollowEnabled(newValue)
+        _followAgentEnabled.value = newValue
+        logger.info { "[ACP] Follow agent toggled: $newValue" }
+    }
+
     // --- Permission persistence ---
 
     private fun loadPersistedPermissions(): Map<String, ToolPermission> {
@@ -756,10 +763,5 @@ class ChatViewModel(
 
     companion object {
         private const val MAX_STEER_WAIT_MS = 10_000L
-
-        /** Load persisted command history from settings. */
-        private fun loadCommandHistory(): List<CommandHistoryEntry> {
-            return ArrayList(OpenCodeSettingsState.getInstance().commandHistory)
-        }
     }
 }

@@ -143,7 +143,8 @@ class McpStatusBarWidget(private val project: Project) : CustomStatusBarWidget {
             g2.drawOval(w - ds - 1, 1, ds, ds)
 
             g2.translate(-x, -y)
-            g2.dispose()
+            // Do NOT call g2.dispose() — the Graphics object is owned by the
+            // Swing painting framework. Disposing it corrupts subsequent rendering.
         }
     }
 

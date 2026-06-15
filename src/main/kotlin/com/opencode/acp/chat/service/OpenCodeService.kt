@@ -17,7 +17,6 @@ import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.mcp.McpConfigWriter
 import com.opencode.acp.mcp.McpConnectionStatus
 import com.opencode.acp.mcp.McpManager
-import com.opencode.acp.mcp.McpToolDescriptor
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -256,16 +255,10 @@ class OpenCodeService(private val project: Project) : Disposable {
     }
 
     private val emptyMcpStatuses = MutableStateFlow<Map<String, McpConnectionStatus>>(emptyMap())
-    private val emptyMcpTools = MutableStateFlow<Map<String, List<McpToolDescriptor>>>(emptyMap())
 
     /** MCP server connection statuses (empty if MCP not initialized). */
     val mcpServerStatuses: StateFlow<Map<String, McpConnectionStatus>>
         get() = mcpManager?.serverStatuses ?: emptyMcpStatuses.asStateFlow()
-
-    /** MCP tool lists per server (empty if MCP not initialized). */
-    @Deprecated("Use toolRegistry?.tools instead", level = DeprecationLevel.WARNING)
-    val mcpTools: StateFlow<Map<String, List<McpToolDescriptor>>>
-        get() = mcpManager?.tools ?: emptyMcpTools.asStateFlow()
 
     // ── Session management (delegated) ─────────────────────────────────────
 

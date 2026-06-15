@@ -50,7 +50,6 @@ fun ConnectionSplashScreen(
     onRetry: () -> Unit = {},
     onStop: () -> Unit = {},
     onCancel: () -> Unit = {},
-    onAutoConnectChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val settings = remember { OpenCodeSettingsState.getInstance() }
@@ -170,7 +169,6 @@ fun ConnectionSplashScreen(
                     .clickable {
                         autoConnect = !autoConnect
                         settings.autoConnect = autoConnect
-                        onAutoConnectChanged(autoConnect)
                     }
                     .padding(8.dp)
             ) {

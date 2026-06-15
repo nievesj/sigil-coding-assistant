@@ -106,6 +106,12 @@ class OpenCodeSettingsPanel {
             "When disabled, sending aborts the current response (legacy behavior)."
     }
 
+    /** Whether to show a confirmation dialog before disconnecting from the server. */
+    val showDisconnectCheckbox: JBCheckBox = JBCheckBox("Show disconnect confirmation dialog").apply {
+        toolTipText = "When enabled, clicking the disconnect button shows a confirmation dialog. " +
+            "When disabled, disconnect happens immediately."
+    }
+
     private fun toolKindLabel(kind: ToolKind): String = when (kind) {
         ToolKind.EXECUTE -> "Shell (Execute)"
         ToolKind.EDIT -> "Edit (Write)"
@@ -157,6 +163,7 @@ class OpenCodeSettingsPanel {
         .addSeparator(5)
         .addComponent(loadAllSessionsCheckbox)
         .addComponent(queueInsteadOfSteerCheckbox)
+        .addComponent(showDisconnectCheckbox)
         .addSeparator(5)
         .addTooltip("Tool pills expanded by default:")
         .apply { 
@@ -179,6 +186,7 @@ class OpenCodeSettingsPanel {
         listNumberColorField.text = settings.listNumberColor
         loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
         queueInsteadOfSteerCheckbox.isSelected = settings.queueInsteadOfSteer
+        showDisconnectCheckbox.isSelected = settings.showDisconnectConfirmation
         // Initialize ToolKind checkboxes from settings
         ToolKind.entries.forEach { kind ->
             toolKindCheckboxes[kind]!!.isSelected = settings.isToolKindDefaultExpanded(kind)
@@ -197,6 +205,7 @@ class OpenCodeSettingsPanel {
         settings.listNumberColor = listNumberColorField.text.trim()
         settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
         settings.queueInsteadOfSteer = queueInsteadOfSteerCheckbox.isSelected
+        settings.showDisconnectConfirmation = showDisconnectCheckbox.isSelected
         // Persist ToolKind expansion defaults
         val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }
         settings.expandedToolKinds = expandedKinds.joinToString(",")
@@ -216,6 +225,7 @@ class OpenCodeSettingsPanel {
                 listNumberColorField.text.trim() != settings.listNumberColor ||
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions ||
                 queueInsteadOfSteerCheckbox.isSelected != settings.queueInsteadOfSteer ||
+                showDisconnectCheckbox.isSelected != settings.showDisconnectConfirmation ||
                 expandedKinds != currentExpandedKinds ||
                 expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault
     }

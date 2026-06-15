@@ -377,10 +377,7 @@ class ProcessManager(private val scope: CoroutineScope) {
         }
     }
 
-    /** @deprecated Use [disconnect] for retry, or [shutdown] for IDE close. */
-    fun close() {
-        // Default to disconnect — callers that truly want to kill the process
-        // should use shutdown() explicitly.
-        disconnect()
-    }
+    /** @deprecated Use disconnect for retry, or shutdown for IDE close. */
+    @Deprecated("Use disconnect for retry, or shutdown for IDE close.", level = DeprecationLevel.ERROR)
+    fun close() = disconnect()
 }

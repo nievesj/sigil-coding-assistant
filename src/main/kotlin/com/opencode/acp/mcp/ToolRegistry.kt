@@ -252,10 +252,9 @@ class ToolRegistry(
     suspend fun setToolEnabled(toolId: String, enabled: Boolean) = toolsMutex.withLock {
         val tool = _toolsSnapshot[toolId] ?: return@withLock
         val newSnapshot = _toolsSnapshot.toMutableMap()
-        newSnapshot[toolId] = tool.copy(
-            enabled = enabled,
-            permission = if (enabled) ToolPermission.ALLOW else ToolPermission.DENY
-        )
+        // Enabled and permission are orthogonal: disabling a tool doesn't change
+        // its permission — the user might want "ask" preserved for re-enable.
+        newSnapshot[toolId] = tool.copy(enabled = enabled)
         _toolsSnapshot = newSnapshot
     }
 

@@ -7,7 +7,9 @@ import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.project.ProjectManager
 import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.mcp.McpConfigWriter
+import com.opencode.acp.mcp.ToolInfo
 import com.opencode.acp.mcp.ToolPermission
+import com.opencode.acp.mcp.ToolSource
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
@@ -78,13 +80,7 @@ class OpenCodeMcpConfigurable : Configurable {
         val toolPermissions = panel?.getAllToolPermissions()
         if (toolPermissions != null && toolPermissions.isNotEmpty()) {
             val permissions = toolPermissions.mapValues { (_, pair) ->
-                val (_, permissionStr) = pair
-                when (permissionStr) {
-                    "allow" -> ToolPermission.ALLOW
-                    "ask" -> ToolPermission.ASK
-                    "deny" -> ToolPermission.DENY
-                    else -> ToolPermission.ALLOW
-                }
+                pair.second
             }
             val projectPath = getActiveProjectPath()
             if (projectPath != null) {
@@ -194,17 +190,9 @@ class OpenCodeMcpConfigurable : Configurable {
                 val allTools = registry.getAllTools()
 
                 ApplicationManager.getApplication().invokeLater({
-                    // Convert ToolInfo to the format the panel expects
-                    val toolPermissionMap = allTools.associate { tool ->
-                        tool.name to OpenCodeMcpPanel.ToolPermissionInfo(
-                            description = tool.description,
-                            source = tool.source.name.lowercase(),
-                            serverName = tool.serverName,
-                            enabled = tool.enabled,
-                            permission = tool.permission.toActionString()
-                        )
-                    }
-                    panelRef.updateToolPermissions(toolPermissionMap)
+                    // Pass ToolInfo directly — no conversion needed
+                    val toolMap = allTools.associate { tool -> tool.name to tool }
+                    panelRef.updateToolPermissions(toolMap)
                     panelRef.discoverToolsButton.isEnabled = true
                     panelRef.discoverToolsButton.text = "Discover Tools"
                     panelRef.isDiscovering = false

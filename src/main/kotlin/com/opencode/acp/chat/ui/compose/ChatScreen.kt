@@ -33,6 +33,7 @@ import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ChatInputState
 import com.opencode.acp.chat.model.ConnectionState
@@ -149,6 +150,7 @@ fun
     val availableCommands by viewModel.availableCommands.collectAsState()
     val commandHistory by viewModel.commandHistory.collectAsState()
     val queuedMessages by viewModel.queuedMessages.collectAsState()
+    val followAgentEnabled by viewModel.followAgentEnabled.collectAsState()
     var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
 
     // Local (non-server) slash commands — always shown first
@@ -309,9 +311,6 @@ fun
                 onCancel = {
                     viewModel.cancelInitialization()
                 },
-                onAutoConnectChanged = { enabled ->
-                    // Auto-connect setting is persisted in the settings
-                },
                 modifier = Modifier.fillMaxSize()
             )
         } else {
@@ -469,6 +468,27 @@ fun
                     attachedFiles.addAll(entry.toAttachedFiles())
                 },
                 project = project,
+                isConnected = connectionState == ConnectionState.CONNECTED,
+                isReconnecting = connectionState == ConnectionState.RECONNECTING,
+                isFollowEnabled = followAgentEnabled,
+                onDisconnect = {
+                    if (OpenCodeSettingsState.getInstance().showDisconnectConfirmation) {
+                        val result = Messages.showOkCancelDialog(
+                            project,
+                            "This will disconnect from the OpenCode server. The server process will keep running so you can reconnect quickly. Any in-progress responses will be aborted.",
+                            "Disconnect from OpenCode?",
+                            "Disconnect",
+                            "Cancel",
+                            Messages.getQuestionIcon(),
+                        )
+                        if (result == Messages.OK) {
+                            viewModel.stopConnection()
+                        }
+                    } else {
+                        viewModel.stopConnection()
+                    }
+                },
+                onToggleFollow = { viewModel.toggleFollowAgent() },
             )
             }
         }

@@ -1,6 +1,7 @@
 package com.opencode.acp.chat.ui.compose
 
 import androidx.compose.foundation.Image as ComposeImage
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -49,6 +50,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.RoundRect
@@ -82,6 +84,7 @@ import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
+import androidx.compose.foundation.TooltipArea
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
@@ -321,6 +324,11 @@ fun InputArea(
     commandHistory: List<CommandHistoryEntry> = emptyList(),
     onLoadHistoryEntry: (CommandHistoryEntry) -> Unit = {},
     project: com.intellij.openapi.project.Project? = null,
+    isConnected: Boolean = false,                    // NEW: connectionState == CONNECTED
+    isReconnecting: Boolean = false,                 // NEW: connectionState == RECONNECTING
+    isFollowEnabled: Boolean = false,                // NEW
+    onDisconnect: () -> Unit = {},                   // NEW
+    onToggleFollow: () -> Unit = {},                 // NEW
     ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
@@ -1013,12 +1021,147 @@ fun InputArea(
 
             Spacer(modifier = Modifier.weight(1f))
 
+            // NEW: Follow checkbox — always visible (local setting)
+            FollowAgentCheckbox(
+                enabled = isFollowEnabled,
+                onToggle = onToggleFollow,
+            )
+
+            // NEW: Separator + disconnect (only when connected or reconnecting)
+            if (isConnected || isReconnecting) {
+                Box(
+                    modifier = Modifier
+                        .width(1.dp)
+                        .height(16.dp)
+                        .background(ChatTheme.colors.component.inputText.copy(alpha = 0.3f))
+                )
+                DisconnectButton(
+                    isReconnecting = isReconnecting,
+                    onClick = onDisconnect,
+                )
+            }
+
             // Context indicator — fillable circle showing context usage
             ContextIndicator(
                 state = contextState,
                 isStreaming = isStreaming,
                 onShowDetails = onShowContextDetails,
                 onRetry = onRetryContext
+            )
+        }
+    }
+}
+
+/**
+ * Green dot + "Connected" text (connected) or amber dot + "Reconnecting…" text (reconnecting).
+ * Click to disconnect from the OpenCode server. Hidden when disconnected.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun DisconnectButton(isReconnecting: Boolean, onClick: () -> Unit) {
+    val dotColor = if (isReconnecting) {
+        ChatTheme.colors.accent.yellow
+    } else {
+        ChatTheme.colors.accent.green
+    }
+    val labelText = if (isReconnecting) "Reconnecting…" else "Connected"
+
+    TooltipArea(
+        tooltip = {
+            Box(
+                modifier = Modifier
+                    .background(ChatTheme.colors.component.tooltipBg, RoundedCornerShape(4.dp))
+                    .border(1.dp, ChatTheme.colors.component.tooltipBorder, RoundedCornerShape(4.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    "Disconnect from OpenCode",
+                    color = ChatTheme.colors.component.tooltipText,
+                    fontSize = ChatTheme.fonts.selectorChip,
+                )
+            }
+        },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier
+                .clip(ChatTheme.shapes.chipCornerRadius)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+        ) {
+            Canvas(modifier = Modifier.size(8.dp)) {
+                drawCircle(color = dotColor)
+            }
+            Text(
+                text = labelText,
+                fontSize = ChatTheme.fonts.selectorChip,
+                color = ChatTheme.colors.text.secondary,
+            )
+        }
+    }
+}
+
+/**
+ * Follow agent checkbox — always visible (local setting, not connection-dependent).
+ * When checked, the editor follows the agent's tool calls (opens files and scrolls).
+ * Font matches SelectorChip for visual consistency with other selector-row controls.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FollowAgentCheckbox(enabled: Boolean, onToggle: () -> Unit) {
+    TooltipArea(
+        tooltip = {
+            Box(
+                modifier = Modifier
+                    .background(ChatTheme.colors.component.tooltipBg, RoundedCornerShape(4.dp))
+                    .border(1.dp, ChatTheme.colors.component.tooltipBorder, RoundedCornerShape(4.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    "When enabled, the editor follows the agent's tool calls — opens files and scrolls to active lines",
+                    color = ChatTheme.colors.component.tooltipText,
+                    fontSize = ChatTheme.fonts.selectorChip,
+                )
+            }
+        },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clip(ChatTheme.shapes.chipCornerRadius)
+                .clickable(enabled = true) { onToggle() }
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(14.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(
+                        if (enabled) ChatTheme.colors.accent.blue
+                        else Color.Transparent
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (enabled) ChatTheme.colors.accent.blue
+                                else ChatTheme.colors.component.inputText.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(3.dp),
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (enabled) {
+                    Text(
+                        text = "\u2713",
+                        fontSize = 10.sp,
+                        color = ChatTheme.colors.text.inverse,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = "Follow Agent",
+                fontSize = ChatTheme.fonts.selectorChip,
+                color = ChatTheme.colors.component.inputText,
             )
         }
     }
