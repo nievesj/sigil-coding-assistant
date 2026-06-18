@@ -45,17 +45,25 @@ import com.intellij.diff.requests.SimpleDiffRequest
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vcs.changes.ChangeListAdapter
 import com.intellij.openapi.vcs.changes.ChangeListManager
 import com.intellij.openapi.vfs.AsyncFileListener
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.opencode.acp.chat.model.ChangedFile
+import com.opencode.acp.chat.model.CommentCounts
 import com.opencode.acp.chat.model.FileChangeStatus
 import com.opencode.acp.chat.model.LineDelta
 import com.opencode.acp.chat.model.ReviewState
+import com.opencode.acp.chat.service.GitService
+import com.opencode.acp.chat.service.getRelativePath
+import com.opencode.acp.review.ReviewCommentDiffExtension
+import com.opencode.acp.review.ReviewCommentManager
+import com.opencode.acp.review.ReviewIndex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.launch
@@ -77,8 +85,8 @@ import org.jetbrains.jewel.ui.icons.AllIconsKeys
  * registered. All VCS reads happen inside runReadActionBlocking on Dispatchers.IO.
  * All UI mutations happen on EDT.
  *
- * PERFORMANCE: Uses Mutex to prevent concurrent refreshes, increased debounce
- * to 2000ms, caches LineDelta results in GitService.
+ * PERFORMANCE: Uses Mutex to prevent concurrent refreshes, debounced at
+ * 300ms, caches LineDelta results in GitService.
  */
 @OptIn(kotlinx.coroutines.FlowPreview::class)
 @Composable
@@ -86,10 +94,12 @@ fun ReviewPanel(
     project: Project,
     modifier: Modifier = Modifier,
     fileChangeSignal: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
+    commentChangeSignal: kotlinx.coroutines.flow.StateFlow<ReviewIndex>,
 ) {
     val gitService = remember { GitService(project) }
     val refreshSignal = remember { MutableStateFlow(0) }
     val refreshMutex = remember { Mutex() }
+    val scope = rememberCoroutineScope()
 
     // Register ChangeListListener + VFS listener for immediate file change detection.
     // ChangeListManager fires when VCS state updates (has its own internal polling).
@@ -98,7 +108,7 @@ fun ReviewPanel(
         val changeListManager = ChangeListManager.getInstance(project)
         val clListener = object : ChangeListAdapter() {
             override fun changeListUpdateDone() {
-                refreshSignal.tryEmit(refreshSignal.value + 1)
+                refreshSignal.value = refreshSignal.value + 1
             }
         }
         changeListManager.addChangeListListener(clListener)
@@ -108,21 +118,25 @@ fun ReviewPanel(
             override fun prepareChange(events: List<VFileEvent>): AsyncFileListener.ChangeApplier? {
                 // Emit on any non-transactional file event (skip .git internal, build dirs, etc.)
                 val relevant = events.any { ev ->
-                    val path = ev.file?.path ?: return@any false
-                    !path.contains("/.git/") && !path.contains("\\.git\\") &&
-                    !path.contains("/.idea/") && !path.contains("\\.idea\\") &&
-                    !path.contains("/build/") && !path.contains("\\build\\")
+                    val path = ev.file?.path?.replace('\\', '/') ?: return@any false
+                    !path.contains("/.git/") &&
+                    !path.contains("/.idea/") &&
+                    !path.contains("/build/")
                 }
                 if (relevant) {
-                    refreshSignal.tryEmit(refreshSignal.value + 1)
+                    refreshSignal.value = refreshSignal.value + 1
                 }
                 return null // no custom change applier needed
             }
         }
-        VirtualFileManager.getInstance().addAsyncFileListener(vfsListener, project)
+        // Use a controlled disposable (not `project`) so the listener is
+        // removed when the composable leaves composition, not just on project dispose.
+        val vfsDisposable = Disposer.newDisposable("OpenCodeReviewPanelVfsListener")
+        VirtualFileManager.getInstance().addAsyncFileListener(vfsListener, vfsDisposable)
 
         onDispose {
             changeListManager.removeChangeListListener(clListener)
+            Disposer.dispose(vfsDisposable)
         }
     }
 
@@ -131,9 +145,20 @@ fun ReviewPanel(
     if (fileChangeSignal != null) {
         LaunchedEffect(Unit) {
             fileChangeSignal.collect {
-                refreshSignal.tryEmit(refreshSignal.value + 1)
+                refreshSignal.value = refreshSignal.value + 1
             }
         }
+    }
+
+    // Collect comment changes from ReviewCommentManager
+    val commentIndex by commentChangeSignal.collectAsState(ReviewIndex())
+
+    // Build CommentCounts from the review index
+    val commentCounts = remember(commentIndex) {
+        val counts = commentIndex.commentsByFile
+            .mapValues { (_, comments) -> comments.count { it.status == com.opencode.acp.review.ReviewStatus.OPEN } }
+            .filterValues { it > 0 }
+        CommentCounts(counts)
     }
 
     // Debounce the refresh signal (300ms — responsive but prevents rapid-fire during bulk ops)
@@ -141,12 +166,17 @@ fun ReviewPanel(
         .debounce(300)
         .collectAsState(initial = 0)
 
+    // Re-compute when debouncedRefresh OR commentCounts changes
+    val refreshKey = remember(debouncedRefresh, commentCounts) {
+        "$debouncedRefresh-${commentCounts.totalOpen}-${commentCounts.countsByFile.size}"
+    }
+
     // Fetch data on background thread inside read action, update state on EDT.
     // Uses Mutex to prevent concurrent refreshes — only one refresh runs at a time.
-    // Catch Throwable (not Exception) to handle NoClassDefFoundError from git4idea.
+    // Catch Exception to avoid swallowing OutOfMemoryError and other serious JVM errors.
     val state by produceState<ReviewState>(
         initialValue = ReviewState.Loading,
-        key1 = debouncedRefresh
+        key1 = refreshKey
     ) {
         try {
             refreshMutex.withLock {
@@ -154,11 +184,11 @@ fun ReviewPanel(
                     readAction {
                         val files = gitService.getChangedFiles()
                         if (files.isEmpty()) ReviewState.Empty
-                        else ReviewState.Loaded(files)
+                        else ReviewState.Loaded(files, commentCounts)
                     }
                 }
             }
-        } catch (e: Throwable) {
+        } catch (e: Exception) {
             value = ReviewState.Error(
                 message = e.message ?: "Failed to load changes",
                 retryable = true
@@ -173,11 +203,12 @@ fun ReviewPanel(
         is ReviewState.Error -> ReviewErrorContent(
             message = s.message,
             retryable = s.retryable,
-            onRetry = { refreshSignal.tryEmit(refreshSignal.value + 1) },
+            onRetry = { refreshSignal.value = refreshSignal.value + 1 },
             modifier = modifier
         )
         is ReviewState.Loaded -> ReviewFileListContent(
             files = s.files,
+            commentCounts = s.commentCounts,
             onFileClick = { filePath, status, virtualFile ->
                 when (status) {
                     FileChangeStatus.UNTRACKED -> {
@@ -186,7 +217,7 @@ fun ReviewPanel(
                             openUntrackedFile(project, virtualFile)
                         }
                     }
-                    else -> openDiffForPath(project, filePath, virtualFile)
+                    else -> openDiffForPath(project, filePath, virtualFile, scope)
                 }
             },
             onOpenFile = { virtualFile ->
@@ -204,6 +235,7 @@ fun ReviewPanel(
 @Composable
 private fun ReviewFileListContent(
     files: List<ChangedFile>,
+    commentCounts: CommentCounts = CommentCounts(),
     onFileClick: (filePath: String, status: FileChangeStatus, virtualFile: com.intellij.openapi.vfs.VirtualFile?) -> Unit,
     onOpenFile: (com.intellij.openapi.vfs.VirtualFile?) -> Unit,
     modifier: Modifier = Modifier
@@ -213,8 +245,10 @@ private fun ReviewFileListContent(
         verticalArrangement = Arrangement.spacedBy(1.dp)
     ) {
         items(files, key = { it.filePath }) { file ->
+            val commentCount = commentCounts.forFile(file.filePath)
             ChangedFileRow(
                 file = file,
+                commentCount = commentCount,
                 onClick = { onFileClick(file.filePath, file.status, file.virtualFile) },
                 onOpenFile = { onOpenFile(file.virtualFile) }
             )
@@ -225,6 +259,7 @@ private fun ReviewFileListContent(
 @Composable
 private fun ChangedFileRow(
     file: ChangedFile,
+    commentCount: Int = 0,
     onClick: () -> Unit,
     onOpenFile: () -> Unit,
     modifier: Modifier = Modifier
@@ -238,6 +273,8 @@ private fun ChangedFileRow(
     val deletedColor = ChatTheme.colors.accent.codeDeleted // Salmon/coral red like OpenCode
     val pathColor = ChatTheme.colors.text.link.copy(alpha = 0.5f)
     val normalColor = ChatTheme.colors.text.primary
+    val commentColor = ChatTheme.colors.accent.blue
+    val commentBg = commentColor.copy(alpha = 0.15f)
 
     Row(
         modifier = modifier
@@ -259,38 +296,59 @@ private fun ChangedFileRow(
         Spacer(Modifier.width(8.dp))
 
         // File info column
-        Column(modifier = Modifier.weight(1f)) {
-            // File name + status label row
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            // File name only
+            Text(
+                text = file.fileName,
+                fontSize = ChatTheme.fonts.reviewFileName,
+                fontWeight = FontWeight.Normal,
+                color = normalColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            // Status / review chips on their own line
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text(
-                    text = file.fileName,
-                    fontSize = ChatTheme.fonts.reviewFileName,
-                    fontWeight = FontWeight.Normal,
-                    color = normalColor,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
                 // Status label for new/untracked files
                 if (file.status == FileChangeStatus.UNTRACKED) {
                     Text(
                         text = "Added",
                         fontSize = ChatTheme.fonts.reviewStatusLabel,
                         fontWeight = FontWeight.Medium,
-                        color = ChatTheme.colors.component.reviewAddedLabel  // Green color like in the image
+                        color = ChatTheme.colors.component.reviewAddedLabel
                     )
                 }
+                // Review comment chip with icon
+                if (commentCount > 0) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
+                            .background(commentBg)
+                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                    ) {
+                        Icon(
+                            key = AllIconsKeys.Actions.IntentionBulb,
+                            contentDescription = null,
+                            modifier = Modifier.size(12.dp),
+                            tint = commentColor
+                        )
+                        Spacer(Modifier.width(3.dp))
+                        Text(
+                            text = "$commentCount comment${if (commentCount > 1) "s" else ""}",
+                            fontSize = ChatTheme.fonts.reviewStatusLabel,
+                            fontWeight = FontWeight.Medium,
+                            color = commentColor,
+                        )
+                    }
+                }
             }
-            // Relative path (dimmed, tinted)
-            Text(
-                text = file.filePath,
-                fontSize = ChatTheme.fonts.reviewFilePath,
-                color = pathColor,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
         }
 
         // Line delta indicator
@@ -444,33 +502,37 @@ private fun ReviewErrorContent(
 
 /**
  * Opens the IDE's native diff viewer for a tracked change.
- * Called on EDT via invokeLater.
+ * All VCS reads happen on Dispatchers.IO inside readAction;
+ * only DiffManager.showDiff runs on EDT via invokeLater.
  *
  * If the Change is stale (committed/reverted), falls back to opening the file.
  * Uses full fileName (not extension) as 3rd arg to DiffContentFactory for syntax highlighting.
+ *
+ * @param scope CoroutineScope for launching the VCS read — should be tied to
+ *   the caller's lifecycle (e.g., the composable's rememberCoroutineScope)
+ *   to prevent coroutine leaks after project disposal.
  */
-fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intellij.openapi.vfs.VirtualFile?) {
-    ApplicationManager.getApplication().invokeLater {
+fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intellij.openapi.vfs.VirtualFile?, scope: kotlinx.coroutines.CoroutineScope) {
+    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
         try {
             val changeListManager = ChangeListManager.getInstance(project)
-            val currentChanges = ReadAction.nonBlocking<List<com.intellij.openapi.vcs.changes.Change>> {
-                changeListManager.defaultChangeList.changes.toList()
-            }.executeSynchronously()
-
-            val change = currentChanges.find {
-                getRelativePath(project, it) == filePath
+            val change = readAction {
+                val currentChanges = changeListManager.defaultChangeList.changes.toList()
+                currentChanges.find {
+                    getRelativePath(project, it) == filePath
+                }
             }
 
             if (change != null) {
-                val fileName = change.virtualFile?.name ?: filePath.substringAfterLast('/')
+                val fileName = readAction { change.virtualFile?.name } ?: filePath.substringAfterLast('/')
                 // Resolve FileType from file name for syntax highlighting in diff viewer
                 val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
-                val beforeContent = ReadAction.nonBlocking<String?> {
+                val beforeContent = readAction {
                     change.beforeRevision?.content
-                }.executeSynchronously() ?: ""
-                val afterContent = ReadAction.nonBlocking<String?> {
+                } ?: ""
+                val afterContent = readAction {
                     change.afterRevision?.content
-                }.executeSynchronously() ?: ""
+                } ?: ""
 
                 val factory = DiffContentFactory.getInstance()
                 val request = SimpleDiffRequest(
@@ -480,14 +542,30 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
                     change.beforeRevision?.revisionNumber?.asString() ?: "Base",
                     change.afterRevision?.revisionNumber?.asString() ?: "Working"
                 )
-                DiffManager.getInstance().showDiff(project, request, DiffDialogHints.DEFAULT)
+                // Stash the relative source path so ReviewCommentDiffExtension
+                // can recover it and apply review-comment highlights to the
+                // diff viewer's after-side editor (TDD §4.3 — NOT via
+                // ContentDiffRequest.contentTitles, which are display labels).
+                request.putUserData(ReviewCommentDiffExtension.REVIEW_PATH_KEY, filePath)
+                // DiffManager.showDiff must run on EDT.
+                ApplicationManager.getApplication().invokeLater {
+                    DiffManager.getInstance().showDiff(project, request, DiffDialogHints.DEFAULT)
+                }
             } else if (virtualFile != null) {
                 // Change was committed/reverted — open file directly
-                FileEditorManager.getInstance(project).openFile(virtualFile, true)
+                ApplicationManager.getApplication().invokeLater {
+                    FileEditorManager.getInstance(project).openFile(virtualFile, true)
+                }
             }
-        } catch (_: Throwable) {
-            // Catch Throwable (not Exception) to handle NoClassDefFoundError from optional plugins
-            // Silently ignore — diff viewer is best-effort
+        } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
+            // PCE must be rethrown — swallowing it breaks cancellation propagation
+            // (IntelliJ contract: ProcessCanceledException is control flow, not an error).
+            throw e
+        } catch (e: Throwable) {
+            // Catch Throwable (not Exception) to handle NoClassDefFoundError from optional plugins.
+            // Log for diagnostics — silently swallowing makes diff-open failures invisible.
+            com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
+                .warn("[ACP] Failed to open diff viewer for $filePath: ${e.message}")
         }
     }
 }

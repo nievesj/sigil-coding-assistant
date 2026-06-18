@@ -6,14 +6,9 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.ScrollType
-import com.intellij.openapi.editor.colors.EditorFontType
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.Inlay
 import com.intellij.openapi.editor.InlayProperties
-import com.intellij.openapi.editor.markup.HighlighterLayer
-import com.intellij.openapi.editor.markup.HighlighterTargetArea
-import com.intellij.openapi.editor.markup.RangeHighlighter
-import com.intellij.openapi.editor.markup.TextAttributes
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.fileEditor.TextEditor
@@ -26,6 +21,7 @@ import com.intellij.openapi.components.service
 import com.intellij.ide.projectView.ProjectView
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.util.EDT
+import com.opencode.acp.review.EditorHighlightSupport
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -63,8 +59,6 @@ class EditorFollowManager(private val project: Project) : Disposable {
 
         private val LINE_HEADER_REGEX = Regex("""^Line (\d+):""")
 
-        private const val FOLLOW_HIGHLIGHT_LAYER = HighlighterLayer.SELECTION - 1
-
         fun getInstance(project: Project): EditorFollowManager =
             project.service<EditorFollowManager>()
     }
@@ -84,30 +78,8 @@ class EditorFollowManager(private val project: Project) : Disposable {
     // so we don't pile up N coroutines that all race to read pendingFollow.
     @Volatile private var pendingJob: kotlinx.coroutines.Job? = null
 
-    private val activeHighlighters = mutableListOf<HighlighterRecord>()
-
-    private data class HighlighterRecord(
-        val editor: Editor,
-        /** Null for inlay-only rows created by [addInlayOnly]. */
-        val highlighter: RangeHighlighter?,
-        val inlay: Inlay<*>?
-    )
-
     override fun dispose() {
-        // Order: cancel scope first (drops pending throttled waits and cleanup
-        // coroutines), then iterate active highlighters. Both run on EDT when
-        // called by IntelliJ's service disposal contract. The try-catch guards
-        // editors that were disposed independently of this manager.
         scope.cancel()
-        for (record in activeHighlighters) {
-            try {
-                record.highlighter?.let { record.editor.markupModel.removeHighlighter(it) }
-                record.inlay?.dispose()
-            } catch (e: Exception) {
-                logger.debug(e) { "[ACP] Follow Agent: error cleaning up highlighter" }
-            }
-        }
-        activeHighlighters.clear()
     }
 
     /** Check if Follow Agent is enabled for this project. */
@@ -221,6 +193,15 @@ class EditorFollowManager(private val project: Project) : Disposable {
         } else {
             Path.of(basePath).resolve(filePath).normalize().toString()
         }
+        // CWE-22: reject paths that escape the project root.
+        // Without this, an LLM (or prompt-injection attacker) could provide
+        // "../" sequences to open files outside the project directory.
+        val baseNormalized = basePath.replace('\\', '/')
+        val absNormalized = absPath.replace('\\', '/')
+        if (!absNormalized.startsWith("$baseNormalized/") && absNormalized != baseNormalized) {
+            logger.warn { "[ACP] Follow Agent: path traversal blocked: $filePath resolves outside project" }
+            return null
+        }
         val normalized = absPath.replace('/', File.separatorChar)
         val vfs = LocalFileSystem.getInstance()
         return vfs.findFileByPath(normalized)
@@ -316,27 +297,15 @@ class EditorFollowManager(private val project: Project) : Disposable {
         val inlay = editor.inlayModel.addBlockElement(
             firstLineOffset,
             InlayProperties()
-                // relatesToPrecedingText=true anchors the inlay to the first line
-                // so it shows ABOVE line 1 (not below). For the first line of a file
-                // there's no "preceding text" to attach to, but relatesToPrecedingText=true
-                // still positions the inlay above the line at the given offset.
                 .relatesToPrecedingText(true)
                 .showAbove(true),
             AgentActionRenderer(actionLabel, color)
         )
-        // Force the editor to show the inlay. After openFile(), the viewport is at
-        // the top, but the inlay's bounds may not be computed yet. Calling
-        // scrollToCaret(MakeVisible) forces a layout pass.
         editor.scrollingModel.scrollToCaret(ScrollType.MAKE_VISIBLE)
-        // Highlighter is null for inlay-only rows; dispose() and the cleanup
-        // coroutine both null-check the field.
-        val record = HighlighterRecord(editor, highlighter = null, inlay = inlay)
-        activeHighlighters.add(record)
         scope.launch {
             delay(HIGHLIGHT_DURATION_MS)
             try {
                 inlay?.dispose()
-                activeHighlighters.remove(record)
             } catch (e: Exception) {
                 logger.debug(e) { "[ACP] Follow Agent: error removing inlay" }
             }
@@ -392,54 +361,14 @@ class EditorFollowManager(private val project: Project) : Disposable {
         color: java.awt.Color, actionLabel: String,
         disposableParent: Disposable
     ) {
-        val lineCount = doc.lineCount
-        if (startLine <= 0 || endLine <= 0 || startLine > lineCount) return
-
-        val hlStart = doc.getLineStartOffset(startLine - 1)
-        val hlEnd = doc.getLineEndOffset(minOf(endLine, lineCount) - 1)
-        if (hlEnd <= hlStart) return
-
-        val attrs = TextAttributes().apply {
-            backgroundColor = color
-            // Add a thin colored border around the highlighted region. Without
-            // this, a 33% transparent background is barely visible against the
-            // editor's background — the border makes the highlight pop.
-            effectColor = color
-            effectType = com.intellij.openapi.editor.markup.EffectType.BOXED
-        }
-        val hl = editor.markupModel.addRangeHighlighter(
-            hlStart, hlEnd,
-            FOLLOW_HIGHLIGHT_LAYER,
-            attrs,
-            HighlighterTargetArea.LINES_IN_RANGE
+        // Delegate to shared EditorHighlightSupport, then auto-cleanup after 5s.
+        // Pass null for disposable since we manage lifecycle via the coroutine below.
+        val handle = EditorHighlightSupport.addHighlight(
+            editor, startLine, endLine, color, actionLabel, disposable = null
         )
-
-        val inlay = editor.inlayModel.addBlockElement(
-            hlStart,
-            InlayProperties()
-                .relatesToPrecedingText(true)
-                .showAbove(true),
-            AgentActionRenderer(actionLabel, color)
-        )
-
-        // Force the editor to lay out the inlay. scrollAndHighlight already
-        // scrolled to hlStart, but the inlay's bounds may not be computed
-        // until the editor does a layout pass. Calling scrollToCaret here
-        // triggers a layout and makes the inlay visible immediately.
-        editor.scrollingModel.scrollToCaret(ScrollType.MAKE_VISIBLE)
-
-        val record = HighlighterRecord(editor, hl, inlay)
-        activeHighlighters.add(record)
-
         scope.launch {
             delay(HIGHLIGHT_DURATION_MS)
-            try {
-                editor.markupModel.removeHighlighter(hl)
-                inlay?.dispose()
-                activeHighlighters.remove(record)
-            } catch (e: Exception) {
-                logger.debug(e) { "[ACP] Follow Agent: error removing highlight" }
-            }
+            EditorHighlightSupport.removeHighlight(handle)
         }
     }
 

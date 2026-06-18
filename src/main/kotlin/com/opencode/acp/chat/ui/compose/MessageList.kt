@@ -35,6 +35,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.withFrameNanos
 
 import androidx.compose.runtime.mutableIntStateOf
@@ -569,161 +570,6 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
 
 // ── Helper Composables for AssistantMessage ──────────────────────────────────
 
-/**
- * Renders Text, Code, and Table message parts with Jewel's Markdown composable.
- */
-@Composable
-private fun RenderTextContent(textParts: List<MessagePart>, project: Project?) {
-    if (textParts.isEmpty()) return
-
-    val currentProject = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-
-    val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
-    val defaultGreen = ChatTheme.colors.accent.green
-    val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
-    val listNumberColor = parseColorOrDefault(settings.listNumberColor, defaultGreen)
-
-    val linkColor = ChatTheme.colors.accent.blue
-    val customInlinesStyling = remember(inlineCodeColor, linkColor) {
-        InlinesStyling.create(
-            inlineCode = SpanStyle(
-                color = inlineCodeColor,
-                background = Color.Transparent,
-                fontFamily = FontFamily.Monospace,
-            ),
-            link = SpanStyle(
-                color = linkColor,
-                textDecoration = TextDecoration.Underline,
-            ),
-            linkHovered = SpanStyle(
-                color = linkColor,
-                textDecoration = TextDecoration.Underline,
-            ),
-        )
-    }
-
-     val blockLineColor = ChatTheme.colors.accent.blockQuoteLine
-     val blockTextColor = ChatTheme.colors.accent.blockQuoteText
-     val orderedListFontSize = ChatTheme.fonts.messageOrderedListItem
-     val markdownStyling = remember(customInlinesStyling, listNumberColor, blockLineColor, blockTextColor, orderedListFontSize) {
-        val baseTextStyle = org.jetbrains.jewel.bridge.theme.retrieveDefaultTextStyle()
-        MarkdownStyling.create(
-            inlinesStyling = customInlinesStyling,
-            heading = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.create(
-                h1 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H1.create(
-                    inlinesStyling = customInlinesStyling,
-                ),
-                h2 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H2.create(
-                    inlinesStyling = customInlinesStyling,
-                ),
-                h3 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H3.create(
-                    inlinesStyling = customInlinesStyling,
-                ),
-                h4 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H4.create(
-                    inlinesStyling = customInlinesStyling,
-                ),
-                h5 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H5.create(
-                    inlinesStyling = customInlinesStyling,
-                ),
-                h6 = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.Heading.H6.create(
-                    inlinesStyling = customInlinesStyling,
-                ),
-            ),
-            list = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.create(
-                ordered = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.create(
-                    numberStyle = TextStyle(color = listNumberColor, fontSize = orderedListFontSize),
-                    numberFormatStyles = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles(
-                        firstLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
-                        secondLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
-                        thirdLevel = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.List.Ordered.NumberFormatStyles.NumberFormatStyle.Decimal,
-                    ),
-                ),
-            ),
-            blockQuote = org.jetbrains.jewel.markdown.rendering.MarkdownStyling.BlockQuote.create(
-                padding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                lineWidth = 3.dp,
-                lineColor = blockLineColor,
-                textColor = blockTextColor,
-            ),
-        )
-    }
-    val markdownProcessor = remember { MarkdownProcessor() }
-    val codeHighlighter = remember(currentProject) {
-        currentProject?.let {
-            try {
-                org.jetbrains.jewel.bridge.code.highlighting.CodeHighlighterFactory.getInstance(it).createHighlighter()
-            } catch (_: Exception) { NoOpCodeHighlighter }
-        } ?: NoOpCodeHighlighter
-    }
-
-    ProvideMarkdownStyling(
-        markdownStyling = markdownStyling,
-        markdownProcessor = markdownProcessor,
-        codeHighlighter = codeHighlighter,
-    ) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            textParts.forEach { part ->
-                when (part) {
-                    is MessagePart.Text -> {
-                        val parsedBlocks = remember(part.content) {
-                            val raw = markdownProcessor.processMarkdownDocument(part.content)
-                            clampOrderedLists(raw)
-                        }
-                        Markdown(
-                            markdownBlocks = parsedBlocks,
-                            markdown = part.content,
-                            modifier = Modifier.fillMaxWidth(),
-                            selectable = true,
-                            onUrlClick = { url -> BrowserUtil.open(url) },
-                        )
-                    }
-                    is MessagePart.Code -> {
-                        ChatFencedCodeBlock(
-                            content = part.content,
-                            language = part.language,
-                        )
-                    }
-                    is MessagePart.Table -> {
-                        ChatTable(
-                            rawMarkdown = part.rawMarkdown,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                    else -> {} // Should not happen given the filter
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun RenderFileChanges(fileChangeParts: List<MessagePart.FileChange>, project: Project?) {
-    if (fileChangeParts.isEmpty()) return
-    FileChangesList(
-        changes = fileChangeParts.map { it.change },
-        project = project,
-        modifier = Modifier.padding(horizontal = 8.dp, vertical = ChatTheme.dims.messagePaddingV),
-    )
-}
-
-@Composable
-private fun RenderErrorParts(errorParts: List<MessagePart.Error>) {
-    errorParts.forEach { part ->
-        val errorText = buildAnnotatedString {
-            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("Error: ") }
-            append(part.message)
-        }
-        Text(
-            text = errorText,
-            color = ChatTheme.colors.accent.codeDeleted,
-            modifier = Modifier.padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
-        )
-    }
-}
-
 @Composable
 private fun AgentBadge(name: String) {
     Row(
@@ -745,46 +591,6 @@ private fun AgentBadge(name: String) {
                 )
                 .padding(horizontal = 6.dp, vertical = 2.dp),
         )
-    }
-}
-
-@Composable
-private fun RenderPatchCards(patchParts: List<MessagePart.Patch>) {
-    if (patchParts.isEmpty()) return
-    patchParts.forEach { patch ->
-        Column(
-            modifier = Modifier
-                .padding(horizontal = 8.dp, vertical = ChatTheme.dims.messagePaddingV)
-                .fillMaxWidth()
-                .background(
-                    color = ChatTheme.colors.surface.card,
-                    shape = ChatTheme.shapes.messageBubbleCornerRadius
-                )
-                .padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Icon(key = AllIconsKeys.Nodes.Folder, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.thinkingChevron)
-                Text(
-                    text = "${patch.files.size} changed file${if (patch.files.size != 1) "s" else ""}",
-                    style = TextStyle(
-                        fontSize = ChatTheme.fonts.messagePatchFileCount,
-                        color = ChatTheme.colors.component.thinkingChevron,
-                        fontWeight = FontWeight.Medium,
-                    ),
-                )
-            }
-            patch.files.forEach { filePath ->
-                val fileName = filePath.substringAfterLast('/')
-                Text(
-                    text = "  $fileName",
-                    style = TextStyle(
-                        fontSize = ChatTheme.fonts.messagePatchFileName,
-                        color = ChatTheme.colors.component.attachmentRemoveIcon,
-                    ),
-                )
-            }
-        }
     }
 }
 
@@ -853,82 +659,6 @@ private fun RetryPill(attempt: Int, maxAttempts: Int, error: String?) {
                     color = ChatTheme.colors.component.retryErrorDetail,
                 ),
             )
-        }
-    }
-}
-
-@Composable
-private fun RenderAssistantFileCards(parts: List<MessagePart.AssistantFile>) {
-    if (parts.isEmpty()) return
-    parts.forEach { file ->
-        Row(
-            modifier = Modifier
-                .padding(horizontal = 8.dp, vertical = 2.dp)
-                .fillMaxWidth()
-                .background(
-                    color = ChatTheme.colors.surface.card,
-                    shape = ChatTheme.shapes.attachmentCornerRadius
-                )
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Icon(key = AllIconsKeys.FileTypes.Text, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.attachmentRemoveIcon)
-            Column {
-                Text(
-                    text = file.filename ?: "file",
-                    style = TextStyle(
-                        fontSize = ChatTheme.fonts.messageFileName,
-                        color = ChatTheme.colors.component.attachmentRemoveIcon,
-                        fontWeight = FontWeight.Medium,
-                    ),
-                )
-                Text(
-                    text = file.mime,
-                    style = TextStyle(
-                        fontSize = ChatTheme.fonts.messageFileMime,
-                        color = ChatTheme.colors.component.mimeText,
-                    ),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun RenderAssistantImageCards(parts: List<MessagePart.Image>) {
-    if (parts.isEmpty()) return
-    parts.forEach { image ->
-        Row(
-            modifier = Modifier
-                .padding(horizontal = 8.dp, vertical = 2.dp)
-                .fillMaxWidth()
-                .background(
-                    color = ChatTheme.colors.surface.card,
-                    shape = ChatTheme.shapes.attachmentCornerRadius
-                )
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Icon(key = AllIconsKeys.FileTypes.Image, contentDescription = null, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.attachmentRemoveIcon)
-            Column {
-                Text(
-                    text = image.filename ?: "image",
-                    style = TextStyle(
-                        fontSize = ChatTheme.fonts.messageFileName,
-                        color = ChatTheme.colors.component.attachmentRemoveIcon,
-                        fontWeight = FontWeight.Medium,
-                    ),
-                )
-                Text(
-                    text = image.mime,
-                    style = TextStyle(
-                        fontSize = ChatTheme.fonts.messageFileMime,
-                        color = ChatTheme.colors.component.mimeText,
-                    ),
-                )
-            }
         }
     }
 }
@@ -1013,6 +743,7 @@ private fun FileChangeCard(
     val isHovered by interactionSource.collectIsHoveredAsState()
     val hoverBg = ChatTheme.colors.component.hoverBg
     val normalColor = ChatTheme.colors.text.primary
+    val scope = rememberCoroutineScope()
 
     // Resolve file type icon
     val fileIconKey = remember(change.fileName) {
@@ -1036,7 +767,7 @@ private fun FileChangeCard(
             .hoverable(interactionSource)
             .clickable {
                 if (projectResolved != null && virtualFile != null) {
-                    openDiffForPath(projectResolved, change.filePath, virtualFile)
+                    openDiffForPath(projectResolved, change.filePath, virtualFile, scope)
                 }
             }
             .padding(horizontal = 8.dp, vertical = 6.dp),

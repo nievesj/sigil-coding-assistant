@@ -12,6 +12,7 @@ import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.chat.ui.compose.ChatScreen
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.chat.viewmodel.ChatViewModel
+import com.opencode.acp.review.ReviewCommentManager
 import java.awt.event.KeyEvent
 import javax.swing.KeyStroke
 import kotlinx.coroutines.CoroutineScope
@@ -25,27 +26,41 @@ import org.jetbrains.jewel.bridge.addComposeTab
 class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
     companion object {
-        @Volatile
-        var activeComposePanel: androidx.compose.ui.awt.ComposePanel? = null
-            internal set
+        /** Per-project ComposePanel references. Keyed by Project to prevent
+         *  cross-project state leaks in multi-project windows. */
+        private val activePanels = java.util.concurrent.ConcurrentHashMap<Project, androidx.compose.ui.awt.ComposePanel>()
 
-        /** Synchronous dispose — for Content disposer (tool window close). */
-        fun disposeActiveComposePanel() {
-            activeComposePanel?.let {
-                try { it.isVisible = false; it.dispose() } catch (_: Exception) {}
-                activeComposePanel = null
+        /** Legacy accessor for single-project scenarios. Returns the panel
+         *  for the first project that has one, or null. */
+        var activeComposePanel: androidx.compose.ui.awt.ComposePanel?
+            get() = activePanels.values.firstOrNull()
+            internal set(value) {
+                // No-op for backward compatibility — callers should use per-project API
             }
+
+        /** Register a ComposePanel for a specific project. */
+        internal fun registerPanel(project: Project, panel: androidx.compose.ui.awt.ComposePanel) {
+            activePanels[project] = panel
+        }
+
+        /** Unregister a ComposePanel for a specific project. */
+        internal fun unregisterPanel(project: Project) {
+            activePanels.remove(project)
         }
 
         /** Async dispose — for OpenCodeService.dispose() during IDE restart.
          *  ComposePanel.dispose() can block EDT if Skiko is mid-frame.
-         *  Daemon thread ensures EDT is NEVER blocked. */
+         *  Daemon thread ensures EDT is NEVER blocked.
+         *  Disposes ALL registered panels across all projects. */
         fun disposeActiveComposePanelAsync() {
-            val panel = activeComposePanel ?: return
-            activeComposePanel = null
-            Thread({
-                try { panel.isVisible = false; panel.dispose() } catch (_: Exception) {}
-            }, "opencode-compose-dispose").apply { isDaemon = true; start() }
+            val iterator = activePanels.entries.iterator()
+            while (iterator.hasNext()) {
+                val (project, panel) = iterator.next()
+                iterator.remove()
+                Thread({
+                    try { panel.isVisible = false; panel.dispose() } catch (_: Exception) {}
+                }, "opencode-compose-dispose-${project.name}").apply { isDaemon = true; start() }
+            }
         }
 
     }
@@ -55,11 +70,27 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         // Skiko on Windows defaults to Direct3D (DirectX 12). The GPU context
         // can hang during JVM exit if the render thread is mid-frame, preventing
         // IDE restart after plugin update. Software rendering has no GPU resources.
+        // Best-effort: only effective if Skiko classes haven't been loaded yet.
+        // For reliable software rendering, set -Dskiko.renderApi=SOFTWARE as a JVM argument.
         System.setProperty("skiko.renderApi", "SOFTWARE")
 
         val service = project.service<OpenCodeService>()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val viewModel = ChatViewModel(scope, service, project)
+
+        // Reload the review comment index from disk when the tool window opens.
+        // This catches .review/ files that appeared since project open (git pull,
+        // branch switch, external tools, LLM writes from a previous session).
+        // loadAll() reads directly from disk via java.nio.file.Files.walk,
+        // bypassing the VFS, so it sees files the VFS hasn't refreshed yet.
+        //
+        // ReviewCommentStartupActivity also calls loadAll() on project open. The
+        // two calls are serialized by ReviewCommentManager.loadAllMutex, so they
+        // can't interleave their clearForEditor + addHighlights on the same
+        // editor (the second waits for the first, then re-reads — idempotent).
+        scope.launch {
+            ReviewCommentManager.getInstance(project).loadAll()
+        }
 
         toolWindow.addComposeTab("") {
             ChatTheme {
@@ -71,7 +102,11 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         if (content != null) {
             val component = content.component
             val composePanelRef = findComposePanel(component)
-            activeComposePanel = composePanelRef
+            if (composePanelRef != null) {
+                registerPanel(project, composePanelRef)
+            } else {
+                com.intellij.openapi.diagnostic.Logger.getInstance("ACP").warn("[ACP] ComposePanel not found in tool window content")
+            }
 
             val pasteAction = DumbAwareAction.create { viewModel.requestImagePaste() }
             val pasteShortcut = CustomShortcutSet(
@@ -90,8 +125,8 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
                     // CRITICAL: Do NOT call ComposePanel.dispose() synchronously on EDT.
                     // Skiko's render thread may be mid-frame, causing EDT to block → IDE lockup.
                     // Use async dispose on a daemon thread (same pattern as disposeActiveComposePanelAsync).
-                    val panel = composePanelRef ?: activeComposePanel
-                    activeComposePanel = null
+                    val panel = composePanelRef ?: activePanels[project]
+                    unregisterPanel(project)
                     if (panel != null) {
                         logger.info("[ACP] ContentDisposer: async disposing ComposePanel=$panel")
                         Thread({

@@ -1,4 +1,4 @@
-package com.opencode.acp.chat.ui.compose
+package com.opencode.acp.chat.service
 
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
@@ -162,12 +162,20 @@ class GitService(private val project: Project) {
         // Use space-optimized version for large files (only keep 2 rows)
         val maxDim = maxOf(m, n)
         if (maxDim > 5000) {
-            // Fall back to line-count comparison for very large files
-            // to avoid O(n*m) memory/time cost
-            return Pair(
-                (after.size - before.size).coerceAtLeast(0),
-                (before.size - after.size).coerceAtLeast(0)
-            )
+            // Fall back to a cheaper O(n) estimation for very large files
+            // to avoid O(n*m) memory/time cost. Count lines only in "after"
+            // not in "before" (additions) and vice versa (deletions).
+            val beforeSet = before.toHashSet()
+            val afterSet = after.toHashSet()
+            var additions = 0
+            var deletions = 0
+            for (line in after) {
+                if (line !in beforeSet) additions++
+            }
+            for (line in before) {
+                if (line !in afterSet) deletions++
+            }
+            return Pair(additions, deletions)
         }
 
         val dp = Array(2) { IntArray(n + 1) }
@@ -192,24 +200,11 @@ class GitService(private val project: Project) {
      * Uses beforeRevision.file.path for deleted files (virtualFile is null).
      * Normalizes path separators to '/' for cross-platform consistency.
      */
-    private fun getRelativePath(change: Change): String {
-        val absolutePath = change.virtualFile?.path
-            ?: change.beforeRevision?.file?.path
-            ?: return "unknown"
-        return getRelativePathFromRoot(absolutePath)
-    }
+    private fun getRelativePath(change: Change): String =
+        getRelativePath(project, change)
 
-    private fun getRelativePathFromRoot(absolutePath: String): String {
-        val basePath = project.basePath ?: return absolutePath
-        // Normalize separators for cross-platform consistency
-        val normalizedAbsolute = absolutePath.replace('\\', '/')
-        val normalizedBase = basePath.replace('\\', '/') + "/"
-        return if (normalizedAbsolute.startsWith(normalizedBase)) {
-            normalizedAbsolute.removePrefix(normalizedBase)
-        } else {
-            normalizedAbsolute
-        }
-    }
+    private fun getRelativePathFromRoot(absolutePath: String): String =
+        getRelativePathFromRoot(project, absolutePath)
 
     private fun mapFileStatus(status: FileStatus): FileChangeStatus = when (status) {
         FileStatus.MODIFIED -> FileChangeStatus.MODIFIED

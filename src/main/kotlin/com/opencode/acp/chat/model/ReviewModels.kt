@@ -30,10 +30,26 @@ enum class FileChangeStatus {
     CONFLICTED
 }
 
+/**
+ * Mapping of file path → number of open review comments.
+ * Built from ReviewIndex.totalOpen per file.
+ */
+data class CommentCounts(
+    val countsByFile: Map<String, Int> = emptyMap(),
+) {
+    /** Open comments count for a given file path, or 0. */
+    fun forFile(path: String): Int = countsByFile[path] ?: 0
+
+    val totalOpen: Int get() = countsByFile.values.sum()
+}
+
 /** Sealed state for the review panel. */
 sealed interface ReviewState {
     data object Loading : ReviewState
-    data class Loaded(val files: List<ChangedFile>) : ReviewState
+    data class Loaded(
+        val files: List<ChangedFile>,
+        val commentCounts: CommentCounts = CommentCounts(),
+    ) : ReviewState
     data object Empty : ReviewState           // No changes in any VCS
     data class Error(val message: String, val retryable: Boolean = true) : ReviewState
 }

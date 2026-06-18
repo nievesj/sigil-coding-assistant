@@ -88,6 +88,7 @@ fun SessionSidebar(
     project: Project,
     modifier: Modifier = Modifier,
     fileChangeSignal: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
+    commentChangeSignal: kotlinx.coroutines.flow.StateFlow<com.opencode.acp.review.ReviewIndex>,
     streamingSessionIds: Set<String> = emptySet(),
     pendingCreationSessionIds: Set<String> = emptySet(),
     clearAllState: ClearAllState = ClearAllState.Idle,
@@ -157,6 +158,7 @@ fun SessionSidebar(
                     project = project,
                     modifier = Modifier.weight(1f),
                     fileChangeSignal = fileChangeSignal,
+                    commentChangeSignal = commentChangeSignal,
                 )
             }
         }

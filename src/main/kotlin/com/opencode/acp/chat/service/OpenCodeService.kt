@@ -172,27 +172,31 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     /** Initialize MCP manager and register all enabled servers. */
     private suspend fun initializeMcp() {
-        val settings = OpenCodeSettingsState.getInstance()
-        val client = connectionManager.client
-        if (client == null) {
-            logger.warn { "[ACP] MCP: skipping initialization — no client available" }
-            return
-        }
-        mcpManager = McpManager(client, settings, scope, client.mcpHttpClient)
-        val configs = mcpManager!!.resolveConfigs()
-        if (configs.isEmpty()) {
-            logger.info { "[ACP] MCP: no servers configured (enableIntellijMcp=${settings.enableIntellijMcp}, additionalMcpServers='${settings.additionalMcpServers.take(50)}')" }
-            return
-        }
-        logger.info { "[ACP] MCP: initializing ${configs.size} server(s): ${configs.map { it.name }}" }
-        mcpManager!!.initialize()
+        try {
+            val settings = OpenCodeSettingsState.getInstance()
+            val client = connectionManager.client
+            if (client == null) {
+                logger.warn { "[ACP] MCP: skipping initialization — no client available" }
+                return
+            }
+            mcpManager = McpManager(client, settings, scope, client.mcpHttpClient)
+            val configs = mcpManager!!.resolveConfigs()
+            if (configs.isEmpty()) {
+                logger.info { "[ACP] MCP: no servers configured (enableIntellijMcp=${settings.enableIntellijMcp}, additionalMcpServers='${settings.additionalMcpServers.take(50)}')" }
+                return
+            }
+            logger.info { "[ACP] MCP: initializing ${configs.size} server(s): ${configs.map { it.name }}" }
+            mcpManager!!.initialize()
 
-        // Wire ToolRegistry after MCP is initialized (McpManager has server URLs)
-        toolRegistry = com.opencode.acp.mcp.ToolRegistry(
-            httpClient = client.mcpHttpClient,
-            mcpToolDiscovery = com.opencode.acp.mcp.McpToolDiscovery(client.mcpHttpClient)
-        )
-        logger.info { "[ACP] ToolRegistry created" }
+            // Wire ToolRegistry after MCP is initialized (McpManager has server URLs)
+            toolRegistry = com.opencode.acp.mcp.ToolRegistry(
+                httpClient = client.mcpHttpClient,
+                mcpToolDiscovery = com.opencode.acp.mcp.McpToolDiscovery(client.mcpHttpClient)
+            )
+            logger.info { "[ACP] ToolRegistry created" }
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] MCP initialization failed — chat will work without MCP" }
+        }
     }
 
     /**
@@ -222,19 +226,23 @@ class OpenCodeService(private val project: Project) : Disposable {
      */
     fun reinitializeMcpFromSettings() {
         scope.launch {
-            disconnectAllMcp()
-            val settings = OpenCodeSettingsState.getInstance()
-            // Write MCP config file — OpenCode reads it on next startup.
-            // For immediate effect (without restart), POST /mcp is also called
-            // by McpManager.initialize() below.
-            val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
-                ?: java.nio.file.Path.of(".")
-            val configWriter = McpConfigWriter(projectPath, settings)
-            if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
-                configWriter.write()
-                reinitializeMcp()
-            } else {
-                configWriter.clearAllEntries()
+            try {
+                disconnectAllMcp()
+                val settings = OpenCodeSettingsState.getInstance()
+                // Write MCP config file — OpenCode reads it on next startup.
+                // For immediate effect (without restart), POST /mcp is also called
+                // by McpManager.initialize() below.
+                val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
+                    ?: java.nio.file.Path.of(".")
+                val configWriter = McpConfigWriter(projectPath, settings)
+                if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
+                    configWriter.write()
+                    reinitializeMcp()
+                } else {
+                    configWriter.clearAllEntries()
+                }
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] Failed to reinitialize MCP from settings" }
             }
         }
     }
@@ -286,13 +294,13 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     // ── SSE subscription (single global, routes by sessionId) ───────────────
 
-    private var sseJob: Job? = null
-    private var sseReconnectJob: Job? = null
-    private var sseReconnectAttempt: Int = 0
+    @Volatile private var sseJob: Job? = null
+    @Volatile private var sseReconnectJob: Job? = null
+    @Volatile private var sseReconnectAttempt: Int = 0
     /** Timestamp (epoch ms) of the last SSE event received. Used for health-check timing. */
     private val sseLastEventTimeMs = AtomicLong(0L)
     /** Job that periodically health-checks the server when SSE is silent. */
-    private var sseHealthCheckJob: Job? = null
+    @Volatile private var sseHealthCheckJob: Job? = null
 
     /** Single global SSE subscription — all events routed to SessionManager.processEvent().
      *  Includes automatic reconnection with exponential backoff on stream end,
@@ -321,8 +329,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                 sseLastEventTimeMs.set(System.currentTimeMillis())
                 handleSseEvent(event)
             }
-        } catch (_: Exception) {
-            // SSE error or cancellation — both end up here
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] SSE collection error: ${e.message}" }
         }
         // Stream ended — trigger reconnection if this wasn't a user-initiated stop.
         // CancellationException from stopConnection() is caught above; after it,
@@ -511,7 +521,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             is SseEvent.Ignored -> "Ignored(type=${event.eventType}, reason=${event.reason})"
             else -> "${event::class.simpleName}(sid=${event.sessionId}, mid=${event.messageId})"
         }
-        logger.info { "[ACP] handleSseEvent: $summary" }
+        logger.debug { "[ACP] handleSseEvent: $summary" }
         sessionManager.processEvent(event)
     }
 
@@ -614,7 +624,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             // receives no events between tool.start and tool.result. Without the running-tool
             // guard, the activity monitor would false-positive after responseTimeoutSeconds
             // even though the server is actively working.
-            val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds * 1000L
+            val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds.coerceAtLeast(10) * 1000L
             val activityMonitorJob = scope.launch {
                 while (isActive) {
                     delay(ACTIVITY_CHECK_INTERVAL_MS)
@@ -655,7 +665,7 @@ class OpenCodeService(private val project: Project) : Disposable {
                 SendMessageResult.Success(assistantMsgId)
             }
         } catch (e: CancellationException) {
-            sessionManager.completeStreaming(assistantMsgId)
+            try { sessionManager.completeStreaming(assistantMsgId) } catch (_: Exception) {}
             throw e
         } catch (e: Exception) {
             val errorMsg = when {
@@ -675,6 +685,22 @@ class OpenCodeService(private val project: Project) : Disposable {
     }
 
     // ── Actions ────────────────────────────────────────────────────────────
+
+    /** Inject a local-only assistant message into the active session's chat
+     *  history WITHOUT sending it to the server. Used for plugin-side info
+     *  messages (e.g. unresolved model args in `/review-perform`, review
+     *  failure notices) that should appear in the chat but don't need an LLM
+     *  response. The message is marked [MessageState.Completed] immediately. */
+    fun injectLocalMessage(text: String) {
+        val msg = ChatMessage(
+            id = generateId(),
+            role = MessageRole.ASSISTANT,
+            parts = linkedMapOf(MessagePart.generatePartId() to MessagePart.Text(text)),
+            timestamp = System.currentTimeMillis(),
+            state = MessageState.Completed,
+        )
+        sessionManager.addMessage(msg)
+    }
 
     suspend fun cancel() {
         val client = connectionManager.client
@@ -710,14 +736,21 @@ class OpenCodeService(private val project: Project) : Disposable {
         cancel()
 
         val deferred = CompletableDeferred<Unit>()
-        scope.launch {
-            // Acquire the mutex (suspends until the old sendMessage()'s
-            // finally block releases it), then immediately release it —
-            // we just want to know it's available, not hold it.
-            sendMutex.lock()
-            sendMutex.unlock()
-            deferred.complete(Unit)
+        val job = scope.launch {
+            try {
+                // Acquire the mutex (suspends until the old sendMessage()'s
+                // finally block releases it), then immediately release it —
+                // we just want to know it's available, not hold it.
+                sendMutex.lock()
+                sendMutex.unlock()
+                deferred.complete(Unit)
+            } catch (_: Exception) {
+                // Scope cancelled or mutex acquisition failed — complete deferred to unblock caller
+                deferred.complete(Unit)
+            }
         }
+        // If the caller times out, cancel the waiting coroutine so it doesn't leak
+        deferred.invokeOnCompletion { if (it != null) job.cancel() }
         return deferred
     }
 
