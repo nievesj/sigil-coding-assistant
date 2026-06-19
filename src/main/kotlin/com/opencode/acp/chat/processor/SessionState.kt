@@ -187,37 +187,51 @@ class SessionState(
         // coroutine (single-writer). External callers send a ResetTurn control
         // event through eventChannel; the auto-create path (fromEventProcessing=true)
         // resets directly since it's already on the event processing coroutine.
+        val id = serverMessageId ?: generateId()
+
         if (fromEventProcessing) {
+            // Already on the event processing coroutine — reset and set ctx directly.
             ctx.resetTurnState()
+            ctx.activeMessageId = id
+            ctx.activeServerMessageId = serverMessageId
+            ctx.modelID = modelID
+            ctx.providerID = providerID
+            ctx.isStreaming = true
         } else {
-            // Drain stale events from previous turn BEFORE enqueuing ResetTurn,
-            // so the channel ordering is: drain → ResetTurn → new events.
-            // NOTE: This is best-effort — events enqueued by processEvent()
-            // between the drain completing and ResetTurn being sent are lost.
-            // This is acceptable because stale events from a previous turn
-            // would be misrouted to the new turn's message anyway.
-            var droppedCount = 0
-            while (eventChannel.tryReceive().isSuccess) { droppedCount++ }
-            if (droppedCount > 0) {
-                logger.info { "[ACP] createAssistantMessage: drained $droppedCount stale events from previous turn" }
+            // Send ResetTurn carrying the new turn's identity. The event-processing
+            // coroutine will drain stale events, resetTurnState(), then apply these
+            // fields atomically — eliminating the window where activeMessageId is null
+            // (which previously caused a duplicate auto-create when the first SSE
+            // content event arrived).
+            //
+            // Stale-event draining is done in the ResetTurn handler (consumer side)
+            // rather than here (producer side) to close the window where an SSE event
+            // could be enqueued between the drain completing and ResetTurn being sent.
+            // The single-reader event coroutine owns both the drain and the reset.
+            //
+            // We do NOT set ctx fields here; the event coroutine owns them.
+            val sendResult = eventChannel.trySend(SseEvent.ResetTurn(
+                sessionId = sessionId,
+                newTurnMessageId = id,
+                newTurnServerMessageId = serverMessageId,
+                newTurnModelID = modelID,
+                newTurnProviderID = providerID,
+            ))
+            if (sendResult.isFailure) {
+                // Channel is full (1024 capacity) or closed. If ResetTurn is lost,
+                // ctx.activeMessageId stays null → the first SSE content event will
+                // auto-create a duplicate message (the original bug). Log loudly so
+                // this is diagnosable; the message was already added to the list.
+                logger.error { "[ACP] createAssistantMessage: eventChannel FULL/CLOSED — ResetTurn dropped! Duplicate message likely. id=$id" }
             }
-            // Send ResetTurn — processed before any new SSE events (FIFO channel).
-            // This ensures ctx is cleared on the event processing coroutine.
-            eventChannel.trySend(SseEvent.ResetTurn(sessionId))
         }
 
         resegmentJob?.cancel()
         resegmentJob = null
 
-        val id = serverMessageId ?: generateId()
-        ctx.activeMessageId = id
-        ctx.activeServerMessageId = serverMessageId
-        ctx.modelID = modelID
-        ctx.providerID = providerID
-        ctx.isStreaming = true
         firstTextSegmented = false
         lastAccessTime = System.currentTimeMillis()
-        logger.info { "[ACP] createAssistantMessage: id=$id, serverMessageId=$serverMessageId" }
+        logger.info { "[ACP] createAssistantMessage: id=$id, serverMessageId=$serverMessageId, fromEventProcessing=$fromEventProcessing" }
 
         val message = ChatMessage(
             id = id,
@@ -403,20 +417,26 @@ class SessionState(
     }
 
     fun updateServerMessageId(messageId: String, serverMessageId: String) = stateLock.withLock {
-        if (messageId != ctx.activeMessageId) {
-            logger.warn { "[ACP] updateServerMessageId MISMATCH: msg=$messageId, serverId=$serverMessageId, activeMessageId=${ctx.activeMessageId}" }
-            return@withLock
-        }
-        // Don't overwrite if already learned from an earlier SSE event (MessageFinalized).
-        // The server ID from the HTTP response and from SSE should match; if they don't,
-        // keep the SSE-learned value (it was confirmed by the event carrying it).
-        if (ctx.activeServerMessageId == null) {
-            ctx.activeServerMessageId = serverMessageId
-            logger.info { "[ACP] updateServerMessageId: msg=$messageId → serverId=$serverMessageId" }
-        } else if (ctx.activeServerMessageId != serverMessageId) {
-            logger.warn { "[ACP] updateServerMessageId: server ID mismatch — HTTP=$serverMessageId, SSE=${ctx.activeServerMessageId}. Keeping SSE value." }
-        }
+        // Always update the message's serverMessageId field — this is a message-level
+        // operation that doesn't depend on ctx (which may be set asynchronously by
+        // ResetTurn on the event-processing coroutine).
         updateMessage(messageId) { it.copy(serverMessageId = serverMessageId) }
+
+        // Only update ctx.activeServerMessageId if ctx still refers to this message.
+        // If ResetTurn hasn't been processed yet, ctx.activeMessageId may be null or
+        // point to a previous turn — in that case, the ResetTurn event carries
+        // newTurnServerMessageId=null, and the first SSE event will set it.
+        // If ctx already learned the server ID from an earlier SSE event, keep it.
+        if (messageId == ctx.activeMessageId) {
+            if (ctx.activeServerMessageId == null) {
+                ctx.activeServerMessageId = serverMessageId
+                logger.info { "[ACP] updateServerMessageId: msg=$messageId → serverId=$serverMessageId" }
+            } else if (ctx.activeServerMessageId != serverMessageId) {
+                logger.warn { "[ACP] updateServerMessageId: server ID mismatch — HTTP=$serverMessageId, SSE=${ctx.activeServerMessageId}. Keeping SSE value." }
+            }
+        } else {
+            logger.info { "[ACP] updateServerMessageId: ctx not yet synced (msg=$messageId, activeMessageId=${ctx.activeMessageId}) — message field updated, ctx will be set by ResetTurn or first SSE event" }
+        }
     }
 
     fun setLastUserText(text: String?) {
@@ -471,7 +491,29 @@ class SessionState(
             // Runs on the event processing coroutine, eliminating the cross-coroutine
             // race between external callers (under stateLock) and event processing.
             is SseEvent.ResetTurn -> {
+                // Drain stale events from the previous turn on the consumer side
+                // (single-reader coroutine). This is strictly more robust than a
+                // producer-side drain because there's no window between draining
+                // and the reset — both run on this coroutine.
+                var drainedCount = 0
+                while (eventChannel.tryReceive().isSuccess) { drainedCount++ }
+                if (drainedCount > 0) {
+                    logger.info { "[ACP] ResetTurn: drained $drainedCount stale events from previous turn" }
+                }
                 ctx.resetTurnState()
+                // Apply the new turn's identity atomically after clearing stale state.
+                // This closes the window where activeMessageId was null between reset
+                // and the first SSE content event (which caused duplicate auto-create).
+                event.newTurnMessageId?.let { ctx.activeMessageId = it }
+                // Only set activeServerMessageId if the event carries one — don't
+                // overwrite a value that updateServerMessageId may have already set
+                // (e.g. if the HTTP response arrived and was processed before ResetTurn).
+                event.newTurnServerMessageId?.let { ctx.activeServerMessageId = it }
+                ctx.modelID = event.newTurnModelID
+                ctx.providerID = event.newTurnProviderID
+                if (event.newTurnMessageId != null) {
+                    ctx.isStreaming = true
+                }
                 return
             }
             is SseEvent.TodoUpdated -> {
@@ -939,6 +981,26 @@ class SessionState(
                             )
                         }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolResult path)" } }
                     }
+                    // Update the message part with the resolved pill
+                    val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
+                    updateMessage(targetMsgId) { msg ->
+                        val parts = LinkedHashMap(msg.parts)
+                        val existing = parts[event.toolCallId]
+                        if (existing is MessagePart.ToolCall) {
+                            parts[event.toolCallId] = existing.copy(
+                                pill = existing.pill.copy(
+                                    status = resolvedStatus,
+                                    title = resolvedTitle,
+                                    kind = resolvedKind,
+                                    input = newInput,
+                                    output = event.content ?: existing.pill.output,
+                                    metadata = event.metadata ?: existing.pill.metadata,
+                                ),
+                                state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed
+                            )
+                        }
+                        msg.copy(parts = parts, isStreaming = ctx.isStreaming)
+                    }
                 } else {
                     // No prior ToolUse — create pill from scratch (fast sub-agents can complete in one event)
                     val newInput = event.input
@@ -975,32 +1037,6 @@ class SessionState(
                         logger.info { "[ACP] Task tool (from ToolResult): proactively caching child session $childId" }
                         scope.launch { sessionManager.ensureSessionCached(childId) }
                     }
-                }
-                val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
-                updateMessage(targetMsgId) { msg ->
-                    val parts = LinkedHashMap(msg.parts)
-                    val existing = parts[event.toolCallId]
-                    if (existing is MessagePart.ToolCall) {
-                        val newInput = event.input ?: existing.pill.input
-                        val resolvedKind = if (existing.pill.kind == ToolKind.OTHER) {
-                            ToolMapper.detectKindFromInput(newInput)
-                        } else existing.pill.kind
-                        val resolvedTitle = newInput?.let { input ->
-                            try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
-                        } ?: existing.pill.title
-                        parts[event.toolCallId] = existing.copy(
-                            pill = existing.pill.copy(
-                                status = resolvedStatus,
-                                title = resolvedTitle,
-                                kind = resolvedKind,
-                                input = newInput,
-                                output = event.content ?: existing.pill.output,
-                                metadata = event.metadata ?: existing.pill.metadata,
-                            ),
-                            state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed
-                        )
-                    }
-                    msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
             }
 
@@ -1091,7 +1127,16 @@ class SessionState(
                     )
                 }
 
-                // Delegate finalization to shared logic (same as Stop handler)
+                // Delegate finalization to shared logic (same as Stop handler).
+                // Only finalize when the server explicitly signals completion via
+                // stopReason (the `finish` field in message.updated). The server sends
+                // message.updated events during streaming with token/cost/model updates
+                // but WITHOUT a finish field — those are intermediate updates, not
+                // finalization. Finalizing on them would prematurely complete the
+                // generation.
+                //
+                // If no stop event arrives (server bug or missing finish field), the
+                // SessionIdle backstop (line 507-518) finalizes the stream.
                 if (event.stopReason != null) {
                     finalizeStreaming(localMsgId, event.stopReason)
                 }
@@ -1284,11 +1329,11 @@ class SessionState(
         }
         resegmentJob?.cancel()
         // Use Dispatchers.Default (NOT EDT) — markdown parsing is CPU-intensive.
+        // CancellationException propagates naturally when a newer resegment cancels
+        // this job (line 1306) or when the scope is cancelled — no catch needed.
         resegmentJob = scope.launch(Dispatchers.Default) {
-            try {
-                delay(DEBOUNCE_MS)
-                resegmentTextPartsDirect(msgId)
-            } catch (_: CancellationException) { /* newer event arrived */ }
+            delay(DEBOUNCE_MS)
+            resegmentTextPartsDirect(msgId)
         }
     }
 

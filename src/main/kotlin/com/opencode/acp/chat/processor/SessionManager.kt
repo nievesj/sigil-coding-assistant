@@ -397,6 +397,38 @@ class SessionManager(
                 if (event.sessionId == _activeSessionId.value) {
                     _globalSignals.tryEmit(UiSignal.SessionIdle(event.sessionId))
                 }
+                // Subagent backstop: if the idle session is NOT the active session
+                // but the active (parent) session is still streaming, finalize the
+                // parent too. A child session going idle implies the parent's tool
+                // call to that child has completed. Without this, the parent stays
+                // stuck in streaming state if its own message.updated lacked a
+                // finish field and no separate stop event arrives.
+                //
+                // Guard: only finalize the parent if it has no OTHER running tools
+                // (besides the child task). If the parent has other in-progress
+                // tools, the turn isn't done yet — the child going idle is just one
+                // tool completing, not the whole turn.
+                val activeId = _activeSessionId.value
+                if (activeId != null && event.sessionId != activeId) {
+                    val activeState = sessionsLock.withLock { sessions[activeId] }
+                    if (activeState != null && activeState.ctx.isStreaming) {
+                        val parentMsgId = activeState.ctx.activeMessageId
+                        // Check if the parent has running tools OTHER than the child
+                        // session's task tool. We can't easily map child sessionId →
+                        // toolCallId, so we approximate: if the parent has exactly one
+                        // running tool, it's likely the child task — finalize.
+                        // If multiple tools are running, don't finalize (turn continues).
+                        val runningToolCount = activeState.ctx.toolPartStates.values.count {
+                            it is PartState.InProgress || it is PartState.Pending
+                        }
+                        if (parentMsgId != null && runningToolCount <= 1) {
+                            logger.info { "[ACP] SessionIdle for child session ${event.sessionId} — finalizing parent $activeId (runningTools=$runningToolCount)" }
+                            activeState.processEvent(SseEvent.SessionIdle(event.sessionId))
+                        } else if (parentMsgId != null) {
+                            logger.debug { "[ACP] SessionIdle for child ${event.sessionId}: parent $activeId still has $runningToolCount running tools — not finalizing" }
+                        }
+                    }
+                }
                 // Also route to SessionState as a backstop — if streaming is still
                 // active when the server says it's idle, finalize it.
                 // Don't return early: fall through to the else -> branch below.
@@ -636,19 +668,16 @@ class SessionManager(
      *  Removes sessions from the map under lock, then closes them outside the lock. */
     private suspend fun evictIfNeeded(excludeSessionId: String? = null) {
         val toEvict = mutableListOf<Pair<String, SessionState>>()
-        val evictedIds = mutableSetOf<String>()
         sessionsLock.withLock {
-            while (sessions.size - evictedIds.size > MAX_CACHED_SESSIONS) {
+            while (sessions.size > MAX_CACHED_SESSIONS) {
                 val lru = sessions.entries
                     .filter { it.key != _activeSessionId.value
                             && it.key != excludeSessionId
                             && !it.value.isStreaming
-                            && !it.value.hasPendingPermission
-                            && it.key !in evictedIds }
+                            && !it.value.hasPendingPermission }
                     .minByOrNull { it.value.lastAccessTime }
                     ?: break
                 toEvict.add(lru.key to lru.value)
-                evictedIds.add(lru.key)
                 sessions.remove(lru.key)
             }
         }
