@@ -14,6 +14,12 @@ import com.opencode.acp.chat.OpenCodeNotifications
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.follow.EditorFollowManager
 import com.opencode.acp.mcp.ToolPermission
+import com.opencode.acp.review.ReviewCommentManager
+import com.opencode.acp.review.ReviewIndex
+import com.opencode.acp.review.ReviewSkill
+import com.opencode.acp.chat.service.GitService
+import com.opencode.acp.util.ModelArgResolver
+import com.intellij.openapi.application.runReadActionBlocking
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
@@ -90,9 +96,22 @@ class ChatViewModel(
     )
     val followAgentEnabled: StateFlow<Boolean> = _followAgentEnabled.asStateFlow()
 
+    /** Review comment changes — forwarded from [ReviewCommentManager]. */
+    val commentChangeSignal: StateFlow<ReviewIndex> by lazy {
+        ReviewCommentManager.getInstance(project).commentChanges
+    }
+
     /** Messages waiting to be sent when the current response completes (queue mode). */
     private val _queuedMessages = MutableStateFlow<List<QueuedMessage>>(emptyList())
     val queuedMessages: StateFlow<List<QueuedMessage>> = _queuedMessages.asStateFlow()
+
+    /** Serializes drainQueue to prevent concurrent queue-drain races. */
+    private val drainMutex = Mutex()
+
+    /** Retry counts for queued messages — prevents infinite retry loops.
+     *  ConcurrentHashMap for thread-safety: clearQueue() (from EDT coroutines)
+     *  and drainQueue() (from ViewModel scope) may access concurrently. */
+    private val queueRetryCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     private val _readyState = MutableStateFlow(ReadyState.NOT_STARTED)
     val readyState: StateFlow<ReadyState> = _readyState.asStateFlow()
@@ -100,6 +119,9 @@ class ChatViewModel(
     private val initMutex = Mutex()
     private var initJob: Job? = null
     private var connectionObserverJob: Job? = null
+
+    /** Cached GitService instance — reuses lineDeltaCache across calls. */
+    private val gitService = GitService(project)
 
     // --- Computed input state (exhaustive state machine) ---
     /**
@@ -160,7 +182,7 @@ class ChatViewModel(
                         // Refresh sessions to pick up new child sessions
                         scope.launch { service.loadSessions() }
                         // Auto-drain queue: send next queued message if any
-                        drainQueue()
+                        scope.launch { drainQueue() }
                     }
                     is UiSignal.PermissionRequested -> {
                         _permissionPrompt.value = signal.prompt
@@ -176,6 +198,12 @@ class ChatViewModel(
                     is UiSignal.TodoUpdated -> Unit
                     is UiSignal.FileChanged -> {
                         _fileChangeSignal.tryEmit(Unit)
+                        // Trigger a VFS refresh so the ReviewCommentManager's
+                        // AsyncFileListener picks up any new .review/ JSON files
+                        // written by the LLM agent. Without this, gutter icons
+                        // and highlights don't appear until the user manually
+                        // refreshes (Ctrl+Alt+Y) or alt-tabs away and back.
+                        refreshReviewFiles()
                     }
                     // Global-only signals — should not arrive on activeSignals,
                     // but must be present for exhaustive when.
@@ -253,7 +281,12 @@ class ChatViewModel(
     }
 
     suspend fun initialize(projectBasePath: String?) {
-        // Guard against concurrent initialization
+        // Guard against concurrent initialization. Intentionally uses tryLock()
+        // instead of lock() because: (1) rapid reconnection events (network flapping)
+        // should not queue up N initialization attempts, (2) the connectionObserverJob
+        // will re-trigger on the next CONNECTED event if the first attempt fails,
+        // and (3) initialization is idempotent — running it twice wastes resources
+        // but doesn't cause correctness issues.
         if (!initMutex.tryLock()) {
             logger.warn { "[ACP] initialize() already in progress — skipping" }
             return
@@ -264,7 +297,12 @@ class ChatViewModel(
                 _readyState.value = ReadyState.NOT_STARTED
 
                 _readyState.value = ReadyState.INITIALIZING_SERVICE
-                val success = service.initialize(projectBasePath)
+                val success = try {
+                    service.initialize(projectBasePath)
+                } catch (e: Exception) {
+                    logger.error(e) { "[ACP] Service initialization failed" }
+                    false
+                }
                 if (!success) {
                     _readyState.value = ReadyState.NOT_STARTED
                     return@launch
@@ -274,7 +312,7 @@ class ChatViewModel(
                 try {
                     val agents = withTimeoutOrNull(30_000) { service.listAgents() }
                     if (agents == null) {
-                        logger.warn { "[ACP] Agent loading timed out after 30s" }
+                        logger.warn { "[ACP] Agent loading timed out after 30s — continuing with defaults" }
                     } else {
                         val filtered = agents.filter { it.mode != "subagent" && it.hidden != true }
                         _controlState.value = _controlState.value.copy(
@@ -295,6 +333,7 @@ class ChatViewModel(
                 } catch (e: Exception) {
                     logger.warn { "[ACP] Agent loading failed: ${e.message}" }
                 }
+                // Always progress — agent loading is optional (chat works with defaults)
 
                 _readyState.value = ReadyState.LOADING_PROVIDERS
                 try {
@@ -303,9 +342,8 @@ class ChatViewModel(
                         logger.warn { "[ACP] Provider loading timed out after 30s" }
                     } else {
                         val connectedIds = providers.connected.toSet()
-                        val models = providers.all
-                            .filter { it.id in connectedIds }
-                            .flatMap { provider ->
+                        fun buildProviderModels(providerList: List<com.opencode.acp.adapter.ProviderData>): List<ProviderModel> {
+                            return providerList.flatMap { provider ->
                                 provider.models.map { (_, modelData) ->
                                     ProviderModel(
                                         providerID = provider.id,
@@ -318,20 +356,9 @@ class ChatViewModel(
                                     )
                                 }
                             }
-                        val allModels = providers.all
-                            .flatMap { provider ->
-                                provider.models.map { (_, modelData) ->
-                                    ProviderModel(
-                                        providerID = provider.id,
-                                        modelID = modelData.id,
-                                        displayName = "${provider.name} / ${modelData.name}",
-                                        reasoning = modelData.reasoning,
-                                        contextWindow = modelData.limit?.context ?: 0,
-                                        providerIconId = provider.id,
-                                        variants = modelData.variants?.keys?.toList() ?: emptyList()
-                                    )
-                                }
-                            }
+                        }
+                        val models = buildProviderModels(providers.all.filter { it.id in connectedIds })
+                        val allModels = buildProviderModels(providers.all)
                         val savedKey = OpenCodeSettingsState.getInstance().lastSelectedModelKey
                         val restoredModel = if (savedKey.isNotEmpty()) {
                             models.find {
@@ -463,30 +490,37 @@ class ChatViewModel(
 
     // --- Message sending ---
 
-    suspend fun sendMessage(text: String, files: List<AttachedFile> = emptyList()) {
+    suspend fun sendMessage(text: String, files: List<AttachedFile> = emptyList()): SendMessageResult {
         recordCommand(text, files)
 
-        // Show streaming indicator immediately — don't wait for the first SSE event
-        _isStreaming.value = true
+        return try {
+            val state = _controlState.value
+            val result = service.sendMessage(
+                text = text,
+                files = files,
+                modelID = state.selectedModel?.modelID,
+                providerID = state.selectedModel?.providerID,
+                variant = state.thinkingEffort.variant,
+                agent = state.selectedAgent?.id,
+                model = state.selectedModel?.let {
+                    OpenCodeClient.MessageModel(providerID = it.providerID, modelID = it.modelID)
+                }
+            )
 
-        val state = _controlState.value
-        val result = service.sendMessage(
-            text = text,
-            files = files,
-            modelID = state.selectedModel?.modelID,
-            providerID = state.selectedModel?.providerID,
-            variant = state.thinkingEffort.variant,
-            agent = state.selectedAgent?.id,
-            model = state.selectedModel?.let {
-                OpenCodeClient.MessageModel(providerID = it.providerID, modelID = it.modelID)
+            when (result) {
+                is SendMessageResult.Success -> {
+                    // Show streaming indicator AFTER sendMessage succeeds — prevents
+                    // brief UI flicker when sendMessage immediately returns an error.
+                    _isStreaming.value = true
+                }
+                is SendMessageResult.Error -> {
+                    _isStreaming.value = false
+                }
             }
-        )
-
-        when (result) {
-            is SendMessageResult.Success -> { /* handled by service */ }
-            is SendMessageResult.Error -> {
-                _isStreaming.value = false
-            }
+            result
+        } catch (e: Exception) {
+            _isStreaming.value = false
+            throw e
         }
     }
 
@@ -516,6 +550,8 @@ class ChatViewModel(
             // Safety net: mutex not released after MAX_STEER_WAIT_MS
             logger.error { "[ACP] steerMessage: mutex not released after ${MAX_STEER_WAIT_MS}ms — giving up" }
             _isStreaming.value = false
+            logger.warn { "[ACP] steerMessage: timed out after ${MAX_STEER_WAIT_MS}ms" }
+            service.injectLocalMessage("⚠️ Could not send steering message — timed out. Please try again.")
             return
         }
 
@@ -525,6 +561,8 @@ class ChatViewModel(
         if (currentSessionId == null) {
             logger.warn { "[ACP] steerMessage: session lost during steer" }
             _isStreaming.value = false
+            logger.warn { "[ACP] steerMessage: session lost during steer" }
+            service.injectLocalMessage("⚠️ Could not send message — session was lost. Please try again.")
             return
         }
 
@@ -574,6 +612,7 @@ class ChatViewModel(
         val count = _queuedMessages.value.size
         if (count > 0) {
             _queuedMessages.value = emptyList()
+            queueRetryCounts.clear()
             logger.info { "[ACP] clearQueue: cleared $count queued messages" }
         }
     }
@@ -581,17 +620,36 @@ class ChatViewModel(
     /**
      * Drain the queue — send the next queued message if any.
      * Called automatically when StreamingCompleted fires and queue is non-empty.
+     * Serialized by [drainMutex] to prevent concurrent queue-drain races.
+     *
+     * RETRY LIMIT: Failed messages are re-queued at most [MAX_QUEUE_RETRIES]
+     * times before being dropped. This prevents infinite retry loops when the
+     * server is unavailable.
      */
-    private fun drainQueue() {
+    private suspend fun drainQueue() = drainMutex.withLock {
         val queue = _queuedMessages.value
-        if (queue.isEmpty()) return
+        if (queue.isEmpty()) return@withLock
 
         val next = queue.first()
         _queuedMessages.value = queue.drop(1)
         logger.info { "[ACP] drainQueue: sending '${next.text.take(50)}' (${_queuedMessages.value.size} remaining)" }
 
-        scope.launch {
-            sendMessage(next.text, next.files)
+        val result = sendMessage(next.text, next.files)
+        if (result is SendMessageResult.Error) {
+            val retryCount = queueRetryCounts.getOrDefault(next.id, 0) + 1
+            if (retryCount <= MAX_QUEUE_RETRIES) {
+                queueRetryCounts[next.id] = retryCount
+                // Delay before re-queue to prevent rapid retry loops when
+                // StreamingCompleted fires multiple times in quick succession.
+                delay(RETRY_DELAY_MS)
+                _queuedMessages.value = _queuedMessages.value + next
+                logger.warn { "[ACP] drainQueue: re-queued failed message (attempt $retryCount/$MAX_QUEUE_RETRIES) — ${result.message}" }
+            } else {
+                queueRetryCounts.remove(next.id)
+                logger.error { "[ACP] drainQueue: dropping message after $MAX_QUEUE_RETRIES failed attempts — ${result.message}" }
+            }
+        } else {
+            queueRetryCounts.remove(next.id)
         }
     }
 
@@ -599,9 +657,18 @@ class ChatViewModel(
 
     suspend fun respondPermission(response: PermissionResponse) {
         val prompt = _permissionPrompt.value ?: return
-        service.respondPermission(prompt.permissionId, prompt.toolCallId, prompt.sessionId, response)
-        _permissionPrompt.value = null
-        service.permissionManager.cancelPermissionTimeout()
+        try {
+            service.respondPermission(prompt.permissionId, prompt.toolCallId, prompt.sessionId, response)
+            _permissionPrompt.value = null
+            service.permissionManager.cancelPermissionTimeout()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Permission response failed (network error, server down). Keep the
+            // prompt open so the user can retry. Don't dismiss it — dismissing
+            // would leave the server waiting for a response it never received.
+            logger.warn(e) { "[ACP] Permission response failed — keeping prompt open for retry" }
+        }
     }
 
     private fun startPermissionTimeout() {
@@ -620,16 +687,19 @@ class ChatViewModel(
                     prompt.options.getOrNull(idx)?.label
                 }
                 val answers = mutableListOf<List<String>>()
-                if (selectedLabels.isNotEmpty()) {
-                    answers.add(selectedLabels)
+                val answer = selectedLabels.toMutableList()
+                response.customInput?.let { answer.add(it) }
+                if (answer.isNotEmpty()) {
+                    answers.add(answer)
                 }
-                response.customInput?.let { answers.add(listOf(it)) }
                 if (answers.isEmpty()) {
                     service.rejectQuestion(prompt.promptId, prompt.sessionId)
                 } else {
                     service.respondQuestion(prompt.promptId, answers, prompt.sessionId)
                 }
                 _selectionPrompt.value = null
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 logger.warn(e) { "Failed to respond to question ${prompt.promptId}" }
             }
@@ -674,6 +744,161 @@ class ChatViewModel(
         }
     }
 
+    /** Execute `/review-perform [model...]` — instructs the LLM to adversarially
+     *  review the VCS-changed files and add review comments to `.review/` JSON files.
+     *
+     *  ## Model selection
+     *
+     *  - **No args** (`/review-perform`): uses the currently-selected control-bar
+     *    model. Backward-compatible with the original behavior.
+     *  - **One or more model args** (`/review-perform glm5.2 claude-sonnet`):
+     *    each arg is fuzzy-matched against the server-fetched model list
+     *    ([ModelArgResolver]) and the review prompt is sent once per matched
+     *    model, **sequentially** (each response completes before the next starts).
+     *    Each response is prefixed with a `### Review by <model>` header so the
+     *    user can compare findings across models in the same chat thread.
+     *  - **`*` wildcard** (`/review-perform *`): runs the review on all available
+     *    models. Use with caution — can be slow and costly.
+     *  - **Unresolved args**: if any arg doesn't match a model, an error message
+     *    is shown in the chat and only the resolved models run (or the control-bar
+     *    model if none resolved). */
+    fun executeReviewPerformCommand(args: String = "") {
+        scope.launch {
+            // GitService.getChangedFiles must run inside a read action.
+            // Uses Dispatchers.IO because runReadActionBlocking may spin-wait
+            // for a write action to complete — IO threads handle blocking.
+            val changedFiles = withContext(Dispatchers.IO) {
+                runReadActionBlocking {
+                    gitService.getChangedFiles()
+                }
+            }
+            val changedPaths = changedFiles.map { it.filePath }
+            val prompt = ReviewSkill.buildPerformPrompt(changedPaths)
+            executeMultiModelReview(args, prompt)
+        }
+    }
+
+    /** Execute `/review-perform-gaming [model...]` — like
+     *  [executeReviewPerformCommand] but injects the game-engine-specific
+     *  adversarial checklist (Unreal C++ GC/threading/lifecycle, Unity C#
+     *  allocations/coroutines/leaks, frame budgets, Blueprint interop,
+     *  replication). Model arg handling is identical to
+     *  [executeReviewPerformCommand]. */
+    fun executeReviewPerformGamingCommand(args: String = "") {
+        scope.launch {
+            val changedFiles = withContext(Dispatchers.IO) {
+                runReadActionBlocking {
+                    gitService.getChangedFiles()
+                }
+            }
+            val changedPaths = changedFiles.map { it.filePath }
+            val prompt = ReviewSkill.buildPerformGamingPrompt(changedPaths)
+            executeMultiModelReview(args, prompt)
+        }
+    }
+
+    /** Shared logic for both review-perform variants: resolve model args and
+     *  send the prompt once per model (or once with the control-bar model if
+     *  no args). Sequential — each [sendMessage] blocks until that model's
+     *  response completes (via the service's sendMutex + responseDeferred). */
+    private suspend fun executeMultiModelReview(args: String, prompt: String) {
+        if (args.isBlank()) {
+            // No model args — use the currently-selected control-bar model.
+            service.sendMessage(text = prompt)
+            return
+        }
+
+        // Use connected-providers models only (controlState.models), NOT
+        // allModels — allModels includes disconnected providers whose models
+        // would 500 when sent to the server.
+        val models = _controlState.value.models
+        val resolution = ModelArgResolver.resolveAll(args, models)
+
+        // Surface unresolved args as a chat message so the user sees the typo.
+        if (resolution.unresolved.isNotEmpty()) {
+            val unresolvedStr = resolution.unresolved.joinToString(", ") { "`$it`" }
+            val availableHints = models.take(5).joinToString(", ") {
+                "`${it.providerID}/${it.modelID}`"
+            }
+            val errorMsg = "⚠️ Could not resolve model(s): $unresolvedStr. " +
+                "Available models include: $availableHints" +
+                if (models.size > 5) ", …" else "."
+            service.injectLocalMessage(errorMsg)
+        }
+
+        if (resolution.models.isEmpty()) {
+            // Nothing resolved — don't run a review with the wrong model silently.
+            return
+        }
+
+        // Send one review per model, sequentially.
+        // For reasoning models that have variants, pick the first variant
+        // (or the control-bar's current thinking effort if the model supports it).
+        val currentVariant = _controlState.value.thinkingEffort.variant
+        for (model in resolution.models) {
+            // If the model has variants and the current thinking effort isn't
+            // null, use it. Otherwise pick the first variant if available, or
+            // null (server default) if the model has no variants.
+            val variant = when {
+                model.variants.isEmpty() -> null
+                currentVariant != null && currentVariant in model.variants -> currentVariant
+                else -> model.variants.firstOrNull()
+            }
+            val header = "### Review by ${model.displayName}\n\n"
+            val result = service.sendMessage(
+                text = header + prompt,
+                modelID = model.modelID,
+                providerID = model.providerID,
+                variant = variant,
+                model = OpenCodeClient.MessageModel(providerID = model.providerID, modelID = model.modelID)
+            )
+            // If a review fails (timeout, error), stop the loop — no point
+            // continuing with the remaining models if the session is in a
+            // bad state.
+            if (result is SendMessageResult.Error) {
+                service.injectLocalMessage(
+                    "⚠️ Review with ${model.displayName} failed: ${result.message}. " +
+                        "Remaining models skipped."
+                )
+                break
+            }
+        }
+    }
+
+    /** Execute `/review-resolve` — injects the [ReviewSkill.buildResolvePrompt]
+     *  summarizing all open review comments and the resolution workflow. */
+    fun executeReviewResolveCommand() {
+        scope.launch {
+            val index = ReviewCommentManager.getInstance(project).getIndex()
+            service.sendMessage(text = ReviewSkill.buildResolvePrompt(index))
+        }
+    }
+
+    /** Trigger a VFS refresh AND a direct disk re-read so the [ReviewCommentManager]
+     *  picks up any new `.review/` JSON files written by the LLM agent.
+     *
+     *  Two paths:
+     *  1. `asyncRefresh(null)` — triggers VFS discovery → AsyncFileListener re-reads
+     *     changed files incrementally. Fire-and-forget; may miss newly-created
+     *     `.review/` subdirectories.
+     *  2. `loadAll()` — reads ALL `.review/` files from disk via
+     *     `java.nio.file.Files.walk()`, bypassing VFS. Reliable but O(all-files).
+     *     Runs on ReviewCommentManager's internal scope (non-blocking).
+     *
+     *  Without this, gutter icons and highlights don't appear after `/review-perform`
+     *  until the user manually refreshes (Ctrl+Alt+Y) or restarts the IDE. */
+    private fun refreshReviewFiles() {
+        // 1. Direct disk re-read — reads ALL .review/ files via java.nio.file.Files.walk(),
+        // bypassing VFS entirely. This is the reliable primary path: even if VFS hasn't
+        // discovered a newly-created .review/ subdirectory, loadAll() still picks it up.
+        // Runs on ReviewCommentManager's internal scope (Dispatchers.Default) — non-blocking.
+        val manager = com.opencode.acp.review.ReviewCommentManager.getInstance(project)
+        manager.scope.launch { manager.loadAll() }
+        // 2. Trigger VFS refresh so the ReviewCommentFileWatcher's AsyncFileListener
+        // can do incremental re-reads for any later changes (secondary path).
+        com.intellij.openapi.vfs.VirtualFileManager.getInstance().asyncRefresh(null)
+    }
+
     /** Get messages StateFlow for a child session (used by ToolPill for task pills). */
     fun getSessionMessages(sessionId: String) = service.getSessionMessages(sessionId)
 
@@ -689,7 +914,8 @@ class ChatViewModel(
         current.removeAll { existing ->
             existing.text == text &&
                 existing.attachedFileNames == files.map { it.name } &&
-                existing.attachedFilePaths == files.map { it.path }
+                existing.attachedFilePaths == files.map { it.path } &&
+                existing.attachedFileMimes == files.map { it.mime }
         }
         current.add(0, entry)
         val trimmed = if (current.size > maxSize) current.take(maxSize) else current
@@ -746,7 +972,7 @@ class ChatViewModel(
                 toolName to ToolPermission.fromActionString(permStr)
             }
         } catch (e: Exception) {
-            logger.warn { "[ACP] Failed to parse persisted tool permissions: ${e.message}" }
+            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — corrupted settings, clearing" }
             emptyMap()
         }
     }
@@ -763,5 +989,8 @@ class ChatViewModel(
 
     companion object {
         private const val MAX_STEER_WAIT_MS = 10_000L
+        private const val MAX_QUEUE_RETRIES = 3
+        /** Delay before re-queuing a failed message to prevent rapid retry loops. */
+        private const val RETRY_DELAY_MS = 2_000L
     }
 }

@@ -57,8 +57,9 @@ class OpenCodeAgentSession(
             replayMessages.forEach { msg ->
                 val contentBlock: ContentBlock = try {
                     json.decodeFromString<ContentBlock>(msg.contentJson)
-                } catch (_: Exception) {
-                    ContentBlock.Text(text = msg.contentJson)
+                } catch (e: Exception) {
+                    logger.warn(e) { "Failed to deserialize ContentBlock, falling back to text" }
+                    ContentBlock.Text(text = msg.contentJson.take(200))
                 }
                 when (msg.role) {
                     "user" -> emit(Event.SessionUpdateEvent(
@@ -276,12 +277,15 @@ class OpenCodeAgentSession(
                     is SseEvent.Ignored -> {
                         logger.debug { "Ignored: ${sseEvent.eventType} — ${sseEvent.reason}" }
                     }
+
+                    is SseEvent.ResetTurn -> {
+                        // Internal control event — only used by SessionState, never arrives via SSE.
+                        // No-op in the ACP SDK path.
+                    }
                 }
             }
         } catch (e: CancellationException) {
-            emit(Event.PromptResponseEvent(
-                response = PromptResponse(stopReason = StopReason.CANCELLED)
-            ))
+            throw e
         } catch (e: Exception) {
             logger.error(e) { "Prompt processing failed" }
             emit(Event.PromptResponseEvent(
@@ -293,10 +297,14 @@ class OpenCodeAgentSession(
     override suspend fun cancel() {
         try {
             openCodeClient.abortSession(openCodeSessionId)
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] Failed to abort session $openCodeSessionId" }
+        }
         try {
             promptJob.getCompleted().cancel()
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            logger.debug(e) { "[ACP] Failed to cancel prompt job for session $openCodeSessionId" }
+        }
         terminalExecutor.releaseAllForSession(openCodeSessionId)
         sessionIdMap.remove(sessionId.value)
     }

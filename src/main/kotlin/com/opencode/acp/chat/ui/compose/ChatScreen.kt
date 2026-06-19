@@ -158,6 +158,9 @@ fun
         listOf(
             SlashCommand("clear", "Start a new session", AllIconsKeys.General.Add),
             SlashCommand("cancel", "Cancel current response", AllIconsKeys.Actions.Suspend),
+            SlashCommand("review-perform", "Adversarial review: add comments on changed files", AllIconsKeys.General.BalloonError),
+            SlashCommand("review-perform-gaming", "Adversarial review: game-engine checklist (Unreal C++ / Unity C#)", AllIconsKeys.General.BalloonError),
+            SlashCommand("review-resolve", "Fix all open review comments", AllIconsKeys.General.BalloonInformation),
         )
     }
     // Merged list: local commands first, then server commands
@@ -352,6 +355,7 @@ fun
                         project = project,
                         modifier = Modifier.width(sidebarWidth),
                         fileChangeSignal = viewModel.fileChangeSignal,
+                        commentChangeSignal = viewModel.commentChangeSignal,
                         streamingSessionIds = streamingSessionIds,
                         pendingCreationSessionIds = pendingCreationSessionIds,
                         clearAllState = clearAllState,
@@ -456,6 +460,9 @@ fun
                         when (command.name) {
                             "clear" -> viewModel.createAndSwitchSession()
                             "cancel" -> viewModel.cancel()
+                            "review-perform" -> viewModel.executeReviewPerformCommand(command.args)
+                            "review-perform-gaming" -> viewModel.executeReviewPerformGamingCommand(command.args)
+                            "review-resolve" -> viewModel.executeReviewResolveCommand()
                             else -> viewModel.executeServerCommand(command.name)
                         }
                     }

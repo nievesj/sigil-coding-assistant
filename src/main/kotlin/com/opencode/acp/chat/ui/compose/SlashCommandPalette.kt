@@ -34,7 +34,12 @@ data class SlashCommand(
     val name: String,
     val description: String,
     val iconKey: IconKey? = null,
-    val isServerCommand: Boolean = false
+    val isServerCommand: Boolean = false,
+    /** Trailing arguments typed after the command name (e.g. for
+     *  `/review-perform glm5.2 claude-sonnet`, args = "glm5.2 claude-sonnet").
+     *  Populated at invocation time by InputArea; empty for palette-selected
+     *  commands with no trailing text. */
+    val args: String = ""
 )
 
 /**

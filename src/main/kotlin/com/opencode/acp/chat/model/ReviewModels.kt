@@ -1,6 +1,7 @@
 package com.opencode.acp.chat.model
 
 import com.intellij.openapi.vfs.VirtualFile
+import com.opencode.acp.review.ReviewComment
 
 /** Display model for a single changed file.
  * Stores filePath (not Change) to avoid stale references after VCS refresh.
@@ -30,10 +31,27 @@ enum class FileChangeStatus {
     CONFLICTED
 }
 
+/**
+ * Mapping of file path → number of open review comments.
+ * Built from ReviewIndex.totalOpen per file.
+ */
+data class CommentCounts(
+    val countsByFile: Map<String, Int> = emptyMap(),
+) {
+    /** Open comments count for a given file path, or 0. */
+    fun forFile(path: String): Int = countsByFile[path] ?: 0
+
+    val totalOpen: Int get() = countsByFile.values.sum()
+}
+
 /** Sealed state for the review panel. */
 sealed interface ReviewState {
     data object Loading : ReviewState
-    data class Loaded(val files: List<ChangedFile>) : ReviewState
+    data class Loaded(
+        val files: List<ChangedFile>,
+        val commentCounts: CommentCounts = CommentCounts(),
+        val openCommentsByFile: Map<String, List<ReviewComment>> = emptyMap(),
+    ) : ReviewState
     data object Empty : ReviewState           // No changes in any VCS
     data class Error(val message: String, val retryable: Boolean = true) : ReviewState
 }

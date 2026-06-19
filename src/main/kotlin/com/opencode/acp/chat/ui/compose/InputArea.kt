@@ -474,11 +474,15 @@ fun InputArea(
         }
     }
 
-    // Watch text changes to show/hide slash palette
+    // Watch text changes to show/hide slash palette.
+    // The palette stays open as long as the text starts with "/" and has no
+    // newline — commands with args (e.g. "/review-perform glm5.2 claude") can
+    // be long, so we don't cap by length here. The palette itself filters by
+    // command-name prefix; non-matching text shows "No matching commands".
     LaunchedEffect(Unit) {
         androidx.compose.runtime.snapshotFlow { textState.text.toString() }
             .collect { text ->
-                showSlashPalette = text.startsWith("/") && text.length < 30 && !text.contains("\n")
+                showSlashPalette = text.startsWith("/") && !text.contains("\n")
             }
     }
 
@@ -507,9 +511,14 @@ fun InputArea(
                         commands = commands,
                         query = slashQuery,
                         onCommandSelected = { command ->
+                            // Extract trailing args from the current input text, same logic
+                            // as the Enter-key path. slashQuery is text after "/".
+                            val args = if (slashQuery.length > command.name.length) {
+                                slashQuery.substring(command.name.length).trim()
+                            } else ""
                             showSlashPalette = false
                             textState.edit { replace(0, length, "") }
-                            onSlashCommand(command)
+                            onSlashCommand(command.copy(args = args))
                         },
                         onDismiss = { showSlashPalette = false },
                     )
@@ -781,22 +790,53 @@ fun InputArea(
                                             event.key == Key.Enter && !event.isShiftPressed && showSlashPalette -> {
                                                 val match = commands.filter { it.name.startsWith(slashQuery, ignoreCase = true) }
                                                 if (match.isNotEmpty()) {
+                                                    val cmd = match.first()
+                                                    // Extract trailing args: everything after the command name in slashQuery.
+                                                    // e.g. "/review-perform glm5.2 claude" → slashQuery="review-perform glm5.2 claude"
+                                                    //      → after "review-perform" → " glm5.2 claude" → trim → "glm5.2 claude"
+                                                    val args = if (slashQuery.length > cmd.name.length) {
+                                                        slashQuery.substring(cmd.name.length).trim()
+                                                    } else ""
                                                     showSlashPalette = false
                                                     textState.edit { replace(0, length, "") }
-                                                    onSlashCommand(match.first())
+                                                    onSlashCommand(cmd.copy(args = args))
                                                 }
                                                 true
                                             }
                                             event.key == Key.Enter && !event.isShiftPressed -> {
                                                 val text = textState.text.toString().trim()
-                                                if (text.isNotEmpty()) {
-                                                    onSend(text, attachedFiles)
+                                                // Slash command interception: even if the palette isn't
+                                                // visible (e.g. text was pasted, or exceeded the old
+                                                // length cap), check if the text starts with "/" and the
+                                                // first word matches a known command. If so, execute it
+                                                // with trailing args instead of sending to the server.
+                                                val slashCmd = if (text.startsWith("/")) {
+                                                    val firstWord = text.substring(1).substringBefore(" ")
+                                                    commands.filter { it.name.equals(firstWord, ignoreCase = true) }
+                                                        .firstOrNull()?.let { cmd ->
+                                                            val args = if (text.length > firstWord.length + 1) {
+                                                                text.substring(firstWord.length + 1).trim()
+                                                            } else ""
+                                                            cmd.copy(args = args)
+                                                        }
+                                                } else null
+                                                if (slashCmd != null) {
+                                                    showSlashPalette = false
+                                                    inHistoryMode = false
+                                                    historyIndex = -1
                                                     textState.edit { replace(0, length, "") }
+                                                    onSlashCommand(slashCmd)
+                                                    true
+                                                } else {
+                                                    if (text.isNotEmpty()) {
+                                                        onSend(text, attachedFiles)
+                                                        textState.edit { replace(0, length, "") }
+                                                    }
+                                                    showSlashPalette = false
+                                                    inHistoryMode = false
+                                                    historyIndex = -1
+                                                    true
                                                 }
-                                                showSlashPalette = false
-                                                inHistoryMode = false
-                                                historyIndex = -1
-                                                true
                                             }
                                             event.key == Key.Enter && event.isShiftPressed -> {
                                                 // Explicitly insert newline — CMP BasicTextField

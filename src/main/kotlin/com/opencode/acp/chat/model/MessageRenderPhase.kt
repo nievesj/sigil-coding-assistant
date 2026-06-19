@@ -41,7 +41,16 @@ fun ChatMessage.renderPhase(): MessageRenderPhase {
         it is MessagePart.ToolCall ||
         it is MessagePart.Text ||
         it is MessagePart.Code ||
-        it is MessagePart.Table
+        it is MessagePart.Table ||
+        it is MessagePart.Patch ||
+        it is MessagePart.Agent ||
+        it is MessagePart.StepFinish ||
+        it is MessagePart.Retry ||
+        it is MessagePart.Compaction ||
+        it is MessagePart.FileChange ||
+        it is MessagePart.AssistantFile ||
+        it is MessagePart.Image ||
+        it is MessagePart.Error
     }
 
     return if (hasAnyContent) MessageRenderPhase.HAS_CONTENT

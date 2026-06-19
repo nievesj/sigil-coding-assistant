@@ -171,15 +171,41 @@ class SessionState(
     fun createAssistantMessage(
         modelID: String?,
         providerID: String?,
-        serverMessageId: String? = null
+        serverMessageId: String? = null,
+        /** When true, [ctx] is reset directly on the event processing coroutine
+         *  (caller is processEventInternal). When false, a [SseEvent.ResetTurn]
+         *  control event is sent through [eventChannel] so the reset runs on the
+         *  event processing coroutine — eliminating the cross-coroutine race on
+         *  ctx fields. */
+        fromEventProcessing: Boolean = false
     ): String = stateLock.withLock {
-        ctx.resetTurnState()
-
-        var droppedCount = 0
-        while (eventChannel.tryReceive().isSuccess) { droppedCount++ }
-        if (droppedCount > 0) {
-            logger.info { "[ACP] createAssistantMessage: drained $droppedCount stale events from previous turn" }
+        // NOTE: This is called from two paths:
+        // 1. OpenCodeService.sendMessageInternal() (caller's coroutine, holds sendMutex)
+        // 2. processEventInternal() auto-create (event processing coroutine, activeMessageId == null)
+        //
+        // Thread-safety: ctx field mutations must run on the event processing
+        // coroutine (single-writer). External callers send a ResetTurn control
+        // event through eventChannel; the auto-create path (fromEventProcessing=true)
+        // resets directly since it's already on the event processing coroutine.
+        if (fromEventProcessing) {
+            ctx.resetTurnState()
+        } else {
+            // Drain stale events from previous turn BEFORE enqueuing ResetTurn,
+            // so the channel ordering is: drain → ResetTurn → new events.
+            // NOTE: This is best-effort — events enqueued by processEvent()
+            // between the drain completing and ResetTurn being sent are lost.
+            // This is acceptable because stale events from a previous turn
+            // would be misrouted to the new turn's message anyway.
+            var droppedCount = 0
+            while (eventChannel.tryReceive().isSuccess) { droppedCount++ }
+            if (droppedCount > 0) {
+                logger.info { "[ACP] createAssistantMessage: drained $droppedCount stale events from previous turn" }
+            }
+            // Send ResetTurn — processed before any new SSE events (FIFO channel).
+            // This ensures ctx is cleared on the event processing coroutine.
+            eventChannel.trySend(SseEvent.ResetTurn(sessionId))
         }
+
         resegmentJob?.cancel()
         resegmentJob = null
 
@@ -262,6 +288,7 @@ class SessionState(
                 val entry = iter.next()
                 entry.value.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
                     ctx.toolCallIndex.remove(part.pill.toolCallId)
+                    ctx.toolCallPills.remove(part.pill.toolCallId)
                 }
                 iter.remove()
                 toRemove--
@@ -380,9 +407,16 @@ class SessionState(
             logger.warn { "[ACP] updateServerMessageId MISMATCH: msg=$messageId, serverId=$serverMessageId, activeMessageId=${ctx.activeMessageId}" }
             return@withLock
         }
-        ctx.activeServerMessageId = serverMessageId
+        // Don't overwrite if already learned from an earlier SSE event (MessageFinalized).
+        // The server ID from the HTTP response and from SSE should match; if they don't,
+        // keep the SSE-learned value (it was confirmed by the event carrying it).
+        if (ctx.activeServerMessageId == null) {
+            ctx.activeServerMessageId = serverMessageId
+            logger.info { "[ACP] updateServerMessageId: msg=$messageId → serverId=$serverMessageId" }
+        } else if (ctx.activeServerMessageId != serverMessageId) {
+            logger.warn { "[ACP] updateServerMessageId: server ID mismatch — HTTP=$serverMessageId, SSE=${ctx.activeServerMessageId}. Keeping SSE value." }
+        }
         updateMessage(messageId) { it.copy(serverMessageId = serverMessageId) }
-        logger.info { "[ACP] updateServerMessageId: msg=$messageId → serverId=$serverMessageId" }
     }
 
     fun setLastUserText(text: String?) {
@@ -433,6 +467,13 @@ class SessionState(
     private fun processEventInternal(event: SseEvent) {
         // Events that don't require an active streaming message
         when (event) {
+            // Internal control event — reset ctx for a new streaming turn.
+            // Runs on the event processing coroutine, eliminating the cross-coroutine
+            // race between external callers (under stateLock) and event processing.
+            is SseEvent.ResetTurn -> {
+                ctx.resetTurnState()
+                return
+            }
             is SseEvent.TodoUpdated -> {
                 val todos = event.todos.map { todo ->
                     TodoItem(content = todo.content, status = todo.status, priority = todo.priority)
@@ -486,6 +527,17 @@ class SessionState(
             is SseEvent.Plan -> { return }
             is SseEvent.MessageComplete -> { return }
             is SseEvent.Ignored -> { return }
+            is SseEvent.SessionError -> {
+                // Surface server-side session errors to the UI via signal.
+                // Without this handler, session.error events were silently dropped.
+                _signals.tryEmit(UiSignal.SessionError(sessionId, event.errorMessage))
+                return
+            }
+            is SseEvent.SessionCompacted -> {
+                // Handled by SessionManager (refreshes messages via REST + recomputes context).
+                // No local state mutation needed in SessionState.
+                return
+            }
             else -> { /* handled below */ }
         }
 
@@ -533,7 +585,7 @@ class SessionState(
         }
         if (needsNewMessage) {
             logger.info { "[ACP] Auto-creating assistant message for session $sessionId (triggered by ${event::class.simpleName}, serverMsgId=$eventServerId)" }
-            createAssistantMessage(modelID = null, providerID = null, serverMessageId = eventServerId)
+            createAssistantMessage(modelID = null, providerID = null, serverMessageId = eventServerId, fromEventProcessing = true)
         }
 
         val msgId = ctx.activeMessageId
@@ -614,6 +666,7 @@ class SessionState(
                 val text = event.text
                 if (!ctx.firstTextChunkReceived && text.isNotBlank()) {
                     ctx.firstTextChunkReceived = true
+                    if (event.partId != null) ctx.activeTextPartId = event.partId
                     emitStreamingStartedIfNeeded(msgId)
                     // Initialize first text segment (anchor set in resegmentTextPartsDirect)
                     if (ctx.textSegments.isEmpty()) {
@@ -622,11 +675,17 @@ class SessionState(
                     val userText = ctx.lastUserText
                     if (userText != null && text.startsWith(userText, ignoreCase = true)) {
                         ctx.userEchoStripped = true
-                        ctx.textBuffer.append(text.substring(userText.length))
+                        ctx.textBuffer.append(text.substring(userText.length).trimStart())
                     } else {
                         ctx.textBuffer.append(text)
                     }
                 } else {
+                    // Track new text part: if partId changed, a new text segment started
+                    // (after a tool call). The ToolUse handler already inserted a
+                    // textSegments boundary — we just update the active part tracker.
+                    if (event.partId != null && event.partId != ctx.activeTextPartId) {
+                        ctx.activeTextPartId = event.partId
+                    }
                     ctx.textBuffer.append(text)
                 }
                 ctx.streamingText.value = ctx.textBuffer.toString()
@@ -639,6 +698,35 @@ class SessionState(
                     ctx.activeThinkingCompleted = true
                     freezeCurrentThinking()
                 }
+
+                // message.part.updated (text) is a per-part finalization echo: it carries
+                // the text for ONE text part, NOT the whole accumulated message. If we
+                // already streamed deltas this turn (for this part or any prior part in an
+                // interleaved text→tool→text message), the streamed content is authoritative
+                // and clobbering the buffer would destroy text from other parts. This guard
+                // is partId-agnostic so it also covers V2 events (session.next.text.ended)
+                // which carry no partId. ToolUse-inserted textSegments boundaries are preserved.
+                if (ctx.firstTextChunkReceived && ctx.textBuffer.isNotEmpty()) {
+                    // Deltas already streamed this turn — streamed content is authoritative.
+                    // Don't clobber the buffer. (Server echo is redundant here.)
+                    // Update the active part tracker if a partId is provided.
+                    if (event.partId != null && event.partId != ctx.activeTextPartId) {
+                        ctx.activeTextPartId = event.partId
+                    }
+                    logger.debug { "[ACP] TextReplace: skipping (partId=${event.partId}, active=${ctx.activeTextPartId}, bufferLen=${ctx.textBuffer.length})" }
+                    return@processEventInternal
+                }
+
+                // No content streamed yet for this turn — seed the buffer.
+                // This covers: history loads, servers that send part.updated before
+                // deltas, and the very first TextReplace of a turn.
+                if (event.text.isEmpty()) {
+                    // Empty finalization echo with no prior streamed content — nothing to seed.
+                    // Avoids stripping rendered text-derived parts via resegmentTextPartsDirect's
+                    // empty-buffer branch.
+                    logger.debug { "[ACP] TextReplace: skipping (empty text, no prior streamed content)" }
+                    return@processEventInternal
+                }
                 ctx.textBuffer.clear()
                 ctx.textBuffer.append(event.text)
                 ctx.userEchoStripped = false
@@ -647,9 +735,13 @@ class SessionState(
                     ctx.textBuffer.delete(0, userText.length)
                     ctx.userEchoStripped = true
                 }
-                // TextReplace replaces the entire buffer — reset segments
-                ctx.textSegments.clear()
-                ctx.textSegments.add(TextSegment(0, null))  // anchor set in resegmentTextPartsDirect
+                ctx.firstTextChunkReceived = true
+                if (event.partId != null) ctx.activeTextPartId = event.partId
+                // Preserve existing textSegments (ToolUse boundaries). Only seed a
+                // default first segment if none exist — DO NOT clear them.
+                if (ctx.textSegments.isEmpty()) {
+                    ctx.textSegments.add(TextSegment(0, null))
+                }
                 ctx.streamingText.value = ctx.textBuffer.toString()
                 scheduleResegment(msgId)
             }
@@ -788,7 +880,6 @@ class SessionState(
                             deletions = deletions
                         )
                         ctx.pendingFileChanges.add(change)
-                        _signals.tryEmit(UiSignal.FileChanged(Unit))
                     }
                 }
 
@@ -873,6 +964,11 @@ class SessionState(
                         parts[event.toolCallId] = MessagePart.ToolCall(pill = newPill, state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed)
                         msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                     }
+                    // For tool results without a prior ToolUse, also emit FileChanged
+                    // when the tool is an edit — this covers fast sub-agent writes.
+                    if (resolvedKind == ToolKind.EDIT) {
+                        _signals.tryEmit(UiSignal.FileChanged(Unit))
+                    }
                     // For task tools: proactively cache the child session
                     val childId = try { event.metadata?.get("sessionId")?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
                     if (childId != null) {
@@ -955,9 +1051,24 @@ class SessionState(
                 // Guard: only process events for the currently streaming message.
                 // Check against both server ID and local ID — the message may have
                 // been created with a generated ID before the server assigned one.
+                //
+                // CRITICAL: When activeServerMessageId is null, we're still waiting
+                // for the HTTP response from sendMessageAsync (which blocks until the
+                // LLM finishes). SSE events arrive BEFORE the HTTP response returns,
+                // so we must accept the first MessageFinalized as belonging to the
+                // active message and learn the server ID from it. Without this,
+                // MessageFinalized is silently dropped and finalizeStreaming() never
+                // fires — the UI stays stuck in streaming state forever.
                 if (serverMsgId != ctx.activeServerMessageId && serverMsgId != ctx.activeMessageId) {
-                    logger.debug { "[ACP] MessageFinalized for non-active message $serverMsgId — skipping (activeLocal=${ctx.activeMessageId}, activeServer=${ctx.activeServerMessageId})" }
-                    return
+                    if (ctx.activeServerMessageId == null && ctx.activeMessageId != null && ctx.isStreaming) {
+                        // We're streaming but haven't received the server message ID yet.
+                        // This MessageFinalized event carries it — adopt it.
+                        logger.info { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${ctx.activeMessageId} (activeServerId was null)" }
+                        ctx.activeServerMessageId = serverMsgId
+                    } else {
+                        logger.debug { "[ACP] MessageFinalized for non-active message $serverMsgId — skipping (activeLocal=${ctx.activeMessageId}, activeServer=${ctx.activeServerMessageId})" }
+                        return
+                    }
                 }
 
                 // Use the LOCAL message ID for map lookups — the message cache is
@@ -997,6 +1108,10 @@ class SessionState(
                     msg.copy(parts = parts, isStreaming = false, state = MessageState.Failed(event.message))
                 }
                 _signals.tryEmit(UiSignal.Error(msgId, event.message))
+                // MUST emit StreamingCompleted so responseDeferred is completed.
+                // Without this, the caller hangs until activity timeout (default 300s)
+                // while holding sendMutex, blocking all subsequent sends.
+                emitStreamingCompleted(msgId)
             }
 
             // ── Patch ─────────────────────────────────────────────────────
@@ -1084,6 +1199,7 @@ class SessionState(
             }
 
             // Unreachable — handled in first when block
+            is SseEvent.ResetTurn,
             is SseEvent.Ignored,
             is SseEvent.MessageComplete,
             is SseEvent.MessageRemoved,
@@ -1102,6 +1218,16 @@ class SessionState(
      * Shared streaming finalization logic — called by both SseEvent.Stop and
      * SseEvent.MessageFinalized handlers. Handles freeze, resegment, tool-calls
      * filter, and debounced completion.
+     *
+     * DEBOUNCE RACE NOTE: The 300ms debounce is intentional. If a new event arrives
+     * before the debounce completes, processEventInternal() cancels pendingStopJob
+     * (line 493), preventing premature finalization. If the debounce completes and
+     * acquires stateLock before a new event can cancel it, finalization proceeds —
+     * the subsequent event processes against the finalized message, which is correct
+     * (the Stop/MessageFinalized event was the last content-bearing event). Under
+     * heavy load (e.g., resegmentTextPartsDirect holding stateLock during markdown
+     * parsing), the debounce job's lock acquisition is delayed, but this only
+     * extends the debounce window — it does not cause incorrect behavior.
      */
     private fun finalizeStreaming(msgId: String, stopReason: String) {
         if (!ctx.isStreaming) {
@@ -1166,7 +1292,7 @@ class SessionState(
         }
     }
 
-    private fun resegmentTextPartsDirect(msgId: String) {
+    private fun resegmentTextPartsDirect(msgId: String, overrideIsStreaming: Boolean = ctx.isStreaming) {
         stateLock.withLock {
             if (ctx.textBuffer.isEmpty()) {
                 updateMessage(msgId) { msg ->
@@ -1195,20 +1321,24 @@ class SessionState(
                 }
             }
 
+            // Snapshot after anchor setup — iteration below uses this snapshot
+            // to avoid races with the event processing coroutine that may mutate ctx.textSegments.
+            val segmentsSnapshot = ctx.textSegments.toList()
+
             val raw = ctx.textBuffer.toString()
 
             // Segment each text segment independently and collect parts per segment.
             // Each segment covers a slice of textBuffer: [startOffset, nextSegment.startOffset).
             val partsBySegment = mutableListOf<List<Pair<String, MessagePart>>>()
-            for (segIdx in ctx.textSegments.indices) {
-                val start = ctx.textSegments[segIdx].startOffset
-                val end = if (segIdx + 1 < ctx.textSegments.size) ctx.textSegments[segIdx + 1].startOffset else raw.length
+            for (segIdx in segmentsSnapshot.indices) {
+                val start = segmentsSnapshot[segIdx].startOffset
+                val end = if (segIdx + 1 < segmentsSnapshot.size) segmentsSnapshot[segIdx + 1].startOffset else raw.length
                 if (start >= end) {
                     partsBySegment.add(emptyList())
                     continue
                 }
                 val segmentText = raw.substring(start, end)
-                val segments = if (ctx.isStreaming) {
+                val segments = if (overrideIsStreaming) {
                     MarkdownSegmenter.segmentHealed(segmentText)
                 } else {
                     MarkdownSegmenter.segment(segmentText)
@@ -1282,7 +1412,7 @@ class SessionState(
                 var nextSegToInsert = 0
 
                 // Insert segments with null anchor at the beginning
-                while (nextSegToInsert < ctx.textSegments.size && ctx.textSegments[nextSegToInsert].anchorKey == null) {
+                while (nextSegToInsert < segmentsSnapshot.size && segmentsSnapshot[nextSegToInsert].anchorKey == null) {
                     partsBySegment[nextSegToInsert].forEach { (tKey, tPart) -> newMap[tKey] = tPart }
                     nextSegToInsert++
                 }
@@ -1290,14 +1420,14 @@ class SessionState(
                 // Iterate preserved parts, inserting segment parts after their anchors
                 preserved.forEach { (key, part) ->
                     newMap[key] = part
-                    while (nextSegToInsert < ctx.textSegments.size && ctx.textSegments[nextSegToInsert].anchorKey == key) {
+                    while (nextSegToInsert < segmentsSnapshot.size && segmentsSnapshot[nextSegToInsert].anchorKey == key) {
                         partsBySegment[nextSegToInsert].forEach { (tKey, tPart) -> newMap[tKey] = tPart }
                         nextSegToInsert++
                     }
                 }
 
                 // Insert remaining segments (anchors were removed, e.g., compaction)
-                while (nextSegToInsert < ctx.textSegments.size) {
+                while (nextSegToInsert < segmentsSnapshot.size) {
                     partsBySegment[nextSegToInsert].forEach { (tKey, tPart) -> newMap[tKey] = tPart }
                     nextSegToInsert++
                 }
@@ -1308,10 +1438,11 @@ class SessionState(
     }
 
     private fun resegmentTextPartsFinal(msgId: String) = stateLock.withLock {
-        val wasStreaming = ctx.isStreaming
-        ctx.isStreaming = false
-        resegmentTextPartsDirect(msgId)
-        ctx.isStreaming = wasStreaming
+        // Pass overrideIsStreaming=false so resegmentTextPartsDirect uses
+        // non-healed segmentation without temporarily mutating ctx.isStreaming.
+        // This avoids a thread-safety issue where the event processing coroutine
+        // could read the temporarily-false value.
+        resegmentTextPartsDirect(msgId, overrideIsStreaming = false)
     }
 
     companion object {
@@ -1320,6 +1451,9 @@ class SessionState(
 
     // ── Internal: Helpers ───────────────────────────────────────────────────
 
+    // NOTE: Most callers already hold stateLock. ReentrantLock allows this
+    // without deadlocking, but consider extracting a stateLock-free internal
+    // variant for hot paths (ToolUse/ToolResult on every SSE event).
     private fun updateMessage(messageId: String, transform: (ChatMessage) -> ChatMessage) = stateLock.withLock {
         val map = _messages.value
         val existing = map[messageId] ?: return@withLock
