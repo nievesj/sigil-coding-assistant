@@ -421,6 +421,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                 logger.info { "[ACP] SSE reconnect: server healthy, re-subscribing" }
                 sseJob?.cancel()
                 sseHealthCheckJob?.cancel()
+                // Wait for old jobs to finish before launching new ones to prevent
+                // stale StreamingCompleted signals from completing the new turn's deferred.
+                sseJob?.join()
+                sseHealthCheckJob?.join()
                 val reconnectTime = System.currentTimeMillis()
                 sseLastEventTimeMs.set(reconnectTime)
                 logger.info { "[ACP] SSE reconnected at $reconnectTime" }
@@ -488,6 +492,9 @@ class OpenCodeService(private val project: Project) : Disposable {
 
                     // Server has a completed assistant message as the last message —
                     // generation completed while we were disconnected.
+                    // Read activeMessageId once (volatile) and pass to completeStreaming.
+                    // completeStreaming() internally verifies the ID matches before finalizing,
+                    // so if the value changed between our read and the call, it's a no-op.
                     val activeMsgId = session.ctx.activeMessageId
                     if (activeMsgId != null) {
                         // completeStreaming() acquires stateLock (a JVM ReentrantLock) and
@@ -496,6 +503,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                         // stateLock handles thread-safety with the EDT event processor.
                         session.completeStreaming(activeMsgId)
                     }
+                    // Complete the deferred to unblock the caller immediately.
+                    // CompletableDeferred.complete() is idempotent — if the signal collector
+                    // also completes it (via StreamingCompleted), the second call is a no-op.
+                    // Null it out so the signal collector's completion is also harmless.
                     session.responseDeferred?.complete(Unit)
                     session.responseDeferred = null
                     logger.info { "[ACP] Recovered background session $sessionId after SSE reconnection" }
@@ -597,7 +608,20 @@ class OpenCodeService(private val project: Project) : Disposable {
                     logger.warn { "[ACP] Skipping attached file '${file.name}' — file not found or unreadable: ${file.path}" }
                     return@forEach
                 }
-                val url = com.opencode.acp.util.pathToFileUrl(file.path)
+                // CWE-22 path traversal guard: reject paths with .. sequences that escape
+                // known-safe locations (project directory, system temp). Clipboard images
+                // are stored in the temp directory; project files are under basePath.
+                val canonicalPath = fileObj.canonicalPath
+                val projectBase = project.basePath?.let { java.io.File(it).canonicalPath }
+                val tempDir = java.io.File(System.getProperty("java.io.tmpdir")).canonicalPath
+                val isInsideProject = projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator)
+                val isInsideTemp = canonicalPath.startsWith(tempDir + java.io.File.separator)
+                if (!isInsideProject && !isInsideTemp) {
+                    logger.warn { "[ACP] Skipping attached file '${file.name}' — path escapes project/temp directory: ${file.path}" }
+                    return@forEach
+                }
+                // Use canonical path for the URL to prevent symlink-based exfiltration
+                val url = com.opencode.acp.util.pathToFileUrl(canonicalPath)
                 if (url == null) {
                     logger.warn { "[ACP] Skipping attached file '${file.name}' — pathToFileUrl returned null for: ${file.path}" }
                     return@forEach
@@ -624,7 +648,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             // receives no events between tool.start and tool.result. Without the running-tool
             // guard, the activity monitor would false-positive after responseTimeoutSeconds
             // even though the server is actively working.
-            val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds.coerceAtLeast(10) * 1000L
+            val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds.coerceIn(10, 3600) * 1000L
             val activityMonitorJob = scope.launch {
                 while (isActive) {
                     delay(ACTIVITY_CHECK_INTERVAL_MS)
@@ -633,7 +657,12 @@ class OpenCodeService(private val project: Project) : Disposable {
                     // file writes, network calls). During this time the parent session gets
                     // no SSE events, so lastActivityTimeMs goes stale even though work is
                     // happening server-side.
-                    val hasRunningTools = activeSession?.ctx?.toolPartStates?.values?.any { it is PartState.InProgress } == true
+                    // PartState.Pending (waiting for user permission) also counts as active —
+                    // the server IS working, just blocked on user input. Without this, the
+                    // monitor would false-positive timeout while the user reads the permission prompt.
+                    val hasRunningTools = activeSession?.ctx?.toolPartStates?.values?.any {
+                        it is PartState.InProgress || it is PartState.Pending
+                    } == true
                     if (hasRunningTools) {
                         logger.debug { "[ACP] sendMessage: tools still running, skipping activity check" }
                         continue
@@ -665,7 +694,9 @@ class OpenCodeService(private val project: Project) : Disposable {
                 SendMessageResult.Success(assistantMsgId)
             }
         } catch (e: CancellationException) {
-            try { sessionManager.completeStreaming(assistantMsgId) } catch (_: Exception) {}
+            try { sessionManager.completeStreaming(assistantMsgId) } catch (ex: Exception) {
+                logger.debug(ex) { "[ACP] completeStreaming failed during CancellationException handling" }
+            }
             throw e
         } catch (e: Exception) {
             val errorMsg = when {
@@ -725,16 +756,14 @@ class OpenCodeService(private val project: Project) : Disposable {
      * deferred without calling cancel().
      */
     suspend fun steerCancel(): CompletableDeferred<Unit> {
-        // Fast path: mutex isn't held, nothing to abort
-        if (!sendMutex.isLocked) {
-            val deferred = CompletableDeferred<Unit>()
-            deferred.complete(Unit)
-            return deferred
-        }
-
-        // Slow path: abort in-progress response and wait for mutex release
+        // Always call cancel() — it's idempotent (abortSession is a no-op if
+        // nothing is streaming). The old TOCTOU check (sendMutex.isLocked) had
+        // a race: between the non-atomic check and the cancel() call, the mutex
+        // state could change, causing the steer message to be silently dropped.
         cancel()
 
+        // Always wait for the mutex to be released — this ensures the old
+        // sendMessage()'s finally block has completed before the caller proceeds.
         val deferred = CompletableDeferred<Unit>()
         val job = scope.launch {
             try {
@@ -744,8 +773,12 @@ class OpenCodeService(private val project: Project) : Disposable {
                 sendMutex.lock()
                 sendMutex.unlock()
                 deferred.complete(Unit)
+            } catch (e: CancellationException) {
+                // Scope cancelled — re-throw per coroutine convention
+                deferred.complete(Unit)
+                throw e
             } catch (_: Exception) {
-                // Scope cancelled or mutex acquisition failed — complete deferred to unblock caller
+                // Mutex acquisition failed — complete deferred to unblock caller
                 deferred.complete(Unit)
             }
         }

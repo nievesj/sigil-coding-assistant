@@ -1,6 +1,7 @@
 package com.opencode.acp.chat.model
 
 import com.intellij.openapi.vfs.VirtualFile
+import com.opencode.acp.review.ReviewComment
 
 /** Display model for a single changed file.
  * Stores filePath (not Change) to avoid stale references after VCS refresh.
@@ -49,6 +50,7 @@ sealed interface ReviewState {
     data class Loaded(
         val files: List<ChangedFile>,
         val commentCounts: CommentCounts = CommentCounts(),
+        val openCommentsByFile: Map<String, List<ReviewComment>> = emptyMap(),
     ) : ReviewState
     data object Empty : ReviewState           // No changes in any VCS
     data class Error(val message: String, val retryable: Boolean = true) : ReviewState

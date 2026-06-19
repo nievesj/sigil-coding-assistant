@@ -24,9 +24,13 @@ data class ReviewComment(
     val resolvedAt: String? = null,
     val resolution: String? = null,
 ) {
-    /** Validate constraints that must hold before write. */
+    /** Validate constraints that must hold before write.
+     *  Includes format validation for the comment ID to catch malformed entries
+     *  from external tools (LLM agents, CI). */
     fun validate(): Boolean =
-        id.isNotBlank() && startLine >= 1 && endLine >= startLine && comment.isNotBlank()
+        id.isNotBlank() && id.matches(Regex("^cmt_[0-9a-fA-F]{12}$")) &&
+            startLine >= 1 && endLine >= startLine && endLine <= 10_000_000 &&
+            comment.isNotBlank()
 
     companion object {
         /** Generate a fresh comment ID: `cmt_` + 12 hex chars (matches the TDD schema). */
@@ -45,9 +49,15 @@ enum class ReviewStatus { OPEN, RESOLVED, DELETED }
  * Wrapper for one JSON file — one per reviewed source file.
  *
  * The `etag` field supports optimistic concurrency: a random opaque token
- * regenerated on every write. Writers must read the current etag, modify,
- * then write — if the etag on disk differs from the read value, the write
- * is retried (re-read, merge, re-write up to 3 attempts).
+ * regenerated on every plugin write. Writers must read the current etag,
+ * modify, then write — if the etag on disk differs from the read value,
+ * the write is retried (re-read, re-apply modifier to latest content,
+ * re-write up to [ReviewCommentRepository.MAX_UPDATE_RETRIES] attempts).
+ *
+ * The default is `""` (empty string) so that files written by external
+ * tools (LLM agents, CI, manual edits) that omit the `etag` field parse
+ * with a stable value instead of a fresh random UUID on every parse —
+ * which would cause the retry loop to never converge.
  *
  * `formatVersion` enables future schema evolution. When introducing a new
  * format version, add a [ReviewFileMigrator] and increment the constant.
@@ -55,7 +65,7 @@ enum class ReviewStatus { OPEN, RESOLVED, DELETED }
 @Serializable
 data class ReviewFile(
     val formatVersion: Int = CURRENT_FORMAT_VERSION,
-    val etag: String = generateEtag(),
+    val etag: String = "",
     val comments: List<ReviewComment> = emptyList(),
 ) {
     companion object {

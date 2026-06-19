@@ -138,7 +138,13 @@ class ReviewCommentRepository(
      *  BEFORE the rename completes, [onWrote] is invoked so the file watcher
      *  can suppress the resulting VFS event (C2: self-write feedback-loop
      *  guard). The `.tmp` suffix is always `.json.tmp` so the startup cleanup
-     *  glob `.review/**/*.json.tmp` catches every orphan. */
+     *  glob `.review/**/*.json.tmp` catches every orphan.
+     *
+     *  IMPORTANT: This method MUST only be called from within [updateFile]'s
+     *  per-path Mutex (via [lockFor]). The etag check is NOT atomic with the
+     *  write — two concurrent writeFile() calls for the same path would both
+     *  pass their etag checks and race on the rename. The Mutex serializes
+     *  the read-modify-write cycle. */
     suspend fun writeFile(
         sourcePath: String,
         file: ReviewFile,
@@ -189,6 +195,13 @@ class ReviewCommentRepository(
      *  MUST NOT set `etag` on the returned file — [updateFile] stamps the new
      *  etag here so callers can't double-generate or omit it.
      *
+     *  The retry loop IS the merge strategy: on etag mismatch (external write
+     *  happened between our read and write), we re-read the latest file from
+     *  disk and re-apply the modifier to it. This preserves external changes
+     *  (e.g., new comments added by an LLM agent) while still applying the
+     *  plugin's change (e.g., resolving a comment). The modifier must be
+     *  idempotent and find its target by comment ID, not by position.
+     *
      *  Retries up to [MAX_UPDATE_RETRIES] times on etag mismatch, then throws
      *  [ConcurrentModificationException]. Returns the resulting [ReviewFile]
      *  written to disk (or null if the modifier returned null and skipped
@@ -211,7 +224,10 @@ class ReviewCommentRepository(
                 return@withLock newFile
             }
 
-            // Etag mismatch — retry after backoff
+            // Etag mismatch — external write happened between our read and write.
+            // Retry: re-read the latest file (which now has the external changes),
+            // re-apply the modifier to it (merge), and write again.
+            logger.info { "[ACP] Etag mismatch for $sourcePath (attempt $attempt/$MAX_UPDATE_RETRIES) — re-reading latest and re-applying change (merge)" }
             lastError = ConcurrentModificationException(
                 "Etag mismatch for $sourcePath after write attempt $attempt"
             )
@@ -246,7 +262,10 @@ class ReviewCommentRepository(
         val oldJson = jsonPathFor(oldSourcePath) ?: return
         val newJson = jsonPathFor(newSourcePath) ?: return
         if (!oldJson.exists()) return
-        // Acquire both locks in consistent order (sorted lexicographically) to prevent deadlock
+        // Acquire both locks in consistent order (sorted lexicographically) to prevent deadlock.
+        // Uses String's natural ordering (Unicode codepoint comparison), which is deterministic
+        // and locale-independent for ASCII file paths. If non-ASCII paths are introduced,
+        // consider using a Comparator.constant to make the invariant explicit.
         val first: String
         val second: String
         if (oldSourcePath <= newSourcePath) {
@@ -254,20 +273,22 @@ class ReviewCommentRepository(
         } else {
             first = newSourcePath; second = oldSourcePath
         }
-        lockFor(first).withLock {
-            lockFor(second).withLock {
-                withContext(Dispatchers.IO) {
-                    try {
-                        newJson.parent?.createDirectories()
-                        onWrote(newSourcePath)  // suppress VFS event for the new path
-                        oldJson.moveTo(newJson, overwrite = true)
-                        logger.info { "[ACP] Moved .review file: $oldSourcePath → $newSourcePath" }
-                    } catch (e: Exception) {
-                        logger.warn(e) { "[ACP] Failed to move .review file: $oldSourcePath → $newSourcePath" }
+            lockFor(first).withLock {
+                lockFor(second).withLock {
+                    withContext(Dispatchers.IO) {
+                        try {
+                            newJson.parent?.createDirectories()
+                            oldJson.moveTo(newJson, overwrite = true)
+                            // C2: mark self-write AFTER the rename succeeds. This prevents
+                            // a failed move from suppressing an external VFS event for 2s.
+                            onWrote(newSourcePath)
+                            logger.info { "[ACP] Moved .review file: $oldSourcePath → $newSourcePath" }
+                        } catch (e: Exception) {
+                            logger.warn(e) { "[ACP] Failed to move .review file: $oldSourcePath → $newSourcePath" }
+                        }
                     }
                 }
             }
-        }
     }
 
     /** Delete the `.review/` JSON file for a source path (used when the
@@ -296,11 +317,13 @@ class ReviewCommentRepository(
                     .filter { it.name.endsWith(".json.tmp") }
                     .forEach { runCatching { java.nio.file.Files.deleteIfExists(it) } }
             }
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] Failed to clean up orphan .json.tmp files" }
+        }
     }
 
     companion object {
-        const val MAX_UPDATE_RETRIES = 3
+        const val MAX_UPDATE_RETRIES = 5
         const val RETRY_DELAY_MS = 100L
     }
 }

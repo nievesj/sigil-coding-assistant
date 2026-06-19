@@ -108,6 +108,11 @@ class ChatViewModel(
     /** Serializes drainQueue to prevent concurrent queue-drain races. */
     private val drainMutex = Mutex()
 
+    /** Retry counts for queued messages — prevents infinite retry loops.
+     *  ConcurrentHashMap for thread-safety: clearQueue() (from EDT coroutines)
+     *  and drainQueue() (from ViewModel scope) may access concurrently. */
+    private val queueRetryCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
     private val _readyState = MutableStateFlow(ReadyState.NOT_STARTED)
     val readyState: StateFlow<ReadyState> = _readyState.asStateFlow()
 
@@ -307,7 +312,7 @@ class ChatViewModel(
                 try {
                     val agents = withTimeoutOrNull(30_000) { service.listAgents() }
                     if (agents == null) {
-                        logger.warn { "[ACP] Agent loading timed out after 30s" }
+                        logger.warn { "[ACP] Agent loading timed out after 30s — continuing with defaults" }
                     } else {
                         val filtered = agents.filter { it.mode != "subagent" && it.hidden != true }
                         _controlState.value = _controlState.value.copy(
@@ -328,6 +333,7 @@ class ChatViewModel(
                 } catch (e: Exception) {
                     logger.warn { "[ACP] Agent loading failed: ${e.message}" }
                 }
+                // Always progress — agent loading is optional (chat works with defaults)
 
                 _readyState.value = ReadyState.LOADING_PROVIDERS
                 try {
@@ -487,9 +493,6 @@ class ChatViewModel(
     suspend fun sendMessage(text: String, files: List<AttachedFile> = emptyList()): SendMessageResult {
         recordCommand(text, files)
 
-        // Show streaming indicator immediately — don't wait for the first SSE event
-        _isStreaming.value = true
-
         return try {
             val state = _controlState.value
             val result = service.sendMessage(
@@ -505,7 +508,11 @@ class ChatViewModel(
             )
 
             when (result) {
-                is SendMessageResult.Success -> { /* handled by service */ }
+                is SendMessageResult.Success -> {
+                    // Show streaming indicator AFTER sendMessage succeeds — prevents
+                    // brief UI flicker when sendMessage immediately returns an error.
+                    _isStreaming.value = true
+                }
                 is SendMessageResult.Error -> {
                     _isStreaming.value = false
                 }
@@ -543,7 +550,8 @@ class ChatViewModel(
             // Safety net: mutex not released after MAX_STEER_WAIT_MS
             logger.error { "[ACP] steerMessage: mutex not released after ${MAX_STEER_WAIT_MS}ms — giving up" }
             _isStreaming.value = false
-            service.injectLocalMessage("⚠️ Could not send steering message — timed out. Your message: \"${text.take(100)}\"")
+            logger.warn { "[ACP] steerMessage: timed out after ${MAX_STEER_WAIT_MS}ms" }
+            service.injectLocalMessage("⚠️ Could not send steering message — timed out. Please try again.")
             return
         }
 
@@ -553,7 +561,8 @@ class ChatViewModel(
         if (currentSessionId == null) {
             logger.warn { "[ACP] steerMessage: session lost during steer" }
             _isStreaming.value = false
-            service.injectLocalMessage("⚠️ Could not send message — session was lost. Your message: \"${text.take(100)}\"")
+            logger.warn { "[ACP] steerMessage: session lost during steer" }
+            service.injectLocalMessage("⚠️ Could not send message — session was lost. Please try again.")
             return
         }
 
@@ -603,6 +612,7 @@ class ChatViewModel(
         val count = _queuedMessages.value.size
         if (count > 0) {
             _queuedMessages.value = emptyList()
+            queueRetryCounts.clear()
             logger.info { "[ACP] clearQueue: cleared $count queued messages" }
         }
     }
@@ -611,6 +621,10 @@ class ChatViewModel(
      * Drain the queue — send the next queued message if any.
      * Called automatically when StreamingCompleted fires and queue is non-empty.
      * Serialized by [drainMutex] to prevent concurrent queue-drain races.
+     *
+     * RETRY LIMIT: Failed messages are re-queued at most [MAX_QUEUE_RETRIES]
+     * times before being dropped. This prevents infinite retry loops when the
+     * server is unavailable.
      */
     private suspend fun drainQueue() = drainMutex.withLock {
         val queue = _queuedMessages.value
@@ -622,9 +636,20 @@ class ChatViewModel(
 
         val result = sendMessage(next.text, next.files)
         if (result is SendMessageResult.Error) {
-            // Re-queue the failed message at the front
-            _queuedMessages.value = listOf(next) + _queuedMessages.value
-            logger.warn { "[ACP] drainQueue: re-queued failed message — ${result.message}" }
+            val retryCount = queueRetryCounts.getOrDefault(next.id, 0) + 1
+            if (retryCount <= MAX_QUEUE_RETRIES) {
+                queueRetryCounts[next.id] = retryCount
+                // Delay before re-queue to prevent rapid retry loops when
+                // StreamingCompleted fires multiple times in quick succession.
+                delay(RETRY_DELAY_MS)
+                _queuedMessages.value = _queuedMessages.value + next
+                logger.warn { "[ACP] drainQueue: re-queued failed message (attempt $retryCount/$MAX_QUEUE_RETRIES) — ${result.message}" }
+            } else {
+                queueRetryCounts.remove(next.id)
+                logger.error { "[ACP] drainQueue: dropping message after $MAX_QUEUE_RETRIES failed attempts — ${result.message}" }
+            }
+        } else {
+            queueRetryCounts.remove(next.id)
         }
     }
 
@@ -632,9 +657,18 @@ class ChatViewModel(
 
     suspend fun respondPermission(response: PermissionResponse) {
         val prompt = _permissionPrompt.value ?: return
-        service.respondPermission(prompt.permissionId, prompt.toolCallId, prompt.sessionId, response)
-        _permissionPrompt.value = null
-        service.permissionManager.cancelPermissionTimeout()
+        try {
+            service.respondPermission(prompt.permissionId, prompt.toolCallId, prompt.sessionId, response)
+            _permissionPrompt.value = null
+            service.permissionManager.cancelPermissionTimeout()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Permission response failed (network error, server down). Keep the
+            // prompt open so the user can retry. Don't dismiss it — dismissing
+            // would leave the server waiting for a response it never received.
+            logger.warn(e) { "[ACP] Permission response failed — keeping prompt open for retry" }
+        }
     }
 
     private fun startPermissionTimeout() {
@@ -664,6 +698,8 @@ class ChatViewModel(
                     service.respondQuestion(prompt.promptId, answers, prompt.sessionId)
                 }
                 _selectionPrompt.value = null
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 logger.warn(e) { "Failed to respond to question ${prompt.promptId}" }
             }
@@ -838,22 +874,28 @@ class ChatViewModel(
         }
     }
 
-    /** Trigger a VFS refresh so the [ReviewCommentManager]'s [AsyncFileListener]
-     *  picks up any new `.review/` JSON files written by the LLM agent. Called on
-     *  [UiSignal.FileChanged] — the LLM's tool calls modify files on disk, but
-     *  IntelliJ's VFS doesn't auto-detect external writes until a refresh.
+    /** Trigger a VFS refresh AND a direct disk re-read so the [ReviewCommentManager]
+     *  picks up any new `.review/` JSON files written by the LLM agent.
      *
-     *  This triggers an ASYNC VFS refresh (non-blocking) rather than a full
-     *  [ReviewCommentManager.loadAll]. The registered [AsyncFileListener]
-     *  ([ReviewCommentFileWatcher.asyncListener]) then re-reads ONLY the changed
-     *  `.review/` files incrementally — O(changed-file), not O(all-files-on-disk).
-     *  This avoids the redundant double-path (loadAll + AsyncFileListener both
-     *  re-reading + racing on `clearForEditor`/`addHighlights`) that the previous
-     *  `loadAll()`-on-every-FileChanged approach caused.
+     *  Two paths:
+     *  1. `asyncRefresh(null)` — triggers VFS discovery → AsyncFileListener re-reads
+     *     changed files incrementally. Fire-and-forget; may miss newly-created
+     *     `.review/` subdirectories.
+     *  2. `loadAll()` — reads ALL `.review/` files from disk via
+     *     `java.nio.file.Files.walk()`, bypassing VFS. Reliable but O(all-files).
+     *     Runs on ReviewCommentManager's internal scope (non-blocking).
      *
-     *  Without any refresh, gutter icons don't appear after `/review-perform`
-     *  until the user manually refreshes (Ctrl+Alt+Y) or alt-tabs away and back. */
+     *  Without this, gutter icons and highlights don't appear after `/review-perform`
+     *  until the user manually refreshes (Ctrl+Alt+Y) or restarts the IDE. */
     private fun refreshReviewFiles() {
+        // 1. Direct disk re-read — reads ALL .review/ files via java.nio.file.Files.walk(),
+        // bypassing VFS entirely. This is the reliable primary path: even if VFS hasn't
+        // discovered a newly-created .review/ subdirectory, loadAll() still picks it up.
+        // Runs on ReviewCommentManager's internal scope (Dispatchers.Default) — non-blocking.
+        val manager = com.opencode.acp.review.ReviewCommentManager.getInstance(project)
+        manager.scope.launch { manager.loadAll() }
+        // 2. Trigger VFS refresh so the ReviewCommentFileWatcher's AsyncFileListener
+        // can do incremental re-reads for any later changes (secondary path).
         com.intellij.openapi.vfs.VirtualFileManager.getInstance().asyncRefresh(null)
     }
 
@@ -872,7 +914,8 @@ class ChatViewModel(
         current.removeAll { existing ->
             existing.text == text &&
                 existing.attachedFileNames == files.map { it.name } &&
-                existing.attachedFilePaths == files.map { it.path }
+                existing.attachedFilePaths == files.map { it.path } &&
+                existing.attachedFileMimes == files.map { it.mime }
         }
         current.add(0, entry)
         val trimmed = if (current.size > maxSize) current.take(maxSize) else current
@@ -929,7 +972,7 @@ class ChatViewModel(
                 toolName to ToolPermission.fromActionString(permStr)
             }
         } catch (e: Exception) {
-            logger.warn { "[ACP] Failed to parse persisted tool permissions: ${e.message}" }
+            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — corrupted settings, clearing" }
             emptyMap()
         }
     }
@@ -946,5 +989,8 @@ class ChatViewModel(
 
     companion object {
         private const val MAX_STEER_WAIT_MS = 10_000L
+        private const val MAX_QUEUE_RETRIES = 3
+        /** Delay before re-queuing a failed message to prevent rapid retry loops. */
+        private const val RETRY_DELAY_MS = 2_000L
     }
 }

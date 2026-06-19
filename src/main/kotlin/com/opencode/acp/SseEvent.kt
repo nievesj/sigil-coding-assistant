@@ -26,7 +26,7 @@ sealed interface SseEvent {
         override val partId: String? = null
     ) : SseEvent
 
-    /** Full text replacement from the model (message.part.updated — full accumulated text, not a delta). */
+    /** Per-part finalization echo (message.part.updated — carries ONE text part's content, NOT the whole message's accumulated text). Streamed TextChunk deltas are authoritative; this confirms them. */
     data class TextReplace(
         override val sessionId: String,
         val text: String,
@@ -117,7 +117,7 @@ sealed interface SseEvent {
         override val partId: String? = null
     ) : SseEvent
 
-    /** Full thinking content replacement (message.part.updated — full accumulated text, not a delta). */
+    /** Per-thinking-part content replacement (message.part.updated — one thinking part's accumulated text, not the full turn's text). */
     data class ThinkingReplace(
         override val sessionId: String,
         val text: String,
@@ -295,6 +295,22 @@ sealed interface SseEvent {
         val reason: String,
         override val messageId: String? = null,
         override val partId: String? = null
+    ) : SseEvent
+
+    /**
+     * Internal control event (never from SSE) — signals that [SessionState.ctx]
+     * should be reset for a new streaming turn. Sent through [SessionState.eventChannel]
+     * so the reset runs on the event processing coroutine, eliminating the race
+     * between external callers (under stateLock) and event processing (no lock).
+     *
+     * This event is NOT produced by the SSE parser — it is only enqueued by
+     * [SessionState.createAssistantMessage] when called from a non-event-processing
+     * coroutine.
+     */
+    data class ResetTurn(
+        override val sessionId: String,
+        override val messageId: String? = null,
+        override val partId: String? = null,
     ) : SseEvent
 }
 

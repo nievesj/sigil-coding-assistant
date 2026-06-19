@@ -82,7 +82,9 @@ class GitService(private val project: Project) {
         val currentPaths = (trackedChanges.map { it.filePath } + untrackedFiles.map { it.filePath }).toSet()
         lineDeltaCache.keys.retainAll(currentPaths)
 
-        return trackedChanges + untrackedFiles
+        // Filter out plugin-internal files that should never appear in the Review tab
+        // (e.g. `.review/` JSON files written by the adversarial-review feature).
+        return (trackedChanges + untrackedFiles).filterNot { it.filePath.startsWith(".review/") }
     }
 
     /**
@@ -135,8 +137,7 @@ class GitService(private val project: Project) {
             // Use LCS diff to compute actual additions and deletions
             val (additions, deletions) = computeLcsDiff(beforeLines, afterLines)
             LineDelta.Known(additions = additions, deletions = deletions)
-        } catch (e: Throwable) {
-            // Catch Throwable (not Exception) to handle NoClassDefFoundError,
+        } catch (e: Exception) {
             // VcsException, IOException, etc. for locked/binary/large files
             LineDelta.Unknown
         }
@@ -147,8 +148,11 @@ class GitService(private val project: Project) {
      * Unlike simple line-count comparison, this correctly identifies lines
      * that were changed (not just net additions).
      *
-     * PERFORMANCE: Space-optimized DP with only 2 rows. Falls back to
-     * net-change for very large files (>5000 lines).
+     * PERFORMANCE: Space-optimized DP with only 2 rows — O(n) space, O(m*n) time.
+     * Previous HashSet-based fallback for large files was removed because it
+     * produced incorrect results for reordered content (gave 0/0 when lines
+     * were reordered rather than deleted/added). The 2-row DP approach keeps
+     * memory bounded even for large files.
      */
     private fun computeLcsDiff(before: List<String>, after: List<String>): Pair<Int, Int> {
         val m = before.size
@@ -158,26 +162,14 @@ class GitService(private val project: Project) {
         if (m == 0) return Pair(n, 0)
         if (n == 0) return Pair(0, m)
 
-        // Standard LCS dynamic programming
-        // Use space-optimized version for large files (only keep 2 rows)
-        val maxDim = maxOf(m, n)
-        if (maxDim > 5000) {
-            // Fall back to a cheaper O(n) estimation for very large files
-            // to avoid O(n*m) memory/time cost. Count lines only in "after"
-            // not in "before" (additions) and vice versa (deletions).
-            val beforeSet = before.toHashSet()
-            val afterSet = after.toHashSet()
-            var additions = 0
-            var deletions = 0
-            for (line in after) {
-                if (line !in beforeSet) additions++
-            }
-            for (line in before) {
-                if (line !in afterSet) deletions++
-            }
-            return Pair(additions, deletions)
+        // Guard: skip O(m*n) LCS for very large files — use simple line count
+        // comparison instead. This is less accurate but prevents CPU spikes
+        // on generated/minified files with 100k+ lines.
+        if (m > LCS_SIZE_THRESHOLD || n > LCS_SIZE_THRESHOLD) {
+            return Pair(n, m) // Conservative: report all lines as changed
         }
 
+        // Standard LCS dynamic programming — space-optimized to 2 rows
         val dp = Array(2) { IntArray(n + 1) }
         for (i in 1..m) {
             for (j in 1..n) {
@@ -221,6 +213,10 @@ class GitService(private val project: Project) {
     fun invalidateCache() {
         lineDeltaCache.clear()
     }
+
+    companion object {
+        private const val LCS_SIZE_THRESHOLD = 10_000
+    }
 }
 
 /**
@@ -236,12 +232,20 @@ fun getRelativePath(project: Project, change: Change): String {
 }
 
 fun getRelativePathFromRoot(project: Project, absolutePath: String): String {
-    val basePath = project.basePath ?: return absolutePath
+    val basePath = project.basePath
+    if (basePath == null) {
+        // No base path (default project, remote dev, lightweight test project).
+        // Return the absolute path — cannot compute relative path.
+        return absolutePath
+    }
     val normalizedAbsolute = absolutePath.replace('\\', '/')
     val normalizedBase = basePath.replace('\\', '/') + "/"
     return if (normalizedAbsolute.startsWith(normalizedBase)) {
         normalizedAbsolute.removePrefix(normalizedBase)
     } else {
+        // File is outside the project root — return absolute path.
+        // This is correct behavior but means the review UI will show
+        // absolute paths for out-of-project files.
         normalizedAbsolute
     }
 }

@@ -338,7 +338,7 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
                         LaunchedEffect(file.path) {
                             bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
                         }
-                        if (bitmap != null) {
+                        bitmap?.let { bm ->
                             Box(
                                 modifier = Modifier
                                     .size(100.dp)
@@ -350,7 +350,7 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
                                     ) { onImagePreview?.invoke(file.path) }
                             ) {
                                 ComposeImage(
-                                    bitmap = bitmap!!,
+                                    bitmap = bm,
                                     contentDescription = file.name,
                                     modifier = Modifier
                                         .size(100.dp)
@@ -447,18 +447,18 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
      ) {
           Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
                // Render parts in LinkedHashMap insertion order — the order events arrived.
-              var hasThinking = false
-              // Pre-compute: if message has any ToolCall parts, suppress Patch/FileChange cards
-              // (ToolPill already shows file info, line counts, and expandable content)
-              val hasToolCallInMessage = message.parts.values.any { it is MessagePart.ToolCall }
+               // Pre-compute part presence to avoid LazyColumn stale-closure bugs
+               val hasThinking = message.parts.values.any { it is MessagePart.Thinking }
+               // Pre-compute: if message has any ToolCall parts, suppress Patch/FileChange cards
+               // (ToolPill already shows file info, line counts, and expandable content)
+               val hasToolCallInMessage = message.parts.values.any { it is MessagePart.ToolCall }
               var hasToolCall = hasToolCallInMessage
               // Render parts in LinkedHashMap insertion order — chronological event order.
               // resegmentTextPartsDirect preserves insertion positions via textSegments.
              for ((key, part) in message.parts.entries) {
                  when (part) {
                         is MessagePart.Thinking -> {
-                           hasThinking = true
-                           key(key) {
+                            key(key) {
                                CollapsibleThinkingPill(
                                    content = part.content,
                                    state = part.state,
@@ -962,7 +962,7 @@ private fun QueuedMessageBubble(
                         LaunchedEffect(file.path) {
                             bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
                         }
-                        if (bitmap != null) {
+                        bitmap?.let { bm ->
                             Box(
                                 modifier = Modifier
                                     .size(60.dp)
@@ -970,7 +970,7 @@ private fun QueuedMessageBubble(
                                     .background(ChatTheme.colors.border.default.copy(alpha = 0.5f))
                             ) {
                                 ComposeImage(
-                                    bitmap = bitmap!!,
+                                    bitmap = bm,
                                     contentDescription = file.name,
                                     modifier = Modifier
                                         .size(60.dp)

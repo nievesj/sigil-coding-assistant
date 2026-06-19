@@ -18,15 +18,18 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -34,6 +37,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+
+import kotlinx.coroutines.CancellationException
 
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ReadAction
@@ -58,14 +63,19 @@ import com.opencode.acp.chat.model.LineDelta
 import com.opencode.acp.chat.model.ReviewState
 import com.opencode.acp.chat.service.GitService
 import com.opencode.acp.chat.service.getRelativePath
+import com.opencode.acp.follow.EditorFollowManager
+import com.opencode.acp.review.ReviewComment
 import com.opencode.acp.review.ReviewCommentDiffExtension
 import com.opencode.acp.review.ReviewCommentManager
 import com.opencode.acp.review.ReviewIndex
+import com.opencode.acp.review.ReviewSeverity
+import com.opencode.acp.review.ReviewStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -73,6 +83,7 @@ import kotlinx.coroutines.withContext
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
+import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 // ── Review Panel (sidebar tab content) ───────────────────────────────────────
@@ -97,7 +108,7 @@ fun ReviewPanel(
     commentChangeSignal: kotlinx.coroutines.flow.StateFlow<ReviewIndex>,
 ) {
     val gitService = remember { GitService(project) }
-    val refreshSignal = remember { MutableStateFlow(0) }
+    val refreshSignal = remember { MutableStateFlow(0L) }
     val refreshMutex = remember { Mutex() }
     val scope = rememberCoroutineScope()
 
@@ -108,7 +119,7 @@ fun ReviewPanel(
         val changeListManager = ChangeListManager.getInstance(project)
         val clListener = object : ChangeListAdapter() {
             override fun changeListUpdateDone() {
-                refreshSignal.value = refreshSignal.value + 1
+                refreshSignal.update { it + 1 }
             }
         }
         changeListManager.addChangeListListener(clListener)
@@ -124,7 +135,7 @@ fun ReviewPanel(
                     !path.contains("/build/")
                 }
                 if (relevant) {
-                    refreshSignal.value = refreshSignal.value + 1
+                    refreshSignal.update { it + 1 }
                 }
                 return null // no custom change applier needed
             }
@@ -145,7 +156,7 @@ fun ReviewPanel(
     if (fileChangeSignal != null) {
         LaunchedEffect(Unit) {
             fileChangeSignal.collect {
-                refreshSignal.value = refreshSignal.value + 1
+                refreshSignal.update { it + 1 }
             }
         }
     }
@@ -156,15 +167,26 @@ fun ReviewPanel(
     // Build CommentCounts from the review index
     val commentCounts = remember(commentIndex) {
         val counts = commentIndex.commentsByFile
-            .mapValues { (_, comments) -> comments.count { it.status == com.opencode.acp.review.ReviewStatus.OPEN } }
+            .mapValues { (_, comments) -> comments.count { it.status == ReviewStatus.OPEN } }
             .filterValues { it > 0 }
         CommentCounts(counts)
+    }
+
+    // Build open-comments-per-file map for direct navigation + child rows.
+    // Sorted by startLine so the first entry is the topmost comment.
+    val openCommentsByFile = remember(commentIndex) {
+        commentIndex.commentsByFile
+            .mapValues { (_, comments) ->
+                comments.filter { it.status == ReviewStatus.OPEN }
+                    .sortedBy { it.startLine }
+            }
+            .filterValues { it.isNotEmpty() }
     }
 
     // Debounce the refresh signal (300ms — responsive but prevents rapid-fire during bulk ops)
     val debouncedRefresh by refreshSignal
         .debounce(300)
-        .collectAsState(initial = 0)
+        .collectAsState(initial = 0L)
 
     // Re-compute when debouncedRefresh OR commentCounts changes
     val refreshKey = remember(debouncedRefresh, commentCounts) {
@@ -182,13 +204,14 @@ fun ReviewPanel(
             refreshMutex.withLock {
                 value = withContext(Dispatchers.IO) {
                     readAction {
-                        val files = gitService.getChangedFiles()
-                        if (files.isEmpty()) ReviewState.Empty
-                        else ReviewState.Loaded(files, commentCounts)
+                    val files = gitService.getChangedFiles()
+                    if (files.isEmpty()) ReviewState.Empty
+                    else ReviewState.Loaded(files, commentCounts, openCommentsByFile)
                     }
                 }
             }
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             value = ReviewState.Error(
                 message = e.message ?: "Failed to load changes",
                 retryable = true
@@ -209,6 +232,7 @@ fun ReviewPanel(
         is ReviewState.Loaded -> ReviewFileListContent(
             files = s.files,
             commentCounts = s.commentCounts,
+            openCommentsByFile = s.openCommentsByFile,
             onFileClick = { filePath, status, virtualFile ->
                 when (status) {
                     FileChangeStatus.UNTRACKED -> {
@@ -225,6 +249,10 @@ fun ReviewPanel(
                     openFileInEditor(project, virtualFile)
                 }
             },
+            onCommentClick = { filePath, line ->
+                EditorFollowManager.getInstance(project)
+                    .openFileAtLine(project, filePath, line, focus = true)
+            },
             modifier = modifier
         )
     }
@@ -236,8 +264,10 @@ fun ReviewPanel(
 private fun ReviewFileListContent(
     files: List<ChangedFile>,
     commentCounts: CommentCounts = CommentCounts(),
+    openCommentsByFile: Map<String, List<ReviewComment>> = emptyMap(),
     onFileClick: (filePath: String, status: FileChangeStatus, virtualFile: com.intellij.openapi.vfs.VirtualFile?) -> Unit,
     onOpenFile: (com.intellij.openapi.vfs.VirtualFile?) -> Unit,
+    onCommentClick: (filePath: String, line: Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     LazyColumn(
@@ -245,12 +275,13 @@ private fun ReviewFileListContent(
         verticalArrangement = Arrangement.spacedBy(1.dp)
     ) {
         items(files, key = { it.filePath }) { file ->
-            val commentCount = commentCounts.forFile(file.filePath)
+            val comments = openCommentsByFile[file.filePath].orEmpty()
             ChangedFileRow(
                 file = file,
-                commentCount = commentCount,
-                onClick = { onFileClick(file.filePath, file.status, file.virtualFile) },
-                onOpenFile = { onOpenFile(file.virtualFile) }
+                comments = comments,
+                onRowClick = { onFileClick(file.filePath, file.status, file.virtualFile) },
+                onOpenFile = { onOpenFile(file.virtualFile) },
+                onCommentClick = { line -> onCommentClick(file.filePath, line) }
             )
         }
     }
@@ -259,13 +290,14 @@ private fun ReviewFileListContent(
 @Composable
 private fun ChangedFileRow(
     file: ChangedFile,
-    commentCount: Int = 0,
-    onClick: () -> Unit,
+    comments: List<ReviewComment> = emptyList(),
+    onRowClick: () -> Unit,
     onOpenFile: () -> Unit,
+    onCommentClick: (line: Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val interactionSource = remember { MutableInteractionSource() }
-    val isHovered by interactionSource.collectIsHoveredAsState()
+    val rowInteractionSource = remember { MutableInteractionSource() }
+    val isRowHovered by rowInteractionSource.collectIsHoveredAsState()
 
     // Colors — ChatTheme provides semantic colors
     val hoverBg = ChatTheme.colors.component.hoverBg
@@ -275,133 +307,217 @@ private fun ChangedFileRow(
     val normalColor = ChatTheme.colors.text.primary
     val commentColor = ChatTheme.colors.accent.blue
     val commentBg = commentColor.copy(alpha = 0.15f)
+    val commentHoverBg = commentColor.copy(alpha = 0.25f)
 
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
-            .background(if (isHovered) hoverBg else Color.Transparent)
-            .hoverable(interactionSource)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        // File type icon
-        Icon(
-            key = getFileTypeIcon(file.fileName),
-            contentDescription = file.fileName,
-            modifier = Modifier.size(ChatTheme.dims.reviewFileIconSize),
-            tint = Color.Unspecified
-        )
-        Spacer(Modifier.width(8.dp))
+    val commentCount = comments.size
 
-        // File info column
-        Column(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
+                .background(if (isRowHovered) hoverBg else Color.Transparent)
+                .hoverable(rowInteractionSource)
+                .clickable(onClick = onRowClick)
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            // File name only
-            Text(
-                text = file.fileName,
-                fontSize = ChatTheme.fonts.reviewFileName,
-                fontWeight = FontWeight.Normal,
-                color = normalColor,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+            // File type icon
+            Icon(
+                key = getFileTypeIcon(file.fileName),
+                contentDescription = file.fileName,
+                modifier = Modifier.size(ChatTheme.dims.reviewFileIconSize),
+                tint = Color.Unspecified
             )
+            Spacer(Modifier.width(8.dp))
 
-            // Status / review chips on their own line
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            // File info column
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                // Status label for new/untracked files
-                if (file.status == FileChangeStatus.UNTRACKED) {
-                    Text(
-                        text = "Added",
-                        fontSize = ChatTheme.fonts.reviewStatusLabel,
-                        fontWeight = FontWeight.Medium,
-                        color = ChatTheme.colors.component.reviewAddedLabel
-                    )
-                }
-                // Review comment chip with icon
-                if (commentCount > 0) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
-                            .background(commentBg)
-                            .padding(horizontal = 4.dp, vertical = 1.dp)
-                    ) {
-                        Icon(
-                            key = AllIconsKeys.Actions.IntentionBulb,
-                            contentDescription = null,
-                            modifier = Modifier.size(12.dp),
-                            tint = commentColor
-                        )
-                        Spacer(Modifier.width(3.dp))
+                // File name only
+                Text(
+                    text = file.fileName,
+                    fontSize = ChatTheme.fonts.reviewFileName,
+                    fontWeight = FontWeight.Normal,
+                    color = normalColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                // Status / review chips on their own line
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    // Status label for new/untracked files
+                    if (file.status == FileChangeStatus.UNTRACKED) {
                         Text(
-                            text = "$commentCount comment${if (commentCount > 1) "s" else ""}",
+                            text = "Added",
                             fontSize = ChatTheme.fonts.reviewStatusLabel,
                             fontWeight = FontWeight.Medium,
-                            color = commentColor,
+                            color = ChatTheme.colors.component.reviewAddedLabel
+                        )
+                    }
+                    // Review comments are shown in the collapsible list below
+                }
+            }
+
+            // Line delta indicator
+            when (val delta = file.lineDelta) {
+                is LineDelta.Known -> {
+                    if (delta.additions > 0) {
+                        Text(
+                            text = "+${delta.additions}",
+                            fontSize = ChatTheme.fonts.reviewLineDelta,
+                            fontWeight = FontWeight.Medium,
+                            color = addedColor
+                        )
+                    }
+                    if (delta.deletions > 0) {
+                        if (delta.additions > 0) Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = "-${delta.deletions}",
+                            fontSize = ChatTheme.fonts.reviewLineDelta,
+                            fontWeight = FontWeight.Medium,
+                            color = deletedColor
+                        )
+                    }
+                    if (delta.additions == 0 && delta.deletions == 0) {
+                        Text(
+                            text = "0",
+                            fontSize = ChatTheme.fonts.reviewLineDelta,
+                            color = pathColor
                         )
                     }
                 }
-            }
-        }
-
-        // Line delta indicator
-        when (val delta = file.lineDelta) {
-            is LineDelta.Known -> {
-                if (delta.additions > 0) {
+                is LineDelta.Unknown -> {
                     Text(
-                        text = "+${delta.additions}",
-                        fontSize = ChatTheme.fonts.reviewLineDelta,
-                        fontWeight = FontWeight.Medium,
-                        color = addedColor
-                    )
-                }
-                if (delta.deletions > 0) {
-                    if (delta.additions > 0) Spacer(Modifier.width(4.dp))
-                    Text(
-                        text = "-${delta.deletions}",
-                        fontSize = ChatTheme.fonts.reviewLineDelta,
-                        fontWeight = FontWeight.Medium,
-                        color = deletedColor
-                    )
-                }
-                if (delta.additions == 0 && delta.deletions == 0) {
-                    Text(
-                        text = "0",
+                        text = "—",
                         fontSize = ChatTheme.fonts.reviewLineDelta,
                         color = pathColor
                     )
                 }
             }
-            is LineDelta.Unknown -> {
-                Text(
-                    text = "—",
-                    fontSize = ChatTheme.fonts.reviewLineDelta,
-                    color = pathColor
-                )
+
+            // Open file icon (always visible target icon) — hoverable + clickable
+            if (file.virtualFile != null) {
+                Spacer(Modifier.width(8.dp))
+                val locateInteractionSource = remember { MutableInteractionSource() }
+                val isLocateHovered by locateInteractionSource.collectIsHoveredAsState()
+                Box(
+                    modifier = Modifier
+                        .size(ChatTheme.dims.reviewOpenFileIconSize + 4.dp)
+                        .clip(CircleShape)
+                        .background(if (isLocateHovered) hoverBg else Color.Transparent)
+                        .hoverable(locateInteractionSource)
+                        .clickable(onClick = onOpenFile),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        key = AllIconsKeys.General.Locate,
+                        contentDescription = "Open file",
+                        modifier = Modifier.size(ChatTheme.dims.reviewOpenFileIconSize),
+                        tint = if (isLocateHovered) ChatTheme.colors.text.link else pathColor
+                    )
+                }
             }
         }
 
-        // Open file icon (always visible target icon)
-        if (file.virtualFile != null) {
-            Spacer(Modifier.width(8.dp))
-            Icon(
-                key = AllIconsKeys.General.Locate,
-                contentDescription = "Open file",
+        // Collapsible child review rows — only when >1 open comments.
+        // Default expanded so all comments are visible; click header to collapse.
+        if (commentCount > 0) {
+            var expanded by remember { mutableStateOf(true) }
+            val toggleInteractionSource = remember { MutableInteractionSource() }
+            val isToggleHovered by toggleInteractionSource.collectIsHoveredAsState()
+            Row(
                 modifier = Modifier
-                    .size(ChatTheme.dims.reviewOpenFileIconSize)
-                    .clickable(onClick = onOpenFile)
-                    .padding(1.dp),
-                tint = pathColor
-            )
+                    .fillMaxWidth()
+                    .padding(start = 28.dp)
+                    .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
+                    .background(if (isToggleHovered) hoverBg else Color.Transparent)
+                    .hoverable(toggleInteractionSource)
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    key = if (expanded) AllIconsKeys.General.ChevronDown
+                          else AllIconsKeys.General.ChevronRight,
+                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    modifier = Modifier.size(12.dp),
+                    tint = commentColor
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = "$commentCount comments",
+                    fontSize = ChatTheme.fonts.reviewStatusLabel,
+                    color = commentColor,
+                )
+            }
+            if (expanded) {
+                comments.forEach { comment ->
+                    ReviewCommentChildRow(
+                        comment = comment,
+                        onClick = { onCommentClick(comment.startLine) }
+                    )
+                }
+            }
         }
     }
+}
+
+/**
+ * A single child row under a file row, representing one open review comment.
+ * Shows the severity icon and a brief (1-line) message; click navigates to
+ * the comment's location in the editor.
+ */
+@Composable
+private fun ReviewCommentChildRow(
+    comment: ReviewComment,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isHovered by interactionSource.collectIsHoveredAsState()
+    val hoverBg = ChatTheme.colors.component.hoverBg
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(start = 40.dp)
+            .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
+            .background(if (isHovered) hoverBg else Color.Transparent)
+            .hoverable(interactionSource)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Severity icon
+        Icon(
+            key = severityIconKey(comment.severity),
+            contentDescription = comment.severity.name,
+            modifier = Modifier.size(12.dp),
+            tint = Color.Unspecified
+        )
+        Spacer(Modifier.width(6.dp))
+        // Brief message — 1 line, ellipsized
+        Text(
+            text = comment.comment,
+            fontSize = ChatTheme.fonts.reviewStatusLabel,
+            color = ChatTheme.colors.text.secondary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/** Map a review severity to a Jewel icon key matching [ReviewIcons]. */
+private fun severityIconKey(severity: ReviewSeverity): IconKey = when (severity) {
+    ReviewSeverity.ERROR   -> AllIconsKeys.General.BalloonError
+    ReviewSeverity.WARNING -> AllIconsKeys.General.Warning
+    ReviewSeverity.INFO    -> AllIconsKeys.General.BalloonInformation
 }
 
 // ── File type icons ────────────────────────────────────────────────────────────
@@ -546,7 +662,9 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
                 // can recover it and apply review-comment highlights to the
                 // diff viewer's after-side editor (TDD §4.3 — NOT via
                 // ContentDiffRequest.contentTitles, which are display labels).
-                request.putUserData(ReviewCommentDiffExtension.REVIEW_PATH_KEY, filePath)
+                if (request is SimpleDiffRequest) {
+                    request.putUserData(ReviewCommentDiffExtension.REVIEW_PATH_KEY, filePath)
+                }
                 // DiffManager.showDiff must run on EDT.
                 ApplicationManager.getApplication().invokeLater {
                     DiffManager.getInstance().showDiff(project, request, DiffDialogHints.DEFAULT)
