@@ -16,6 +16,9 @@ sealed interface UiSignal {
     /** Stop event processed — streaming is complete. */
     data class StreamingCompleted(val messageId: String, val fileChanges: List<ChatFileChange>) : UiSignal
 
+    /** Intermediate message update (token/cost data applied) — triggers local-only context refresh. */
+    data class MessageUpdated(val messageId: String) : UiSignal
+
     /** Permission prompt received from the server. */
     data class PermissionRequested(val prompt: PermissionPrompt) : UiSignal
 

@@ -56,6 +56,20 @@ class ProcessorContext {
     val textBuffer: StringBuilder = StringBuilder()
     /** Mirrors textBuffer content as a StateFlow for real-time observation by UI (e.g. task pill). */
     val streamingText = MutableStateFlow("")
+
+    // ── Typewriter reveal buffer ──────────────────────────────────────────
+    /** The full accumulated text from SSE (same as textBuffer content).
+     *  The reveal coroutine drains from here; only [revealedLen] characters
+     *  are segmented and rendered. */
+    val revealBuffer: StringBuilder = StringBuilder()
+    /** How much of revealBuffer has been revealed to the UI so far (character count). */
+    @Volatile var revealedLen: Int = 0
+    /** Job for the reveal coroutine. Cancelled on reset/finalize. */
+    @Volatile var revealJob: Job? = null
+    /** Whether the source (SSE) has stopped sending text. When true, the reveal
+     *  loop flushes remaining buffer immediately instead of continuing slow reveal. */
+    @Volatile var sourceComplete: Boolean = false
+
     /** Tracks text segments split at tool call / thinking boundaries.
      *  Each segment records where in [textBuffer] it starts and which non-text
      *  part key it should be inserted after. This enables chronological
@@ -75,6 +89,16 @@ class ProcessorContext {
     var activeThinkingCompleted: Boolean = false
     /** Monotonic counter for generating unique thinking keys. */
     var thinkingPhaseIndex: Int = 0
+
+    // ── Thinking typewriter reveal buffer ──────────────────────────────────
+    /** Reveal buffer for thinking — mirrors thinkingBuffer but only revealedLen chars are shown. */
+    val thinkingRevealBuffer: StringBuilder = StringBuilder()
+    /** How much of thinkingRevealBuffer has been revealed to the UI so far. */
+    @Volatile var thinkingRevealedLen: Int = 0
+    /** Job for the thinking reveal coroutine. Cancelled on freeze/reset. */
+    @Volatile var thinkingRevealJob: Job? = null
+    /** Whether the thinking source has stopped sending. When true, flush remaining buffer. */
+    @Volatile var thinkingSourceComplete: Boolean = false
 
     // ── Tool call state ───────────────────────────────────────────────────
     /** Tool call pills keyed by callId. Secondary index for updates — the primary
@@ -143,8 +167,18 @@ class ProcessorContext {
     fun resetTurnState() {
         textBuffer.clear()
         streamingText.value = ""
+        revealBuffer.clear()
+        revealedLen = 0
+        revealJob?.cancel()
+        revealJob = null
+        sourceComplete = false
         textSegments.clear()
         thinkingBuffer.clear()
+        thinkingRevealBuffer.clear()
+        thinkingRevealedLen = 0
+        thinkingRevealJob?.cancel()
+        thinkingRevealJob = null
+        thinkingSourceComplete = false
         activeThinkingKey = null
         activeThinkingCompleted = false
         thinkingPhaseIndex = 0

@@ -446,6 +446,17 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // Recover background sessions that may have completed during disconnection
                 recoverBackgroundSessions()
 
+                // Refresh state that went stale during the disconnect — the server
+                // may have updated todos or context while we weren't listening to SSE.
+                try {
+                    sessionManager.fetchTodos()
+                    sessionManager.computeSessionContext()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] SSE reconnect: failed to refresh todos/context" }
+                }
+
                 sseReconnectAttempt = 0
                 logger.info { "[ACP] SSE reconnected successfully" }
                 return@launch
@@ -823,6 +834,10 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     suspend fun computeSessionContext(controlState: ControlBarState? = null) {
         sessionManager.computeSessionContext(controlState)
+    }
+
+    suspend fun computeSessionContextLocal(controlState: ControlBarState? = null) {
+        sessionManager.computeSessionContextLocal(controlState)
     }
 
     suspend fun refreshActiveSessionMessages() {

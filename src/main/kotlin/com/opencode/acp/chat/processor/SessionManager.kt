@@ -20,7 +20,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import java.util.LinkedHashMap
 import java.util.concurrent.locks.ReentrantLock
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.withLock
 
 /**
@@ -54,9 +54,10 @@ class SessionManager(
     /** Mutex to serialize session switches. */
     private val switchMutex = Mutex()
 
-    /** Timestamp of the last successful computeSessionContext() call (dedup guard).
-     *  AtomicLong for atomic compareAndSet in the dedup guard. */
-    private val lastContextComputeTime = AtomicLong(0L)
+    /** In-flight guard for computeSessionContext — prevents stacking concurrent computations.
+     *  AtomicBoolean CAS: only one computation runs at a time; concurrent callers get the
+     *  current state. Replaces the old timestamp-based dedup guard (simpler, no time window). */
+    private val contextComputeInFlight = AtomicBoolean(false)
 
     /** The currently active session ID. Null if no session is active. */
     private val _activeSessionId = MutableStateFlow<String?>(null)
@@ -321,7 +322,7 @@ class SessionManager(
             throw e
         } catch (e: Exception) {
             logger.error(e) { "Failed to archive session $targetSessionId" }
-            try { loadSessions() } catch (e2: Exception) { logger.warn(e2) { "Also failed to refresh sessions" } }
+            try { loadSessions() } catch (e2: CancellationException) { throw e2 } catch (e2: Exception) { logger.warn(e2) { "Also failed to refresh sessions" } }
             return
         }
 
@@ -714,64 +715,110 @@ class SessionManager(
     }
 
     internal suspend fun computeSessionContext(controlState: ControlBarState? = null): SessionContextState {
+        // NOTE: Do NOT acquire switchMutex here — switchSession() and
+        // createAndSwitchSession() already hold it when they call this method,
+        // and kotlinx.coroutines.sync.Mutex is non-reentrant (would deadlock).
+        // The session-switch race window (reading _activeSessionId.value then
+        // getActiveSession()) is negligible — both are thread-safe reads, and
+        // a switch between them only means slightly stale messages for one frame.
         val currentSessionId = _activeSessionId.value ?: return SessionContextState.Loading
+        val messages = getActiveSession()?.messages?.value ?: emptyMap()
         val c = client ?: return SessionContextState.Loading
 
-        // Dedup: skip re-computation if last call was < 300ms ago and state is Loaded.
-        // This prevents redundant REST calls when StreamingCompleted and SessionIdle
-        // fire close together for the same response.
-        // Atomic check-and-set via AtomicLong.compareAndSet: if two concurrent calls
-        // race, only one wins the CAS; the other proceeds (idempotent — wastes one
-        // REST call, not a correctness issue).
-        val now = System.currentTimeMillis()
-        val lastTime = lastContextComputeTime.get()
-        if (now - lastTime < 300 && _sessionContextState.value is SessionContextState.Loaded) {
+        // In-flight guard: skip if another computation is already running.
+        // Replaces the timestamp-based dedup guard — simpler and correct under concurrency.
+        if (!contextComputeInFlight.compareAndSet(false, true)) {
             return _sessionContextState.value
         }
-        lastContextCompareAndSet(lastTime, now)
+        try {
+            return computeSessionContextInternal(currentSessionId, messages, c, controlState, fetchSession = true)
+        } finally {
+            contextComputeInFlight.set(false)
+        }
+    }
 
+    /**
+     * Local-only context computation — no REST call. Used during streaming and on
+     * intermediate [UiSignal.MessageUpdated] signals. Reads token/cost/model data
+     * from the local message cache only; summary/time fields reuse the last loaded
+     * values (they don't change mid-stream).
+     *
+     * Thread-safe via [contextComputeInFlight] — if a full computation is in flight,
+     * this returns the current state instead of stacking another computation.
+     */
+    internal suspend fun computeSessionContextLocal(controlState: ControlBarState? = null): SessionContextState {
+        val currentSessionId = _activeSessionId.value ?: return SessionContextState.Loading
         val messages = getActiveSession()?.messages?.value ?: emptyMap()
+        val c = client ?: return SessionContextState.Loading
 
-        // Best-effort session fetch — used for summary, time, and model metadata.
+        // Reuse the in-flight guard so local refreshes don't stack with full refreshes
+        if (!contextComputeInFlight.compareAndSet(false, true)) {
+            return _sessionContextState.value
+        }
+        try {
+            return computeSessionContextInternal(currentSessionId, messages, c, controlState, fetchSession = false)
+        } finally {
+            contextComputeInFlight.set(false)
+        }
+    }
+
+    /**
+     * Shared computation logic for both full (REST) and local-only context computation.
+     *
+     * @param fetchSession if true, fetches session metadata (summary, time, model) via REST;
+     *                     if false, reuses the last loaded summary/time values (they don't
+     *                     change mid-stream) and falls back to controlState for model info.
+     */
+    private suspend fun computeSessionContextInternal(
+        currentSessionId: String,
+        messages: Map<String, ChatMessage>,
+        c: OpenCodeClient,
+        controlState: ControlBarState?,
+        fetchSession: Boolean,
+    ): SessionContextState {
+        // Best-effort session fetch — only when fetchSession=true (full path).
         // Token/cost data comes from the local message cache (kept accurate by
         // MessageFinalized SSE events), NOT from session.tokens/session.cost
         // (the V1 API returns these as always-zero — see AGENTS.md § API Testing).
-        //
-        // Design deviation from TDD §7.1: On fetch failure, we return Loaded with
-        // defaults (0 for summary/time, controlState fallback for model) instead of
-        // Error. This is intentional because token/cost data (the primary context
-        // data) is still available from the local message cache — only the secondary
-        // metadata (summary, time, model) degrades gracefully. Showing an Error
-        // state for a transient session-fetch failure would be too aggressive since
-        // the core data is still correct.
-        val session = try {
-            c.getSession(currentSessionId)
-        } catch (e: Exception) {
-            logger.error(e) { "[ACP] Failed to fetch session for context" }
+        val session = if (fetchSession) {
+            try {
+                c.getSession(currentSessionId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(e) { "[ACP] Failed to fetch session for context" }
+                null
+            }
+        } else {
+            // Local-only path: reuse last loaded session metadata for summary/time
+            // (they don't change mid-stream). Model falls back to controlState.
             null
         }
 
-        // ── Token data: use LAST assistant message (matches OpenCode desktop) ──
-        // The desktop app shows the last assistant message's token breakdown,
-        // not cumulative across all messages. Only cost is cumulative.
-        // MessageFinalized SSE events keep per-message fields accurate.
+        // ── Token data ──
+        // inputTokens and cacheReadTokens are CUMULATIVE (each message's value
+        // represents the full prompt context sent for that LLM call, including all
+        // prior messages). Use the LAST assistant message with non-zero tokens —
+        // NOT a sum across all messages (that would double-count).
+        // outputTokens, reasoningTokens, cacheWriteTokens, and cost are PER-MESSAGE
+        // (incremental for that step). Sum these across all assistant messages.
         val assistantMessages = messages.values.filter { it.role == MessageRole.ASSISTANT }
-        val lastAssistant = messages.values.findLast {
-            it.role == MessageRole.ASSISTANT &&
-                (it.inputTokens + it.outputTokens + it.reasoningTokens + it.cacheReadTokens + it.cacheWriteTokens) > 0
-        }
-        val inputTokens = lastAssistant?.inputTokens ?: 0L
-        val outputTokens = lastAssistant?.outputTokens ?: 0L
-        val reasoningTokens = lastAssistant?.reasoningTokens ?: 0L
-        val cacheReadTokens = lastAssistant?.cacheReadTokens ?: 0L
-        val cacheWriteTokens = lastAssistant?.cacheWriteTokens ?: 0L
+
+        // Cumulative fields: last message with non-zero input tokens (not 0L fallback).
+        // Falls back to the previous message's tokens when the last assistant is still
+        // streaming (no MessageFinalized yet) — prevents the indicator from dropping to 0.
+        val lastWithInput = assistantMessages.findLast { it.inputTokens > 0 }
+        val inputTokens = lastWithInput?.inputTokens ?: 0L
+        val cacheReadTokens = lastWithInput?.cacheReadTokens ?: 0L
+
+        // Per-message fields: sum across all assistant messages
+        val outputTokens = assistantMessages.sumOf { it.outputTokens }
+        val reasoningTokens = assistantMessages.sumOf { it.reasoningTokens }
+        val cacheWriteTokens = assistantMessages.sumOf { it.cacheWriteTokens }
         val totalTokens = inputTokens + outputTokens + reasoningTokens + cacheReadTokens + cacheWriteTokens
-        val totalCost = assistantMessages.sumOf { it.cost }  // cumulative across all messages
+        val totalCost = assistantMessages.sumOf { it.cost }
 
         // ── Model info: from session metadata, fallback to controlState ──
-        // Note: SessionModel.id is String = "" (non-nullable). Must use takeIf
-        // to avoid treating empty string as a valid model ID, which would
-        // suppress the controlState fallback.
         val modelId = session?.model?.id?.takeIf { it.isNotBlank() } ?: controlState?.selectedModel?.modelID
         val providerId = session?.model?.providerID?.takeIf { it.isNotBlank() } ?: controlState?.selectedModel?.providerID
 
@@ -787,13 +834,21 @@ class SessionManager(
             (totalTokens.toFloat() / contextLimit.toFloat()) * 100f
         } else 0f
 
-        // ── Message counts: from local cache (not in OpenCodeSession) ──
+        // ── Message counts: from local cache ──
         val messageCount = messages.size
         val userMessageCount = messages.values.count { it.role == MessageRole.USER }
         val assistantMessageCount = assistantMessages.size
 
         val sessionTitle = (_sessionListState.value as? SessionListState.Loaded)
             ?.sessions?.find { it.id == currentSessionId }?.title ?: "Untitled"
+
+        // ── Summary/time: from REST (full path) or reuse last loaded (local path) ──
+        val lastLoaded = (_sessionContextState.value as? SessionContextState.Loaded)?.context
+        val additions = session?.summary?.additions ?: lastLoaded?.additions ?: 0
+        val deletions = session?.summary?.deletions ?: lastLoaded?.deletions ?: 0
+        val filesModified = session?.summary?.files ?: lastLoaded?.filesModified ?: 0
+        val sessionCreated = session?.time?.created ?: lastLoaded?.sessionCreated ?: 0L
+        val lastUpdated = session?.time?.updated ?: lastLoaded?.lastUpdated ?: 0L
 
         val result = SessionContextState.Loaded(
             context = SessionContext(
@@ -815,14 +870,14 @@ class SessionManager(
                 messageCount = messageCount,
                 userMessageCount = userMessageCount,
                 assistantMessageCount = assistantMessageCount,
-                additions = session?.summary?.additions ?: 0,
-                deletions = session?.summary?.deletions ?: 0,
-                filesModified = session?.summary?.files ?: 0,
-                sessionCreated = session?.time?.created ?: 0L,
-                lastUpdated = session?.time?.updated ?: 0L,
+                additions = additions,
+                deletions = deletions,
+                filesModified = filesModified,
+                sessionCreated = sessionCreated,
+                lastUpdated = lastUpdated,
             )
         )
-        logger.info { "[ACP] computeSessionContext: session=$currentSessionId totalTokens=$totalTokens cost=$totalCost usagePercent=${"%.1f".format(usagePercent)}% model=$modelId provider=$providerId" }
+        logger.info { "[ACP] computeSessionContext(${if (fetchSession) "full" else "local"}): session=$currentSessionId totalTokens=$totalTokens cost=$totalCost usagePercent=${"%.1f".format(usagePercent)}% model=$modelId provider=$providerId" }
         _sessionContextState.value = result
         return result
     }
@@ -842,14 +897,6 @@ class SessionManager(
     }
 
     // ── Private: Helpers ──
-
-    /** Atomic compare-and-set for the dedup guard timestamp.
-     *  If the current value matches [expected], sets it to [update] and returns true.
-     *  If another thread updated it concurrently, returns false (caller should proceed
-     *  with computation — the CAS "lost" the race, but the other thread's computation
-     *  covers this call too since the result is shared via _sessionContextState). */
-    private fun lastContextCompareAndSet(expected: Long, update: Long): Boolean =
-        lastContextComputeTime.compareAndSet(expected, update)
 
     private fun resolveModelNames(models: List<ProviderModel>, modelId: String?, providerId: String?): Pair<String, String> {
         if (modelId.isNullOrBlank() && providerId.isNullOrBlank()) return Pair("Unknown", "Unknown")

@@ -596,8 +596,18 @@ private fun SessionRow(
                 }
                 Spacer(Modifier.width(4.dp))
             } else {
-                // Spacer so text aligns with rows that have chevrons
-                Spacer(Modifier.width(24.dp))
+                // Leading indicator for top-level leaf sessions
+                Box(
+                    modifier = Modifier.size(24.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        key = AllIconsKeys.FileTypes.Text,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = iconTint,
+                    )
+                }
                 Spacer(Modifier.width(4.dp))
             }
 
@@ -621,54 +631,60 @@ private fun SessionRow(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
-                    // Archive button — always visible, subtle until hover
-                    Icon(
-                        key = AllIconsKeys.Actions.Close,
-                        contentDescription = "Archive",
+                    // Archive button — centered, slightly larger, with a visible hover highlight
+                    val archiveHoverBg = retrieveColorOrUnspecified("Component.errorFocusColor").copy(alpha = 0.12f)
+                    Box(
                         modifier = Modifier
-                            .size(20.dp)
+                            .size(24.dp)
                             .clip(RoundedCornerShape(4.dp))
-                            .clickable(onClick = onArchive)
-                            .padding(2.dp),
-                        tint = if (isHovered) {
-                            retrieveColorOrUnspecified("Component.errorFocusColor")
-                        } else {
-                            retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.35f)
-                        },
-                    )
+                            .background(if (isHovered) archiveHoverBg else Color.Transparent)
+                            .clickable(onClick = onArchive),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            key = AllIconsKeys.Actions.Close,
+                            contentDescription = "Archive",
+                            modifier = Modifier.size(18.dp),
+                            tint = if (isHovered) {
+                                retrieveColorOrUnspecified("Component.errorFocusColor")
+                            } else {
+                                retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.45f)
+                            },
+                        )
+                    }
                 }
 
                 // Metadata row: timestamp + cost + tokens
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        // Timestamp
-        Text(
-            text = formatRelativeTime(session.updatedAt),
-            fontSize = 11.sp,
-            color = metaColor,
-            maxLines = 1,
-        )
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // Timestamp
+                    Text(
+                        text = formatRelativeTime(session.updatedAt),
+                        fontSize = 11.sp,
+                        color = metaColor,
+                        maxLines = 1,
+                    )
 
-        // Separator
-        Text(
-            text = "\u00B7",
-            fontSize = 11.sp,
-            color = sepColor,
-            maxLines = 1,
-        )
+                    // Separator
+                    Text(
+                        text = "\u00B7",
+                        fontSize = 11.sp,
+                        color = sepColor,
+                        maxLines = 1,
+                    )
 
-        // Cost
-        Text(
-            text = formatCost(session.cost),
-            fontSize = 11.sp,
-            color = metaColor,
-            maxLines = 1,
-        )
+                    // Cost
+                    Text(
+                        text = formatCost(session.cost),
+                        fontSize = 11.sp,
+                        color = metaColor,
+                        maxLines = 1,
+                    )
 
-        // Separator
+                    // Separator
                     Text(
                         text = "\u00B7",
                         fontSize = 11.sp,

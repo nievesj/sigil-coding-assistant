@@ -226,6 +226,12 @@ class ChatViewModel(
                         // refreshes (Ctrl+Alt+Y) or alt-tabs away and back.
                         refreshReviewFiles()
                     }
+                    is UiSignal.MessageUpdated -> {
+                        // Intermediate token/cost update — local-only refresh (no REST).
+                        // Keeps the context indicator live during streaming without
+                        // spamming the server. Full REST refresh on StreamingCompleted.
+                        scope.launch { computeSessionContextLocal() }
+                    }
                     // Global-only signals — should not arrive on activeSignals,
                     // but must be present for exhaustive when.
                     is UiSignal.SessionCreated -> Unit
@@ -805,6 +811,10 @@ class ChatViewModel(
 
     suspend fun computeSessionContext() {
         service.computeSessionContext(_controlState.value)
+    }
+
+    private suspend fun computeSessionContextLocal() {
+        service.computeSessionContextLocal(_controlState.value)
     }
 
     fun retryContextFetch() {

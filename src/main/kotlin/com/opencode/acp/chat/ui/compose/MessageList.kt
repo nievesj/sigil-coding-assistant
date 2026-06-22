@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -31,6 +32,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.key
@@ -61,6 +63,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -127,6 +130,28 @@ fun MessageList(
     // message, streaming content growth, jump-to-bottom click) all bump this.
     var scrollRequest by remember { mutableIntStateOf(0) }
 
+    // Track previous message count to distinguish bulk loads (session switch)
+    // from single new messages from streaming in-place growth.
+    var prevMessageCount by remember { mutableIntStateOf(0) }
+
+    // Pixel-based "at bottom" detection — more reliable than canScrollForward,
+    // which toggles rapidly during streaming as content grows. This checks
+    // that the last visible item IS the last item AND is fully visible (its
+    // bottom edge is within the viewport). See:
+    // https://github.com/gkd-kit/gkd/blob/main/app/src/main/kotlin/li/songe/gkd/ui/component/Hooks.kt
+    val isAtBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()
+            if (lastVisible == null) {
+                info.totalItemsCount == 0 // empty list = "at bottom"
+            } else {
+                lastVisible.index == info.totalItemsCount - 1 &&
+                    lastVisible.offset + lastVisible.size <= info.viewportEndOffset
+            }
+        }
+    }
+
     // Detect user scroll toward older messages (up). previousScrollIndex/Offset
     // are plain local vars (not Compose state) to avoid recompositions.
     LaunchedEffect(Unit) {
@@ -141,10 +166,8 @@ fun MessageList(
                 previousScrollOffset = offset
                 return@collect
             }
-            // Only disable when the user has actually moved up and is NOT at the
-            // bottom. Layout changes during streaming can shift the first visible
-            // item temporarily; those are not user scrolls.
-            val isAtBottom = !listState.canScrollForward
+            // Use pixel-based isAtBottom instead of canScrollForward — the latter
+            // toggles rapidly during streaming, causing false "moved up" detection.
             if (isAtBottom) {
                 autoScrollEnabled = true
             } else {
@@ -160,22 +183,32 @@ fun MessageList(
     }
 
     // Re-enable auto-scroll when user scrolls back to the very bottom.
+    // Uses pixel-based isAtBottom to avoid the canScrollForward toggle noise.
     LaunchedEffect(Unit) {
-        snapshotFlow { !listState.canScrollForward }
-            .collect { isAtBottom ->
-                if (isAtBottom) autoScrollEnabled = true
+        snapshotFlow { isAtBottom }
+            .collect { atBottom ->
+                if (atBottom) autoScrollEnabled = true
             }
     }
 
-    // Trigger scroll on content growth during streaming (message size is constant
-    // while the assistant message grows in-place).
+    // Trigger scroll on content growth during streaming. Instead of watching
+    // canScrollForward (which toggles on every content change, creating a
+    // feedback loop), watch the last visible item's size. When it grows and
+    // we're at the bottom, request a scroll. distinctUntilChanged prevents
+    // re-triggering on the same size. See:
+    // https://github.com/ggml-org/llama.cpp/commit/e58add7
     LaunchedEffect(Unit) {
-        snapshotFlow { listState.canScrollForward }
-            .collect { canForward ->
-                if (canForward && autoScrollEnabled) {
-                    scrollRequest++
-                }
+        var lastHeight = 0
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val lastItem = info.visibleItemsInfo.lastOrNull()
+            (lastItem?.index ?: -1) to (lastItem?.size ?: 0)
+        }.collect { (lastIndex, lastSize) ->
+            if (lastSize > lastHeight && lastIndex == listState.layoutInfo.totalItemsCount - 1 && autoScrollEnabled) {
+                scrollRequest++
             }
+            lastHeight = lastSize
+        }
     }
 
     // Trigger scroll on new messages / queued messages.
@@ -194,21 +227,60 @@ fun MessageList(
 
     // Single scroll coordinator. Serializes all programmatic scrolls and keeps
     // the scroll guard active until the list has fully settled.
+    //
+    // Three scroll modes based on what triggered the request:
+    // 1. Bulk load (session switch): messages.size jumps by >1 or from 0 →
+    //    instant scrollToItem (no animation — history should appear at bottom)
+    // 2. New message (messages.size grows by exactly 1): animateScrollToItem
+    //    (gentle glide when a new message bubble appears)
+    // 3. Streaming growth (messages.size unchanged, content grew in-place):
+    //    instant scrollToItem (no animation — the content growth IS the motion;
+    //    animating creates a feedback loop where the animation fights content growth)
     LaunchedEffect(scrollRequest) {
         if (!autoScrollEnabled) return@LaunchedEffect
         val totalItems = messages.size + queuedMessages.size + if (queuedMessages.isNotEmpty() && messages.isNotEmpty()) 1 else 0
         if (totalItems <= 0) return@LaunchedEffect
+
+        // Determine scroll mode by comparing message count delta.
+        val messageDelta = messages.size - prevMessageCount
+        prevMessageCount = messages.size
+        val isBulkLoad = messageDelta > 1 || (prevMessageCount == messages.size && messages.size > 1 && scrollRequest == 1)
+        // isBulkLoad: session switch loaded N messages at once (delta > 1),
+        // or first render with existing messages (prevCount=0, now >1).
+        // Treat delta 0 (streaming growth) and delta 1 (single new message) as
+        // non-bulk. delta 1 gets animation; delta 0 gets instant.
+        val isStreamingGrowth = messageDelta == 0
+
         scrollMutex.withLock {
             try {
-                // Int.MAX_VALUE as offset forces scroll to the very bottom of the
-                // last item. Required with Arrangement.Bottom: scrollToItem(index)
-                // alone would position the item at the top, leaving empty space
-                // below. Compose clamps the offset internally to a valid range.
-                listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
+                if (isBulkLoad || isStreamingGrowth) {
+                    // Instant snap — no animation. For bulk loads, history appears
+                    // at the bottom immediately. For streaming, the content growth
+                    // is the motion; animating creates a feedback loop.
+                    // Int.MAX_VALUE offset forces scroll to the very bottom of the
+                    // last item (required with Arrangement.Bottom).
+                    listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
+                } else {
+                    // New message appeared (delta == 1) — gentle animated glide.
+                    // Short coalesce delay so rapid size changes merge into one
+                    // animation. 60ms is short enough to feel responsive.
+                    delay(60)
+                    listState.animateScrollToItem(totalItems - 1, Int.MAX_VALUE)
+                }
             } catch (e: Exception) {
-                // Fallback in case the offset is rejected.
-                logger.debug(e) { "[ACP] scrollToItem with Int.MAX_VALUE offset failed, retrying without offset" }
-                listState.scrollToItem(totalItems - 1)
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                logger.debug(e) { "[ACP] scroll failed, retrying without offset" }
+                try {
+                    if (isBulkLoad || isStreamingGrowth) {
+                        listState.scrollToItem(totalItems - 1)
+                    } else {
+                        listState.animateScrollToItem(totalItems - 1)
+                    }
+                } catch (e2: Exception) {
+                    if (e2 is kotlinx.coroutines.CancellationException) throw e2
+                    logger.debug(e2) { "[ACP] scroll fallback to instant scrollToItem" }
+                    listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
+                }
             }
             // Wait for the scroll to fully settle before releasing the mutex.
             // This prevents the disable detector from seeing isScrollInProgress
@@ -282,7 +354,6 @@ fun MessageList(
         // Jump to bottom button — always visible when there are messages.
         // Bright when scrolled up (actionable), dimmed when already at bottom.
         if (messages.isNotEmpty()) {
-            val isAtBottom = !listState.canScrollForward
             val buttonBg = if (isAtBottom) ChatTheme.colors.text.muted.copy(alpha = 0.3f) else ChatTheme.colors.accent.blue
             val iconTint = if (isAtBottom) ChatTheme.colors.text.muted.copy(alpha = 0.6f) else Color.White
             Box(
@@ -373,15 +444,18 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
         if (textContent.isNotBlank()) {
             Box(
                 modifier = Modifier
+                    .heightIn(min = ChatTheme.dims.toolAccentStripHeight)
                     .background(
                         color = ChatTheme.colors.border.selectionBg,
                         shape = ChatTheme.shapes.messageBubbleCornerRadius
                     )
-                    .padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = 6.dp)
+                    .padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = 6.dp),
+                contentAlignment = Alignment.Center
             ) {
                 org.jetbrains.jewel.ui.component.Text(
                     text = textContent,
-                    style = TextStyle(fontSize = ChatTheme.fonts.messageBody * 1.5f),
+                    fontSize = ChatTheme.fonts.toolKindLabel,
+                    fontWeight = ChatTheme.fontWeights.toolKindLabel,
                 )
             }
         }
@@ -491,7 +565,11 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                              )
                          }
                      }
-                     is MessagePart.Code -> key(key) { ChatFencedCodeBlock(content = part.content, language = part.language) }
+                      is MessagePart.Code -> key(key) {
+                          Box(modifier = Modifier.padding(vertical = 8.dp)) {
+                              ChatFencedCodeBlock(content = part.content, language = part.language)
+                          }
+                      }
                      is MessagePart.Table -> key(key) { ChatTable(rawMarkdown = part.rawMarkdown, modifier = Modifier.fillMaxWidth()) }
                      is MessagePart.Patch -> if (!hasToolCall) key(key) {
                          Column(
@@ -843,14 +921,14 @@ private fun FileChangeCard(
         }
 
         // Open file target icon
-        if (virtualFile != null) {
+        if (virtualFile != null && projectResolved != null) {
             Spacer(Modifier.width(8.dp))
             Icon(
                 key = AllIconsKeys.General.Locate,
                 contentDescription = "Open file",
                 modifier = Modifier
                     .size(18.dp)
-                    .clickable { openFileInEditor(projectResolved!!, virtualFile) }
+                    .clickable { openFileInEditor(projectResolved, virtualFile) }
                     .padding(1.dp),
                 tint = pathColor,
             )

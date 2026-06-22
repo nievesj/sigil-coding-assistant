@@ -89,8 +89,10 @@ class SessionState(
     internal val ctx = ProcessorContext()
 
     /** Whether the first text chunk has been segmented (controls non-debounced
-     *  re-segment for responsiveness on the first chunk). Reset in createAssistantMessage(). */
-    internal var firstTextSegmented = false
+     *  re-segment for responsiveness on the first chunk). Reset in createAssistantMessage().
+     *  @Volatile because written by [adoptStreamingContext] on the caller's coroutine and
+     *  read by the event processing coroutine. */
+    @Volatile internal var firstTextSegmented = false
 
     /** Event channel — SSE events buffered for EDT processing. */
     private val eventChannel = Channel<SseEvent>(1024)
@@ -267,6 +269,7 @@ class SessionState(
     fun completeStreaming(messageId: String) = stateLock.withLock {
         if (messageId != ctx.activeMessageId) return@withLock
         freezeCurrentThinking()
+        flushRevealBuffer()
         resegmentTextPartsFinal(messageId)
         ctx.isStreaming = false
         updateMessage(messageId) { it.copy(isStreaming = false, state = MessageState.Completed) }
@@ -276,6 +279,7 @@ class SessionState(
     fun abortStreaming(reason: String) = stateLock.withLock {
         val msgId = ctx.activeMessageId ?: return@withLock
         freezeCurrentThinking()
+        flushRevealBuffer()
         ctx.errorMessage = reason
         ctx.isStreaming = false
         updateMessage(msgId) { msg ->
@@ -459,6 +463,8 @@ class SessionState(
         signalForwardJob = null
         ctx.pendingStopJob?.cancel()
         ctx.pendingStopJob = null
+        ctx.revealJob?.cancel()
+        ctx.revealJob = null
         eventChannel.close()
         _pendingPermission.value = null
         _pendingSelection.value = null
@@ -662,14 +668,9 @@ class SessionState(
                     }
                 }
                 ctx.thinkingBuffer.append(event.text)
-                updateMessage(msgId) { msg ->
-                    val parts = LinkedHashMap(msg.parts)
-                    parts[ctx.activeThinkingKey!!] = MessagePart.Thinking(
-                        content = ctx.thinkingBuffer.toString(),
-                        state = PartState.Streaming
-                    )
-                    msg.copy(parts = parts, isStreaming = ctx.isStreaming)
-                }
+                ctx.thinkingRevealBuffer.append(event.text)
+                ctx.thinkingSourceComplete = false
+                startThinkingRevealLoop(msgId)
             }
 
             is SseEvent.ThinkingReplace -> {
@@ -688,10 +689,16 @@ class SessionState(
                 }
                 ctx.thinkingBuffer.setLength(0)
                 ctx.thinkingBuffer.append(event.text)
+                ctx.thinkingRevealBuffer.clear()
+                ctx.thinkingRevealBuffer.append(event.text)
+                ctx.thinkingRevealedLen = event.text.length
+                ctx.thinkingSourceComplete = true
+                ctx.thinkingRevealJob?.cancel()
+                ctx.thinkingRevealJob = null
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     parts[ctx.activeThinkingKey!!] = MessagePart.Thinking(
-                        content = ctx.thinkingBuffer.toString(),
+                        content = ctx.thinkingRevealBuffer.substring(0, ctx.thinkingRevealedLen),
                         state = if (ctx.activeThinkingCompleted) PartState.Completed else PartState.Streaming
                     )
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
@@ -717,9 +724,12 @@ class SessionState(
                     val userText = ctx.lastUserText
                     if (userText != null && text.startsWith(userText, ignoreCase = true)) {
                         ctx.userEchoStripped = true
-                        ctx.textBuffer.append(text.substring(userText.length).trimStart())
+                        val chunk = text.substring(userText.length).trimStart()
+                        ctx.textBuffer.append(chunk)
+                        ctx.revealBuffer.append(chunk)
                     } else {
                         ctx.textBuffer.append(text)
+                        ctx.revealBuffer.append(text)
                     }
                 } else {
                     // Track new text part: if partId changed, a new text segment started
@@ -729,9 +739,11 @@ class SessionState(
                         ctx.activeTextPartId = event.partId
                     }
                     ctx.textBuffer.append(text)
+                    ctx.revealBuffer.append(text)
                 }
+                ctx.sourceComplete = false
                 ctx.streamingText.value = ctx.textBuffer.toString()
-                scheduleResegment(msgId)
+                startRevealLoop(msgId)
             }
 
             is SseEvent.TextReplace -> {
@@ -771,10 +783,22 @@ class SessionState(
                 }
                 ctx.textBuffer.clear()
                 ctx.textBuffer.append(event.text)
+                ctx.revealBuffer.clear()
+                ctx.revealBuffer.append(event.text)
+                ctx.revealedLen = event.text.length // TextReplace is a finalization echo — reveal all
+                ctx.sourceComplete = true
+        ctx.revealJob?.cancel()
+        ctx.revealJob = null
+        ctx.thinkingRevealJob?.cancel()
+        ctx.thinkingRevealJob = null
                 ctx.userEchoStripped = false
                 val userText = ctx.lastUserText
                 if (userText != null && ctx.textBuffer.toString().startsWith(userText, ignoreCase = true)) {
                     ctx.textBuffer.delete(0, userText.length)
+                    // Also strip the user echo from revealBuffer so it's not shown to the user.
+                    // revealedLen must be adjusted to match the stripped buffer length.
+                    ctx.revealBuffer.delete(0, userText.length)
+                    ctx.revealedLen = ctx.revealBuffer.length
                     ctx.userEchoStripped = true
                 }
                 ctx.firstTextChunkReceived = true
@@ -1139,6 +1163,12 @@ class SessionState(
                 // SessionIdle backstop (line 507-518) finalizes the stream.
                 if (event.stopReason != null) {
                     finalizeStreaming(localMsgId, event.stopReason)
+                } else {
+                    // Intermediate token/cost update (no finish) — trigger local-only
+                    // context refresh so the indicator updates immediately without
+                    // waiting for StreamingCompleted. The full REST refresh happens
+                    // when the response completes (StreamingCompleted / SessionIdle).
+                    _signals.tryEmit(UiSignal.MessageUpdated(localMsgId))
                 }
             }
 
@@ -1281,6 +1311,7 @@ class SessionState(
         }
 
         freezeCurrentThinking()
+        flushRevealBuffer()
         resegmentTextPartsDirect(msgId)
 
         if (stopReason == "tool-calls") {
@@ -1307,7 +1338,8 @@ class SessionState(
     private fun freezeCurrentThinking() {
         val key = ctx.activeThinkingKey ?: return
         if (ctx.thinkingBuffer.isEmpty()) return
-        val content = ctx.thinkingBuffer.toString()
+        flushThinkingRevealBuffer()
+        val content = ctx.thinkingRevealBuffer.substring(0, ctx.thinkingRevealedLen)
         val msgId = ctx.activeMessageId ?: return
         updateMessage(msgId) { msg ->
             val parts = LinkedHashMap(msg.parts)
@@ -1315,11 +1347,158 @@ class SessionState(
             msg.copy(parts = parts)
         }
         ctx.thinkingBuffer.setLength(0)
+        ctx.thinkingRevealBuffer.clear()
+        ctx.thinkingRevealedLen = 0
         ctx.activeThinkingKey = null
         ctx.activeThinkingCompleted = false
     }
 
+    /**
+     * Start (or no-op if already running) the typewriter reveal coroutine for thinking.
+     * Mirrors [startRevealLoop] but for thinking content — updates the thinking
+     * MessagePart directly via [updateMessage] with only the revealed portion.
+     */
+    private fun startThinkingRevealLoop(msgId: String) {
+        if (ctx.thinkingRevealJob?.isActive == true) return
+        ctx.thinkingSourceComplete = false
+        ctx.thinkingRevealJob = scope.launch(Dispatchers.Default) {
+            var charBudget = 0.0
+            var lastTickMs = System.currentTimeMillis()
+            try {
+                while (true) {
+                    val target = ctx.thinkingRevealBuffer.length
+                    val backlog = target - ctx.thinkingRevealedLen
+                    if (backlog <= 0) {
+                        if (ctx.thinkingSourceComplete) break
+                        delay(50) // idle poll
+                        lastTickMs = System.currentTimeMillis()
+                        continue
+                    }
+                    val now = System.currentTimeMillis()
+                    val dtMs = (now - lastTickMs).coerceAtLeast(1)
+                    lastTickMs = now
+                    // Adaptive rate: 42 cps at rest, 125 cps normal, 500 cps catching up
+                    val rate = when {
+                        ctx.thinkingSourceComplete -> backlog.toDouble() // flush all
+                        backlog > 80 -> 500.0
+                        backlog > 30 -> 125.0
+                        else -> 42.0
+                    }
+                    charBudget += rate * (dtMs / 1000.0)
+                    val wholeChars = charBudget.toInt()
+                    if (wholeChars >= 1) {
+                        val reveal = minOf(wholeChars, backlog)
+                        ctx.thinkingRevealedLen = minOf(ctx.thinkingRevealedLen + reveal, target)
+                        charBudget -= reveal
+                        // Update the thinking MessagePart with the revealed content.
+                        val key = ctx.activeThinkingKey
+                        if (key != null) {
+                            val revealedContent = ctx.thinkingRevealBuffer.substring(0, ctx.thinkingRevealedLen)
+                            updateMessage(msgId) { msg ->
+                                val parts = LinkedHashMap(msg.parts)
+                                parts[key] = MessagePart.Thinking(
+                                    content = revealedContent,
+                                    state = PartState.Streaming
+                                )
+                                msg.copy(parts = parts, isStreaming = ctx.isStreaming)
+                            }
+                        }
+                    }
+                    val delayMs = when {
+                        ctx.thinkingSourceComplete -> 0L
+                        backlog > 80 -> 8L
+                        backlog > 30 -> 16L
+                        else -> 24L
+                    }
+                    if (delayMs > 0) delay(delayMs)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            }
+        }
+    }
+
+    /**
+     * Flush the thinking reveal buffer — reveal all remaining thinking text immediately
+     * and stop the reveal loop. Called by freezeCurrentThinking.
+     */
+    private fun flushThinkingRevealBuffer() {
+        ctx.thinkingSourceComplete = true
+        ctx.thinkingRevealedLen = ctx.thinkingRevealBuffer.length
+        ctx.thinkingRevealJob?.cancel()
+        ctx.thinkingRevealJob = null
+    }
+
     // ── Internal: Text Re-Segmentation ──────────────────────────────────────
+
+    /**
+     * Start (or no-op if already running) the typewriter reveal coroutine.
+     * This coroutine drains [ctx.revealBuffer] at an adaptive rate, calling
+     * [scheduleResegment] each time new characters are revealed. The effect is
+     * that text appears gradually instead of in irregular SSE-driven bursts.
+     */
+    private fun startRevealLoop(msgId: String) {
+        if (ctx.revealJob?.isActive == true) return
+        ctx.sourceComplete = false
+        ctx.revealJob = scope.launch(Dispatchers.Default) {
+            var charBudget = 0.0
+            var lastTickMs = System.currentTimeMillis()
+            try {
+                while (true) {
+                    val target = ctx.revealBuffer.length
+                    val backlog = target - ctx.revealedLen
+                    if (backlog <= 0) {
+                        if (ctx.sourceComplete) break
+                        delay(50) // idle poll
+                        lastTickMs = System.currentTimeMillis()
+                        continue
+                    }
+                    val now = System.currentTimeMillis()
+                    val dtMs = (now - lastTickMs).coerceAtLeast(1)
+                    lastTickMs = now
+                    // Adaptive rate: 42 cps at rest, 125 cps normal, 500 cps catching up
+                    val rate = when {
+                        ctx.sourceComplete -> backlog.toDouble() // flush all
+                        backlog > 80 -> 500.0
+                        backlog > 30 -> 125.0
+                        else -> 42.0
+                    }
+                    charBudget += rate * (dtMs / 1000.0)
+                    val wholeChars = charBudget.toInt()
+                    if (wholeChars >= 1) {
+                        val reveal = minOf(wholeChars, backlog)
+                        ctx.revealedLen = minOf(ctx.revealedLen + reveal, target)
+                        charBudget -= reveal
+                        // Call resegment DIRECTLY — no debounce. The reveal loop's delay
+                        // is the pacing mechanism. scheduleResegment's 50ms debounce
+                        // cancels every tick because the reveal loop ticks faster than 50ms.
+                        resegmentTextPartsDirect(msgId)
+                    }
+                    val delayMs = when {
+                        ctx.sourceComplete -> 0L
+                        backlog > 80 -> 8L
+                        backlog > 30 -> 16L
+                        else -> 24L
+                    }
+                    if (delayMs > 0) delay(delayMs)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            }
+        }
+    }
+
+    /**
+     * Flush the reveal buffer — reveal all remaining text immediately and
+     * stop the reveal loop. Called by finalizeStreaming, completeStreaming,
+     * abortStreaming, and TextReplace handler.
+     */
+    private fun flushRevealBuffer() {
+        ctx.sourceComplete = true
+        ctx.revealedLen = ctx.revealBuffer.length
+        ctx.revealJob?.cancel()
+        ctx.revealJob = null
+    }
 
     private fun scheduleResegment(msgId: String) {
         if (!firstTextSegmented) {
@@ -1339,7 +1518,7 @@ class SessionState(
 
     private fun resegmentTextPartsDirect(msgId: String, overrideIsStreaming: Boolean = ctx.isStreaming) {
         stateLock.withLock {
-            if (ctx.textBuffer.isEmpty()) {
+            if (ctx.revealedLen == 0) {
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     parts.keys.removeIf { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }
@@ -1370,14 +1549,14 @@ class SessionState(
             // to avoid races with the event processing coroutine that may mutate ctx.textSegments.
             val segmentsSnapshot = ctx.textSegments.toList()
 
-            val raw = ctx.textBuffer.toString()
+            val raw = ctx.revealBuffer.substring(0, ctx.revealedLen)
 
             // Segment each text segment independently and collect parts per segment.
             // Each segment covers a slice of textBuffer: [startOffset, nextSegment.startOffset).
             val partsBySegment = mutableListOf<List<Pair<String, MessagePart>>>()
             for (segIdx in segmentsSnapshot.indices) {
-                val start = segmentsSnapshot[segIdx].startOffset
-                val end = if (segIdx + 1 < segmentsSnapshot.size) segmentsSnapshot[segIdx + 1].startOffset else raw.length
+                val start = minOf(segmentsSnapshot[segIdx].startOffset, ctx.revealedLen)
+                val end = if (segIdx + 1 < segmentsSnapshot.size) minOf(segmentsSnapshot[segIdx + 1].startOffset, ctx.revealedLen) else ctx.revealedLen
                 if (start >= end) {
                     partsBySegment.add(emptyList())
                     continue

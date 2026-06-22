@@ -207,7 +207,7 @@ private fun DoughnutRing(
     modifier: Modifier = Modifier
 ) {
     val colors = ChatTheme.colors
-    val displayText = "${(fillFraction * 100).toInt()}"
+    val displayText = "${(fillFraction * 100).toInt()}%"
 
     Box(modifier = modifier.size(sizeDp), contentAlignment = Alignment.Center) {
         Canvas(modifier = Modifier.size(sizeDp)) {

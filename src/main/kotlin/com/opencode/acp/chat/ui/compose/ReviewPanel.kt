@@ -233,20 +233,20 @@ fun ReviewPanel(
             files = s.files,
             commentCounts = s.commentCounts,
             openCommentsByFile = s.openCommentsByFile,
-            onFileClick = { filePath, status, virtualFile ->
+            onFileClick = { _, _, virtualFile ->
+                if (virtualFile != null) {
+                    openFileInEditor(project, virtualFile)
+                }
+            },
+            onOpenFile = { filePath, status, virtualFile ->
                 when (status) {
                     FileChangeStatus.UNTRACKED -> {
                         // Use virtualFile directly — ChangedFile already stores it.
                         if (virtualFile != null) {
-                            openUntrackedFile(project, virtualFile)
+                            openFileInEditor(project, virtualFile)
                         }
                     }
                     else -> openDiffForPath(project, filePath, virtualFile, scope)
-                }
-            },
-            onOpenFile = { virtualFile ->
-                if (virtualFile != null) {
-                    openFileInEditor(project, virtualFile)
                 }
             },
             onCommentClick = { filePath, line ->
@@ -266,7 +266,7 @@ private fun ReviewFileListContent(
     commentCounts: CommentCounts = CommentCounts(),
     openCommentsByFile: Map<String, List<ReviewComment>> = emptyMap(),
     onFileClick: (filePath: String, status: FileChangeStatus, virtualFile: com.intellij.openapi.vfs.VirtualFile?) -> Unit,
-    onOpenFile: (com.intellij.openapi.vfs.VirtualFile?) -> Unit,
+    onOpenFile: (filePath: String, status: FileChangeStatus, virtualFile: com.intellij.openapi.vfs.VirtualFile?) -> Unit,
     onCommentClick: (filePath: String, line: Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -280,7 +280,7 @@ private fun ReviewFileListContent(
                 file = file,
                 comments = comments,
                 onRowClick = { onFileClick(file.filePath, file.status, file.virtualFile) },
-                onOpenFile = { onOpenFile(file.virtualFile) },
+                onOpenFile = { onOpenFile(file.filePath, file.status, file.virtualFile) },
                 onCommentClick = { line -> onCommentClick(file.filePath, line) }
             )
         }
@@ -415,12 +415,12 @@ private fun ChangedFileRow(
                         .clickable(onClick = onOpenFile),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        key = AllIconsKeys.General.Locate,
-                        contentDescription = "Open file",
-                        modifier = Modifier.size(ChatTheme.dims.reviewOpenFileIconSize),
-                        tint = if (isLocateHovered) ChatTheme.colors.text.link else pathColor
-                    )
+                Icon(
+                    key = AllIconsKeys.Actions.Diff,
+                    contentDescription = "Diff",
+                    modifier = Modifier.size(ChatTheme.dims.reviewOpenFileIconSize),
+                    tint = if (isLocateHovered) ChatTheme.colors.text.link else pathColor
+                )
                 }
             }
         }
