@@ -62,21 +62,37 @@ private fun rememberChatThemeData(): ChatThemeData {
     val disabledFg = retrieveColorOrUnspecified("Label.disabledForeground")
 
     return remember(panelBg, panelFg, borderColor, selectionBg, selectionFg, hoverBg, linkColor, errorColor, disabledFg) {
+        // Derived theme-aware values — adapt to light/dark IDE themes.
+        // panelBg/panelFg come from UIManager and are the source of truth for the
+        // current IDE theme. All component colors below derive from these so the
+        // chat UI stays readable on both light and dark themes.
+        val isDarkTheme = panelBg.red * 0.299f + panelBg.green * 0.587f + panelBg.blue * 0.114f < 0.5f
+        val surfaceCard = panelBg.copy(red = panelBg.red * 0.9f, green = panelBg.green * 0.9f, blue = panelBg.blue * 0.9f)
+        val surfaceDark = panelBg.copy(red = panelBg.red * 0.75f, green = panelBg.green * 0.75f, blue = panelBg.blue * 0.75f)
+        val surfaceTableHeader = panelBg.copy(red = panelBg.red * 0.82f, green = panelBg.green * 0.82f, blue = panelBg.blue * 0.82f)
+        val textPrimary = panelFg
+        val textSecondary = panelFg.copy(alpha = 0.85f)
+        val textMuted = panelFg.copy(alpha = 0.5f)
+        val subtleBorder = borderColor.copy(alpha = 0.5f)
+
         ChatThemeData(
         colors = ChatThemeData.Colors(
             surface = ChatThemeData.SurfaceColors(
                 primary = panelBg,
                 secondary = panelBg.copy(red = panelBg.red * 0.85f, green = panelBg.green * 0.85f, blue = panelBg.blue * 0.85f),
-                card = panelBg.copy(red = panelBg.red * 0.9f, green = panelBg.green * 0.9f, blue = panelBg.blue * 0.9f),
-                dark = panelBg.copy(red = panelBg.red * 0.75f, green = panelBg.green * 0.75f, blue = panelBg.blue * 0.75f),
+                card = surfaceCard,
+                dark = surfaceDark,
                 elevated = hoverBg,
-                tableHeader = panelBg.copy(red = panelBg.red * 0.82f, green = panelBg.green * 0.82f, blue = panelBg.blue * 0.82f),
+                tableHeader = surfaceTableHeader,
             ),
             text = ChatThemeData.TextColors(
-                primary = panelFg,
-                secondary = panelFg.copy(alpha = 0.85f),
-                muted = panelFg.copy(alpha = 0.5f),
+                primary = textPrimary,
+                secondary = textSecondary,
+                muted = textMuted,
                 disabled = disabledFg,
+                // text.inverse is only used on known-dark or saturated fills (splash bg,
+                // checkbox fill, accent blue). White is correct in all themes for those
+                // surfaces. Do NOT use text.inverse on theme-aware backgrounds.
                 inverse = Color.White,
                 link = linkColor,
                 error = errorColor,
@@ -103,8 +119,9 @@ private fun rememberChatThemeData(): ChatThemeData {
                 codeDeleted = Color(0xFFFF7B72),
                 codeModified = Color(0xFFF0C674),
                 inlineCodeBackground = Color.Transparent,
-                blockQuoteLine = Color(0xFF3E3E3E),
-                blockQuoteText = Color(0xFF9E9E9E),
+                blockQuoteLine = subtleBorder,
+                // blockQuoteText is drawn as text on theme-aware surfaces — derive from panelFg
+                blockQuoteText = textMuted,
                 pillContainerBg = Color(0x0CFFFFFF),
                 overlaySemiTransparent = Color(0x88000000),
                 highlightBlueAlpha = Color(0x182196F3),
@@ -184,88 +201,134 @@ private fun rememberChatThemeData(): ChatThemeData {
             tool = ChatThemeData.ToolColors(
                 execute = Color(0xFF3574F0),
                 edit = Color(0xFF7EE787),
-                read = Color(0xFFBBBBBB),
+                // read/move are used as TEXT on theme-aware surfaces (tool pill header text,
+                // task pill description). Derive from panelFg so they stay readable on light themes.
+                read = textSecondary,
                 search = Color(0xFFF0C674),
                 delete = Color(0xFFFF7B72),
-                move = Color(0xFFBBBBBB),
+                move = textSecondary,
                 fetch = Color(0xFFF0C674),
-                think = Color(0xFF9E9E9E),
-                switchMode = Color(0xFF9E9E9E),
-                other = Color(0xFF9E9E9E),
+                // think/switchMode/other are used as text/icon tints on theme-aware surfaces.
+                think = textMuted,
+                switchMode = textMuted,
+                other = textMuted,
             ),
             component = ChatThemeData.ComponentColors(
+                // Sidebar shimmer — accent colors, safe as hardcoded (used as icon tints)
                 sidebarShimmerCreating = Color(0xFFFFC107),
                 sidebarShimmerStreaming = Color(0xFF4CAF50),
+                // Splash screen — accent status colors, safe as hardcoded (icons on dark splash bg)
                 splashConnected = Color(0xFF4CAF50),
                 splashError = Color(0xFFF44336),
                 splashRetry = Color(0xFFFF9800),
+                // Task/subagent pills — text on theme-aware pill container bg
                 taskAccent = Color(0xFF7EE787),
-                taskRunning = Color(0xFF808080),
-                taskCompleted = Color(0xFFCCCCCC),
+                taskRunning = textMuted,
+                taskCompleted = textSecondary,
                 taskFailed = Color(0xFFFF7B72),
-                taskPending = Color(0xFF808080),
-                retryBg = Color(0xFF5C4A00),
-                retryText = Color(0xFFFFD666),
-                retryErrorDetail = Color(0xFFCCAA44),
+                taskPending = textMuted,
+                // Retry pill — paired palette: bg is a tinted fill, text must contrast with it.
+                // Use accent.yellow as the base tint with alpha, and derive text from panelFg
+                // so it adapts. On dark themes the tint is dark amber → light text; on light themes
+                // the tint is light amber → dark text.
+                retryBg = if (isDarkTheme) Color(0xFF5C4A00) else Color(0xFFFFF4D6),
+                retryText = if (isDarkTheme) Color(0xFFFFD666) else Color(0xFF6B4A00),
+                retryErrorDetail = if (isDarkTheme) Color(0xFFCCAA44) else Color(0xFF8A6A00),
+                // Selection prompt
                 selectionCheckboxFill = Color(0xFF2196F3),
-                selectionCheckboxBorder = Color.Gray,
+                // selectionCheckboxBorder is used BOTH as the checkbox border (on theme-aware bg)
+                // AND as the option description text color (SelectionPrompt.kt:201). Derive from
+                // panelFg so description text is readable on light themes.
+                selectionCheckboxBorder = textMuted,
                 selectionCustomBullet = Color(0xFF4CAF50),
-                interruptedDivider = Color(0xFF444444),
-                tableHeaderText = Color(0xFF6BBE50),
-                tableCellText = Color(0xFFD4D4D4),
-                tableSeparator = Color(0xFF3E3E3E),
-                tableHeaderBg = Color(0xFF2A2A2A),
-                tableHoverBg = Color(0xFF252525),
-                tableBorder = Color(0xFF3E3E3E),
-                tableContainerBg = Color(0xFF1E1E1E),
+                // Interrupted / divider — on theme-aware surface
+                interruptedDivider = subtleBorder,
+                // Markdown table — full unit: bg + text + border together.
+                // tableHeaderText uses text.primary for readability; brand green tint applied
+                // to the header bg instead (text-on-tinted-bg is the safe pattern).
+                tableHeaderText = textPrimary,
+                tableCellText = textPrimary,
+                tableSeparator = subtleBorder,
+                tableHeaderBg = surfaceTableHeader,
+                tableHoverBg = surfaceDark,
+                tableBorder = subtleBorder,
+                tableContainerBg = surfaceCard,
+                // Streaming glow animation — accent colors on dark input, safe as hardcoded
                 glowTransparent = Color.Transparent,
                 glowStart = Color(0xFF4A9EFF).copy(alpha = 0.15f),
                 glowPeak = Color(0xFF4A9EFF).copy(alpha = 0.45f),
                 glowHot = Color(0xFF00D4FF).copy(alpha = 0.85f),
-                inputBg = Color(0xFF2B2B2B),
-                inputBorder = Color(0xFF3E3E3E),
-                inputCursor = Color.White,
-                inputText = Color(0xFFCCCCCC),
-                inputPlaceholder = Color(0xFF808080),
-                dragActiveBg = Color(0xFF2E3A2E),
-                attachmentBg = Color(0xFF3E3E3E),
-                attachmentRemoveIcon = Color(0xFFBBBBBB),
-                attachmentImageOverlay = Color(0xFF555555),
-                attachmentImageRemove = Color(0xFFCCCCCC),
-                attachmentFileSize = Color(0xFF808080),
-                contextPanelLabel = Color(0xFF999999),
-                contextPanelValue = Color(0xFFDDDDDD),
-                contextPanelSeparator = Color(0xFF3E3E3E),
-                contextProgressBarBg = Color(0xFF3C3C3C),
-                indicatorBg = Color(0xFF3C3C3C),
-                tooltipBg = Color(0xFF2B2B2B),
-                tooltipBorder = Color(0xFF4A4A4A),
-                tooltipText = Color(0xFFCCCCCC),
-                tooltipMuted = Color(0xFF999999),
-                codeCopyIcon = Color(0xFF6BBE50),
-                codeLanguageLabel = Color(0xFFBBBBBB),
-                todoBg = Color(0xFF252525),
-                todoHeader = Color(0xFF808080),
-                todoPending = Color(0xFF808080),
+                // Input area — full unit: bg + text + border + cursor together.
+                // Derive from panelBg/panelFg so the input adapts to light/dark themes.
+                inputBg = surfaceCard,
+                inputBorder = subtleBorder,
+                inputCursor = textPrimary,
+                inputText = textPrimary,
+                inputPlaceholder = disabledFg,
+                dragActiveBg = if (isDarkTheme) Color(0xFF2E3A2E) else Color(0xFFE8F5E8),
+                // Attachment thumbnails — on theme-aware input bg
+                attachmentBg = surfaceDark,
+                attachmentRemoveIcon = textSecondary,
+                attachmentImageOverlay = Color(0x88000000),
+                attachmentImageRemove = if (isDarkTheme) Color(0xFFCCCCCC) else Color(0xFFFFFFFF),
+                attachmentFileSize = textMuted,
+                // Context panel — labels/values on theme-aware sidebar bg
+                contextPanelLabel = textMuted,
+                contextPanelValue = textSecondary,
+                contextPanelSeparator = subtleBorder,
+                contextProgressBarBg = surfaceDark,
+                // Indicator — context ring background
+                indicatorBg = surfaceDark,
+                // Tooltip — derive from panelBg/panelFg for theme adaptation
+                tooltipBg = surfaceDark,
+                tooltipBorder = subtleBorder,
+                tooltipText = textSecondary,
+                tooltipMuted = textMuted,
+                // Code block — header is on editorBgColor (from EditorColorsScheme), NOT theme-aware.
+                // The code block is a special unit: its surfaces come from the editor scheme and
+                // are NOT derived from panelBg. Use text.muted for the language label so it stays
+                // readable on both light and dark editor schemes (muted = panelFg × 0.5, which
+                // is dark-gray on light editor bg and light-gray on dark editor bg).
+                codeCopyIcon = textMuted,
+                codeLanguageLabel = textMuted,
+                // Todo panel — full unit: bg + text together.
+                todoBg = surfaceCard,
+                todoHeader = textMuted,
+                todoPending = textMuted,
                 todoInProgress = Color(0xFFE5A617),
                 todoCompleted = Color(0xFF6BBE50),
-                todoCancelled = Color(0xFF666666),
+                todoCancelled = textMuted,
                 todoAccent = Color(0xFF3574F0),
-                todoActiveText = Color(0xFFDDDDDD),
-                compactionText = Color(0xFF7EBF7E),
-                compactionIcon = Color(0xFF7EBF7E),
+                todoActiveText = textPrimary,
+                // Compaction pill — paired palette like retry pill
+                compactionText = if (isDarkTheme) Color(0xFF7EBF7E) else Color(0xFF2E6B2E),
+                compactionIcon = if (isDarkTheme) Color(0xFF7EBF7E) else Color(0xFF2E6B2E),
+                // Selector hover tint
                 selectorHoverTint = Color(0xFF3574F0),
+                // Star ratings — accent colors, safe as hardcoded (icons)
                 starGold = Color(0xFFE5C100),
-                starMuted = Color(0xFF606060),
-                selectedRowBg = Color(0xFF2D4F6D),
-                thinkingText = Color.Gray,
-                thinkingChevron = Color(0xFF9E9E9E),
-                mimeText = Color(0xFF7E7E7E),
-                reviewAddedLabel = Color(0xFF7CB342),
+                starMuted = textMuted,
+                // Selected row — use platform selection color (already read from UIManager)
+                selectedRowBg = selectionBg,
+                // Thinking indicator — text on theme-aware surface
+                thinkingText = textMuted,
+                thinkingChevron = textMuted,
+                // MIME text — on theme-aware surface
+                mimeText = textMuted,
+                // Review panel "Added" label — accent color, but used as text. Use a darker
+                // green on light themes for readability.
+                reviewAddedLabel = if (isDarkTheme) Color(0xFF7CB342) else Color(0xFF3D7A00),
+                // Hover background — already theme-aware from UIManager
                 hoverBg = hoverBg,
-                compactionBg = Color(0xFF1A2A1A),
-                paletteHoverBg = Color(0xFF2E3A2E),
+                // Compaction pill background — paired with compactionText above
+                compactionBg = if (isDarkTheme) Color(0xFF1A2A1A) else Color(0xFFE8F5E8),
+                // Slash command palette row hover — use theme-aware hover bg
+                paletteHoverBg = hoverBg,
+                // Capability icon accent (vision, etc.) — accent, safe as hardcoded icon tint
                 capabilityVision = Color(0xFF4285F4),
+                // Splash screen background — intentional dark branding island.
+                // Kept dark in all themes for visual consistency with the splash status colors
+                // (splashConnected/Error/Retry are hardcoded bright colors that need a dark bg).
                 splashBg = Color(0xFF1E1E1E),
             ),
         ),
@@ -336,7 +399,7 @@ private fun rememberChatThemeData(): ChatThemeData {
             todoStatusIconSize = 12.dp,
             todoChevronSize = 12.dp,
             paletteCornerRadius = 8.dp,
-            paletteMaxWidth = 300.dp,
+            paletteMaxWidth = 440.dp,
             paletteRowCornerRadius = 4.dp,
             permissionCornerRadius = 4.dp,
             permissionBorderWidth = 1.dp,
