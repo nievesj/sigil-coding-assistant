@@ -97,6 +97,9 @@ import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.util.decodeFileToBitmap
+import io.github.oshai.kotlinlogging.KotlinLogging
+
+private val logger = KotlinLogging.logger {}
 
 @Composable
 fun MessageList(
@@ -202,8 +205,9 @@ fun MessageList(
                 // alone would position the item at the top, leaving empty space
                 // below. Compose clamps the offset internally to a valid range.
                 listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 // Fallback in case the offset is rejected.
+                logger.debug(e) { "[ACP] scrollToItem with Int.MAX_VALUE offset failed, retrying without offset" }
                 listState.scrollToItem(totalItems - 1)
             }
             // Wait for the scroll to fully settle before releasing the mutex.
@@ -370,12 +374,15 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
             Box(
                 modifier = Modifier
                     .background(
-                        color = ChatTheme.colors.accent.userBubbleBg,
+                        color = ChatTheme.colors.border.selectionBg,
                         shape = ChatTheme.shapes.messageBubbleCornerRadius
                     )
                     .padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = 6.dp)
             ) {
-                org.jetbrains.jewel.ui.component.Text(textContent)
+                org.jetbrains.jewel.ui.component.Text(
+                    text = textContent,
+                    style = TextStyle(fontSize = ChatTheme.fonts.messageBody * 1.5f),
+                )
             }
         }
     }
@@ -754,8 +761,21 @@ private fun FileChangeCard(
     val projectResolved = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
     val virtualFile = remember(projectResolved, change.filePath) {
         projectResolved?.basePath?.let { basePath ->
+            // CWE-22 path traversal guard: change.filePath originates from LLM tool
+            // output (SessionState.kt:900-918), which is untrusted. A prompt injection
+            // could emit filePath = "../../etc/passwd". Validate that the resolved
+            // canonical path stays within the project basePath before resolving via
+            // LocalFileSystem — prevents opening arbitrary system files in the editor.
             val absPath = "$basePath/${change.filePath}".replace('/', java.io.File.separatorChar)
-            LocalFileSystem.getInstance().findFileByPath(absPath)
+            val canonicalBase = java.io.File(basePath).canonicalPath
+            val canonicalTarget = java.io.File(absPath).canonicalPath
+            if (canonicalTarget.startsWith(canonicalBase + java.io.File.separator) ||
+                canonicalTarget == canonicalBase) {
+                LocalFileSystem.getInstance().findFileByPath(canonicalTarget)
+            } else {
+                logger.warn { "[ACP] FileChangeCard: refusing to open path outside project: ${change.filePath}" }
+                null
+            }
         }
     }
 
@@ -883,6 +903,10 @@ private fun parseColorOrDefault(hex: String, defaultColor: Color): Color {
     if (hex.isBlank()) return defaultColor
     val clean = hex.removePrefix("#")
     return try {
+        // Only support 6-char hex (RRGGBB) — force alpha to 0xFF.
+        // 8-char hex (AARRGGBB) would truncate on Long.toInt() and produce
+        // wrong colors, so reject it and fall back to defaultColor.
+        if (clean.length != 6) return defaultColor
         val argb = clean.toLong(16) or 0xFF000000
         Color(argb.toInt())
     } catch (_: Exception) {
@@ -934,7 +958,7 @@ private fun QueuedMessageBubble(
         Box(
             modifier = Modifier
                 .background(
-                    color = ChatTheme.colors.accent.userBubbleBg.copy(alpha = 0.6f),
+                    color = ChatTheme.colors.border.selectionBg.copy(alpha = 0.6f),
                     shape = ChatTheme.shapes.messageBubbleCornerRadius
                 )
                 .border(
@@ -946,6 +970,7 @@ private fun QueuedMessageBubble(
         ) {
             Text(
                 text = message.text,
+                style = TextStyle(fontSize = ChatTheme.fonts.messageBody * 1.5f),
                 color = ChatTheme.colors.text.primary.copy(alpha = 0.7f),
             )
         }

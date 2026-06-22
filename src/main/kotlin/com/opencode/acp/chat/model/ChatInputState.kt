@@ -15,8 +15,13 @@ sealed interface ChatInputState {
     /** Normal idle state — text field active, green Send button when text present. */
     data object Idle : ChatInputState
 
+    /** Message dispatched, awaiting first LLM token.
+     *  Visually identical to [Streaming] — both show glow, stop button, pulse. */
+    data object Sending : ChatInputState
+
     /** AI is generating a response. Text field active.
-     *  Send button visible when text present (steer), Stop button when empty. */
+     *  Send button visible when text present (steer), Stop button when empty.
+     *  Visually identical to [Sending]. */
     data object Streaming : ChatInputState
 
     /** Tool permission prompt is showing — input disabled, user must respond. */

@@ -277,6 +277,17 @@ class OpenCodeService(private val project: Project) : Disposable {
     suspend fun archiveSession(sessionId: String) = sessionManager.archiveSession(sessionId)
     suspend fun clearAllSessions() = sessionManager.clearAllSessions()
 
+    // ── Streaming session tracking (sidebar shimmer) ─────────────────────────
+
+    /** Imperatively add a session ID to the streaming set (activates sidebar shimmer).
+     *  Used by ChatViewModel.sendMessage() before the suspend call so the shimmer
+     *  appears immediately on send. Idempotent. */
+    fun addStreamingSession(sessionId: String) = sessionManager.addStreamingSession(sessionId)
+
+    /** Imperatively remove a session ID from the streaming set (deactivates sidebar shimmer).
+     *  Used by ChatViewModel on cancel/switch/error. Idempotent. */
+    fun removeStreamingSession(sessionId: String) = sessionManager.removeStreamingSession(sessionId)
+
     // ── Connection stop ─────────────────────────────────────────────────────
 
     /** Stop all connection activity: cancel SSE reconnection loop, cancel SSE
@@ -652,6 +663,18 @@ class OpenCodeService(private val project: Project) : Disposable {
             val activityMonitorJob = scope.launch {
                 while (isActive) {
                     delay(ACTIVITY_CHECK_INTERVAL_MS)
+                    // Re-fetch the active session on each iteration instead of using the
+                    // captured reference. The session could be evicted from the cache
+                    // during the long-running send (e.g., user switches sessions and the
+                    // old session is LRU-evicted). Reading from an evicted SessionState
+                    // would give stale toolPartStates and lastActivityTimeMs values.
+                    val monitorSession = sessionManager.getActiveSession()
+                    // If the session was evicted or switched, fall back to current time
+                    // so we don't false-positive timeout on stale data.
+                    if (monitorSession == null) {
+                        logger.debug { "[ACP] sendMessage: active session no longer cached, skipping activity check" }
+                        continue
+                    }
                     // If any tool is actively running, the server is busy — don't timeout.
                     // Tool events (ToolUse→ToolResult) can take arbitrarily long (subtasks,
                     // file writes, network calls). During this time the parent session gets
@@ -660,14 +683,14 @@ class OpenCodeService(private val project: Project) : Disposable {
                     // PartState.Pending (waiting for user permission) also counts as active —
                     // the server IS working, just blocked on user input. Without this, the
                     // monitor would false-positive timeout while the user reads the permission prompt.
-                    val hasRunningTools = activeSession?.ctx?.toolPartStates?.values?.any {
+                    val hasRunningTools = monitorSession.ctx.toolPartStates.values.any {
                         it is PartState.InProgress || it is PartState.Pending
-                    } == true
+                    }
                     if (hasRunningTools) {
                         logger.debug { "[ACP] sendMessage: tools still running, skipping activity check" }
                         continue
                     }
-                    val lastActivity = activeSession?.ctx?.lastActivityTimeMs ?: System.currentTimeMillis()
+                    val lastActivity = monitorSession.ctx.lastActivityTimeMs
                     val elapsed = System.currentTimeMillis() - lastActivity
                     if (elapsed > responseTimeoutMs) {
                         val timeoutSec = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds

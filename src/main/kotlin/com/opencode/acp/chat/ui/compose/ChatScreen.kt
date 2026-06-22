@@ -99,17 +99,26 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
     val basePath = project.basePath ?: return results
     val baseDir = localFileSystem.findFileByPath(basePath) ?: return results
 
-    fun searchDir(dir: VirtualFile) {
-        if (results.size >= maxResults) return
+    // Bounded recursive traversal: depth limit prevents deep recursion on
+    // huge directory trees, and maxVisited caps total work to avoid holding
+    // the read lock for too long on large projects.
+    val maxDepth = 10
+    val maxVisited = 5000
+    var visited = 0
+
+    fun searchDir(dir: VirtualFile, depth: Int) {
+        if (results.size >= maxResults || depth > maxDepth || visited >= maxVisited) return
+        visited++
         val children = dir.children ?: return
         for (child in children) {
-            if (results.size >= maxResults) return
+            if (results.size >= maxResults || visited >= maxVisited) return
             if (child.isDirectory) {
                 // Skip hidden and build directories
                 if (!child.name.startsWith(".") && child.name !in setOf("build", "node_modules", ".git", "out", "target")) {
-                    searchDir(child)
+                    searchDir(child, depth + 1)
                 }
             } else if (child.isValid) {
+                visited++
                 val nameLower = child.name.lowercase()
                 if (nameLower.contains(query.lowercase()) && child.path !in seen) {
                     seen.add(child.path)
@@ -121,7 +130,7 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
 
     // If exact match didn't find enough, do partial search
     if (results.size < maxResults) {
-        searchDir(baseDir)
+        searchDir(baseDir, 0)
     }
 
     return results.take(maxResults)
@@ -138,7 +147,7 @@ fun
     val readyState by viewModel.readyState.collectAsState()
     val controlState by viewModel.controlState.collectAsState()
     val inputState by viewModel.inputState.collectAsState()
-    val isStreaming = inputState is ChatInputState.Streaming
+    val isStreaming = inputState is ChatInputState.Sending || inputState is ChatInputState.Streaming
     val permissionPrompt = (inputState as? ChatInputState.AwaitingPermission)?.prompt
     val selectionPrompt = (inputState as? ChatInputState.AwaitingSelection)?.prompt
     val sessionListState by viewModel.sessionListState.collectAsState()
@@ -187,21 +196,25 @@ fun
         recentFiles.clear()
         recentFiles.addAll(initial)
 
-        // Listen for file open/close events to update the list reactively
+        // Listen for file open/close events to update the list reactively.
+        // Debounced: rapid file operations (multi-file paste, git checkout) coalesce
+        // into a single recomputation after a 100ms quiet period, avoiding UI flicker
+        // from repeated clear()+addAll() calls.
         val connection = project.messageBus.connect()
         connection.subscribe(FileEditorManagerListener.FILE_EDITOR_MANAGER, object : FileEditorManagerListener {
             override fun fileOpened(source: FileEditorManager, file: VirtualFile) {
-                scope.launch {
-                    val updated = withContext(Dispatchers.IO) {
-                        readAction { computeRecentFiles(project) }
-                    }
-                    recentFiles.clear()
-                    recentFiles.addAll(updated)
-                }
+                scheduleRecentFilesRefresh()
             }
 
             override fun fileClosed(source: FileEditorManager, file: VirtualFile) {
-                scope.launch {
+                scheduleRecentFilesRefresh()
+            }
+
+            var refreshJob: kotlinx.coroutines.Job? = null
+            private fun scheduleRecentFilesRefresh() {
+                refreshJob?.cancel()
+                refreshJob = scope.launch {
+                    kotlinx.coroutines.delay(100) // debounce — coalesce rapid events
                     val updated = withContext(Dispatchers.IO) {
                         readAction { computeRecentFiles(project) }
                     }
@@ -558,7 +571,8 @@ private fun addFileAttachment(
     try {
         val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(file.name)
         attachedFiles.add(AttachedFile(name = file.name, path = file.path, mime = mime))
-    } catch (_: Exception) {
+    } catch (e: Exception) {
         // Skip files that can't be read (e.g., deleted between picker and confirm)
+        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] addFileAttachment: failed to attach ${file.name}" }
     }
 }

@@ -20,6 +20,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import java.util.LinkedHashMap
 import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.withLock
 
 /**
@@ -53,9 +54,9 @@ class SessionManager(
     /** Mutex to serialize session switches. */
     private val switchMutex = Mutex()
 
-    /** Timestamp of the last successful computeSessionContext() call (dedup guard). */
-    @Volatile
-    private var lastContextComputeTime: Long = 0L
+    /** Timestamp of the last successful computeSessionContext() call (dedup guard).
+     *  AtomicLong for atomic compareAndSet in the dedup guard. */
+    private val lastContextComputeTime = AtomicLong(0L)
 
     /** The currently active session ID. Null if no session is active. */
     private val _activeSessionId = MutableStateFlow<String?>(null)
@@ -137,6 +138,22 @@ class SessionManager(
 
     internal fun emitSessionSignal(sessionId: String, signal: UiSignal) {
         _allSessionSignals.tryEmit(sessionId to signal)
+    }
+
+    /** Imperatively add a session ID to the streaming set.
+     *  Used by ChatViewModel.sendMessage() to activate the sidebar shimmer
+     *  immediately on send, before any SSE events arrive.
+     *  Idempotent — duplicate adds are harmless (Set semantics). */
+    fun addStreamingSession(sessionId: String) {
+        _streamingSessionIds.value = _streamingSessionIds.value + sessionId
+    }
+
+    /** Imperatively remove a session ID from the streaming set.
+     *  Used by ChatViewModel on cancel/switch/error to deactivate the shimmer
+     *  immediately, without waiting for StreamingCompleted.
+     *  Idempotent — duplicate removes are harmless. */
+    fun removeStreamingSession(sessionId: String) {
+        _streamingSessionIds.value = _streamingSessionIds.value - sessionId
     }
 
     init {
@@ -703,11 +720,15 @@ class SessionManager(
         // Dedup: skip re-computation if last call was < 300ms ago and state is Loaded.
         // This prevents redundant REST calls when StreamingCompleted and SessionIdle
         // fire close together for the same response.
+        // Atomic check-and-set via AtomicLong.compareAndSet: if two concurrent calls
+        // race, only one wins the CAS; the other proceeds (idempotent — wastes one
+        // REST call, not a correctness issue).
         val now = System.currentTimeMillis()
-        if (now - lastContextComputeTime < 300 && _sessionContextState.value is SessionContextState.Loaded) {
+        val lastTime = lastContextComputeTime.get()
+        if (now - lastTime < 300 && _sessionContextState.value is SessionContextState.Loaded) {
             return _sessionContextState.value
         }
-        lastContextComputeTime = now
+        lastContextCompareAndSet(lastTime, now)
 
         val messages = getActiveSession()?.messages?.value ?: emptyMap()
 
@@ -814,12 +835,21 @@ class SessionManager(
             _todoItems.value = todos.map { TodoItem(content = it.content, status = it.status, priority = it.priority) }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
-            // Silently fail
+        } catch (e: Exception) {
+            // Log for diagnostics — user sees no feedback (todo list just doesn't update)
+            logger.warn(e) { "[ACP] Failed to fetch todos for session $currentSessionId" }
         }
     }
 
     // ── Private: Helpers ──
+
+    /** Atomic compare-and-set for the dedup guard timestamp.
+     *  If the current value matches [expected], sets it to [update] and returns true.
+     *  If another thread updated it concurrently, returns false (caller should proceed
+     *  with computation — the CAS "lost" the race, but the other thread's computation
+     *  covers this call too since the result is shared via _sessionContextState). */
+    private fun lastContextCompareAndSet(expected: Long, update: Long): Boolean =
+        lastContextComputeTime.compareAndSet(expected, update)
 
     private fun resolveModelNames(models: List<ProviderModel>, modelId: String?, providerId: String?): Pair<String, String> {
         if (modelId.isNullOrBlank() && providerId.isNullOrBlank()) return Pair("Unknown", "Unknown")

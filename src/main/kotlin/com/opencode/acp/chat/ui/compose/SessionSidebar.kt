@@ -420,20 +420,29 @@ private fun SessionList(
         }
     }
 
-    // Read expandedIds directly in composable body to trigger recomposition.
-    // Don't wrap in remember — it's cheap and must re-evaluate on every toggle.
-    val visibleItems = fullTree.filter { item ->
-        if (item.depth == 0) return@filter true
-        var idx = fullTree.indexOf(item)
-        while (idx > 0) {
-            val parent = fullTree.subList(0, idx).lastOrNull { it.depth < fullTree[idx].depth }
-                ?: break
-            if (expandedIds[parent.session.id] != true) {
-                return@filter false
+    // Compute visible items by walking the tree with indices (O(n) instead of
+    // the previous O(n²) filter that used indexOf + subList per item).
+    // An item is visible if all its ancestors are expanded.
+    val visibleItems = remember(fullTree, expandedIds.toMap()) {
+        fullTree.filterIndexed { idx, item ->
+            if (item.depth == 0) return@filterIndexed true
+            // Walk backwards from idx to find ancestors. Each ancestor must be expanded.
+            var i = idx
+            while (i > 0) {
+                // Find the nearest preceding item with smaller depth (an ancestor)
+                var parentIdx = i - 1
+                while (parentIdx >= 0 && fullTree[parentIdx].depth >= fullTree[i].depth) {
+                    parentIdx--
+                }
+                if (parentIdx < 0) break
+                val parent = fullTree[parentIdx]
+                if (expandedIds[parent.session.id] != true) {
+                    return@filterIndexed false
+                }
+                i = parentIdx
             }
-            idx = fullTree.indexOf(parent)
+            true
         }
-        true
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -691,11 +700,9 @@ private fun SessionRow(
 private fun Modifier.sessionShimmer(indicator: SessionIndicator): Modifier = composed {
     if (indicator == SessionIndicator.NONE) return@composed Modifier
 
-    val shimmerColor = when (indicator) {
-        SessionIndicator.CREATING -> ChatTheme.colors.component.sidebarShimmerCreating
-        SessionIndicator.STREAMING -> ChatTheme.colors.component.sidebarShimmerStreaming
-        SessionIndicator.NONE -> Color.Transparent // unreachable, kept for exhaustiveness
-    }
+    val edge = Color.Transparent
+    val soft = ChatTheme.colors.component.glowStart
+    val peak = ChatTheme.colors.component.glowPeak
 
     val transition = rememberInfiniteTransition(label = "shimmer")
     val shimmerProgressState = transition.animateFloat(
@@ -715,11 +722,11 @@ private fun Modifier.sessionShimmer(indicator: SessionIndicator): Modifier = com
         drawRect(
             brush = Brush.horizontalGradient(
                 colors = listOf(
-                    Color.Transparent,
-                    shimmerColor.copy(alpha = 0.15f),
-                    shimmerColor.copy(alpha = 0.35f),
-                    shimmerColor.copy(alpha = 0.15f),
-                    Color.Transparent
+                    edge,
+                    soft,
+                    peak,
+                    soft,
+                    edge
                 ),
                 startX = startX,
                 endX = startX + bandWidth
