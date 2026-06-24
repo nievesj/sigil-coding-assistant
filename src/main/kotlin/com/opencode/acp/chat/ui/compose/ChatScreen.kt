@@ -21,6 +21,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.State
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -142,7 +143,7 @@ fun
     viewModel: ChatViewModel,
     project: Project
 ) {
-    val messages by viewModel.messages.collectAsState()
+    val messagesState = viewModel.messages.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
     val readyState by viewModel.readyState.collectAsState()
     val controlState by viewModel.controlState.collectAsState()
@@ -387,7 +388,7 @@ fun
 
                         // Message list (fills remaining space)
                         MessageList(
-                            messages = messages.values.toList(),
+                            messagesState = messagesState,
                             modifier = Modifier.weight(1f).fillMaxWidth(),
                             project = project,
                             onImagePreview = { path -> previewImagePath = path },

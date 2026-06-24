@@ -15,11 +15,15 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -36,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -101,10 +106,9 @@ fun ContextIndicator(
     val colors = ChatTheme.colors
     val dims = ChatTheme.dims
     val fonts = ChatTheme.fonts
-    val shapes = ChatTheme.shapes
     val animations = ChatTheme.animations
 
-    val sizeDp = dims.contextIndicatorSize
+    val ringSize = dims.contextIndicatorSize
 
     TooltipArea(
         tooltip = {
@@ -112,56 +116,95 @@ fun ContextIndicator(
         },
         modifier = modifier
     ) {
-        Box(
+        Row(
             modifier = Modifier
-                .size(sizeDp)
-                .clickable { onClickAction(state, onShowDetails, onRetry) }
+                .height(28.dp)
+                .clickable { onClickAction(state, onShowDetails, onRetry) },
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Start
         ) {
-            when (state) {
-                is SessionContextState.Loading -> {
-                    LoadingCircle(sizeDp)
-                }
-                is SessionContextState.Loaded -> {
-                    val ctx = state.context
-                    val color = contextColorForPercent(ctx.usagePercent)
-                    val fillFraction = if (ctx.contextLimit > 0L) {
-                        (ctx.usagePercent / 100f).coerceIn(0f, 1f)
-                    } else 0f
-                    val alphaState = rememberPulsingAlpha(isStreaming, animations.contextPulseMs)
-
-                    // Outer ring for high usage
-                    if (ctx.contextLimit > 0L && ctx.usagePercent >= 75f) {
-                        Canvas(
-                            modifier = Modifier
-                                .size(sizeDp + 4.dp)
-                                .align(Alignment.Center)
-                        ) {
-                            val outerDiameter = (sizeDp + 4.dp).toPx()
-                            val ringRadius = outerDiameter / 2f - 2.dp.toPx()
-                            drawCircle(
-                                color = color.copy(alpha = alphaState.value),
-                                radius = ringRadius,
-                                center = center,
-                                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
-                            )
-                        }
+            // Ring glyph
+            Box(modifier = Modifier.size(ringSize)) {
+                when (state) {
+                    is SessionContextState.Loading -> {
+                        LoadingCircle(sizeDp = ringSize, modifier = Modifier.align(Alignment.Center))
                     }
+                    is SessionContextState.Loaded -> {
+                        val ctx = state.context
+                        val color = contextColorForPercent(ctx.usagePercent)
+                        val fillFraction = if (ctx.contextLimit > 0L) {
+                            (ctx.usagePercent / 100f).coerceIn(0f, 1f)
+                        } else 0f
+                        val alphaState = rememberPulsingAlpha(isStreaming, animations.contextPulseMs)
 
-                    DoughnutRing(
-                        fillFraction = fillFraction,
-                        fillColor = color,
-                        alphaState = alphaState,
-                        sizeDp = sizeDp,
-                        modifier = Modifier.align(Alignment.Center)
-                    )
+                        // Outer ring for high usage
+                        if (ctx.contextLimit > 0L && ctx.usagePercent >= 75f) {
+                            Canvas(
+                                modifier = Modifier
+                                    .size(ringSize + 3.dp)
+                                    .align(Alignment.Center)
+                            ) {
+                                val outerDiameter = (ringSize + 3.dp).toPx()
+                                val ringRadius = outerDiameter / 2f - 1.5.dp.toPx()
+                                drawCircle(
+                                    color = color.copy(alpha = alphaState.value),
+                                    radius = ringRadius,
+                                    center = center,
+                                    style = Stroke(width = 1.5.dp.toPx(), cap = StrokeCap.Round)
+                                )
+                            }
+                        }
+
+                        DoughnutRing(
+                            fillFraction = fillFraction,
+                            fillColor = color,
+                            alphaState = alphaState,
+                            sizeDp = ringSize,
+                            modifier = Modifier.align(Alignment.Center)
+                        )
+                    }
+                    is SessionContextState.Error -> {
+                        ErrorCircle(
+                            retryable = state.retryable,
+                            sizeDp = ringSize,
+                            modifier = Modifier.align(Alignment.Center)
+                        )
+                    }
                 }
-                is SessionContextState.Error -> {
-                    ErrorCircle(
-                        retryable = state.retryable,
-                        sizeDp = sizeDp,
-                        modifier = Modifier.align(Alignment.Center)
-                    )
+            }
+
+            Spacer(modifier = Modifier.width(6.dp))
+
+            // Percent/error label outside on the right, fixed width next to ring
+            Column(
+                modifier = Modifier
+                    .width(dims.contextIndicatorTextWidth)
+                    .fillMaxHeight(),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.Center
+            ) {
+                val (labelText, labelColor) = when (state) {
+                    is SessionContextState.Loading -> "…" to colors.component.tooltipMuted
+                    is SessionContextState.Loaded -> {
+                        val pct = state.context.usagePercent.coerceAtLeast(0f)
+                        "${pct.toInt()}%" to contextColorForPercent(pct)
+                    }
+                    is SessionContextState.Error -> {
+                        if (state.retryable) "!" to colors.accent.contextYellow
+                        else "✕" to colors.accent.contextRed
+                    }
                 }
+
+                Text(
+                    text = labelText,
+                    fontSize = fonts.contextPercent,
+                    fontWeight = ChatTheme.fontWeights.contextPercent,
+                    color = labelColor,
+                    textAlign = TextAlign.End,
+                    maxLines = 1,
+                    overflow = TextOverflow.Clip,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         }
     }
@@ -178,10 +221,10 @@ private fun onClickAction(state: SessionContextState, onShowDetails: () -> Unit,
 // ── Loading Circle ──────────────────────────────────────────────────────────
 
 @Composable
-private fun LoadingCircle(sizeDp: Dp) {
+private fun LoadingCircle(sizeDp: Dp, modifier: Modifier = Modifier) {
     val colors = ChatTheme.colors
     Box(
-        modifier = Modifier
+        modifier = modifier
             .size(sizeDp)
             .clip(CircleShape)
             .background(colors.component.indicatorBg)
@@ -190,7 +233,7 @@ private fun LoadingCircle(sizeDp: Dp) {
     ) {
         Text(
             text = "⋯",
-            fontSize = ChatTheme.fonts.contextPercent,
+            fontSize = ChatTheme.fonts.contextTooltipValue,
             color = colors.component.tooltipMuted
         )
     }
@@ -207,20 +250,19 @@ private fun DoughnutRing(
     modifier: Modifier = Modifier
 ) {
     val colors = ChatTheme.colors
-    val displayText = "${(fillFraction * 100).toInt()}%"
+    val strokeWidth = ChatTheme.dims.contextRingStroke
 
     Box(modifier = modifier.size(sizeDp), contentAlignment = Alignment.Center) {
         Canvas(modifier = Modifier.size(sizeDp)) {
+            val stroke = strokeWidth.toPx()
             val alpha = alphaState.value
             val diameter = sizeDp.toPx()
             val radius = diameter / 2f
-            val stroke = 3.dp.toPx() // Thick stroke for doughnut effect
-            val innerRadius = radius - stroke
 
             // Background ring (track)
             drawCircle(
                 color = colors.component.indicatorBg,
-                radius = innerRadius,
+                radius = radius - stroke / 2f,
                 center = center,
                 style = Stroke(width = stroke, cap = StrokeCap.Round)
             )
@@ -246,15 +288,6 @@ private fun DoughnutRing(
                 style = Stroke(width = 1.dp.toPx())
             )
         }
-
-        // Center text
-        Text(
-            text = displayText,
-            fontSize = ChatTheme.fonts.contextErrorBadge,
-            fontWeight = ChatTheme.fontWeights.contextPercent,
-            color = Color.White,
-            maxLines = 1
-        )
     }
 }
 
@@ -269,16 +302,8 @@ private fun ErrorCircle(retryable: Boolean, sizeDp: Dp, modifier: Modifier = Mod
             .size(sizeDp)
             .clip(CircleShape)
             .background(colors.component.indicatorBg)
-            .border(1.dp, borderColor, CircleShape),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = if (retryable) "!" else "✕",
-            fontSize = if (retryable) ChatTheme.fonts.contextTooltipValue else ChatTheme.fonts.contextTooltipSub,
-            fontWeight = FontWeight.Bold,
-            color = borderColor
-        )
-    }
+            .border(1.dp, borderColor, CircleShape)
+    )
 }
 
 // ── Tooltip ────────────────────────────────────────────────────────────────

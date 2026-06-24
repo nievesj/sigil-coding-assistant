@@ -38,6 +38,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.State
 import androidx.compose.runtime.withFrameNanos
 
 import androidx.compose.runtime.mutableIntStateOf
@@ -106,7 +107,7 @@ private val logger = KotlinLogging.logger {}
 
 @Composable
 fun MessageList(
-    messages: List<ChatMessage>,
+    messagesState: State<Map<String, ChatMessage>>,
     modifier: Modifier = Modifier,
     project: Project? = null,
     onImagePreview: ((String) -> Unit)? = null,
@@ -114,6 +115,11 @@ fun MessageList(
     queuedMessages: List<com.opencode.acp.chat.model.QueuedMessage> = emptyList(),
     onCancelQueuedMessage: ((String) -> Unit)? = null,
 ) {
+    // Derive the indexed list from State for count/key computation.
+    // The item content lambda reads messagesState.value directly (below) to
+    // create a per-item snapshot subscription — this is what drives recomposition
+    // when a message's parts change, without needing the LazyColumn key to change.
+    val messages = messagesState.value.values.toList()
     val listState = rememberLazyListState()
 
     // Auto-scroll state: starts ON, stays ON until user manually scrolls up.
@@ -278,8 +284,7 @@ fun MessageList(
                     }
                 } catch (e2: Exception) {
                     if (e2 is kotlinx.coroutines.CancellationException) throw e2
-                    logger.debug(e2) { "[ACP] scroll fallback to instant scrollToItem" }
-                    listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
+                    logger.debug(e2) { "[ACP] scroll fallback also failed — giving up" }
                 }
             }
             // Wait for the scroll to fully settle before releasing the mutex.
@@ -306,15 +311,17 @@ fun MessageList(
             ) {
                 items(
                     count = messages.size,
-                    key = { index ->
-                        val m = messages[index]
-                        // Include parts count and streaming state in key so LazyColumn
-                        // detects data changes (new tool calls, thinking completed, etc.)
-                        // and recreates the composition instead of reusing stale data.
-                        "${m.id}_${m.parts.size}_${m.isStreaming}"
-                    }
+                    key = { index -> messages[index].id }
                 ) { index ->
-                    MessageItem(messages[index], project, onImagePreview, getStreamingText = getStreamingText)
+                    // Read State INSIDE the item content lambda to create a per-item
+                    // snapshot subscription. The bundled Compose Foundation does NOT
+                    // re-invoke item content lambdas for stable keys on its own.
+                    // The snapshot system invalidates this item's composition when
+                    // messagesState changes, re-invoking this lambda with fresh data
+                    // — bypassing LazyColumn's key-diffing. This eliminates both the
+                    // flicker (no dispose+recreate) and the stale-data bug (fresh read).
+                    val currentMessage = messagesState.value[messages[index].id] ?: messages[index]
+                    MessageItem(currentMessage, project, onImagePreview, getStreamingText = getStreamingText)
                     if (index < messages.size - 1) {
                         Spacer(modifier = Modifier.height(12.dp))
                     }
@@ -533,10 +540,19 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                // Pre-compute: if message has any ToolCall parts, suppress Patch/FileChange cards
                // (ToolPill already shows file info, line counts, and expandable content)
                val hasToolCallInMessage = message.parts.values.any { it is MessagePart.ToolCall }
-              var hasToolCall = hasToolCallInMessage
-              // Render parts in LinkedHashMap insertion order — chronological event order.
-              // resegmentTextPartsDirect preserves insertion positions via textSegments.
-             for ((key, part) in message.parts.entries) {
+               var hasToolCall = hasToolCallInMessage
+                // Standalone thinking indicator — rendered BEFORE the for-loop so it
+                // appears at the TOP of the Column, at the same position where
+                // CollapsibleThinkingPill will appear once the thinking part arrives.
+                // This eliminates the position-swap flicker (indicator at bottom →
+                // pill at top) by making the transition an in-place content swap.
+                when (message.renderPhase()) {
+                    MessageRenderPhase.THINKING -> if (!hasThinking) ThinkingIndicator()
+                    else -> { /* HAS_CONTENT or COMPLETE — no standalone indicator needed */ }
+                }
+               // Render parts in LinkedHashMap insertion order — chronological event order.
+               // resegmentTextPartsDirect preserves insertion positions via textSegments.
+              for ((key, part) in message.parts.entries) {
                  when (part) {
                         is MessagePart.Thinking -> {
                             key(key) {
@@ -561,7 +577,7 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                                  markdown = part.content,
                                  modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
                                  selectable = true,
-                                 onUrlClick = { url -> BrowserUtil.open(url) },
+                                  onUrlClick = { url -> openUrlSafely(url) },
                              )
                          }
                      }
@@ -641,17 +657,10 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                       )
                       Spacer(Modifier.weight(1f).height(1.dp).background(ChatTheme.colors.component.interruptedDivider))
                   }
-              }
-              // Show thinking indicator when streaming with no content yet.
-              // Only show if no CollapsibleThinkingPill was rendered in the for-loop above
-              // (hasThinking guard prevents duplicate indicators).
-              when (message.renderPhase()) {
-                  MessageRenderPhase.THINKING -> if (!hasThinking) ThinkingIndicator()
-                  else -> { /* HAS_CONTENT or COMPLETE — no standalone indicator needed */ }
-              }
-         }
-     }
-}
+               }
+          }
+      }
+ }
 
 // ── Helper Composables for AssistantMessage ──────────────────────────────────
 
@@ -975,6 +984,20 @@ private fun clampBlock(block: MarkdownBlock): MarkdownBlock = when (block) {
 private fun clampListItem(item: MarkdownBlock.ListItem): MarkdownBlock.ListItem {
     val fixedChildren = item.children.map { clampBlock(it) }
     return MarkdownBlock.ListItem(fixedChildren, item.level)
+}
+
+/**
+ * Open a URL safely — only allows http and https schemes to prevent SSRF via
+ * LLM-generated markdown links (e.g., file://, javascript:, data: URIs).
+ * Logs and silently drops non-http(s) URLs.
+ */
+private fun openUrlSafely(url: String) {
+    val trimmed = url.trim()
+    if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
+        BrowserUtil.open(trimmed)
+    } else {
+        logger.warn { "[ACP] Blocked non-http URL from markdown: ${trimmed.take(100)}" }
+    }
 }
 
 private fun parseColorOrDefault(hex: String, defaultColor: Color): Color {

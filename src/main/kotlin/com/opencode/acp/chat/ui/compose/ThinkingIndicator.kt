@@ -4,6 +4,7 @@ package com.opencode.acp.chat.ui.compose
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -28,18 +29,55 @@ import org.jetbrains.jewel.markdown.processing.MarkdownProcessor
 import org.jetbrains.jewel.ui.component.CircularProgressIndicator
 import org.jetbrains.jewel.ui.component.Text
 
+/**
+ * Shared header for [ThinkingIndicator] and [CollapsibleThinkingPill].
+ *
+ * Renders the chevron + "Thought" label + spinner (when streaming).
+ * Both components use this so the indicator→pill transition is visually
+ * seamless — the header stays identical, only content appears below it.
+ */
+@Composable
+private fun ThinkingHeader(
+    expanded: Boolean,
+    streaming: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
+) {
+    val rowModifier = if (onClick != null) {
+        modifier.clickable { onClick() }.padding(vertical = 2.dp)
+    } else {
+        modifier.padding(vertical = 2.dp)
+    }
+    Row(
+        modifier = rowModifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(
+            text = if (expanded) "▾" else "▸",
+            color = ChatTheme.colors.component.thinkingChevron,
+            style = TextStyle(fontSize = ChatTheme.fonts.thinkingChevron)
+        )
+        Text(
+            text = if (expanded) "Thought" else "\uD83E\uDDE0 Thought",
+            fontStyle = FontStyle.Italic,
+            color = ChatTheme.colors.component.thinkingChevron,
+            style = TextStyle(fontSize = ChatTheme.fonts.thinkingLabel)
+        )
+        if (streaming) {
+            CircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingStreamingSpinnerSize))
+        }
+    }
+}
+
 @Composable
 fun ThinkingIndicator(modifier: Modifier = Modifier) {
-    Row(
-        modifier = modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        CircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingSpinnerSize))
-        Text(
-            text = " Thinking...",
-            fontStyle = FontStyle.Italic,
-            color = ChatTheme.colors.component.thinkingText
-        )
+    // Renders the same header as CollapsibleThinkingPill during streaming
+    // (expanded = true, streaming = true) so the indicator→pill transition
+    // is an in-place content swap — the header stays identical, only
+    // content appears below it.
+    Column(modifier = modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+        ThinkingHeader(expanded = true, streaming = true)
     }
 }
 
@@ -60,29 +98,12 @@ fun CollapsibleThinkingPill(
         if (state is PartState.Streaming) expanded = true
     }
 
-    androidx.compose.foundation.layout.Column(modifier = modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
-        // Header — always visible, clickable
-        Row(
-            modifier = Modifier.clickable { if (state is PartState.Completed) expanded = !expanded }
-                .padding(vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Text(
-                text = if (expanded) "▾" else "▸",
-                color = ChatTheme.colors.component.thinkingChevron,
-                style = TextStyle(fontSize = ChatTheme.fonts.thinkingChevron)
-            )
-            Text(
-                text = if (expanded) "Thought" else "\uD83E\uDDE0 Thought",
-                fontStyle = FontStyle.Italic,
-                color = ChatTheme.colors.component.thinkingChevron,
-                style = TextStyle(fontSize = ChatTheme.fonts.thinkingLabel)
-            )
-            if (state is PartState.Streaming) {
-                CircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingStreamingSpinnerSize))
-            }
-        }
+    Column(modifier = modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+        ThinkingHeader(
+            expanded = expanded,
+            streaming = state is PartState.Streaming,
+            onClick = if (state is PartState.Completed) { { expanded = !expanded } } else null
+        )
 
         // Content — only when expanded, rendered with full markdown
         if (expanded && content.isNotBlank()) {

@@ -442,40 +442,49 @@ closure. When LazyColumn detects stable keys (same message IDs), it reuses the
 existing composition slot. The OLD lambda (capturing OLD data) is called, not the new
 one. This is a known behavior in Compose Foundation bundled with IntelliJ Platform.
 
-**Fix:** Include data-dependent fields in the LazyColumn key so key changes when
-data changes, forcing LazyColumn to treat it as a new item:
+**Fix (current â€” State-read pattern):** Use a stable key (just `m.id`) and read
+`State<Map<String, ChatMessage>>` *inside* the item content lambda. The Compose
+snapshot system registers a per-item subscription when the lambda reads `.value`,
+and invalidates the item's composition when the State changes â€” re-invoking the
+lambda with fresh data, bypassing LazyColumn's key-diffing entirely.
 
 ```kotlin
 items(
     count = messages.size,
-    key = { index ->
-        val m = messages[index]
-        "${m.id}_${m.parts.size}_${m.isStreaming}"
-    }
+    key = { index -> messages[index].id }
 ) { index ->
-    MessageItem(messages[index], ...)
+    // Read State INSIDE the lambda â€” creates a snapshot subscription
+    val currentMessage = messagesState.value[messages[index].id] ?: messages[index]
+    MessageItem(currentMessage, ...)
 }
 ```
 
-**Why `key()` composable inside the item doesn't work:** `key(msg.hashCode())`
+This eliminates both the stale-data bug (snapshot system drives recomposition) and
+the flicker (no dispose+recreate when key is stable). It also preserves `remember`
+state (expanded pills, markdown caches) since the item composition is never disposed.
+
+**Previous fix (superseded â€” caused flicker):** Including `parts.size` and
+`isStreaming` in the key forced LazyColumn to dispose+recreate the item on every
+part addition. This fixed stale data but caused a visible flicker when pills/thinking
+elements appeared, and reset all `remember` state (expanded/collapsed pills).
+
+**Why `key()` composable inside the item doesn't work alone:** `key(msg.hashCode())`
 inside the item content lambda is never re-evaluated because LazyColumn doesn't
 re-call the item content lambda when the outer key is stable. The inner `key()`
-is dead code in this context.
+becomes live only when the snapshot system re-invokes the lambda (via the State read).
 
 **Why `items(items = List)` overload doesn't work:** The IntelliJ Platform bundles
 an older Compose Foundation version that only has the `items(count, key)` overload.
 `items(items = messages, key = { it.id })` does not compile.
 
-**Trade-off:** When the key changes (e.g., `parts.size` grows), LazyColumn disposes
-the old item and creates a new one. This resets any internal `remember` state
-(expanded/collapsed pills). This is acceptable because pill expanded state is
-managed by settings defaults + streaming state, not persistent user toggles.
-
 **Warning:** Do NOT use `items(count, key)` with a stable-only key (e.g., just message
-ID) for any list item whose data changes while visible. Always include
-data-dependent fields in the key, or use a different data flow pattern.
+ID) for any list item whose data changes while visible **unless** the item content
+lambda reads a `State<T>` to create a snapshot subscription. Without the State read,
+the item will render stale data. With the State read, stable keys are safe and
+preferable (no flicker, preserved `remember` state).
 
-- **Files:** `MessageList.kt` (LazyColumn items key)
+- **Files:** `MessageList.kt` (LazyColumn items key + State read), `ChatScreen.kt`
+  (passes `State<Map<String, ChatMessage>>` to MessageList)
 
 ### IntelliJ Platform Icons (AllIcons) â€” Confirmed Available
 
@@ -899,6 +908,8 @@ custom sounds per notification group via Settings â†’ Appearance & Behavior
 - [x] Removed no-op `onAutoConnectChanged` callback from `ConnectionSplashScreen` + `ChatScreen` (setting is persisted directly by the splash screen)
 - [x] Cleaned up dead signal handler branches in `ChatViewModel` (Error, TodoUpdated, SessionCreated, SessionIdle, SessionError, SessionCompacted — informational/exhaustiveness-only)
 - [x] `McpConfigWriter` — extracted shared `writeConfig()` method to eliminate ~60 lines of duplicated read-modify-write boilerplate between `write()`, `writeToolPermissions()`, and `clearAllEntries()`
+- [x] Fixed intermittent "stuck generation" bug after tool calls (bash, shell, task, council) — root cause was a race in `pendingStopJob` debounce cancellation. Three-layer fix: (1) Gate `pendingStopJob` cancel on `isGenerationEvent` — only content-bearing events (TextChunk, ThinkingChunk, ToolUse, Patch, etc.) cancel the debounce; metadata events (MessageFinalized without stopReason, ToolResult, Agent, StepFinish, Snapshot, Compaction) no longer cancel it. (2) Added `toolStuckTimeoutSeconds` setting (default 300s, range 60-3600) — a hard ceiling in the activity monitor that fires even when `hasRunningTools` is true, based on tool START TIME (not `lastActivityTimeMs` which is reset by metadata events). (3) `SessionIdle` now finalizes immediately without the 300ms debounce — it's a terminal server signal, debouncing only created a race window. Council-reviewed (3 councillors: kimi-k2.7-code, GLM-5.1, Mimo v2.5 Pro). Files: `SessionState.kt` (lines 592-615, 1341-1354), `OpenCodeService.kt` (lines 700-726), `OpenCodeSettingsState.kt` (line 54), `OpenCodeSettingsPanel.kt` (lines 61-65, 165, 193, 213, 234)
+- [x] Fixed premature "Response Complete" notification after task tool — root cause was the child-session backstop in `SessionManager.processEvent(SessionIdle)` (lines 418-449) which finalized the parent when a child session went idle. This was wrong: a child going idle does NOT mean the parent's turn is done. The `runningToolCount <= 1` guard was unreliable because the parent's `ToolResult` for the task tool hasn't arrived yet when the child goes idle (it arrives after), so the tool is still `InProgress` and the guard passes. Combined with Layer 3's immediate finalization for `SessionIdle`, this caused irreversible premature finalization — `isStreaming` was set to `false` instantly, and all subsequent `tool-calls` stops hit `finalizeStreaming SKIP: not streaming`. Fix: removed the child-backstop entirely. The parent now finalizes on its own via its own `Stop`/`MessageFinalized`/`SessionIdle` events, which are reliable with Layer 1 (gated `pendingStopJob` cancel) in place. File: `SessionManager.kt` (lines 414-440)
 - [x] Unified `ToolPermissionInfo` with `ToolInfo` — removed `ToolPermissionInfo` data class from `OpenCodeMcpPanel`; panel now uses `ToolInfo` + `ToolPermission` + `ToolSource` from `ToolRegistry` directly â€” `.log`, `.env`, `.gitignore`, `.gitattributes`, `.editorconfig`, `.eslintrc`, `.prettierrc`, `.babelrc` and other common extensions now map to correct MIME types instead of `application/octet-stream`
 
 

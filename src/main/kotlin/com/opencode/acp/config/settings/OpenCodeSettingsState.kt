@@ -45,6 +45,13 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      *  LLM generation time: request queuing, tool execution, network latency, and
      *  bookkeeping. Default 30, minimum 10. */
     var longTimeoutBufferSeconds: Int = 30
+    /** Maximum time (seconds) a single tool call can run with no SSE activity before
+     *  being considered stuck. This is a safety net for lost ToolResult events — if a
+     *  tool's result is never received (e.g., child session crash, SSE event lost during
+     *  reconnect), the tool stays InProgress forever and blocks the activity monitor's
+     *  normal timeout. This ceiling fires regardless of hasRunningTools.
+     *  Default 300 (5 minutes). Range: 60-3600. */
+    var toolStuckTimeoutSeconds: Int = 300
     /** @deprecated Migrated to [responseTimeoutSeconds]. Kept for XStream backward compatibility.
      *  Can be removed once all users have migrated (i.e., after 2+ release cycles).
      *  The migration logic in loadState() handles the transition from old to new setting. */
@@ -183,12 +190,14 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     override fun loadState(state: OpenCodeSettingsState) {
         binaryPath = state.binaryPath
         permissionTimeoutSeconds = state.permissionTimeoutSeconds
-        favoriteModels = state.favoriteModels
+        // Copy ArrayLists to avoid shared references — if the persistence framework
+        // reuses the state parameter, mutations on the loaded instance would affect it.
+        favoriteModels = java.util.ArrayList(state.favoriteModels)
         inlineCodeColor = state.inlineCodeColor
         listNumberColor = state.listNumberColor
         lastSelectedModelKey = state.lastSelectedModelKey
         sidebarVisible = state.sidebarVisible
-        commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
+        commandHistorySize = state.commandHistorySize.coerceIn(1, 100)
         // Migrate legacy sseSocketTimeoutSeconds → responseTimeoutSeconds.
         // If responseTimeoutSeconds was explicitly set (not default 300), keep it.
         // Otherwise, if sseSocketTimeoutSeconds was customized (not default 60), use that
@@ -201,12 +210,13 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             else -> 300
         }
         longTimeoutBufferSeconds = state.longTimeoutBufferSeconds.coerceAtLeast(10)
+        toolStuckTimeoutSeconds = state.toolStuckTimeoutSeconds.coerceIn(60, 3600)
         @Suppress("DEPRECATION")
         sseSocketTimeoutSeconds = state.sseSocketTimeoutSeconds
         autoConnect = state.autoConnect
         port = if (state.port in 1024..65535) state.port else 4096
         loadAllSessions = state.loadAllSessions
-        commandHistory = state.commandHistory
+        commandHistory = java.util.ArrayList(state.commandHistory)
         expandedToolKinds = state.expandedToolKinds.ifBlank { "EXECUTE,EDIT,READ,THINK" }
         expandTaskPillsByDefault = state.expandTaskPillsByDefault
         queueInsteadOfSteer = state.queueInsteadOfSteer

@@ -57,6 +57,13 @@ class OpenCodeSettingsPanel {
             "(e.g., /review, /init). Accounts for server overhead. Default: 30. Minimum: 10."
     }
 
+    /** Tool stuck timeout — max seconds a tool can run with no SSE activity before abort. */
+    val toolStuckTimeoutField: JBTextField = JBTextField("300", 5).apply {
+        toolTipText = "Maximum time (in seconds) a single tool call can run with no SSE activity " +
+            "before being considered stuck. Safety net for lost tool results. Default: 300 (5 min). " +
+            "Range: 60-3600."
+    }
+
     /** Inline code text color — hex string like "#6BBE50" */
     val inlineCodeColorField: JBTextField = JBTextField("#6BBE50", 8)
 
@@ -155,6 +162,7 @@ class OpenCodeSettingsPanel {
         .addLabeledComponent("Command history size:", commandHistorySizeField, 5)
         .addLabeledComponent("Response timeout (seconds):", responseTimeoutField, 5)
         .addLabeledComponent("Long timeout buffer (seconds):", longTimeoutBufferField, 5)
+        .addLabeledComponent("Tool stuck timeout (seconds):", toolStuckTimeoutField, 5)
         .addSeparator(5)
         .addLabeledComponent("Inline code color:", inlineCodeColorField, 5)
         .addComponentToRightColumn(inlineCodeColorButton)
@@ -182,6 +190,7 @@ class OpenCodeSettingsPanel {
         commandHistorySizeField.text = settings.commandHistorySize.toString()
         responseTimeoutField.text = settings.responseTimeoutSeconds.toString()
         longTimeoutBufferField.text = settings.longTimeoutBufferSeconds.toString()
+        toolStuckTimeoutField.text = settings.toolStuckTimeoutSeconds.toString()
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
         loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
@@ -195,14 +204,27 @@ class OpenCodeSettingsPanel {
     }
 
     fun applyTo(settings: OpenCodeSettingsState) {
+        // Validate numeric fields and warn on invalid input
+        val invalidFields = mutableListOf<String>()
+        if (portField.text.trim().toIntOrNull() == null && portField.text.trim().isNotBlank()) invalidFields.add("Server port")
+        if (timeoutField.text.trim().toIntOrNull() == null && timeoutField.text.trim().isNotBlank()) invalidFields.add("Permission timeout")
+        if (commandHistorySizeField.text.trim().toIntOrNull() == null && commandHistorySizeField.text.trim().isNotBlank()) invalidFields.add("Command history size")
+        if (responseTimeoutField.text.trim().toIntOrNull() == null && responseTimeoutField.text.trim().isNotBlank()) invalidFields.add("Response timeout")
+        if (longTimeoutBufferField.text.trim().toIntOrNull() == null && longTimeoutBufferField.text.trim().isNotBlank()) invalidFields.add("Long timeout buffer")
+        if (toolStuckTimeoutField.text.trim().toIntOrNull() == null && toolStuckTimeoutField.text.trim().isNotBlank()) invalidFields.add("Tool stuck timeout")
+        if (invalidFields.isNotEmpty()) {
+            showStatus("Invalid values in: ${invalidFields.joinToString(", ")} — using defaults", false)
+        }
+
         settings.binaryPath = binaryPathField.text.trim()
         settings.port = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535) ?: 4096
-        settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60
+        settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull()?.coerceIn(5, 300) ?: 60
         settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
         settings.responseTimeoutSeconds = responseTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600) ?: 300
         settings.longTimeoutBufferSeconds = longTimeoutBufferField.text.trim().toIntOrNull()?.coerceAtLeast(10) ?: 30
-        settings.inlineCodeColor = inlineCodeColorField.text.trim()
-        settings.listNumberColor = listNumberColorField.text.trim()
+        settings.toolStuckTimeoutSeconds = toolStuckTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600) ?: 300
+        settings.inlineCodeColor = validateHexColor(inlineCodeColorField.text.trim(), settings.inlineCodeColor)
+        settings.listNumberColor = validateHexColor(listNumberColorField.text.trim(), settings.listNumberColor)
         settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
         settings.queueInsteadOfSteer = queueInsteadOfSteerCheckbox.isSelected
         settings.showDisconnectConfirmation = showDisconnectCheckbox.isSelected
@@ -221,8 +243,9 @@ class OpenCodeSettingsPanel {
                 (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
                 (responseTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.responseTimeoutSeconds ||
                 (longTimeoutBufferField.text.trim().toIntOrNull() ?: 30) != settings.longTimeoutBufferSeconds ||
-                inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
-                listNumberColorField.text.trim() != settings.listNumberColor ||
+                (toolStuckTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.toolStuckTimeoutSeconds ||
+                validateHexColor(inlineCodeColorField.text.trim(), settings.inlineCodeColor) != settings.inlineCodeColor ||
+                validateHexColor(listNumberColorField.text.trim(), settings.listNumberColor) != settings.listNumberColor ||
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions ||
                 queueInsteadOfSteerCheckbox.isSelected != settings.queueInsteadOfSteer ||
                 showDisconnectCheckbox.isSelected != settings.showDisconnectConfirmation ||
@@ -241,9 +264,16 @@ class OpenCodeSettingsPanel {
     }
 
     companion object {
+        private val HEX_COLOR_REGEX = Regex("^#?[0-9A-Fa-f]{6}$")
+
+        /** Validate hex color format. Returns [fallback] if invalid. */
+        private fun validateHexColor(value: String, fallback: String): String =
+            if (value.matches(HEX_COLOR_REGEX)) value else fallback
+
         private fun parseColor(hex: String): java.awt.Color {
             if (hex.isBlank()) return java.awt.Color(60, 60, 60)
             val clean = hex.removePrefix("#")
+            if (clean.length != 6) return java.awt.Color(60, 60, 60)
             return try {
                 java.awt.Color(clean.toInt(16))
             } catch (_: Exception) {

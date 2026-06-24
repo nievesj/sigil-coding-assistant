@@ -146,7 +146,7 @@ class SessionManager(
      *  immediately on send, before any SSE events arrive.
      *  Idempotent — duplicate adds are harmless (Set semantics). */
     fun addStreamingSession(sessionId: String) {
-        _streamingSessionIds.value = _streamingSessionIds.value + sessionId
+        _streamingSessionIds.update { it + sessionId }
     }
 
     /** Imperatively remove a session ID from the streaming set.
@@ -154,7 +154,7 @@ class SessionManager(
      *  immediately, without waiting for StreamingCompleted.
      *  Idempotent — duplicate removes are harmless. */
     fun removeStreamingSession(sessionId: String) {
-        _streamingSessionIds.value = _streamingSessionIds.value - sessionId
+        _streamingSessionIds.update { it - sessionId }
     }
 
     init {
@@ -163,10 +163,10 @@ class SessionManager(
             allSessionSignals.collect { (sessionId, signal) ->
                 when (signal) {
                     is UiSignal.StreamingStarted -> {
-                        _streamingSessionIds.value = _streamingSessionIds.value + sessionId
+                        _streamingSessionIds.update { it + sessionId }
                     }
                     is UiSignal.StreamingCompleted -> {
-                        _streamingSessionIds.value = _streamingSessionIds.value - sessionId
+                        _streamingSessionIds.update { it - sessionId }
                     }
                     else -> {}
                 }
@@ -415,41 +415,28 @@ class SessionManager(
                 if (event.sessionId == _activeSessionId.value) {
                     _globalSignals.tryEmit(UiSignal.SessionIdle(event.sessionId))
                 }
-                // Subagent backstop: if the idle session is NOT the active session
-                // but the active (parent) session is still streaming, finalize the
-                // parent too. A child session going idle implies the parent's tool
-                // call to that child has completed. Without this, the parent stays
-                // stuck in streaming state if its own message.updated lacked a
-                // finish field and no separate stop event arrives.
+                // NOTE: The child-session backstop that previously finalized the
+                // parent when a child went idle has been REMOVED. It caused premature
+                // "Response Complete" notifications because a child session going idle
+                // does NOT mean the parent's turn is done — the parent may continue
+                // with more tool calls or text generation. The runningToolCount <= 1
+                // guard was unreliable because the parent's ToolResult for the task
+                // tool hasn't arrived yet when the child goes idle (it arrives after),
+                // so the tool is still InProgress and the guard passes.
                 //
-                // Guard: only finalize the parent if it has no OTHER running tools
-                // (besides the child task). If the parent has other in-progress
-                // tools, the turn isn't done yet — the child going idle is just one
-                // tool completing, not the whole turn.
-                val activeId = _activeSessionId.value
-                if (activeId != null && event.sessionId != activeId) {
-                    val activeState = sessionsLock.withLock { sessions[activeId] }
-                    if (activeState != null && activeState.ctx.isStreaming) {
-                        val parentMsgId = activeState.ctx.activeMessageId
-                        // Check if the parent has running tools OTHER than the child
-                        // session's task tool. We can't easily map child sessionId →
-                        // toolCallId, so we approximate: if the parent has exactly one
-                        // running tool, it's likely the child task — finalize.
-                        // If multiple tools are running, don't finalize (turn continues).
-                        val runningToolCount = activeState.ctx.toolPartStates.values.count {
-                            it is PartState.InProgress || it is PartState.Pending
-                        }
-                        if (parentMsgId != null && runningToolCount <= 1) {
-                            logger.info { "[ACP] SessionIdle for child session ${event.sessionId} — finalizing parent $activeId (runningTools=$runningToolCount)" }
-                            activeState.processEvent(SseEvent.SessionIdle(event.sessionId))
-                        } else if (parentMsgId != null) {
-                            logger.debug { "[ACP] SessionIdle for child ${event.sessionId}: parent $activeId still has $runningToolCount running tools — not finalizing" }
-                        }
-                    }
-                }
-                // Also route to SessionState as a backstop — if streaming is still
-                // active when the server says it's idle, finalize it.
-                // Don't return early: fall through to the else -> branch below.
+                // The parent will finalize on its own via:
+                //   - Its own Stop event (with non-tool-calls stopReason)
+                //   - Its own MessageFinalized (with stopReason != null)
+                //   - Its own SessionIdle (the active-session backstop at
+                //     SessionState.kt:555-566, which now finalizes immediately
+                //     via Layer 3)
+                // These paths are reliable with Layer 1 (gated pendingStopJob cancel)
+                // in place — the original cancel race that the child-backstop was
+                // added to work around is now fixed at the root.
+                //
+                // Route to the child's own SessionState as a backstop — if the
+                // child's streaming is still active when the server says it's idle,
+                // finalize the CHILD (not the parent). Fall through to else branch.
             }
             is SseEvent.SessionError -> {
                 logger.warn { "[ACP] Session error: session=${event.sessionId}, error=${event.errorMessage}" }
@@ -904,17 +891,34 @@ class SessionManager(
 
         val exactMatch = models.find { it.providerID == providerId && it.modelID == modelId }
         if (exactMatch != null) {
-            val parts = exactMatch.displayName.split(" / ", limit = 2)
-            return Pair(parts.getOrElse(0) { exactMatch.providerID }, parts.getOrElse(1) { exactMatch.modelID })
+            return splitDisplayName(exactMatch.displayName, exactMatch.providerID, exactMatch.modelID)
         }
 
         val modelOnlyMatch = models.find { it.modelID == modelId }
         if (modelOnlyMatch != null) {
-            val parts = modelOnlyMatch.displayName.split(" / ", limit = 2)
-            return Pair(parts.getOrElse(0) { modelOnlyMatch.providerID }, parts.getOrElse(1) { modelOnlyMatch.modelID })
+            return splitDisplayName(modelOnlyMatch.displayName, modelOnlyMatch.providerID, modelOnlyMatch.modelID)
         }
 
         return Pair(providerId ?: "Unknown", modelId ?: "Unknown")
+    }
+
+    /**
+     * Split a displayName in "provider / model" format using the LAST occurrence
+     * of " / " as the delimiter. This handles provider names that contain " / "
+     * (e.g., "AI / ML Provider / gpt-4" → provider="AI / ML Provider", model="gpt-4").
+     * Falls back to the provided providerID/modelID if the format doesn't match.
+     */
+    private fun splitDisplayName(displayName: String, providerID: String, modelID: String): Pair<String, String> {
+        val separator = " / "
+        val lastIdx = displayName.lastIndexOf(separator)
+        if (lastIdx > 0) {
+            val provider = displayName.substring(0, lastIdx)
+            val model = displayName.substring(lastIdx + separator.length)
+            if (provider.isNotBlank() && model.isNotBlank()) {
+                return Pair(provider, model)
+            }
+        }
+        return Pair(providerID, modelID)
     }
 
     private fun resolveContextLimit(models: List<ProviderModel>, providerId: String?, modelId: String?): Long {

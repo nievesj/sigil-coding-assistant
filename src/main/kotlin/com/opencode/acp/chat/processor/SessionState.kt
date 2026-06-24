@@ -220,11 +220,42 @@ class SessionState(
                 newTurnProviderID = providerID,
             ))
             if (sendResult.isFailure) {
-                // Channel is full (1024 capacity) or closed. If ResetTurn is lost,
-                // ctx.activeMessageId stays null → the first SSE content event will
-                // auto-create a duplicate message (the original bug). Log loudly so
-                // this is diagnosable; the message was already added to the list.
-                logger.error { "[ACP] createAssistantMessage: eventChannel FULL/CLOSED — ResetTurn dropped! Duplicate message likely. id=$id" }
+                // Channel is full (1024 capacity) or closed. Try to drain old events
+                // to make room, then retry. Only drain events from OTHER sessions
+                // (same-session events are from the old turn and can be dropped).
+                val drained = mutableListOf<SseEvent>()
+                repeat(64) {
+                    val r = eventChannel.tryReceive()
+                    if (r.isFailure) return@repeat
+                    val evt = r.getOrNull()
+                    if (evt != null && evt.sessionId != sessionId) {
+                        drained.add(evt)
+                    }
+                    // Same-session events from old turn: safely drop
+                }
+                // Re-enqueue non-session events
+                for (evt in drained) {
+                    eventChannel.trySend(evt)
+                }
+                // Retry the ResetTurn send
+                val retryResult = eventChannel.trySend(SseEvent.ResetTurn(
+                    sessionId = sessionId,
+                    newTurnMessageId = id,
+                    newTurnServerMessageId = serverMessageId,
+                    newTurnModelID = modelID,
+                    newTurnProviderID = providerID,
+                ))
+                if (retryResult.isFailure) {
+                    // Still can't send. Set ctx directly as last resort — we're
+                    // under stateLock and the event processing coroutine will
+                    // process subsequent events against this state.
+                    logger.error { "[ACP] createAssistantMessage: eventChannel FULL after drain — setting ctx directly. id=$id" }
+                    ctx.activeMessageId = id
+                    ctx.activeServerMessageId = serverMessageId
+                    ctx.modelID = modelID
+                    ctx.providerID = providerID
+                    ctx.isStreaming = true
+                }
             }
         }
 
@@ -501,10 +532,30 @@ class SessionState(
                 // (single-reader coroutine). This is strictly more robust than a
                 // producer-side drain because there's no window between draining
                 // and the reset — both run on this coroutine.
+                //
+                // SELECTIVE DRAIN: Only drain events that belong to THIS session.
+                // Events from other sessions (child subagents, background sessions)
+                // are left in the channel to be processed normally. Draining them
+                // would cause their events to be silently lost.
                 var drainedCount = 0
-                while (eventChannel.tryReceive().isSuccess) { drainedCount++ }
+                val drainedOtherSession = mutableListOf<SseEvent>()
+                while (true) {
+                    val result = eventChannel.tryReceive()
+                    if (result.isFailure) break
+                    val evt = result.getOrNull()
+                    if (evt != null && evt.sessionId == sessionId) {
+                        drainedCount++
+                    } else if (evt != null) {
+                        // Not our session — put it back (preserve order)
+                        drainedOtherSession.add(evt)
+                    }
+                }
+                // Re-enqueue non-session events so they're not lost
+                for (evt in drainedOtherSession) {
+                    eventChannel.trySend(evt)
+                }
                 if (drainedCount > 0) {
-                    logger.info { "[ACP] ResetTurn: drained $drainedCount stale events from previous turn" }
+                    logger.info { "[ACP] ResetTurn: drained $drainedCount stale events for session $sessionId (preserved ${drainedOtherSession.size} events from other sessions)" }
                 }
                 ctx.resetTurnState()
                 // Apply the new turn's identity atomically after clearing stale state.
@@ -589,9 +640,30 @@ class SessionState(
             else -> { /* handled below */ }
         }
 
-        // Cancel any pending debounced Stop — a new event means streaming continues
-        ctx.pendingStopJob?.cancel()
-        ctx.pendingStopJob = null
+        // Cancel pending debounced Stop ONLY for content-bearing events that indicate
+        // continued generation. Metadata events (MessageFinalized without stopReason,
+        // ToolResult, StepFinish, Snapshot, Compaction, Agent) must NOT cancel the
+        // debounce — they can arrive after the final Stop and would otherwise prevent
+        // finalization, leaving isStreaming=true forever (the "stuck generation" bug).
+        //
+        // NOTE: This list is intentionally DIFFERENT from isContentEvent (line 603-609).
+        // isContentEvent includes ToolResult/StepFinish/Snapshot/Compaction for auto-create
+        // logic. isGenerationEvent excludes them because they don't indicate the LLM is
+        // still generating text. If you add a new event type, consider BOTH lists.
+        val isGenerationEvent = event is SseEvent.TextChunk
+            || event is SseEvent.TextReplace
+            || event is SseEvent.ThinkingChunk
+            || event is SseEvent.ThinkingReplace
+            || event is SseEvent.ToolUse
+            || event is SseEvent.Patch
+            || event is SseEvent.AssistantFile
+            || event is SseEvent.AssistantImage
+            || event is SseEvent.Retry
+            || event is SseEvent.Subtask
+        if (isGenerationEvent) {
+            ctx.pendingStopJob?.cancel()
+            ctx.pendingStopJob = null
+        }
 
         // Auto-create or rotate assistant message for child/subagent sessions.
         // Their SSE events arrive while the parent is streaming, but createAssistantMessage
@@ -689,7 +761,7 @@ class SessionState(
                 }
                 ctx.thinkingBuffer.setLength(0)
                 ctx.thinkingBuffer.append(event.text)
-                ctx.thinkingRevealBuffer.clear()
+                ctx.thinkingRevealBuffer.setLength(0)
                 ctx.thinkingRevealBuffer.append(event.text)
                 ctx.thinkingRevealedLen = event.text.length
                 ctx.thinkingSourceComplete = true
@@ -783,7 +855,7 @@ class SessionState(
                 }
                 ctx.textBuffer.clear()
                 ctx.textBuffer.append(event.text)
-                ctx.revealBuffer.clear()
+                ctx.revealBuffer.setLength(0)
                 ctx.revealBuffer.append(event.text)
                 ctx.revealedLen = event.text.length // TextReplace is a finalization echo — reveal all
                 ctx.sourceComplete = true
@@ -1294,9 +1366,15 @@ class SessionState(
      * SseEvent.MessageFinalized handlers. Handles freeze, resegment, tool-calls
      * filter, and debounced completion.
      *
+     * DEBOUNCE SCOPE: The 300ms debounce applies ONLY to non-"tool-calls",
+     * non-"idle" stop reasons. "tool-calls" is an intermediate stop (message
+     * continues streaming for the next tool cycle). "idle" is a terminal server
+     * signal that finalizes immediately (no debounce — debouncing would create a
+     * race window where a late metadata event could cancel the finalization).
+     *
      * DEBOUNCE RACE NOTE: The 300ms debounce is intentional. If a new event arrives
      * before the debounce completes, processEventInternal() cancels pendingStopJob
-     * (line 493), preventing premature finalization. If the debounce completes and
+     * (line 613), preventing premature finalization. If the debounce completes and
      * acquires stateLock before a new event can cancel it, finalization proceeds —
      * the subsequent event processes against the finalized message, which is correct
      * (the Stop/MessageFinalized event was the last content-bearing event). Under
@@ -1317,6 +1395,20 @@ class SessionState(
         if (stopReason == "tool-calls") {
             // Intermediate stop — tool calls starting; keep message streaming, don't mark completed
             logger.info { "[ACP] finalizeStreaming (tool-calls): intermediate — continuing stream, token data applied" }
+        } else if (stopReason == "idle") {
+            // Server explicitly declared session idle — finalize immediately without
+            // the 300ms debounce. The debounce exists to absorb late content events
+            // after a normal Stop, but SessionIdle is a terminal server signal.
+            // Debouncing here only creates a race window where a late metadata event
+            // (e.g., MessageFinalized with stopReason=null) can cancel the finalization
+            // and leave isStreaming=true forever.
+            logger.info { "[ACP] finalizeStreaming (idle): immediate finalization (no debounce)" }
+            stateLock.withLock {
+                if (!ctx.isStreaming) return@withLock
+                ctx.isStreaming = false
+                updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
+                emitStreamingCompleted(msgId)
+            }
         } else {
             val capturedMsgId = msgId
             ctx.pendingStopJob?.cancel()
@@ -1347,7 +1439,7 @@ class SessionState(
             msg.copy(parts = parts)
         }
         ctx.thinkingBuffer.setLength(0)
-        ctx.thinkingRevealBuffer.clear()
+        ctx.thinkingRevealBuffer.setLength(0)
         ctx.thinkingRevealedLen = 0
         ctx.activeThinkingKey = null
         ctx.activeThinkingCompleted = false
@@ -1414,6 +1506,9 @@ class SessionState(
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
+            } catch (e: Exception) {
+                logger.error(e) { "[ACP] startThinkingRevealLoop: unexpected exception — flushing thinking reveal buffer" }
+                flushThinkingRevealBuffer()
             }
         }
     }
@@ -1484,6 +1579,9 @@ class SessionState(
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
+            } catch (e: Exception) {
+                logger.error(e) { "[ACP] startRevealLoop: unexpected exception — flushing reveal buffer" }
+                flushRevealBuffer()
             }
         }
     }
@@ -1518,6 +1616,18 @@ class SessionState(
 
     private fun resegmentTextPartsDirect(msgId: String, overrideIsStreaming: Boolean = ctx.isStreaming) {
         stateLock.withLock {
+            // SHORT-CIRCUIT: Skip re-segmentation if revealed text hasn't changed since
+            // the last call. This eliminates redundant O(n) markdown parsing on every
+            // reveal loop tick (8-24ms) when no new text has been revealed. The reveal
+            // loop calls this on every tick, but charBudget may not produce new chars
+            // if the backlog is small or the rate is low. Without this guard, a 50k-token
+            // response would trigger O(n) segmentation on every 8ms tick regardless of
+            // whether new text was revealed.
+            if (ctx.revealedLen == ctx.lastSegmentedLen && ctx.revealedLen > 0) {
+                return@withLock
+            }
+            ctx.lastSegmentedLen = ctx.revealedLen
+
             if (ctx.revealedLen == 0) {
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)

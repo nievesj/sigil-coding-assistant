@@ -487,58 +487,48 @@ class OpenCodeService(private val project: Project) : Disposable {
 
         logger.info { "[ACP] recoverBackgroundSessions: checking ${streamingSessions.size} streaming sessions" }
 
-        for (session in streamingSessions) {
-            val sessionId = session.sessionId
-            try {
-                // Re-fetch recent messages to check if the session completed
-                val messages = client.listMessages(sessionId, limit = 5)
-                val lastMessage = messages.lastOrNull()
-                val lastIsAssistant = lastMessage?.info?.role == "assistant"
+        // Parallelize REST fetches — each session needs a separate listMessages call.
+        // Sequential fetches would take N * RTT; parallel fetches take ~1 * RTT.
+        coroutineScope {
+            val deferreds = streamingSessions.map { session ->
+                async {
+                    val sessionId = session.sessionId
+                    try {
+                        val messages = client.listMessages(sessionId, limit = 5)
+                        val lastMessage = messages.lastOrNull()
+                        val lastIsAssistant = lastMessage?.info?.role == "assistant"
 
-                if (lastIsAssistant) {
-                    // Safety check: detect in-progress tool calls (TDD §11 Risk 3).
-                    // If the last assistant message has ToolUse parts without matching
-                    // ToolResult parts, the session is likely still generating.
-                    val hasInProgressTools = lastMessage.parts
-                        .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
-                        .any { toolUse ->
-                            lastMessage.parts
-                                .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
-                                .none { it.toolUseId == toolUse.id }
+                        if (lastIsAssistant) {
+                            // Safety check: detect in-progress tool calls (TDD section 11 Risk 3).
+                            val hasInProgressTools = lastMessage.parts
+                                .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
+                                .any { toolUse ->
+                                    lastMessage.parts
+                                        .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
+                                        .none { it.toolUseId == toolUse.id }
+                                }
+
+                            if (hasInProgressTools) {
+                                logger.info { "[ACP] recoverBackgroundSessions: session $sessionId has in-progress tools — skipping finalization (will recover via SSE)" }
+                                return@async
+                            }
+
+                            val activeMsgId = session.ctx.activeMessageId
+                            if (activeMsgId != null) {
+                                session.completeStreaming(activeMsgId)
+                            }
+                            session.responseDeferred?.complete(Unit)
+                            session.responseDeferred = null
+                            logger.info { "[ACP] Recovered background session $sessionId after SSE reconnection" }
                         }
-
-                    if (hasInProgressTools) {
-                        logger.info { "[ACP] recoverBackgroundSessions: session $sessionId has in-progress tools — skipping finalization (will recover via SSE)" }
-                        continue
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.warn(e) { "[ACP] Failed to recover session $sessionId" }
                     }
-
-                    // Server has a completed assistant message as the last message —
-                    // generation completed while we were disconnected.
-                    // Read activeMessageId once (volatile) and pass to completeStreaming.
-                    // completeStreaming() internally verifies the ID matches before finalizing,
-                    // so if the value changed between our read and the call, it's a no-op.
-                    val activeMsgId = session.ctx.activeMessageId
-                    if (activeMsgId != null) {
-                        // completeStreaming() acquires stateLock (a JVM ReentrantLock) and
-                        // does markdown segmentation. Runs on the coroutine's dispatcher
-                        // (Default) — NOT on EDT, which would block the UI thread.
-                        // stateLock handles thread-safety with the EDT event processor.
-                        session.completeStreaming(activeMsgId)
-                    }
-                    // Complete the deferred to unblock the caller immediately.
-                    // CompletableDeferred.complete() is idempotent — if the signal collector
-                    // also completes it (via StreamingCompleted), the second call is a no-op.
-                    // Null it out so the signal collector's completion is also harmless.
-                    session.responseDeferred?.complete(Unit)
-                    session.responseDeferred = null
-                    logger.info { "[ACP] Recovered background session $sessionId after SSE reconnection" }
                 }
-                // If last message is not assistant, session may still be generating — leave it
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.warn(e) { "[ACP] Failed to recover session $sessionId" }
             }
+            deferreds.awaitAll()
         }
     }
 
@@ -591,7 +581,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     ): SendMessageResult {
         val client = connectionManager.client ?: return SendMessageResult.Error("No client")
         val currentSessionId = sessionManager.activeSessionId.value ?: return SendMessageResult.Error("No session")
-        logger.info { "[ACP] sendMessage: START session=$currentSessionId text='${text.take(50)}'" }
+        logger.debug { "[ACP] sendMessage: START session=$currentSessionId textLength=${text.length}" }
 
         val userMsg = ChatMessage(
             id = generateId(),
@@ -670,10 +660,10 @@ class OpenCodeService(private val project: Project) : Disposable {
             // receives no events between tool.start and tool.result. Without the running-tool
             // guard, the activity monitor would false-positive after responseTimeoutSeconds
             // even though the server is actively working.
-            val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds.coerceIn(10, 3600) * 1000L
             val activityMonitorJob = scope.launch {
                 while (isActive) {
                     delay(ACTIVITY_CHECK_INTERVAL_MS)
+                    val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds.coerceIn(10, 3600) * 1000L
                     // Re-fetch the active session on each iteration instead of using the
                     // captured reference. The session could be evicted from the cache
                     // during the long-running send (e.g., user switches sessions and the
@@ -698,6 +688,29 @@ class OpenCodeService(private val project: Project) : Disposable {
                         it is PartState.InProgress || it is PartState.Pending
                     }
                     if (hasRunningTools) {
+                        // Tools are running — skip the normal activity timeout, BUT enforce
+                        // a hard ceiling based on tool START TIME (not lastActivityTimeMs,
+                        // which is reset by metadata events and thus unreliable for detecting
+                        // truly stuck tools). If a tool's ToolResult is lost (child crash, SSE
+                        // reconnect gap), the tool stays InProgress forever. This ceiling
+                        // ensures recovery.
+                        val toolStuckTimeoutSec = OpenCodeSettingsState.getInstance().state.toolStuckTimeoutSeconds
+                        val toolStuckTimeoutMs = toolStuckTimeoutSec.coerceIn(60, 3600) * 1000L
+                        val oldestToolStartMs = monitorSession.ctx.toolCallPills.entries
+                            .filter {
+                                val state = monitorSession.ctx.toolPartStates[it.key]
+                                state is PartState.InProgress || state is PartState.Pending
+                            }
+                            .mapNotNull { it.value.startTimeMs }
+                            .minOrNull()
+                        if (oldestToolStartMs != null) {
+                            val toolElapsed = System.currentTimeMillis() - oldestToolStartMs
+                            if (toolElapsed > toolStuckTimeoutMs) {
+                                logger.error { "[ACP] sendMessage: tool stuck for ${toolElapsed}ms (> ${toolStuckTimeoutSec}s) — aborting" }
+                                sessionManager.abortStreaming("Tool stuck for >${toolStuckTimeoutSec}s.")
+                                break
+                            }
+                        }
                         logger.debug { "[ACP] sendMessage: tools still running, skipping activity check" }
                         continue
                     }
@@ -791,14 +804,21 @@ class OpenCodeService(private val project: Project) : Disposable {
      */
     suspend fun steerCancel(): CompletableDeferred<Unit> {
         // Always call cancel() — it's idempotent (abortSession is a no-op if
-        // nothing is streaming). The old TOCTOU check (sendMutex.isLocked) had
-        // a race: between the non-atomic check and the cancel() call, the mutex
-        // state could change, causing the steer message to be silently dropped.
+        // nothing is streaming).
         cancel()
 
         // Always wait for the mutex to be released — this ensures the old
         // sendMessage()'s finally block has completed before the caller proceeds.
         val deferred = CompletableDeferred<Unit>()
+
+        // Guard against scope cancellation: if the scope is already cancelled
+        // when we try to launch, the coroutine never starts and deferred
+        // would never complete. Complete it immediately in that case.
+        if (!scope.isActive) {
+            deferred.complete(Unit)
+            return deferred
+        }
+
         val job = scope.launch {
             try {
                 // Acquire the mutex (suspends until the old sendMessage()'s
@@ -808,7 +828,7 @@ class OpenCodeService(private val project: Project) : Disposable {
                 sendMutex.unlock()
                 deferred.complete(Unit)
             } catch (e: CancellationException) {
-                // Scope cancelled — re-throw per coroutine convention
+                // Scope cancelled — complete deferred so caller unblocks
                 deferred.complete(Unit)
                 throw e
             } catch (_: Exception) {
