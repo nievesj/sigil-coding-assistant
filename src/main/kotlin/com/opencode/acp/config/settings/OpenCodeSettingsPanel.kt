@@ -11,6 +11,7 @@ import com.intellij.ui.JBColor
 import com.intellij.util.ui.FormBuilder
 import java.awt.event.ActionListener
 import javax.swing.JButton
+import javax.swing.JComboBox
 import javax.swing.JPanel
 
 class OpenCodeSettingsPanel {
@@ -119,6 +120,14 @@ class OpenCodeSettingsPanel {
             "When disabled, disconnect happens immediately."
     }
 
+    /** Plugin log level — controls verbosity of [ACP] logs in idea.log. */
+    val logLevelCombo: JComboBox<String> = JComboBox(AcpLogLevel.entries.map { it.name }.toTypedArray()).apply {
+        toolTipText = "Controls verbosity of [ACP] plugin logs in idea.log.\n" +
+            "OFF = silent, ERROR = errors only, WARN = warnings+, INFO = normal (default),\n" +
+            "DEBUG = verbose diagnostics (SSE events, tool calls, session state),\n" +
+            "TRACE = everything, ALL = no filtering."
+    }
+
     private fun toolKindLabel(kind: ToolKind): String = when (kind) {
         ToolKind.EXECUTE -> "Shell (Execute)"
         ToolKind.EDIT -> "Edit (Write)"
@@ -173,10 +182,12 @@ class OpenCodeSettingsPanel {
         .addComponent(queueInsteadOfSteerCheckbox)
         .addComponent(showDisconnectCheckbox)
         .addSeparator(5)
+        .addLabeledComponent("Plugin log level:", logLevelCombo, 5)
+        .addSeparator(5)
         .addTooltip("Tool pills expanded by default:")
         .apply { 
             ToolKind.entries.forEach { kind ->
-                addComponent(toolKindCheckboxes[kind]!!)
+                addComponent(toolKindCheckboxes.getValue(kind))
             }
             addComponent(expandTaskPillsCheckbox)
         }
@@ -196,9 +207,10 @@ class OpenCodeSettingsPanel {
         loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
         queueInsteadOfSteerCheckbox.isSelected = settings.queueInsteadOfSteer
         showDisconnectCheckbox.isSelected = settings.showDisconnectConfirmation
+        logLevelCombo.selectedItem = AcpLogLevel.fromName(settings.logLevel).name
         // Initialize ToolKind checkboxes from settings
         ToolKind.entries.forEach { kind ->
-            toolKindCheckboxes[kind]!!.isSelected = settings.isToolKindDefaultExpanded(kind)
+            toolKindCheckboxes.getValue(kind).isSelected = settings.isToolKindDefaultExpanded(kind)
         }
         expandTaskPillsCheckbox.isSelected = settings.expandTaskPillsByDefault
     }
@@ -212,11 +224,17 @@ class OpenCodeSettingsPanel {
         if (responseTimeoutField.text.trim().toIntOrNull() == null && responseTimeoutField.text.trim().isNotBlank()) invalidFields.add("Response timeout")
         if (longTimeoutBufferField.text.trim().toIntOrNull() == null && longTimeoutBufferField.text.trim().isNotBlank()) invalidFields.add("Long timeout buffer")
         if (toolStuckTimeoutField.text.trim().toIntOrNull() == null && toolStuckTimeoutField.text.trim().isNotBlank()) invalidFields.add("Tool stuck timeout")
+        val port = portField.text.trim().toIntOrNull()
+        if (port != null && port !in 1024..65535) invalidFields.add("Server port (must be 1024-65535)")
         if (invalidFields.isNotEmpty()) {
             showStatus("Invalid values in: ${invalidFields.joinToString(", ")} — using defaults", false)
         }
 
-        settings.binaryPath = binaryPathField.text.trim()
+        val binPath = binaryPathField.text.trim()
+        if (binPath.isNotBlank() && !java.io.File(binPath).canExecute()) {
+            showStatus("Warning: '$binPath' may not be executable", false)
+        }
+        settings.binaryPath = binPath
         settings.port = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535) ?: 4096
         settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull()?.coerceIn(5, 300) ?: 60
         settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
@@ -228,14 +246,16 @@ class OpenCodeSettingsPanel {
         settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
         settings.queueInsteadOfSteer = queueInsteadOfSteerCheckbox.isSelected
         settings.showDisconnectConfirmation = showDisconnectCheckbox.isSelected
+        val selectedLevel = logLevelCombo.selectedItem as? String
+        settings.logLevel = if (selectedLevel != null && AcpLogLevel.entries.any { it.name == selectedLevel }) selectedLevel else "INFO"
         // Persist ToolKind expansion defaults
-        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }
+        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes.getValue(it).isSelected }.map { it.name }
         settings.expandedToolKinds = expandedKinds.joinToString(",")
         settings.expandTaskPillsByDefault = expandTaskPillsCheckbox.isSelected
     }
 
     fun isModified(settings: OpenCodeSettingsState): Boolean {
-        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }.toSet()
+        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes.getValue(it).isSelected }.map { it.name }.toSet()
         val currentExpandedKinds = settings.expandedToolKinds.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
         return binaryPathField.text.trim() != settings.binaryPath ||
                 (portField.text.trim().toIntOrNull() ?: 4096) != settings.port ||
@@ -244,11 +264,12 @@ class OpenCodeSettingsPanel {
                 (responseTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.responseTimeoutSeconds ||
                 (longTimeoutBufferField.text.trim().toIntOrNull() ?: 30) != settings.longTimeoutBufferSeconds ||
                 (toolStuckTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.toolStuckTimeoutSeconds ||
-                validateHexColor(inlineCodeColorField.text.trim(), settings.inlineCodeColor) != settings.inlineCodeColor ||
-                validateHexColor(listNumberColorField.text.trim(), settings.listNumberColor) != settings.listNumberColor ||
+                inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
+                listNumberColorField.text.trim() != settings.listNumberColor ||
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions ||
                 queueInsteadOfSteerCheckbox.isSelected != settings.queueInsteadOfSteer ||
                 showDisconnectCheckbox.isSelected != settings.showDisconnectConfirmation ||
+                (logLevelCombo.selectedItem as? String ?: "INFO") != settings.logLevel ||
                 expandedKinds != currentExpandedKinds ||
                 expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault
     }
@@ -264,7 +285,7 @@ class OpenCodeSettingsPanel {
     }
 
     companion object {
-        private val HEX_COLOR_REGEX = Regex("^#?[0-9A-Fa-f]{6}$")
+        private val HEX_COLOR_REGEX = Regex("^#[0-9A-Fa-f]{6}$")
 
         /** Validate hex color format. Returns [fallback] if invalid. */
         private fun validateHexColor(value: String, fallback: String): String =

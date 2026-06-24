@@ -79,6 +79,27 @@ To enable verbose SSE logging in idea.log, add to Help â†’ Debug Log Settin
 #com.opencode.acp.adapter.OpenCodeClient=debug
 ```
 
+### Configurable Log Level (Settings → Tools → OpenCode)
+
+The plugin has a built-in log-level dropdown in Settings → Tools → OpenCode
+("Plugin log level") that controls the Logback level for the entire
+`com.opencode.acp` package at runtime. This is the **preferred** mechanism —
+no need to manually edit Debug Log Settings.
+
+Options: OFF, ERROR, WARN, INFO (default), DEBUG, TRACE, ALL.
+
+- **INFO** (default): startup, connection, MCP registration, errors, warnings
+- **DEBUG**: adds SSE wire-format logs, tool call details, session state transitions
+- **ALL**: no filtering — every log call flows to idea.log
+- **OFF**: completely silent (even errors suppressed)
+
+The setting is applied at IDE startup (`StartupLogConfigListener.appFrameCreated`)
+and on settings Apply (`OpenCodeSettingsConfigurable.apply()`). It persists across
+restarts via `OpenCodeSettingsState.logLevel`.
+
+- **Files:** `AcpLogLevel.kt`, `DebugLogConfig.kt`, `StartupLogConfigListener.kt`,
+  `OpenCodeSettingsState.kt` (`logLevel` field), `OpenCodeSettingsPanel.kt` (dropdown),
+  `OpenCodeSettingsConfigurable.kt` (apply on change), `plugin.xml` (listener registration)
 ### Jewel Markdown: Cannot Override DefaultMarkdownBlockRenderer for Code Blocks
 
 Jewel's `DefaultMarkdownBlockRenderer` in IU-261 has method overrides like

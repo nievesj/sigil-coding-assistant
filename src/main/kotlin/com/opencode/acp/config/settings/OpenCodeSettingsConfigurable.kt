@@ -25,6 +25,7 @@ class OpenCodeSettingsConfigurable : Configurable {
     override fun apply() {
         val settings = OpenCodeSettingsState.getInstance()
         panel?.applyTo(settings)
+        DebugLogConfig.apply(settings.logLevel)
     }
 
     override fun reset() {
