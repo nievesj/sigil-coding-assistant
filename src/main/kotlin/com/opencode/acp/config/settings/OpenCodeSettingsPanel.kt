@@ -21,7 +21,8 @@ class OpenCodeSettingsPanel {
             TextBrowseFolderListener(
                 FileChooserDescriptor(true, false, false, false, false, false)
                     .withTitle("Select OpenCode Binary")
-                    .withDescription("Choose the opencode executable")
+                    .withDescription("Choose the opencode executable"),
+                null  // no project context needed (binary path is global)
             )
         )
     }
@@ -228,11 +229,32 @@ class OpenCodeSettingsPanel {
         if (port != null && port !in 1024..65535) invalidFields.add("Server port (must be 1024-65535)")
         if (invalidFields.isNotEmpty()) {
             showStatus("Invalid values in: ${invalidFields.joinToString(", ")} — using defaults", false)
+            // Reset invalid fields to their coerced values so the UI matches what will be applied.
+            // Without this, the invalid text remains in the field and isModified() produces
+            // confusing results on the next check.
+            portField.text = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535)?.toString() ?: "4096"
+            timeoutField.text = timeoutField.text.trim().toIntOrNull()?.coerceIn(5, 300)?.toString() ?: "60"
+            commandHistorySizeField.text = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100)?.toString() ?: "15"
+            responseTimeoutField.text = responseTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600)?.toString() ?: "300"
+            longTimeoutBufferField.text = longTimeoutBufferField.text.trim().toIntOrNull()?.coerceAtLeast(10)?.toString() ?: "30"
+            toolStuckTimeoutField.text = toolStuckTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600)?.toString() ?: "300"
         }
 
         val binPath = binaryPathField.text.trim()
-        if (binPath.isNotBlank() && !java.io.File(binPath).canExecute()) {
-            showStatus("Warning: '$binPath' may not be executable", false)
+        if (binPath.isNotBlank()) {
+            val file = java.io.File(binPath)
+            if (!file.exists()) {
+                showStatus("Warning: '$binPath' does not exist", false)
+            } else if (System.getProperty("os.name").lowercase().contains("win")) {
+                // On Windows, canExecute() is unreliable (always true for readable files).
+                // Check the file extension instead.
+                val ext = file.extension.lowercase()
+                if (ext !in listOf("exe", "bat", "cmd", "ps1")) {
+                    showStatus("Warning: '$binPath' may not be an executable (expected .exe, .bat, .cmd, or .ps1)", false)
+                }
+            } else if (!file.canExecute()) {
+                showStatus("Warning: '$binPath' may not be executable", false)
+            }
         }
         settings.binaryPath = binPath
         settings.port = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535) ?: 4096
@@ -257,13 +279,19 @@ class OpenCodeSettingsPanel {
     fun isModified(settings: OpenCodeSettingsState): Boolean {
         val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes.getValue(it).isSelected }.map { it.name }.toSet()
         val currentExpandedKinds = settings.expandedToolKinds.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        // For numeric fields: a non-parseable value is always "modified" so that
+        // Apply is enabled and applyTo can coerce/reset it.
+        fun isNumericModified(field: JBTextField, current: Int, default: Int): Boolean {
+            val parsed = field.text.trim().toIntOrNull()
+            return if (parsed != null) parsed != current else field.text.trim().isNotEmpty()
+        }
         return binaryPathField.text.trim() != settings.binaryPath ||
-                (portField.text.trim().toIntOrNull() ?: 4096) != settings.port ||
-                (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
-                (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
-                (responseTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.responseTimeoutSeconds ||
-                (longTimeoutBufferField.text.trim().toIntOrNull() ?: 30) != settings.longTimeoutBufferSeconds ||
-                (toolStuckTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.toolStuckTimeoutSeconds ||
+                isNumericModified(portField, settings.port, 4096) ||
+                isNumericModified(timeoutField, settings.permissionTimeoutSeconds, 60) ||
+                isNumericModified(commandHistorySizeField, settings.commandHistorySize, 15) ||
+                isNumericModified(responseTimeoutField, settings.responseTimeoutSeconds, 300) ||
+                isNumericModified(longTimeoutBufferField, settings.longTimeoutBufferSeconds, 30) ||
+                isNumericModified(toolStuckTimeoutField, settings.toolStuckTimeoutSeconds, 300) ||
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
                 listNumberColorField.text.trim() != settings.listNumberColor ||
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions ||
@@ -297,7 +325,9 @@ class OpenCodeSettingsPanel {
             if (clean.length != 6) return java.awt.Color(60, 60, 60)
             return try {
                 java.awt.Color(clean.toInt(16))
-            } catch (_: Exception) {
+            } catch (e: NumberFormatException) {
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                    .debug(e) { "[ACP] Failed to parse hex color: $hex" }
                 java.awt.Color(60, 60, 60)
             }
         }

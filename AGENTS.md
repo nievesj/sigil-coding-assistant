@@ -802,9 +802,13 @@ setting the property in `createToolWindowContent()` is likely a no-op.
 
 ### Image Content Support (v2)
 
-- **Status:** Planned per TDD but not yet implemented.
-- **Action:** Add `ImageContent` to message parts, render inline in chat messages.
-- **Files:** `ChatModels.kt`, `MessageListComponent.kt`, `OpenCodeClient.kt`.
+- **Status:** Data plumbing complete (`MessagePart.Image`, SSE parsing, REST model,
+  markdown rendering). Image pixel rendering is NOT yet implemented — currently
+  shows a metadata card (icon + filename + MIME type).
+- **Action:** Implement actual image rendering in `MessageList.kt` (decode from
+  URL or data-URI, display inline). Add URL/data-URI decoder to `ImageUtils.kt`.
+- **Files:** `MessageList.kt:623-635` (rendering), `ImageUtils.kt` (decoder),
+  `MessagePart.kt:94` (model), `ChatModels.kt:374` (markdown content).
 
 ---
 
@@ -812,127 +816,17 @@ setting the property in `createToolWindowContent()` is likely a no-op.
 
 ### `addBrowseFolderListener` Deprecation
 
-- **Status:** `OpenCodeSettingsPanel.kt` uses the deprecated 4-arg overload.
-- **Action:** Migrate to the newer `addBrowseFolderListener` with `Producer<Project?>` parameter.
-- **File:** `OpenCodeSettingsPanel.kt:18`
+- **Status:** `OpenCodeSettingsPanel.kt:20` uses the 1-arg
+  `TextBrowseFolderListener(FileChooserDescriptor)` constructor, which is
+  deprecated in IntelliJ Platform 2026.1.
+- **Action:** Migrate to `TextBrowseFolderListener(FileChooserDescriptor, Producer<Project?>)`.
+- **File:** `OpenCodeSettingsPanel.kt:19-26`
 
 ### AcpServerConfig `parse()` Method
 
 - **Status:** `AcpServerConfig.parse()` reads CLI args and env vars but is only used in `Main.kt` (standalone server mode). The IntelliJ plugin uses `OpenCodeSettingsState` instead.
-- **Action:** Decide whether to keep the standalone server path or consolidate.
-- **Files:** `AcpServerConfig.kt`, `Main.kt`
-
-### Permission Bridge (ACP SDK)
-
-- **Status:** `PermissionBridge.kt` is used by the ACP SDK path (`OpenCodeAgentSession`, `OpenCodeAgentSupport`). The chat UI uses `OpenCodeClient.respondPermission()` directly. Both paths are valid for their respective use cases.
-- **Action:** No action needed â€” `PermissionBridge` serves the ACP SDK integration, not the chat UI.
-- **File:** `PermissionBridge.kt`
-
-### CommandInfo Deserialization â€” Missing `id` Field
-
-- **Status:** `GET /command` returns `CommandInfo` objects without an `id` field. The `CommandInfo` data class (`OpenCodeModels.kt:261`) requires `id` as a non-optional field, causing `MissingFieldException` on deserialization. The slash command palette fails to populate with server commands.
-- **Action:** Make `id` optional in `CommandInfo` (e.g., `val id: String? = null`) or add `@JsonIgnoreUnknownKeys` / fallback. The server response only has `name` and `description`.
-- **File:** `OpenCodeModels.kt:261` (`CommandInfo` data class), `OpenCodeClient.kt:1365` (`listCommands()`)
-- **Impact:** Non-critical â€” local commands (`/clear`, `/cancel`) still work. Server commands (`/init`, `/review`, `/simplify`, etc.) are unavailable in the palette.
-
-### IDE-Level Notifications (Response Complete / Question / Permission)
-
-The plugin shows IntelliJ balloon notifications for events that need user attention.
-Uses the `Notification` API with group ID `"OpenCode"` (registered in `plugin.xml`).
-
-**Three notification types:**
-1. **Response complete** (`notifyResponseComplete`) â€” fires when `StreamingCompleted` sets `_isStreaming = false`. Only fires when the IDE window is NOT focused (checked via `WindowManager.getInstance().getFrame(project)?.isActive`). Plays system beep.
-2. **Question asked** (`notifyQuestionAsked`) â€” fires when `SelectionRequested` arrives. Always fires (blocks conversation). Plays system beep.
-3. **Permission needed** (`notifyPermissionNeeded`) â€” fires when `PermissionRequested` arrives. Always fires (blocks conversation). Plays system beep.
-
-All notifications include an "Open" action button that focuses the OpenCode tool window.
-
-**Focus detection:** `WindowManager.getInstance().getFrame(project)?.isActive` checks if the
-project frame has focus. Response-complete notifications are suppressed when the IDE is focused
-(since the user can already see the chat updating).
-
-**Sound:** `Toolkit.getDefaultToolkit().beep()` â€” system beep. IntelliJ also lets users assign
-custom sounds per notification group via Settings â†’ Appearance & Behavior â†’ Notifications.
-
-- **Files:** `Notifications.kt` (utility), `ChatViewModel.kt` (signal handlers), `plugin.xml` (notification group), `OpenCodeService.kt` (`project` made public)
-
----
-
-## Completed (for reference)
-
-- [x] Settings page (binary discovery, permission timeout)
-- [x] Permission prompt UI with Allow/Reject/Always Allow
-- [x] Dead code cleanup (configure(), setConnectionState(), getViewModel(), ProviderInfo, ModelInfo, OpenCodePlugin, BinaryDiscovery.verify())
-- [x] Plugin always launches its own OpenCode instance on tool window open
-- [x] Fixed SSE event parsing to match actual server format (message.part.delta, message.updated, etc.)
-- [x] Fixed SSE V2 SyncEvent parsing â€” V2 events use `data` wrapper + versioned type names (`.1` suffix) instead of `properties` wrapper; all V2 events (thinking, tools, text) were silently dropped
-- [x] Fixed SVG icon (was symlink with @media style rules)
-- [x] Fixed CSS rendering crash (Swing HTML renderer can't handle border-radius, margin, etc.)
-- [x] Dark theme chat UI with proper typography and colors
-- [x] Code block rendering with custom ChatFencedCodeBlock via MarkdownSegmenter (bypasses dead DefaultMarkdownBlockRenderer override)
-- [x] Inline code gray background removed â€” fix was SpanStyle(background=Transparent) propagation to Heading.H1â€“H6 (not a composable-level background)
-- [x] Context usage indicator (doughnut ring + tooltip + sidebar panel) â€” auto-compaction is server-side
-- [x] SSE `todo.updated` event handling + `GET /session/:id/todo` fetch
-- [x] Todo list panel (collapsible, `âœ“`/`â€¢`/`â—‹` status indicators, auto-collapse >4 items)
-- [x] Slash command palette (`/clear`, `/cancel`) triggered by `/` prefix in input
-- [x] StreamHealer for inline markdown formatting during streaming
-- [x] Question/selection prompt wired to server (`question.asked` SSE â†’ `POST /question/:id/reply` or `/reject`)
-- [x] MIME type detection for file attachments â€” `MimeTypes.guessFromFileName()` replaces `URLConnection.guessContentTypeFromName()` (which returns `application/octet-stream` for most dev files); additional common extensions (.log, .env, .gitignore, etc.) added
-- [x] Markdown tables with column alignment and inline formatting via InlineMarkdownText
-- [x] SSE reconnection with exponential backoff (1sâ†’2sâ†’4sâ†’...â†’30s cap, Â±20% jitter, abort in-flight response, retryConnection for ERROR state)
-- [x] SSE idle detection â€” replaced with health-check probes (`launchHealthCheck`) that verify server liveness without killing healthy connections during user thinking time (see TDD Â§4.2.1)
-- [x] SSE observability â€” connect/disconnect/uptime/last-event timing logged with `[ACP]` prefix
-- [x] Removed `socketTimeoutMillis` from HttpClient config â€” it's a no-op on Java engine (TDD Â§4.2.1)
-- [x] Replaced `sseSocketTimeoutSeconds` setting with `responseTimeoutSeconds` â€” controls `withTimeout` on `deferred.await()` (was hardcoded 5 min; see TDD Â§7.1)
-- [x] `ProcessManager` (was `OpenCodeConnectionManager`) no longer sets `socketTimeoutMillis` on `HttpTimeout` plugin â€” no effect on Java engine
-- [x] `HttpClient` ownership centralized in `OpenCodeClient` â€” creates, configures, and closes internally; `ProcessManager` no longer creates or stores `HttpClient`
-- [x] Timeout profiles (SHORT/LONG/INFINITE) added to `OpenCodeClient` â€” `executeCommand` and `compactSession` use LONG profile (`responseTimeoutSeconds + longTimeoutBufferSeconds`), `sendMessageAsync` uses INFINITE, all others use SHORT (60s)
-- [x] `postSuccess`, `deleteSuccess`, `healthCheck` now propagate `CancellationException` instead of swallowing it â€” callers can distinguish timeout/cancellation from server errors
-- [x] `longTimeoutBufferSeconds` setting added (default 30, minimum 10) â€” configurable in Settings â†’ Tools â†’ OpenCode
-- [x] `OpenCodeService.dispose()` now cancels `sseReconnectJob` and `sseHealthCheckJob` before `shutdown()` â€” eliminates gap where reconnection could run against a closed client
-- [x] Input command history with Up/Down arrow navigation (configurable size, persists with attachments, draft save/restore, `onSend` signature fixed to pass files)
-- [x] `toChatMessage()` now uses `ToolMapper.toAcpKind()` instead of hardcoded `ToolKind.OTHER` â€” historical tool pills match live ones
-- [x] `ToolPill` defaults collapsed (`expanded = false`) â€” was defaulting expanded
-- [x] `SseEvent.ToolResult.content` now populated from V2 and V1 SSE events â€” tool output visible in expanded pills
-- [x] `handleSseEvent()` no longer drops `TodoUpdated`/`QuestionAsked`/`SessionCreated`/`UserMessage` when `activeAssistantMessageId` is null â€” these events are handled before the null check
-- [x] `SubagentStatus` now inferred from session token usage (`outputTokens > 0` â†’ COMPLETED, else RUNNING) â€” was always RUNNING
-- [x] `CommandHistoryEntry` dedup now compares `attachedFileDataUris` in addition to paths â€” clipboard images with same text no longer falsely deduped
-- [x] Removed unreachable `MimeTypes` compound extension entry `"gradle.kts"` (never matched by `substringAfterLast('.')`)
-- [x] Removed empty `loadSettings()` method and its call from `ChatViewModel.initialize()`
-- [x] Removed all `println()` debug statements from production code (ChatScreen.kt, InputArea.kt, AttachMenu.kt, OpenCodeSettingsState.kt, ProviderIconLoader.kt)
-- [x] `SseEventListener` now handles V2 event types (`session.next.*`) and passes `patterns` to `SseEvent.Permission`
-- [x] `addMessage()` FIFO eviction now rebuilds `toolCallIndex` alongside `messageIndex` â€” no stale entries after 500+ messages
-- [x] `pendingFileChanges` cleared on session switch via `resetSessionState()` â€” no memory leak across sessions
-- [x] Shutdown hook removed entirely â€” was redundant with ShutdownListener, leaked ClassLoaders on dynamic plugin reload, and raced with content disposer
-- [x] `respondPermission`/`respondQuestion`/`rejectQuestion` in `OpenCodeClient` now throw on failure instead of swallowing â€” ViewModel catch blocks are reachable
-- [x] IDE-level notifications (response complete, question asked, permission needed) â€” `Notifications.kt`, focus detection via `WindowManager`, system beep, "Open" action to focus tool window
-- [x] `SessionItem.createdAt` renamed to `updatedAt` (was actually `time.updated`, not `time.created`)
-- [x] `SessionContext` fields (`additions`/`deletions`/`filesModified`/`sessionCreated`/`lastUpdated`) now populated from `GET /session/:id` summary â€” were hardcoded to 0
-- [x] `computeSessionContext()` accumulates token/cost from local message cache (all assistant messages) instead of always-zero `session.tokens`/`.cost` or single `lastAssistant` lookup
-- [x] `MessageFinalized` SSE event parses `message.updated` `info.tokens`/`cost`/`modelID`/`providerID` â€” local message cache stays accurate for accumulation
-- [x] `finalizeStreaming()` extracted as shared logic between `Stop` and `MessageFinalized` handlers â€” eliminates duplication
-- [x] `session.idle` SSE event triggers `computeSessionContext()` immediately â€” eliminates 300ms debounce dependency
-- [x] `session.error` SSE event parsed with structured error object (`data.message` with fallback to `name`)
-- [x] `session.compacted` SSE event triggers message cache refresh (`refreshActiveSessionMessages()`) + context recomputation â€” prevents inflated token counts after auto-compaction
-- [x] `message.removed` SSE event removes message from local cache by `serverMessageId` + triggers context refresh
-- [x] `computeSessionContext()` dedup guard â€” skips re-computation if < 300ms since last call and state is Loaded (prevents double REST calls when `StreamingCompleted` + `SessionIdle` fire close together)
-- [x] `SseEventListener` standalone parser now extracts `properties` wrapper for V1 bus events â€” `session.error` parsing was broken (read from top-level `obj` instead of `obj["properties"]`)
-- [x] `SessionState.replaceAllMessages()` and `removeMessageByServerId()` â€” support cache invalidation after compaction/message deletion
-- [x] Sidebar session pagination â€” `displayLimit` high-water mark on `SessionListState.Loaded`, `loadMoreSessions()` increments by 10, `resetDisplayLimit()` on init/switch, `clearAllSessions()` deletes all sessions except active, `ClearAllConfirmationDialog` with progress feedback, `SessionListFooter` with "X of Y sessions loaded" + "Load more" + "Clear all", `loadAllSessions` settings toggle
-- [x] ComposePanel.dispose() EDT hang fixed — all dispose paths (content disposer, ShutdownListener) now use `disposeActiveComposePanelAsync()` instead of synchronous EDT dispose; shutdown hook removed
-- [x] ChatViewModel.scope exposed as public val â€” ChatScreen uses `viewModel.scope.launch` for all ViewModel calls instead of composition-scoped `rememberCoroutineScope` (fixes CancellationException on long-running HTTP requests)
-- [x] Additional MIME types added to MimeTypes.kt — `.log`, `.env`, `.gitignore`, `.gitattributes`, `.editorconfig`, `.eslintrc`, `.prettierrc`, `.babelrc` and other common extensions now map to correct MIME types instead of `application/octet-stream`
-- [x] `McpStatusBarWidget.McpIcon.paintIcon()` — removed `g2.dispose()` call that corrupted Swing rendering (the Graphics object is owned by the framework)
-- [x] `OpenCodeMcpPanel.generateToolPermissionsJson()` / `generateDiscoveredToolsJson()` — replaced hand-rolled string-concatenation JSON with `buildJsonObject` + `encodeToString` (prevents malformed JSON on special characters)
-- [x] `ToolRegistry.setToolEnabled()` — decoupled `enabled` from `permission` (disabling a tool no longer forces `DENY`; preserves `ASK` for re-enable)
-- [x] Removed dead code: `ChatViewModel.loadCommandHistory()`, `McpManager._deprecatedTools` + deprecated `tools` property, `OpenCodeService.emptyMcpTools` + deprecated `mcpTools`, `ProcessManager.close()`, `McpManager.disconnectIntellij()` + `retryIntellij()`
-- [x] Removed no-op `onAutoConnectChanged` callback from `ConnectionSplashScreen` + `ChatScreen` (setting is persisted directly by the splash screen)
-- [x] Cleaned up dead signal handler branches in `ChatViewModel` (Error, TodoUpdated, SessionCreated, SessionIdle, SessionError, SessionCompacted — informational/exhaustiveness-only)
-- [x] `McpConfigWriter` — extracted shared `writeConfig()` method to eliminate ~60 lines of duplicated read-modify-write boilerplate between `write()`, `writeToolPermissions()`, and `clearAllEntries()`
-- [x] Fixed intermittent "stuck generation" bug after tool calls (bash, shell, task, council) — root cause was a race in `pendingStopJob` debounce cancellation. Three-layer fix: (1) Gate `pendingStopJob` cancel on `isGenerationEvent` — only content-bearing events (TextChunk, ThinkingChunk, ToolUse, Patch, etc.) cancel the debounce; metadata events (MessageFinalized without stopReason, ToolResult, Agent, StepFinish, Snapshot, Compaction) no longer cancel it. (2) Added `toolStuckTimeoutSeconds` setting (default 300s, range 60-3600) — a hard ceiling in the activity monitor that fires even when `hasRunningTools` is true, based on tool START TIME (not `lastActivityTimeMs` which is reset by metadata events). (3) `SessionIdle` now finalizes immediately without the 300ms debounce — it's a terminal server signal, debouncing only created a race window. Council-reviewed (3 councillors: kimi-k2.7-code, GLM-5.1, Mimo v2.5 Pro). Files: `SessionState.kt` (lines 592-615, 1341-1354), `OpenCodeService.kt` (lines 700-726), `OpenCodeSettingsState.kt` (line 54), `OpenCodeSettingsPanel.kt` (lines 61-65, 165, 193, 213, 234)
-- [x] Fixed premature "Response Complete" notification after task tool — root cause was the child-session backstop in `SessionManager.processEvent(SessionIdle)` (lines 418-449) which finalized the parent when a child session went idle. This was wrong: a child going idle does NOT mean the parent's turn is done. The `runningToolCount <= 1` guard was unreliable because the parent's `ToolResult` for the task tool hasn't arrived yet when the child goes idle (it arrives after), so the tool is still `InProgress` and the guard passes. Combined with Layer 3's immediate finalization for `SessionIdle`, this caused irreversible premature finalization — `isStreaming` was set to `false` instantly, and all subsequent `tool-calls` stops hit `finalizeStreaming SKIP: not streaming`. Fix: removed the child-backstop entirely. The parent now finalizes on its own via its own `Stop`/`MessageFinalized`/`SessionIdle` events, which are reliable with Layer 1 (gated `pendingStopJob` cancel) in place. File: `SessionManager.kt` (lines 414-440)
-- [x] Unified `ToolPermissionInfo` with `ToolInfo` — removed `ToolPermissionInfo` data class from `OpenCodeMcpPanel`; panel now uses `ToolInfo` + `ToolPermission` + `ToolSource` from `ToolRegistry` directly â€” `.log`, `.env`, `.gitignore`, `.gitattributes`, `.editorconfig`, `.eslintrc`, `.prettierrc`, `.babelrc` and other common extensions now map to correct MIME types instead of `application/octet-stream`
-
+- **Decision (2026-06-24, stakeholder-confirmed): Retain.** The standalone `Main.kt` + `AcpServerConfig` path is kept as a reference implementation and entry point for external consumers of the ACP SDK bridge. `AcpServerConfigTest.kt` and `OpenCodeAgentSupport.kt`'s `config` field are retained alongside it. See `docs/tdd/outstanding-tech-debt.md` §6 for the alternatives analysis.
+- **Files:** `AcpServerConfig.kt`, `Main.kt`, `AcpServerConfigTest.kt`
 
 ---
 
@@ -964,13 +858,19 @@ The JetBrains MCP Server plugin (bundled with IntelliJ IDEA 2025.2+) runs on its
 - **Files:** `McpServerDiscovery.kt`, `McpRegistrar.kt`, `McpConfigWriter.kt`, `McpToolList.kt`, `McpManager.kt`, `McpModels.kt`, `McpStatusBarWidget.kt`, `ChatConstants.kt`, `OpenCodeSettingsPanel.kt`, `OpenCodeSettingsState.kt`, `ProcessManager.kt`, `OpenCodeService.kt`, `McpToolDiscovery.kt`, `ToolRegistry.kt`, `OpenCodeSettingsConfigurable.kt`
 - **TDD deviation log:** `docs/tdd/intellij-mcp-integration.md` has a detailed "Implementation Deviations" section at the top
 
-### Tool Permissions â€” Partial Implementation
+### Tool Permissions — Implementation Status
 
-The tool permissions feature (TDD Â§10) is partially implemented. What works: `ToolRegistry` aggregates tools from built-in + MCP sources, `McpToolDiscovery` implements MCP protocol `tools/list` via JSON-RPC over SSE, `McpConfigWriter.writeToolPermissions()` writes per-agent permission rules to `.opencode/opencode.json`, and the settings panel has basic tool discovery (`GET /experimental/tool/ids`) with per-tool checkbox + Allow/Ask/Deny dropdown.
+The tool permissions feature (TDD §10) is substantially implemented.
 
-**Known gaps:**
-- `OpenCodeSettingsConfigurable.discoverMcpTools()` is a **stub** returning `emptyMap()` â€” the existing `McpToolDiscovery` class is NOT wired into the settings flow
-- **FIXED** ~~Two parallel data models~~: `ToolPermissionInfo` removed; `OpenCodeMcpPanel` uses `ToolInfo` directly: `ToolInfo` (in `ToolRegistry.kt`) vs `ToolPermissionInfo` (inner class of `OpenCodeSettingsPanel.kt`) â€” these should be unified
-- Missing UI features: Enable All/Disable All buttons, filter/search bar, source dropdown, "N/M enabled" counter, per-server grouping headers (e.g., "MCP: intellij (12 tools)"), restart warning
-- Tool states are NOT persisted in `OpenCodeSettingsState` â€” must re-discover on each settings panel open
-- `McpManager` does not expose connected server SSE URLs for `McpToolDiscovery` to use
+**Working:**
+- `ToolRegistry` aggregates tools from built-in + MCP sources
+- `McpToolDiscovery` implements MCP protocol `tools/list` via JSON-RPC over SSE
+- `McpConfigWriter.writeToolPermissions()` writes per-agent permission rules to `.opencode/opencode.json`
+- Settings panel (`OpenCodeMcpPanel`) has: Enable All/Disable All buttons, filter/search bar,
+  source dropdown filter, "N/M tools enabled" counter, per-server grouping headers,
+  per-tool checkbox + Allow/Ask/Deny dropdown
+- Tool states persisted in `OpenCodeSettingsState` (`toolPermissions`, `discoveredToolsJson`)
+- `McpManager.getServerUrls()` exposes connected server SSE URLs for discovery
+
+**Remaining gaps:**
+- Panel's Enable All/Disable All batch sync uses name-based matching in `ToolRegistry.syncEnabled()`, which may affect tools across servers when two MCP servers expose tools with the same raw name (e.g., both server A and server B have "create_file"). Both are updated because `syncEnabled` matches by raw name without server qualification.

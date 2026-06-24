@@ -103,6 +103,15 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var toolPermissions: String = ""
 
     /**
+     * Permissions saved before Disable All, so Enable All can restore ASK
+     * settings that were active before the disable. Prevents ASK→ALLOW
+     * promotion on a disable→enable cycle across IDE restarts.
+     * Format: {"toolId":"allow",...} (tool ID → permission action string).
+     * Empty when no Disable All has been performed.
+     */
+    var savedToolPermissionsBeforeDisable: String = ""
+
+    /**
      * Discovered tools cache as JSON string.
      * Format: [{"name":"bash","description":"...","source":"builtin","serverName":"builtin"},...]
      * Allows showing previously discovered tools without re-discovery.
@@ -246,6 +255,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             ""
         }
         toolPermissions = state.toolPermissions
+        savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
         discoveredToolsJson = state.discoveredToolsJson
         followAgentEnabled = state.followAgentEnabled
         followReadColor = state.followReadColor
