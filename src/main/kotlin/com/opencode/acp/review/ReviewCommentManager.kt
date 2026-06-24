@@ -291,13 +291,15 @@ class ReviewCommentManager(private val project: Project) : Disposable {
             // that are already open when loadAll runs. Otherwise comments loaded
             // after editor creation never get highlights until something else
             // triggers onFileCommentsChanged.
-            stateHolder.set(newIndex)
-            invalidateAllCaches()
+            // NOTE: stateHolder.set() is AFTER highlights/gutter icons so UI
+            // collectors see a consistent state — index + highlights published together.
             for ((sourcePath, comments) in newIndex.commentsByFile) {
                 val open = comments.filter { it.status == ReviewStatus.OPEN }
                 editorLifecycle.onFileCommentsChanged(sourcePath, open)
             }
             refreshGutterIcons(newIndex.commentsByFile.keys)
+            stateHolder.set(newIndex)
+            invalidateAllCaches()
             logger.info {
                 "[ACP] Loaded ${files.size} review file(s), ${newIndex.totalOpen} open comment(s)"
             }
@@ -410,6 +412,137 @@ class ReviewCommentManager(private val project: Project) : Disposable {
                     "comments on $sourcePath"
             }
         }
+    }
+
+    // ── Replies (review-reply threading) ──
+
+    /** Add a reply to a comment. Uses the same [updateFile] optimistic-concurrency
+     *  path as [addComment]/[updateCommentStatus]. Rejects replies to resolved or
+     *  missing comments — replies are only meaningful on OPEN comments. */
+    suspend fun addReply(sourcePath: String, commentId: String, reply: ReviewReply): Boolean {
+        if (!reply.validate()) {
+            logger.warn { "[ACP] Invalid review reply skipped: id=${reply.id}" }
+            return false
+        }
+        val written = repository.updateFile(sourcePath) { existing ->
+            if (existing == null) return@updateFile null
+            val target = existing.comments.find { it.id == commentId }
+            if (target == null) {
+                logger.warn { "[ACP] addReply: commentId $commentId not found in $sourcePath" }
+                return@updateFile null
+            }
+            // Reject replies to resolved comments — the discussion is closed.
+            if (target.status == ReviewStatus.RESOLVED) {
+                logger.warn { "[ACP] addReply: comment $commentId is already resolved — reply rejected" }
+                return@updateFile null
+            }
+            existing.copy(
+                comments = existing.comments.map {
+                    if (it.id == commentId) it.copy(replies = it.replies + reply) else it
+                }
+            )
+        }
+        if (written != null) {
+            val newIndex = stateHolder.value.withFile(sourcePath, written)
+            updateIndex(newIndex, setOf(sourcePath))
+            logger.info { "[ACP] Added reply ${reply.id} to comment $commentId on $sourcePath" }
+            return true
+        }
+        return false
+    }
+
+    /** Delete a reply by ID. Only user-authored replies are deletable from the UI
+     *  (ai-review replies represent the re-review verdict and are not user-editable). */
+    suspend fun deleteReply(sourcePath: String, commentId: String, replyId: String): Boolean {
+        val written = repository.updateFile(sourcePath) { existing ->
+            if (existing == null) return@updateFile null
+            val target = existing.comments.find { it.id == commentId } ?: return@updateFile null
+            val reply = target.replies.find { it.id == replyId } ?: return@updateFile null
+            if (reply.author != "user") {
+                logger.warn { "[ACP] deleteReply: reply $replyId is not user-authored — rejected" }
+                return@updateFile null
+            }
+            existing.copy(
+                comments = existing.comments.map {
+                    if (it.id == commentId) it.copy(replies = it.replies.filterNot { r -> r.id == replyId }) else it
+                }
+            )
+        }
+        if (written != null) {
+            val newIndex = stateHolder.value.withFile(sourcePath, written)
+            updateIndex(newIndex, setOf(sourcePath))
+            logger.info { "[ACP] Deleted reply $replyId from comment $commentId on $sourcePath" }
+            return true
+        }
+        return false
+    }
+
+    /** Get replies for a comment from the in-memory index (no disk read). */
+    fun getReplies(sourcePath: String, commentId: String): List<ReviewReply> {
+        val comment = stateHolder.value.forFile(sourcePath).find { it.id == commentId }
+        return comment?.replies ?: emptyList()
+    }
+
+    /** Snapshot all (commentId → replyIds) pairs from an index. Used by
+     *  `executeReviewRecheckCommand()` to detect reply loss after the LLM rewrites
+     *  `.review/` files. This is a structural safety net independent of prompt
+     *  compliance — see TDD §4 (Reply preservation guarantee). */
+    fun snapshotReplyIds(index: ReviewIndex): Map<String, Set<String>> {
+        val out = mutableMapOf<String, Set<String>>()
+        for ((_, comments) in index.commentsByFile) {
+            for (c in comments) {
+                if (c.replies.isNotEmpty()) out[c.id] = c.replies.map { it.id }.toSet()
+            }
+        }
+        return out
+    }
+
+    /** Re-merge replies present in [snapshot] but absent in the current index.
+     *  Called after `refreshReviewFiles()` in `executeReviewRecheckCommand()`.
+     *  [preRecheckIndex] is the index captured before the recheck prompt was sent —
+     *  used to look up the original reply objects. Returns the number of replies restored. */
+    suspend fun restoreMissingReplies(
+        snapshot: Map<String, Set<String>>,
+        preRecheckIndex: ReviewIndex,
+    ): Int {
+        var restored = 0
+        val current = stateHolder.value
+        // Group missing replies by source file for batched updateFile() calls.
+        val byFile = mutableMapOf<String, MutableList<Pair<String, ReviewReply>>>()
+        for ((sourcePath, comments) in current.commentsByFile) {
+            for (c in comments) {
+                val expected = snapshot[c.id] ?: continue
+                val present = c.replies.map { it.id }.toSet()
+                val missing = expected - present
+                if (missing.isEmpty()) continue
+                // Find the original reply objects from the pre-recheck index.
+                val preComments = preRecheckIndex.commentsByFile[sourcePath] ?: continue
+                val preComment = preComments.find { it.id == c.id } ?: continue
+                for (replyId in missing) {
+                    val reply = preComment.replies.find { it.id == replyId } ?: continue
+                    byFile.getOrPut(sourcePath) { mutableListOf() }.add(c.id to reply)
+                    restored++
+                }
+            }
+        }
+        for ((sourcePath, pairs) in byFile) {
+            repository.updateFile(sourcePath) { existing ->
+                if (existing == null) return@updateFile null
+                existing.copy(
+                    comments = existing.comments.map { c ->
+                        val toAdd = pairs.filter { it.first == c.id }.map { it.second }
+                        if (toAdd.isEmpty()) c else c.copy(replies = c.replies + toAdd)
+                    }
+                )
+            }?.let { written ->
+                val newIndex = stateHolder.value.withFile(sourcePath, written)
+                updateIndex(newIndex, setOf(sourcePath))
+            }
+        }
+        if (restored > 0) {
+            logger.warn { "[ACP] restoreMissingReplies: re-merged $restored dropped reply(ies) after /review-recheck" }
+        }
+        return restored
     }
 
     // ── Disposal ──

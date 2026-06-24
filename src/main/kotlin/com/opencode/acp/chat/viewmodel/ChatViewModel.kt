@@ -969,6 +969,44 @@ class ChatViewModel(
         }
     }
 
+    /** Execute `/review-recheck [model...]` — re-runs the adversarial review with
+     *  existing comments + replies as context. The LLM verifies replies against
+     *  the actual code, re-raises unresolved issues, marks resolved comments, and
+     *  adds new comments. Model arg handling is identical to
+     *  [executeReviewPerformCommand] (via [executeMultiModelReview]).
+     *
+     *  ## Reply preservation safety net
+     *
+     *  After the LLM finishes and [refreshReviewFiles] re-reads the `.review/` files,
+     *  the plugin verifies no pre-existing replies were dropped by the LLM's file
+     *  rewrite and re-merges any that were via [ReviewCommentManager.restoreMissingReplies].
+     *  This is a structural guarantee independent of prompt compliance — see TDD §4. */
+    fun executeReviewRecheckCommand(args: String = "") {
+        scope.launch {
+            val manager = ReviewCommentManager.getInstance(project)
+            val preRecheckIndex = manager.getIndex()
+            val replySnapshot = manager.snapshotReplyIds(preRecheckIndex)
+            val changedFiles = withContext(Dispatchers.IO) {
+                runReadActionBlocking {
+                    gitService.getChangedFiles()
+                }
+            }
+            val changedPaths = changedFiles.map { it.filePath }
+            val prompt = ReviewSkill.buildRecheckPrompt(preRecheckIndex, changedPaths)
+            executeMultiModelReview(args, prompt)
+            // After the LLM writes updated .review/ files, refresh the index
+            // and WAIT for loadAll() to finish before checking for dropped replies.
+            // The restore reads stateHolder.value which must reflect the post-LLM state.
+            refreshReviewFiles().join()
+            // Structural safety net: re-merge any replies the LLM dropped.
+            val restored = manager.restoreMissingReplies(replySnapshot, preRecheckIndex)
+            if (restored > 0) {
+                logger.warn { "[ACP] /review-recheck restored $restored dropped reply(ies)" }
+                refreshReviewFiles()
+            }
+        }
+    }
+
     /** Trigger a VFS refresh AND a direct disk re-read so the [ReviewCommentManager]
      *  picks up any new `.review/` JSON files written by the LLM agent.
      *
@@ -982,16 +1020,17 @@ class ChatViewModel(
      *
      *  Without this, gutter icons and highlights don't appear after `/review-perform`
      *  until the user manually refreshes (Ctrl+Alt+Y) or restarts the IDE. */
-    private fun refreshReviewFiles() {
+    private fun refreshReviewFiles(): kotlinx.coroutines.Job {
         // 1. Direct disk re-read — reads ALL .review/ files via java.nio.file.Files.walk(),
         // bypassing VFS entirely. This is the reliable primary path: even if VFS hasn't
         // discovered a newly-created .review/ subdirectory, loadAll() still picks it up.
         // Runs on ReviewCommentManager's internal scope (Dispatchers.Default) — non-blocking.
         val manager = com.opencode.acp.review.ReviewCommentManager.getInstance(project)
-        manager.scope.launch { manager.loadAll() }
+        val job = manager.scope.launch { manager.loadAll() }
         // 2. Trigger VFS refresh so the ReviewCommentFileWatcher's AsyncFileListener
         // can do incremental re-reads for any later changes (secondary path).
         com.intellij.openapi.vfs.VirtualFileManager.getInstance().asyncRefresh(null)
+        return job
     }
 
     /** Get messages StateFlow for a child session (used by ToolPill for task pills). */

@@ -23,6 +23,7 @@ data class ReviewComment(
     val revisionLabel: String? = null,
     val resolvedAt: String? = null,
     val resolution: String? = null,
+    val replies: List<ReviewReply> = emptyList(),
 ) {
     /** Validate constraints that must hold before write.
      *  Includes format validation for the comment ID to catch malformed entries
@@ -30,12 +31,45 @@ data class ReviewComment(
     fun validate(): Boolean =
         id.isNotBlank() && id.matches(Regex("^cmt_[0-9a-fA-F]{12}$")) &&
             startLine >= 1 && endLine >= startLine && endLine <= 10_000_000 &&
-            comment.isNotBlank()
+            comment.isNotBlank() &&
+            replies.all { it.validate() }
 
     companion object {
         /** Generate a fresh comment ID: `cmt_` + 12 hex chars (matches the TDD schema). */
         fun generateId(): String =
             "cmt_" + java.util.UUID.randomUUID().toString().replace("-", "").take(12)
+    }
+}
+
+/**
+ * A reply to a review comment. Flat (one level deep — no nested replies).
+ *
+ * Replies are stored in the `replies` array on the parent [ReviewComment].
+ * User-authored replies (`author = "user"`) are deletable from the UI;
+ * LLM-authored replies (`author = "ai-review"`) represent the re-review
+ * verdict and are not user-deletable.
+ *
+ * JSON schema (additive — existing `.review/` files without `replies` parse
+ * with `replies = emptyList()` via kotlinx.serialization defaults):
+ * ```json
+ * { "id": "rpl_8e7f6d5c4b3a", "author": "user", "text": "...", "createdAt": "..." }
+ * ```
+ */
+@Serializable
+data class ReviewReply(
+    val id: String,
+    val author: String = "user",
+    val text: String,
+    val createdAt: String = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString(),
+) {
+    /** Validate the reply ID format (`rpl_` + 12 hex chars) and non-blank text. */
+    fun validate(): Boolean =
+        id.isNotBlank() && id.matches(Regex("^rpl_[0-9a-fA-F]{12}$")) && text.isNotBlank()
+
+    companion object {
+        /** Generate a fresh reply ID: `rpl_` + 12 hex chars (parallel to `cmt_` for comments). */
+        fun generateId(): String =
+            "rpl_" + java.util.UUID.randomUUID().toString().replace("-", "").take(12)
     }
 }
 

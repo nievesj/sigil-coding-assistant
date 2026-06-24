@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.Composable
@@ -471,7 +472,8 @@ private fun ChangedFileRow(
 /**
  * A single child row under a file row, representing one open review comment.
  * Shows the severity icon and a brief (1-line) message; click navigates to
- * the comment's location in the editor.
+ * the comment's location in the editor. When the comment has replies, a reply
+ * count badge is shown; clicking it expands/collapses the reply thread.
  */
 @Composable
 private fun ReviewCommentChildRow(
@@ -479,37 +481,84 @@ private fun ReviewCommentChildRow(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var repliesExpanded by remember(comment.id) { mutableStateOf(false) }
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
     val hoverBg = ChatTheme.colors.component.hoverBg
 
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(start = 40.dp)
-            .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
-            .background(if (isHovered) hoverBg else Color.Transparent)
-            .hoverable(interactionSource)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 3.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        // Severity icon
-        Icon(
-            key = severityIconKey(comment.severity),
-            contentDescription = comment.severity.name,
-            modifier = Modifier.size(12.dp),
-            tint = Color.Unspecified
-        )
-        Spacer(Modifier.width(6.dp))
-        // Brief message — 1 line, ellipsized
-        Text(
-            text = comment.comment,
-            fontSize = ChatTheme.fonts.reviewStatusLabel,
-            color = ChatTheme.colors.text.secondary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 40.dp)
+                .clip(ChatTheme.shapes.fileChangeRowCornerRadius)
+                .background(if (isHovered) hoverBg else Color.Transparent)
+                .hoverable(interactionSource)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Severity icon
+            Icon(
+                key = severityIconKey(comment.severity),
+                contentDescription = comment.severity.name,
+                modifier = Modifier.size(12.dp),
+                tint = Color.Unspecified
+            )
+            Spacer(Modifier.width(6.dp))
+            // Brief message — 1 line, ellipsized
+            Text(
+                text = comment.comment,
+                fontSize = ChatTheme.fonts.reviewStatusLabel,
+                color = ChatTheme.colors.text.secondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            // Reply count badge — click toggles the reply thread
+            if (comment.replies.isNotEmpty()) {
+                Spacer(Modifier.width(6.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0x1AFFFFFF))
+                        .clickable { repliesExpanded = !repliesExpanded }
+                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                ) {
+                    Text(
+                        text = "${comment.replies.size} reply(ies)",
+                        fontSize = ChatTheme.fonts.reviewStatusLabel,
+                        color = ChatTheme.colors.text.secondary,
+                    )
+                }
+            }
+        }
+        // Expandable reply thread
+        if (repliesExpanded && comment.replies.isNotEmpty()) {
+            Column(modifier = Modifier.padding(start = 56.dp, end = 6.dp)) {
+                for (reply in comment.replies) {
+                    Row(
+                        modifier = Modifier.padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "${reply.author}:",
+                            fontSize = ChatTheme.fonts.reviewStatusLabel,
+                            color = ChatTheme.colors.text.secondary,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = reply.text,
+                            fontSize = ChatTheme.fonts.reviewStatusLabel,
+                            color = ChatTheme.colors.text.secondary,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
