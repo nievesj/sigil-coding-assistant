@@ -21,7 +21,7 @@ The bigger problem I have with coding assistants is that they tend to take the w
 - **Context panel** - See how much context you're using, what model is active, and a rough cost breakdown.
 - **Code review** - The plugin can request reviews from the OpenCode server and show the results both in a dedicated Review tab and as inline comments in the editor gutter. You can resolve, reply to, or delete review comments directly from the editor.
 - **Slash commands** - Type `/` in the input to trigger commands like `/clear` and `/cancel`, plus any commands exposed by the connected OpenCode server.
-- **Tool permissions and MCP support** - Connect to MCP servers and pick which tools the agent is allowed to call.
+- **Tool permissions and MCP support** - Connect to MCP servers and pick which tools the agent is allowed to call. There's also built-in support for registering IntelliJ's own bundled MCP server, so the agent can call IDE actions and tools.
 
 <div align="center">
 
@@ -106,18 +106,4 @@ This plugin uses [Jewel](https://github.com/JetBrains/jewel), JetBrains' Compose
 
 ## Installing
 
-Build the plugin with Gradle, then install the resulting ZIP through **Settings → Plugins → Install Plugin from Disk**.
-
-```bash
-./gradlew buildPlugin
-```
-
-The plugin ZIP will be under `build/distributions/`.
-
-## Running from source
-
-```bash
-./gradlew runIde
-```
-
-Logs for `runIde` go to the sandbox directory, not the main IDEA log. See `AGENTS.md` in this repo for the exact path and other dev notes.
+Download the latest ZIP from the [GitHub releases](https://github.com/nievesj/intellij-opencode-plugin/releases) page or install it from the JetBrains Marketplace, then install it through **Settings → Plugins → Install Plugin from Disk**.
