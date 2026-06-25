@@ -28,9 +28,10 @@ import java.io.InputStreamReader
 
 private val logger = KotlinLogging.logger {}
 
-/** Debug log helper — uses logger so output goes to idea.log, not a temp file. */
+/** Debug log helper — uses logger so output goes to idea.log, not a temp file.
+ *  Uses DEBUG level (not INFO) to avoid leaking prompt content in default logs. */
 private fun debugLog(msg: String) {
-    logger.info { "[ACP-SSE] $msg" }
+    logger.debug { "[ACP-SSE] $msg" }
 }
 
 /**

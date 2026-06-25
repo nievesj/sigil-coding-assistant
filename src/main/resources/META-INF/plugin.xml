@@ -1,9 +1,58 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<idea-plugin require-restart="true">
+<idea-plugin require-restart="true" version="1.0.0">
     <id>com.opencode.plugin</id>
+    <idea-version since-build="261" until-build="263.*"/>
     <name>OpenCode Plugin</name>
-    <vendor>OpenCode</vendor>
-    <description>AI-assisted development plugin for IntelliJ IDEA.</description>
+    <vendor url="https://opencode.ai" email="support@opencode.ai">OpenCode</vendor>
+    <description><![CDATA[
+        <p>An <a href="https://opencode.ai/">OpenCode</a> plugin for IntelliJ IDEA that integrates AI-assisted development directly into the IDE — not just a thin CLI wrapper.</p>
+
+        <h3>Features</h3>
+        <ul>
+            <li><b>AI chat inside the IDE</b> — Ask questions, paste code, attach files, and get answers in a side panel. Responses render markdown, code blocks, and inline tool usage.</li>
+            <li><b>Sessions</b> — Keep conversations organized. Each session tracks its own token usage and estimated cost.</li>
+            <li><b>Context panel</b> — See how much context you're using, what model is active, and a rough cost breakdown.</li>
+            <li><b>Code review</b> — Request reviews from the OpenCode server and see results in a dedicated Review tab and as inline editor gutter comments. Resolve, reply to, or delete comments directly from the editor.</li>
+            <li><b>Slash commands</b> — Type <code>/</code> in the input to trigger commands like <code>/clear</code> and <code>/cancel</code>, plus any commands exposed by the connected OpenCode server.</li>
+            <li><b>Tool permissions and MCP support</b> — Connect to MCP servers and pick which tools the agent is allowed to call. Built-in support for registering IntelliJ's own bundled MCP server.</li>
+        </ul>
+
+        <h3>Requirements</h3>
+        <ul>
+            <li>IntelliJ IDEA 2026.1 or newer.</li>
+            <li>The <code>opencode</code> CLI installed and available on your system PATH, or configured in the plugin settings (Settings → Tools → OpenCode).</li>
+        </ul>
+
+        <h3>How it works</h3>
+        <p>The plugin launches a local <code>opencode serve</code> process and communicates with it via HTTP REST and SSE on localhost. All network traffic stays on your machine — no data is sent to external servers by the plugin itself.</p>
+
+        <h3>Review workflow</h3>
+        <p>The review feature stores comments as JSON files under <code>.review/</code> in your project. Comments track a line range, message, severity, and status. Because the comments live in the repo as regular files, they can be committed alongside the code — a branch can carry its own review state.</p>
+        <ul>
+            <li><code>/review</code> — asks OpenCode to review the current change and write review comments.</li>
+            <li><code>/review-perform</code> — runs a stricter, adversarial review.</li>
+            <li><code>/review-resolve</code> — sends open comments to the agent and asks it to fix the code.</li>
+            <li><code>/review-recheck</code> — re-runs the review with awareness of existing comments and replies.</li>
+        </ul>
+
+        <h3>UI</h3>
+        <p>Built with <a href="https://github.com/JetBrains/jewel">Jewel</a>, JetBrains' Compose-based UI toolkit for IntelliJ plugins, so it looks at home in Darcula, New UI, or any custom theme.</p>
+    ]]></description>
+
+    <change-notes><![CDATA[
+        <h3>1.0.0</h3>
+        <ul>
+            <li>Initial public release.</li>
+            <li>AI chat with SSE streaming, markdown rendering, and inline tool usage display.</li>
+            <li>Session management with token usage and cost tracking.</li>
+            <li>Context panel showing model, token breakdown, and cost.</li>
+            <li>Code review with inline editor gutter comments and Review tab.</li>
+            <li>Slash command palette with local and server commands.</li>
+            <li>MCP server integration with tool permissions.</li>
+            <li>File and image attachments.</li>
+            <li>Configurable server port, log level, and binary path.</li>
+        </ul>
+    ]]></change-notes>
 
     <dependencies>
         <plugin id="com.intellij.modules.platform"/>
