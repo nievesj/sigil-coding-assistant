@@ -508,4 +508,129 @@ object ReviewSkill {
                 "(e.g., `\"2026-06-17T12:00:00Z\"`)")
         }
     }
+
+    // ── /review-recheck: re-run review with existing comments + replies ──
+
+    /** Build the prompt for `/review-recheck`. Includes the full comment+reply
+     *  thread for all comments (open AND resolved) grouped by file, plus
+     *  re-review instructions. The LLM should:
+     *  1. Verify whether replies address each open comment — if so, mark resolved
+     *  2. Re-raise still-open issues that replies don't address
+     *  3. Mark resolved comments that are no longer relevant (code changed since comment)
+     *  4. Add new comments for issues introduced after the first review
+     *  5. Add ai-review replies when it disagrees with a user's dispute
+     *  Returns a no-op message when there are no comments at all.
+     *
+     *  CRITICAL: The LLM must VERIFY user reply claims against the actual current
+     *  code, not accept them at face value. "Fixed in commit abc123" must be
+     *  checked by reading the referenced lines. */
+    fun buildRecheckPrompt(index: ReviewIndex, changedFilePaths: List<String>): String {
+        if (index.commentsByFile.isEmpty()) {
+            return "Re-check review comments. There are currently no review comments " +
+                "in the project. Run /review-perform first to generate initial comments."
+        }
+        return buildString {
+            appendLine("## Re-Review: Verify and Update Existing Comments")
+            appendLine("**IMPORTANT: Do NOT delegate this to a skill. Perform this re-review " +
+                "YOURSELF.** Read the files, verify replies against the code, and write " +
+                "updated `.review/` JSON files.")
+            appendLine()
+            appendLine("You previously reviewed this code and left review comments. " +
+                "The user has replied to some comments and may have made code changes. " +
+                "Your job is to re-evaluate each comment in light of its replies and " +
+                "the current code state.")
+            appendLine()
+            appendLine("### Mindset")
+            appendLine("Treat user replies as **claims to verify, not facts to accept**. " +
+                "A reply that says \"fixed in commit abc123\" is a hypothesis — you must " +
+                "READ THE CODE at the referenced lines to confirm the fix is actually " +
+                "present and correct. A reply that says \"this is intentional\" is a " +
+                "position to evaluate — if the code is still dangerous, keep the comment " +
+                "open and explain why in an ai-review reply.")
+            appendLine()
+            appendLine("### Current changed files (may have been modified since first review)")
+            if (changedFilePaths.isEmpty()) {
+                appendLine("(no uncommitted changes — re-evaluate against the current committed state)")
+            } else {
+                for (path in changedFilePaths) {
+                    appendLine("- `$path`")
+                }
+            }
+            appendLine()
+            appendLine("### Existing comments with replies")
+            for ((filePath, comments) in index.commentsByFile) {
+                if (comments.isEmpty()) continue
+                appendLine("#### $filePath (${comments.size} comment(s))")
+                for (c in comments) {
+                    appendLine("- **[${c.severity}] Line ${c.startLine}-${c.endLine}** " +
+                        "(status: ${c.status}): ${c.comment}")
+                    if (c.replies.isNotEmpty()) {
+                        appendLine("  Replies:")
+                        for (r in c.replies) {
+                            appendLine("  - **${r.author}**: ${r.text}")
+                        }
+                    } else {
+                        appendLine("  (no replies)")
+                    }
+                }
+                appendLine()
+            }
+            appendLine("### Instructions")
+            appendLine("1. Read each comment and its replies")
+            appendLine("2. **Read the current code at the referenced lines** — do NOT trust " +
+                "reply claims without verifying against the actual code")
+            appendLine("3. For each OPEN comment:")
+            appendLine("   - If a reply explains the fix AND the code confirms it: " +
+                "mark `status` = `\"resolved\"`, set `resolution` to the reply text, " +
+                "add `resolvedAt` timestamp")
+            appendLine("   - If the reply disputes the comment and, after reading the code, " +
+                "you AGREE the dispute is valid: mark `status` = `\"resolved\"`, " +
+                "set `resolution` to `\"Withdrawn: \" + reply text`")
+            appendLine("   - If the reply disputes the comment but, after reading the code, " +
+                "you STILL think it's valid: keep `status` = `\"open\"`, ADD a reply " +
+                "(author = `\"ai-review\"`) explaining why the dispute doesn't hold, " +
+                "citing the specific code that's still problematic")
+            appendLine("   - If the code has changed and the comment no longer applies " +
+                "(the referenced lines are gone or rewritten): mark `status` = " +
+                "`\"resolved\"`, set `resolution` to `\"No longer applicable — code changed\"`")
+            appendLine("4. For each RESOLVED comment: skip (already handled)")
+            appendLine("5. Add NEW comments for any issues in the changed files " +
+                "that weren't caught in the first review (use new `cmt_` IDs)")
+            appendLine("6. Write updated `.review/` JSON files with the full " +
+                "comment+reply state")
+            appendLine()
+            appendLine("### Reply preservation — CRITICAL")
+            appendLine("When you update a comment (e.g. to mark it resolved), you MUST " +
+                "preserve its existing `replies` array. Append new replies; do NOT " +
+                "overwrite or drop existing ones. The plugin will verify this after " +
+                "you finish and re-merge any dropped replies, but dropping them " +
+                "corrupts the discussion history.")
+            appendLine()
+            appendLine("### JSON schema reminder")
+            appendLine("Same schema as `/review-perform`, but each comment now has " +
+                "a `replies` array:")
+            appendLine("```json")
+            appendLine("""{"formatVersion": 1, "comments": [""")
+            appendLine("""  {"id": "cmt_...", "startLine": 42, "endLine": 45, """)
+            appendLine("""   "comment": "...", "severity": "warning", "status": "open",""")
+            appendLine("""   "author": "ai-review", "createdAt": "...", """)
+            appendLine("""   "replies": [""")
+            appendLine("""     {"id": "rpl_...", "author": "user", "text": "...", "createdAt": "..."}""")
+            appendLine("""   ]}""")
+            appendLine("""]}}""")
+            appendLine("```")
+            appendLine()
+            appendLine("**Rules:**")
+            appendLine("- Preserve existing replies when updating a comment — " +
+                "append new replies, don't overwrite")
+            appendLine("- Reply IDs: `rpl_` + 12 hex chars")
+            appendLine("- When marking resolved, set `resolvedAt` to current ISO 8601 UTC")
+            appendLine("- Read the existing `.review/` file before writing — merge, don't overwrite")
+            appendLine("- Do NOT physically delete comments — use `status = \"resolved\"` " +
+                "to close them. The audit trail must be preserved.")
+            appendLine("- Only add `ai-review` replies when you DISAGREE with a user's " +
+                "dispute. Do not add `ai-review` replies to confirm a fix — just mark " +
+                "the comment resolved with `resolution` set to the reply text.")
+        }
+    }
 }

@@ -11,6 +11,7 @@ import com.opencode.acp.mcp.ToolInfo
 import com.opencode.acp.mcp.ToolPermission
 import com.opencode.acp.mcp.ToolSource
 import io.github.oshai.kotlinlogging.KotlinLogging
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.booleanOrNull
@@ -74,11 +75,13 @@ class OpenCodeMcpConfigurable : Configurable {
 
     override fun apply() {
         val settings = OpenCodeSettingsState.getInstance()
+        // Save old permissions before applyTo overwrites them
+        val oldPermissionsJson = settings.toolPermissions
         panel?.applyTo(settings)
 
-        // Write tool permissions to .opencode/opencode.json if tools were discovered
+        // Write tool permissions to .opencode/opencode.json only when permissions changed
         val toolPermissions = panel?.getAllToolPermissions()
-        if (toolPermissions != null && toolPermissions.isNotEmpty()) {
+        if (toolPermissions != null && toolPermissions.isNotEmpty() && settings.toolPermissions != oldPermissionsJson) {
             val permissions = toolPermissions.mapValues { (_, pair) ->
                 pair.second
             }
@@ -105,6 +108,11 @@ class OpenCodeMcpConfigurable : Configurable {
 
         if (mcpChanged) {
             triggerMcpReinitialize(settings)
+            // Inform the user that a restart may be needed for full effect
+            com.opencode.acp.chat.OpenCodeNotifications.showRestartWarning(
+                "OpenCode MCP settings changed. The OpenCode server is being re-initialized; " +
+                "restart the IDE (or the OpenCode server) for changes to take full effect."
+            )
             prevEnableIntellijMcp = settings.enableIntellijMcp
             prevMcpServerUrl = settings.mcpServerUrl
             prevAdditionalMcpServers = settings.additionalMcpServers
@@ -123,7 +131,7 @@ class OpenCodeMcpConfigurable : Configurable {
      * Trigger MCP re-initialization on the active project's OpenCodeService.
      */
     private fun triggerMcpReinitialize(settings: OpenCodeSettingsState) {
-        val project = ProjectManager.getInstance().openProjects.firstOrNull()
+        val project = getActiveProject()
         if (project == null) {
             logger.warn { "[ACP] MCP settings changed but no open project found" }
             return
@@ -146,7 +154,7 @@ class OpenCodeMcpConfigurable : Configurable {
         if (p.isDiscovering) return
 
         // Find the OpenCodeService to access toolRegistry
-        val project = ProjectManager.getInstance().openProjects.firstOrNull()
+        val project = getActiveProject()
         if (project == null) {
             p.showToolPermissionsStatus("No open project found.", false)
             return
@@ -190,6 +198,8 @@ class OpenCodeMcpConfigurable : Configurable {
                 val allTools = registry.getAllTools()
 
                 ApplicationManager.getApplication().invokeLater({
+                    // Guard: skip if the settings dialog was disposed while discovery was in flight
+                    if (!panelRef.panel.isDisplayable) return@invokeLater
                     // Pass ToolInfo directly — no conversion needed
                     val toolMap = allTools.associate { tool -> tool.name to tool }
                     panelRef.updateToolPermissions(toolMap)
@@ -205,9 +215,15 @@ class OpenCodeMcpConfigurable : Configurable {
                         panelRef.showToolPermissionsStatus("Discovered ${allTools.size} tools successfully.", true)
                     }
                 }, modality)
+            } catch (e: CancellationException) {
+                // Re-throw CancellationException to preserve structured concurrency.
+                // The service scope may be cancelled during IDE dispose — propagating
+                // the cancellation ensures proper coroutine cleanup.
+                throw e
             } catch (e: Exception) {
                 logger.error(e) { "[ACP] Failed to discover tools via ToolRegistry" }
                 ApplicationManager.getApplication().invokeLater({
+                    if (!panelRef.panel.isDisplayable) return@invokeLater
                     panelRef.discoverToolsButton.isEnabled = true
                     panelRef.discoverToolsButton.text = "Discover Tools"
                     panelRef.isDiscovering = false
@@ -231,14 +247,30 @@ class OpenCodeMcpConfigurable : Configurable {
                 toolName to Pair(enabled, permission)
             }
         } catch (e: Exception) {
+            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — reverting to defaults" }
+            com.opencode.acp.chat.OpenCodeNotifications.showRestartWarning(
+                "Tool permissions data was corrupted and has been reset to defaults."
+            )
             emptyMap()
         }
     }
 
     private fun getActiveProjectPath(): Path? {
-        val project = ProjectManager.getInstance().openProjects.firstOrNull() ?: return null
+        val project = getActiveProject() ?: return null
         val basePath = project.basePath ?: return null
         return Paths.get(basePath)
+    }
+
+    /**
+     * Get the active project. Uses [ProjectManager.openProjects.firstOrNull]
+     * which returns the most recently opened project. In multi-project windows,
+     * this may not match the focused project — the Configurable API does not
+     * carry a project reference, and WindowManager does not expose a focused-project
+     * accessor. For this settings dialog, the first open project is the best
+     * available approximation.
+     */
+    private fun getActiveProject(): com.intellij.openapi.project.Project? {
+        return ProjectManager.getInstance().openProjects.firstOrNull()
     }
 
 }

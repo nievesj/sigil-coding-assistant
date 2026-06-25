@@ -11,6 +11,7 @@ import com.intellij.ui.JBColor
 import com.intellij.util.ui.FormBuilder
 import java.awt.event.ActionListener
 import javax.swing.JButton
+import javax.swing.JComboBox
 import javax.swing.JPanel
 
 class OpenCodeSettingsPanel {
@@ -20,7 +21,8 @@ class OpenCodeSettingsPanel {
             TextBrowseFolderListener(
                 FileChooserDescriptor(true, false, false, false, false, false)
                     .withTitle("Select OpenCode Binary")
-                    .withDescription("Choose the opencode executable")
+                    .withDescription("Choose the opencode executable"),
+                null  // no project context needed (binary path is global)
             )
         )
     }
@@ -55,6 +57,13 @@ class OpenCodeSettingsPanel {
     val longTimeoutBufferField: JBTextField = JBTextField("30", 5).apply {
         toolTipText = "Buffer time (in seconds) added to response timeout for LLM-backed commands " +
             "(e.g., /review, /init). Accounts for server overhead. Default: 30. Minimum: 10."
+    }
+
+    /** Tool stuck timeout — max seconds a tool can run with no SSE activity before abort. */
+    val toolStuckTimeoutField: JBTextField = JBTextField("300", 5).apply {
+        toolTipText = "Maximum time (in seconds) a single tool call can run with no SSE activity " +
+            "before being considered stuck. Safety net for lost tool results. Default: 300 (5 min). " +
+            "Range: 60-3600."
     }
 
     /** Inline code text color — hex string like "#6BBE50" */
@@ -112,6 +121,14 @@ class OpenCodeSettingsPanel {
             "When disabled, disconnect happens immediately."
     }
 
+    /** Plugin log level — controls verbosity of [ACP] logs in idea.log. */
+    val logLevelCombo: JComboBox<String> = JComboBox(AcpLogLevel.entries.map { it.name }.toTypedArray()).apply {
+        toolTipText = "Controls verbosity of [ACP] plugin logs in idea.log.\n" +
+            "OFF = silent, ERROR = errors only, WARN = warnings+, INFO = normal (default),\n" +
+            "DEBUG = verbose diagnostics (SSE events, tool calls, session state),\n" +
+            "TRACE = everything, ALL = no filtering."
+    }
+
     private fun toolKindLabel(kind: ToolKind): String = when (kind) {
         ToolKind.EXECUTE -> "Shell (Execute)"
         ToolKind.EDIT -> "Edit (Write)"
@@ -155,6 +172,7 @@ class OpenCodeSettingsPanel {
         .addLabeledComponent("Command history size:", commandHistorySizeField, 5)
         .addLabeledComponent("Response timeout (seconds):", responseTimeoutField, 5)
         .addLabeledComponent("Long timeout buffer (seconds):", longTimeoutBufferField, 5)
+        .addLabeledComponent("Tool stuck timeout (seconds):", toolStuckTimeoutField, 5)
         .addSeparator(5)
         .addLabeledComponent("Inline code color:", inlineCodeColorField, 5)
         .addComponentToRightColumn(inlineCodeColorButton)
@@ -165,10 +183,12 @@ class OpenCodeSettingsPanel {
         .addComponent(queueInsteadOfSteerCheckbox)
         .addComponent(showDisconnectCheckbox)
         .addSeparator(5)
+        .addLabeledComponent("Plugin log level:", logLevelCombo, 5)
+        .addSeparator(5)
         .addTooltip("Tool pills expanded by default:")
         .apply { 
             ToolKind.entries.forEach { kind ->
-                addComponent(toolKindCheckboxes[kind]!!)
+                addComponent(toolKindCheckboxes.getValue(kind))
             }
             addComponent(expandTaskPillsCheckbox)
         }
@@ -182,50 +202,102 @@ class OpenCodeSettingsPanel {
         commandHistorySizeField.text = settings.commandHistorySize.toString()
         responseTimeoutField.text = settings.responseTimeoutSeconds.toString()
         longTimeoutBufferField.text = settings.longTimeoutBufferSeconds.toString()
+        toolStuckTimeoutField.text = settings.toolStuckTimeoutSeconds.toString()
         inlineCodeColorField.text = settings.inlineCodeColor
         listNumberColorField.text = settings.listNumberColor
         loadAllSessionsCheckbox.isSelected = settings.loadAllSessions
         queueInsteadOfSteerCheckbox.isSelected = settings.queueInsteadOfSteer
         showDisconnectCheckbox.isSelected = settings.showDisconnectConfirmation
+        logLevelCombo.selectedItem = AcpLogLevel.fromName(settings.logLevel).name
         // Initialize ToolKind checkboxes from settings
         ToolKind.entries.forEach { kind ->
-            toolKindCheckboxes[kind]!!.isSelected = settings.isToolKindDefaultExpanded(kind)
+            toolKindCheckboxes.getValue(kind).isSelected = settings.isToolKindDefaultExpanded(kind)
         }
         expandTaskPillsCheckbox.isSelected = settings.expandTaskPillsByDefault
     }
 
     fun applyTo(settings: OpenCodeSettingsState) {
-        settings.binaryPath = binaryPathField.text.trim()
+        // Validate numeric fields and warn on invalid input
+        val invalidFields = mutableListOf<String>()
+        if (portField.text.trim().toIntOrNull() == null && portField.text.trim().isNotBlank()) invalidFields.add("Server port")
+        if (timeoutField.text.trim().toIntOrNull() == null && timeoutField.text.trim().isNotBlank()) invalidFields.add("Permission timeout")
+        if (commandHistorySizeField.text.trim().toIntOrNull() == null && commandHistorySizeField.text.trim().isNotBlank()) invalidFields.add("Command history size")
+        if (responseTimeoutField.text.trim().toIntOrNull() == null && responseTimeoutField.text.trim().isNotBlank()) invalidFields.add("Response timeout")
+        if (longTimeoutBufferField.text.trim().toIntOrNull() == null && longTimeoutBufferField.text.trim().isNotBlank()) invalidFields.add("Long timeout buffer")
+        if (toolStuckTimeoutField.text.trim().toIntOrNull() == null && toolStuckTimeoutField.text.trim().isNotBlank()) invalidFields.add("Tool stuck timeout")
+        val port = portField.text.trim().toIntOrNull()
+        if (port != null && port !in 1024..65535) invalidFields.add("Server port (must be 1024-65535)")
+        if (invalidFields.isNotEmpty()) {
+            showStatus("Invalid values in: ${invalidFields.joinToString(", ")} — using defaults", false)
+            // Reset invalid fields to their coerced values so the UI matches what will be applied.
+            // Without this, the invalid text remains in the field and isModified() produces
+            // confusing results on the next check.
+            portField.text = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535)?.toString() ?: "4096"
+            timeoutField.text = timeoutField.text.trim().toIntOrNull()?.coerceIn(5, 300)?.toString() ?: "60"
+            commandHistorySizeField.text = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100)?.toString() ?: "15"
+            responseTimeoutField.text = responseTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600)?.toString() ?: "300"
+            longTimeoutBufferField.text = longTimeoutBufferField.text.trim().toIntOrNull()?.coerceAtLeast(10)?.toString() ?: "30"
+            toolStuckTimeoutField.text = toolStuckTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600)?.toString() ?: "300"
+        }
+
+        val binPath = binaryPathField.text.trim()
+        if (binPath.isNotBlank()) {
+            val file = java.io.File(binPath)
+            if (!file.exists()) {
+                showStatus("Warning: '$binPath' does not exist", false)
+            } else if (System.getProperty("os.name").lowercase().contains("win")) {
+                // On Windows, canExecute() is unreliable (always true for readable files).
+                // Check the file extension instead.
+                val ext = file.extension.lowercase()
+                if (ext !in listOf("exe", "bat", "cmd", "ps1")) {
+                    showStatus("Warning: '$binPath' may not be an executable (expected .exe, .bat, .cmd, or .ps1)", false)
+                }
+            } else if (!file.canExecute()) {
+                showStatus("Warning: '$binPath' may not be executable", false)
+            }
+        }
+        settings.binaryPath = binPath
         settings.port = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535) ?: 4096
-        settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: 60
+        settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull()?.coerceIn(5, 300) ?: 60
         settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
         settings.responseTimeoutSeconds = responseTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600) ?: 300
         settings.longTimeoutBufferSeconds = longTimeoutBufferField.text.trim().toIntOrNull()?.coerceAtLeast(10) ?: 30
-        settings.inlineCodeColor = inlineCodeColorField.text.trim()
-        settings.listNumberColor = listNumberColorField.text.trim()
+        settings.toolStuckTimeoutSeconds = toolStuckTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600) ?: 300
+        settings.inlineCodeColor = validateHexColor(inlineCodeColorField.text.trim(), settings.inlineCodeColor)
+        settings.listNumberColor = validateHexColor(listNumberColorField.text.trim(), settings.listNumberColor)
         settings.loadAllSessions = loadAllSessionsCheckbox.isSelected
         settings.queueInsteadOfSteer = queueInsteadOfSteerCheckbox.isSelected
         settings.showDisconnectConfirmation = showDisconnectCheckbox.isSelected
+        val selectedLevel = logLevelCombo.selectedItem as? String
+        settings.logLevel = if (selectedLevel != null && AcpLogLevel.entries.any { it.name == selectedLevel }) selectedLevel else "INFO"
         // Persist ToolKind expansion defaults
-        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }
+        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes.getValue(it).isSelected }.map { it.name }
         settings.expandedToolKinds = expandedKinds.joinToString(",")
         settings.expandTaskPillsByDefault = expandTaskPillsCheckbox.isSelected
     }
 
     fun isModified(settings: OpenCodeSettingsState): Boolean {
-        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes[it]!!.isSelected }.map { it.name }.toSet()
+        val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes.getValue(it).isSelected }.map { it.name }.toSet()
         val currentExpandedKinds = settings.expandedToolKinds.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        // For numeric fields: a non-parseable value is always "modified" so that
+        // Apply is enabled and applyTo can coerce/reset it.
+        fun isNumericModified(field: JBTextField, current: Int, default: Int): Boolean {
+            val parsed = field.text.trim().toIntOrNull()
+            return if (parsed != null) parsed != current else field.text.trim().isNotEmpty()
+        }
         return binaryPathField.text.trim() != settings.binaryPath ||
-                (portField.text.trim().toIntOrNull() ?: 4096) != settings.port ||
-                (timeoutField.text.trim().toIntOrNull() ?: 60) != settings.permissionTimeoutSeconds ||
-                (commandHistorySizeField.text.trim().toIntOrNull() ?: 15) != settings.commandHistorySize ||
-                (responseTimeoutField.text.trim().toIntOrNull() ?: 300) != settings.responseTimeoutSeconds ||
-                (longTimeoutBufferField.text.trim().toIntOrNull() ?: 30) != settings.longTimeoutBufferSeconds ||
+                isNumericModified(portField, settings.port, 4096) ||
+                isNumericModified(timeoutField, settings.permissionTimeoutSeconds, 60) ||
+                isNumericModified(commandHistorySizeField, settings.commandHistorySize, 15) ||
+                isNumericModified(responseTimeoutField, settings.responseTimeoutSeconds, 300) ||
+                isNumericModified(longTimeoutBufferField, settings.longTimeoutBufferSeconds, 30) ||
+                isNumericModified(toolStuckTimeoutField, settings.toolStuckTimeoutSeconds, 300) ||
                 inlineCodeColorField.text.trim() != settings.inlineCodeColor ||
                 listNumberColorField.text.trim() != settings.listNumberColor ||
                 loadAllSessionsCheckbox.isSelected != settings.loadAllSessions ||
                 queueInsteadOfSteerCheckbox.isSelected != settings.queueInsteadOfSteer ||
                 showDisconnectCheckbox.isSelected != settings.showDisconnectConfirmation ||
+                (logLevelCombo.selectedItem as? String ?: "INFO") != settings.logLevel ||
                 expandedKinds != currentExpandedKinds ||
                 expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault
     }
@@ -241,12 +313,21 @@ class OpenCodeSettingsPanel {
     }
 
     companion object {
+        private val HEX_COLOR_REGEX = Regex("^#[0-9A-Fa-f]{6}$")
+
+        /** Validate hex color format. Returns [fallback] if invalid. */
+        private fun validateHexColor(value: String, fallback: String): String =
+            if (value.matches(HEX_COLOR_REGEX)) value else fallback
+
         private fun parseColor(hex: String): java.awt.Color {
             if (hex.isBlank()) return java.awt.Color(60, 60, 60)
             val clean = hex.removePrefix("#")
+            if (clean.length != 6) return java.awt.Color(60, 60, 60)
             return try {
                 java.awt.Color(clean.toInt(16))
-            } catch (_: Exception) {
+            } catch (e: NumberFormatException) {
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                    .debug(e) { "[ACP] Failed to parse hex color: $hex" }
                 java.awt.Color(60, 60, 60)
             }
         }

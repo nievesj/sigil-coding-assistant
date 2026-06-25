@@ -306,11 +306,23 @@ sealed interface SseEvent {
      * This event is NOT produced by the SSE parser — it is only enqueued by
      * [SessionState.createAssistantMessage] when called from a non-event-processing
      * coroutine.
+     *
+     * When [newTurnMessageId] is non-null, the event carries the identity of the
+     * freshly-created turn so the event-processing coroutine can apply it
+     * atomically after clearing stale state. This eliminates the window where
+     * [ProcessorContext.activeMessageId] is null between the reset and the first
+     * real SSE content event — which previously caused a duplicate auto-create.
      */
     data class ResetTurn(
         override val sessionId: String,
         override val messageId: String? = null,
         override val partId: String? = null,
+        /** Identity of the new turn established by [SessionState.createAssistantMessage].
+         *  When non-null, applied to [ProcessorContext] after [ProcessorContext.resetTurnState]. */
+        val newTurnMessageId: String? = null,
+        val newTurnServerMessageId: String? = null,
+        val newTurnModelID: String? = null,
+        val newTurnProviderID: String? = null,
     ) : SseEvent
 }
 

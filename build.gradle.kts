@@ -119,6 +119,24 @@ intellijPlatform {
             recommended()
         }
     }
+
+    signing {
+        certificateChain = providers.environmentVariable("CERTIFICATE_CHAIN")
+        privateKey = providers.environmentVariable("PRIVATE_KEY")
+        password = providers.environmentVariable("PRIVATE_KEY_PASSWORD")
+    }
+
+    publishing {
+        token = providers.environmentVariable("PUBLISH_TOKEN")
+        // The plugin ID from plugin.xml — used by the publishPlugin task
+        // Uncomment and set if not using the default from plugin.xml
+        // pluginId = "com.opencode.plugin"
+    }
+}
+
+// Compose-based settings panels are not Swing-indexable; disable searchable options build
+tasks.buildSearchableOptions {
+    enabled = false
 }
 
 tasks.runIde {

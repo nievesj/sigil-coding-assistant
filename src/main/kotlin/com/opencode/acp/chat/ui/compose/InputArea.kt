@@ -52,10 +52,15 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathOperation
+import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.rotate
+import kotlin.math.sqrt
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -338,8 +343,22 @@ fun InputArea(
 
     // Slash command palette state: shown when text starts with "/"
     var showSlashPalette by remember { mutableStateOf(false) }
+    var selectedIndex by remember { mutableStateOf(0) }
     val currentText = textState.text.toString()
     val slashQuery = if (currentText.startsWith("/")) currentText.substring(1) else ""
+
+    val filtered = remember(slashQuery, commands) {
+        if (slashQuery.isBlank()) commands
+        else commands.filter { it.name.startsWith(slashQuery, ignoreCase = true) }
+    }
+
+    LaunchedEffect(filtered.size) { selectedIndex = 0 }
+
+    /** Extract trailing args from slashQuery for the given command. */
+    fun extractArgs(cmd: SlashCommand): String =
+        if (slashQuery.startsWith(cmd.name, ignoreCase = true) && slashQuery.length > cmd.name.length) {
+            slashQuery.substring(cmd.name.length).trim()
+        } else ""
 
     // Command history navigation state
     var historyIndex by remember { mutableStateOf(-1) }  // -1 = not navigating, 0 = newest, 1 = next older...
@@ -508,14 +527,11 @@ fun InputArea(
                     onDismissRequest = { showSlashPalette = false },
                 ) {
                     SlashCommandPalette(
-                        commands = commands,
-                        query = slashQuery,
+                        filtered = filtered,
+                        selectedIndex = selectedIndex,
+                        onSelectedIndexChange = { selectedIndex = it },
                         onCommandSelected = { command ->
-                            // Extract trailing args from the current input text, same logic
-                            // as the Enter-key path. slashQuery is text after "/".
-                            val args = if (slashQuery.length > command.name.length) {
-                                slashQuery.substring(command.name.length).trim()
-                            } else ""
+                            val args = extractArgs(command)
                             showSlashPalette = false
                             textState.edit { replace(0, length, "") }
                             onSlashCommand(command.copy(args = args))
@@ -543,15 +559,18 @@ fun InputArea(
         ) {
             // Animated blue glow when LLM is streaming.
             //
-            // The sweep gradient goes 0°→360° (right → clockwise).  We shift
-            // the color-stop positions each frame to orbit the bright spot.
-            // The peak is centred at 0.50 with wide transparent margins
-            // (0.00–0.35 and 0.65–1.00) so the shifted peak — which is only
-            // 0.30 wide — can never cross the 0/1 seam, no matter the offset.
+            // A fixed seamless sweep gradient (transparent at 0°/360°, bright bump
+            // at 180°) is rotated each frame via DrawScope.rotate to orbit the bright
+            // spot around the input box.  clipPath limits the gradient to a ring
+            // (outer rounded rect minus inner rounded rect) so only the border glows.
             //
-            // Color-stop computation and rotation state read are kept inside
-            // drawBehind so that the composable body does not recompose on
-            // every animation frame — only the draw scope re-executes.
+            // Because the gradient never changes and the seam (0°/360°) is always in
+            // the transparent region 180° opposite the bump, the bump crosses every
+            // corner smoothly — no stop shifting, no seam artifact.
+            //
+            // The brush is built once (remember) and only the canvas rotation changes
+            // per frame inside drawBehind, so the composable body does not recompose
+            // on every animation frame — only the draw scope re-executes.
             if (isStreaming) {
                 val infiniteTransition = rememberInfiniteTransition(label = "glow")
                 val rotation = infiniteTransition.animateFloat(
@@ -564,54 +583,81 @@ fun InputArea(
                 )
                 val density = LocalDensity.current
                 val cornerRadiusPx = with(density) { ChatTheme.dims.inputCornerRadius.toPx() }
-                val glowPath = remember { androidx.compose.ui.graphics.Path() }
-                val baseStops = floatArrayOf(
-                    0.00f, 0.35f, 0.42f, 0.46f, 0.50f, 0.54f, 0.58f, 0.65f, 1.00f
-                )
-                val baseColors = arrayOf(
-                    ChatTheme.colors.component.glowTransparent,               // 0.00
-                    ChatTheme.colors.component.glowTransparent,               // 0.35
-                    ChatTheme.colors.component.glowStart,                     // 0.42
-                    ChatTheme.colors.component.glowPeak,                      // 0.46
-                    ChatTheme.colors.component.glowHot,                       // 0.50  ← peak
-                    ChatTheme.colors.component.glowPeak,                      // 0.54
-                    ChatTheme.colors.component.glowStart,                     // 0.58
-                    ChatTheme.colors.component.glowTransparent,               // 0.65
-                    ChatTheme.colors.component.glowTransparent,               // 1.00
-                )
+
+                // Read @Composable color tokens into local vals before remember
+                val glowTransparent = ChatTheme.colors.component.glowTransparent
+                val glowStart = ChatTheme.colors.component.glowStart
+                val glowPeak = ChatTheme.colors.component.glowPeak
+                val glowHot = ChatTheme.colors.component.glowHot
+
+                // Fixed seamless gradient: transparent at 0°/360°, bright bump at 180°.
+                // The seam is always in the transparent region — never crosses the bump.
+                val seamlessBrush = remember(glowTransparent, glowStart, glowPeak, glowHot) {
+                    Brush.sweepGradient(
+                        colorStops = arrayOf(
+                            0.00f to glowTransparent,
+                            0.35f to glowTransparent,
+                            0.42f to glowStart,
+                            0.46f to glowPeak,
+                            0.50f to glowHot,       // peak at 180° (left side at rotation=0)
+                            0.54f to glowPeak,
+                            0.58f to glowStart,
+                            0.65f to glowTransparent,
+                            1.00f to glowTransparent,
+                        ),
+                        center = Offset.Unspecified   // resolves to size.center at shader creation
+                    )
+                }
+
+                val ringPath = remember { Path() }
+                val outerPath = remember { Path() }
+                val innerPath = remember { Path() }
 
                 Box(
                     modifier = Modifier
                         .matchParentSize()
                         .drawBehind {
-                            // Read the animated value only inside the draw scope
-                            // to avoid triggering recomposition each frame.
-                            val offset = rotation.value / 360f
-                            val shiftedStops = FloatArray(baseStops.size) { i ->
-                                (baseStops[i] + offset) % 1f
-                            }
-                            val paired = shiftedStops.indices.map { shiftedStops[it] to baseColors[it] }
-                            val sorted = paired.sortedBy { it.first }
-
+                            val angleDeg = rotation.value
                             val glowPx = 3.dp.toPx()
-                            glowPath.reset()
-                            glowPath.addRoundRect(
-                                RoundRect(
-                                    left = 0f,
-                                    top = 0f,
-                                    right = size.width,
-                                    bottom = size.height,
-                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(cornerRadiusPx, cornerRadiusPx)
+                            val halfGlow = glowPx / 2f
+
+                            // Build ring path: outer rounded rect minus inner rounded rect
+                            val outerRR = RoundRect(
+                                left = -halfGlow, top = -halfGlow,
+                                right = size.width + halfGlow, bottom = size.height + halfGlow,
+                                cornerRadius = CornerRadius(cornerRadiusPx + halfGlow, cornerRadiusPx + halfGlow)
+                            )
+                            val innerRR = RoundRect(
+                                left = halfGlow, top = halfGlow,
+                                right = size.width - halfGlow, bottom = size.height - halfGlow,
+                                cornerRadius = CornerRadius(
+                                    (cornerRadiusPx - halfGlow).coerceAtLeast(0f),
+                                    (cornerRadiusPx - halfGlow).coerceAtLeast(0f)
                                 )
                             )
-                            drawPath(
-                                path = glowPath,
-                                brush = Brush.sweepGradient(
-                                    colorStops = sorted.toTypedArray(),
-                                    center = center
-                                ),
-                                style = Stroke(width = glowPx)
-                            )
+                            ringPath.reset()
+                            outerPath.reset()
+                            outerPath.addRoundRect(outerRR)
+                            innerPath.reset()
+                            innerPath.addRoundRect(innerRR)
+                            ringPath.op(outerPath, innerPath, PathOperation.Difference)
+
+                            // Diagonal ensures the circle covers the entire ring when rotated
+                            val diagonal = sqrt(size.width * size.width + size.height * size.height)
+
+                            // Clip to the ring (axis-aligned, not rotated), then rotate the scope
+                            // and draw a filled circle. The circle is rotation-invariant, so only
+                            // the sweep gradient pattern rotates. The clip limits visible pixels
+                            // to the ring shape.
+                            clipPath(ringPath) {
+                                rotate(angleDeg, center) {
+                                    drawCircle(
+                                        brush = seamlessBrush,
+                                        radius = diagonal / 2f,
+                                        center = center
+                                    )
+                                }
+                            }
                         }
                 )
             }
@@ -763,6 +809,16 @@ fun InputArea(
                                 .onPreviewKeyEvent { event ->
                                     if (event.type == KeyEventType.KeyDown) {
                                         when {
+                                            // Up arrow — navigate slash palette selection (older)
+                                            event.key == Key.DirectionUp && !event.isShiftPressed && showSlashPalette && filtered.isNotEmpty() -> {
+                                                selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
+                                                true
+                                            }
+                                            // Down arrow — navigate slash palette selection (newer)
+                                            event.key == Key.DirectionDown && !event.isShiftPressed && showSlashPalette && filtered.isNotEmpty() -> {
+                                                selectedIndex = (selectedIndex + 1).coerceAtMost(filtered.lastIndex)
+                                                true
+                                            }
                                             // Up arrow — navigate command history (older)
                                             event.key == Key.DirectionUp && !event.isShiftPressed && !showSlashPalette && commandHistory.isNotEmpty() -> {
                                                 saveDraftIfNeeded(attachedFiles)
@@ -786,17 +842,11 @@ fun InputArea(
                                                 }
                                                 true
                                             }
-                                            // Enter with slash palette: execute first matching command
+                                            // Enter with slash palette: execute selected command
                                             event.key == Key.Enter && !event.isShiftPressed && showSlashPalette -> {
-                                                val match = commands.filter { it.name.startsWith(slashQuery, ignoreCase = true) }
-                                                if (match.isNotEmpty()) {
-                                                    val cmd = match.first()
-                                                    // Extract trailing args: everything after the command name in slashQuery.
-                                                    // e.g. "/review-perform glm5.2 claude" → slashQuery="review-perform glm5.2 claude"
-                                                    //      → after "review-perform" → " glm5.2 claude" → trim → "glm5.2 claude"
-                                                    val args = if (slashQuery.length > cmd.name.length) {
-                                                        slashQuery.substring(cmd.name.length).trim()
-                                                    } else ""
+                                                val cmd = filtered.getOrNull(selectedIndex) ?: filtered.firstOrNull()
+                                                if (cmd != null) {
+                                                    val args = extractArgs(cmd)
                                                     showSlashPalette = false
                                                     textState.edit { replace(0, length, "") }
                                                     onSlashCommand(cmd.copy(args = args))

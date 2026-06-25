@@ -1,13 +1,27 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.TooltipArea
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -16,6 +30,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.TodoItem
@@ -26,7 +45,7 @@ import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 /**
  * Collapsible todo list panel showing the current session's tasks.
- * Uses IntelliJ platform icons for status indicators — consistent with the IDE.
+ * Styled to match the chat UI's card surfaces and spacing rhythm.
  */
 @Composable
 fun TodoListPanel(
@@ -35,8 +54,10 @@ fun TodoListPanel(
 ) {
     if (todos.isEmpty()) return
 
-    val incomplete = todos.filter { it.status != "completed" && it.status != "cancelled" }
-    if (incomplete.isEmpty()) return
+    // Show all todos except cancelled. Completed items are kept and rendered
+    // with a green check + strikethrough so the user sees progress.
+    val visibleTodos = todos.filter { it.status != TodoItem.STATUS_CANCELLED }
+    if (visibleTodos.isEmpty()) return
 
     var expanded by remember { mutableStateOf(true) }
 
@@ -50,21 +71,28 @@ fun TodoListPanel(
         modifier = modifier
             .fillMaxWidth()
             .clip(shapes.todoCornerRadius)
+            .border(width = 1.dp, color = colors.border.subtle, shape = shapes.todoCornerRadius)
             .background(colors.component.todoBg)
             .padding(horizontal = dims.todoPaddingH, vertical = dims.todoPaddingV),
         verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
-        // Header with toggle
+        // Header with toggle — always collapsible
+        val interactionSource = remember { MutableInteractionSource() }
+        val isHovered by interactionSource.collectIsHoveredAsState()
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(enabled = incomplete.size > 4) { expanded = !expanded }
-                .padding(vertical = 2.dp),
+                .clip(RoundedCornerShape(4.dp))
+                .background(if (isHovered) colors.component.paletteHoverBg else Color.Transparent)
+                .hoverable(interactionSource)
+                .clickable(interactionSource = interactionSource, indication = null) { expanded = !expanded }
+                .padding(vertical = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                key = if (incomplete.size > 4 && !expanded) AllIconsKeys.General.ChevronRight else AllIconsKeys.General.ChevronDown,
+                key = if (expanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
                 contentDescription = if (expanded) "Collapse" else "Expand",
                 modifier = Modifier.size(dims.todoChevronSize),
                 tint = colors.component.todoHeader,
@@ -73,27 +101,27 @@ fun TodoListPanel(
                 text = "Todo",
                 fontSize = fonts.todoHeader,
                 fontWeight = fontWeights.todoHeader,
-                color = colors.component.todoAccent,
+                color = colors.text.secondary,
             )
             Text(
-                text = "${incomplete.size}",
+                text = "${visibleTodos.size}",
                 fontSize = fonts.todoCount,
+                fontWeight = FontWeight.Medium,
                 color = colors.component.todoPending,
             )
         }
 
-        // Todo items
-        val visibleItems = if (expanded || incomplete.size <= 4) incomplete else incomplete.take(2)
-        visibleItems.forEach { todo ->
-            TodoRow(todo = todo)
-        }
-        if (!expanded && incomplete.size > 4) {
-            Text(
-                text = "  +${incomplete.size - 2} more…",
-                fontSize = fonts.todoMoreHint,
-                color = colors.component.todoPending,
-                modifier = Modifier.padding(start = 16.dp)
-            )
+        // Todo items with animated expand/collapse
+        AnimatedVisibility(
+            visible = expanded,
+            enter = expandVertically(animationSpec = tween(150)),
+            exit = shrinkVertically(animationSpec = tween(150))
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                visibleTodos.forEach { todo ->
+                    TodoRow(todo = todo)
+                }
+            }
         }
     }
 }
@@ -103,32 +131,90 @@ private fun TodoRow(todo: TodoItem) {
     val colors = ChatTheme.colors
     val dims = ChatTheme.dims
     val fonts = ChatTheme.fonts
+    val shapes = ChatTheme.shapes
 
-    val (iconKey, color) = when (todo.status) {
-        "completed" -> AllIconsKeys.Actions.Checked to colors.component.todoCompleted
-        "in_progress" -> AllIconsKeys.Actions.Execute to colors.component.todoInProgress
-        "cancelled" -> AllIconsKeys.Actions.Cancel to colors.component.todoCancelled
-        else -> AllIconsKeys.Actions.Lightning to colors.component.todoPending
+    val contentColor = if (todo.status == TodoItem.STATUS_COMPLETED || todo.status == TodoItem.STATUS_CANCELLED) {
+        colors.component.todoPending
+    } else {
+        colors.component.todoActiveText
     }
+    val textDecoration = if (todo.status == TodoItem.STATUS_COMPLETED) TextDecoration.LineThrough else TextDecoration.None
 
     Row(
         modifier = Modifier.fillMaxWidth().padding(start = dims.todoPaddingH, end = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.Top
     ) {
-        Icon(
-            key = iconKey,
-            contentDescription = todo.status,
-            modifier = Modifier.size(dims.todoStatusIconSize),
-            tint = color,
-        )
-        Text(
-            text = todo.content,
-            fontSize = fonts.todoContent,
-            color = if (todo.status == "completed" || todo.status == "cancelled") colors.component.todoPending
-                    else colors.component.todoActiveText,
-            lineHeight = 14.sp,
-            modifier = Modifier.weight(1f).padding(end = 4.dp)
+        when (todo.status) {
+            TodoItem.STATUS_COMPLETED -> Icon(
+                key = AllIconsKeys.Actions.Checked,
+                contentDescription = todo.status,
+                modifier = Modifier.size(dims.todoStatusIconSize),
+                tint = colors.component.todoCompleted,
+            )
+            TodoItem.STATUS_IN_PROGRESS -> Icon(
+                key = AllIconsKeys.Actions.Execute,
+                contentDescription = todo.status,
+                modifier = Modifier.size(dims.todoStatusIconSize),
+                tint = colors.component.todoInProgress,
+            )
+            TodoItem.STATUS_CANCELLED -> Icon(
+                key = AllIconsKeys.Actions.Cancel,
+                contentDescription = todo.status,
+                modifier = Modifier.size(dims.todoStatusIconSize),
+                tint = colors.component.todoCancelled,
+            )
+            else -> TodoPendingDot(
+                color = colors.component.todoPending,
+                size = dims.todoStatusIconSize
+            )
+        }
+        TooltipArea(
+            tooltip = {
+                Box(
+                    modifier = Modifier
+                        .clip(shapes.contextTooltipCornerRadius)
+                        .background(colors.surface.dark)
+                        .border(1.dp, colors.component.tooltipBorder, shapes.contextTooltipCornerRadius)
+                        .padding(8.dp)
+                ) {
+                    Text(
+                        text = todo.content,
+                        fontSize = 11.sp,
+                        color = colors.text.primary
+                    )
+                }
+            }
+        ) {
+            Text(
+                text = todo.content,
+                fontSize = fonts.todoContent,
+                color = contentColor,
+                lineHeight = 16.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                textDecoration = textDecoration,
+                modifier = Modifier.weight(1f).padding(end = 4.dp)
+            )
+        }
+    }
+}
+
+/**
+ * Hollow ring indicator for pending todo items.
+ */
+@Composable
+private fun TodoPendingDot(
+    color: Color,
+    size: androidx.compose.ui.unit.Dp
+) {
+    Canvas(modifier = Modifier.size(size)) {
+        val strokeWidth = 1.5.dp.toPx()
+        val radius = size.toPx() / 2f - strokeWidth
+        drawCircle(
+            color = color,
+            radius = radius,
+            style = Stroke(width = strokeWidth)
         )
     }
 }

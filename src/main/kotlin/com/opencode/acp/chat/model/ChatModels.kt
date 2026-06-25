@@ -331,7 +331,14 @@ data class TodoItem(
     val content: String,
     val status: String,    // "pending", "in_progress", "completed"
     val priority: String   // "high", "medium", "low"
-)
+) {
+    companion object {
+        const val STATUS_PENDING = "pending"
+        const val STATUS_IN_PROGRESS = "in_progress"
+        const val STATUS_COMPLETED = "completed"
+        const val STATUS_CANCELLED = "cancelled"
+    }
+}
 
 /**
  * Returns the full markdown representation of a ChatMessage, suitable for

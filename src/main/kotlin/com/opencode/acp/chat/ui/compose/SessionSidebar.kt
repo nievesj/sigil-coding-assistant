@@ -420,20 +420,29 @@ private fun SessionList(
         }
     }
 
-    // Read expandedIds directly in composable body to trigger recomposition.
-    // Don't wrap in remember — it's cheap and must re-evaluate on every toggle.
-    val visibleItems = fullTree.filter { item ->
-        if (item.depth == 0) return@filter true
-        var idx = fullTree.indexOf(item)
-        while (idx > 0) {
-            val parent = fullTree.subList(0, idx).lastOrNull { it.depth < fullTree[idx].depth }
-                ?: break
-            if (expandedIds[parent.session.id] != true) {
-                return@filter false
+    // Compute visible items by walking the tree with indices (O(n) instead of
+    // the previous O(n²) filter that used indexOf + subList per item).
+    // An item is visible if all its ancestors are expanded.
+    val visibleItems = remember(fullTree, expandedIds.toMap()) {
+        fullTree.filterIndexed { idx, item ->
+            if (item.depth == 0) return@filterIndexed true
+            // Walk backwards from idx to find ancestors. Each ancestor must be expanded.
+            var i = idx
+            while (i > 0) {
+                // Find the nearest preceding item with smaller depth (an ancestor)
+                var parentIdx = i - 1
+                while (parentIdx >= 0 && fullTree[parentIdx].depth >= fullTree[i].depth) {
+                    parentIdx--
+                }
+                if (parentIdx < 0) break
+                val parent = fullTree[parentIdx]
+                if (expandedIds[parent.session.id] != true) {
+                    return@filterIndexed false
+                }
+                i = parentIdx
             }
-            idx = fullTree.indexOf(parent)
+            true
         }
-        true
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -587,8 +596,18 @@ private fun SessionRow(
                 }
                 Spacer(Modifier.width(4.dp))
             } else {
-                // Spacer so text aligns with rows that have chevrons
-                Spacer(Modifier.width(24.dp))
+                // Leading indicator for top-level leaf sessions
+                Box(
+                    modifier = Modifier.size(24.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        key = AllIconsKeys.FileTypes.Text,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = iconTint,
+                    )
+                }
                 Spacer(Modifier.width(4.dp))
             }
 
@@ -612,54 +631,60 @@ private fun SessionRow(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
-                    // Archive button — always visible, subtle until hover
-                    Icon(
-                        key = AllIconsKeys.Actions.Close,
-                        contentDescription = "Archive",
+                    // Archive button — centered, slightly larger, with a visible hover highlight
+                    val archiveHoverBg = retrieveColorOrUnspecified("Component.errorFocusColor").copy(alpha = 0.12f)
+                    Box(
                         modifier = Modifier
-                            .size(20.dp)
+                            .size(24.dp)
                             .clip(RoundedCornerShape(4.dp))
-                            .clickable(onClick = onArchive)
-                            .padding(2.dp),
-                        tint = if (isHovered) {
-                            retrieveColorOrUnspecified("Component.errorFocusColor")
-                        } else {
-                            retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.35f)
-                        },
-                    )
+                            .background(if (isHovered) archiveHoverBg else Color.Transparent)
+                            .clickable(onClick = onArchive),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            key = AllIconsKeys.Actions.Close,
+                            contentDescription = "Archive",
+                            modifier = Modifier.size(18.dp),
+                            tint = if (isHovered) {
+                                retrieveColorOrUnspecified("Component.errorFocusColor")
+                            } else {
+                                retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.45f)
+                            },
+                        )
+                    }
                 }
 
                 // Metadata row: timestamp + cost + tokens
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        // Timestamp
-        Text(
-            text = formatRelativeTime(session.updatedAt),
-            fontSize = 11.sp,
-            color = metaColor,
-            maxLines = 1,
-        )
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // Timestamp
+                    Text(
+                        text = formatRelativeTime(session.updatedAt),
+                        fontSize = 11.sp,
+                        color = metaColor,
+                        maxLines = 1,
+                    )
 
-        // Separator
-        Text(
-            text = "\u00B7",
-            fontSize = 11.sp,
-            color = sepColor,
-            maxLines = 1,
-        )
+                    // Separator
+                    Text(
+                        text = "\u00B7",
+                        fontSize = 11.sp,
+                        color = sepColor,
+                        maxLines = 1,
+                    )
 
-        // Cost
-        Text(
-            text = formatCost(session.cost),
-            fontSize = 11.sp,
-            color = metaColor,
-            maxLines = 1,
-        )
+                    // Cost
+                    Text(
+                        text = formatCost(session.cost),
+                        fontSize = 11.sp,
+                        color = metaColor,
+                        maxLines = 1,
+                    )
 
-        // Separator
+                    // Separator
                     Text(
                         text = "\u00B7",
                         fontSize = 11.sp,
@@ -691,11 +716,9 @@ private fun SessionRow(
 private fun Modifier.sessionShimmer(indicator: SessionIndicator): Modifier = composed {
     if (indicator == SessionIndicator.NONE) return@composed Modifier
 
-    val shimmerColor = when (indicator) {
-        SessionIndicator.CREATING -> ChatTheme.colors.component.sidebarShimmerCreating
-        SessionIndicator.STREAMING -> ChatTheme.colors.component.sidebarShimmerStreaming
-        SessionIndicator.NONE -> Color.Transparent // unreachable, kept for exhaustiveness
-    }
+    val edge = Color.Transparent
+    val soft = ChatTheme.colors.component.glowStart
+    val peak = ChatTheme.colors.component.glowPeak
 
     val transition = rememberInfiniteTransition(label = "shimmer")
     val shimmerProgressState = transition.animateFloat(
@@ -715,11 +738,11 @@ private fun Modifier.sessionShimmer(indicator: SessionIndicator): Modifier = com
         drawRect(
             brush = Brush.horizontalGradient(
                 colors = listOf(
-                    Color.Transparent,
-                    shimmerColor.copy(alpha = 0.15f),
-                    shimmerColor.copy(alpha = 0.35f),
-                    shimmerColor.copy(alpha = 0.15f),
-                    Color.Transparent
+                    edge,
+                    soft,
+                    peak,
+                    soft,
+                    edge
                 ),
                 startX = startX,
                 endX = startX + bandWidth

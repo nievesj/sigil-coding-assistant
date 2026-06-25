@@ -258,7 +258,6 @@ data class ChatThemeData(
         val todoInProgress: Color,
         val todoCompleted: Color,
         val todoCancelled: Color,
-        val todoAccent: Color,
         val todoActiveText: Color,
         // Compaction pill
         val compactionText: Color,
@@ -299,6 +298,7 @@ data class ChatThemeData(
         val contextIndicatorSize: Dp,
         val contextRingStroke: Dp,
         val contextRingGap: Dp,
+        val contextIndicatorTextWidth: Dp,
         val contextTooltipWidth: Dp,
         val contextTooltipPadding: Dp,
         val contextErrorBadgeBorder: Dp,

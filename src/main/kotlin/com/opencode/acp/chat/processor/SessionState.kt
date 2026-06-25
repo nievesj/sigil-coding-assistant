@@ -89,8 +89,10 @@ class SessionState(
     internal val ctx = ProcessorContext()
 
     /** Whether the first text chunk has been segmented (controls non-debounced
-     *  re-segment for responsiveness on the first chunk). Reset in createAssistantMessage(). */
-    internal var firstTextSegmented = false
+     *  re-segment for responsiveness on the first chunk). Reset in createAssistantMessage().
+     *  @Volatile because written by [adoptStreamingContext] on the caller's coroutine and
+     *  read by the event processing coroutine. */
+    @Volatile internal var firstTextSegmented = false
 
     /** Event channel — SSE events buffered for EDT processing. */
     private val eventChannel = Channel<SseEvent>(1024)
@@ -187,37 +189,82 @@ class SessionState(
         // coroutine (single-writer). External callers send a ResetTurn control
         // event through eventChannel; the auto-create path (fromEventProcessing=true)
         // resets directly since it's already on the event processing coroutine.
+        val id = serverMessageId ?: generateId()
+
         if (fromEventProcessing) {
+            // Already on the event processing coroutine — reset and set ctx directly.
             ctx.resetTurnState()
+            ctx.activeMessageId = id
+            ctx.activeServerMessageId = serverMessageId
+            ctx.modelID = modelID
+            ctx.providerID = providerID
+            ctx.isStreaming = true
         } else {
-            // Drain stale events from previous turn BEFORE enqueuing ResetTurn,
-            // so the channel ordering is: drain → ResetTurn → new events.
-            // NOTE: This is best-effort — events enqueued by processEvent()
-            // between the drain completing and ResetTurn being sent are lost.
-            // This is acceptable because stale events from a previous turn
-            // would be misrouted to the new turn's message anyway.
-            var droppedCount = 0
-            while (eventChannel.tryReceive().isSuccess) { droppedCount++ }
-            if (droppedCount > 0) {
-                logger.info { "[ACP] createAssistantMessage: drained $droppedCount stale events from previous turn" }
+            // Send ResetTurn carrying the new turn's identity. The event-processing
+            // coroutine will drain stale events, resetTurnState(), then apply these
+            // fields atomically — eliminating the window where activeMessageId is null
+            // (which previously caused a duplicate auto-create when the first SSE
+            // content event arrived).
+            //
+            // Stale-event draining is done in the ResetTurn handler (consumer side)
+            // rather than here (producer side) to close the window where an SSE event
+            // could be enqueued between the drain completing and ResetTurn being sent.
+            // The single-reader event coroutine owns both the drain and the reset.
+            //
+            // We do NOT set ctx fields here; the event coroutine owns them.
+            val sendResult = eventChannel.trySend(SseEvent.ResetTurn(
+                sessionId = sessionId,
+                newTurnMessageId = id,
+                newTurnServerMessageId = serverMessageId,
+                newTurnModelID = modelID,
+                newTurnProviderID = providerID,
+            ))
+            if (sendResult.isFailure) {
+                // Channel is full (1024 capacity) or closed. Try to drain old events
+                // to make room, then retry. Only drain events from OTHER sessions
+                // (same-session events are from the old turn and can be dropped).
+                val drained = mutableListOf<SseEvent>()
+                repeat(64) {
+                    val r = eventChannel.tryReceive()
+                    if (r.isFailure) return@repeat
+                    val evt = r.getOrNull()
+                    if (evt != null && evt.sessionId != sessionId) {
+                        drained.add(evt)
+                    }
+                    // Same-session events from old turn: safely drop
+                }
+                // Re-enqueue non-session events
+                for (evt in drained) {
+                    eventChannel.trySend(evt)
+                }
+                // Retry the ResetTurn send
+                val retryResult = eventChannel.trySend(SseEvent.ResetTurn(
+                    sessionId = sessionId,
+                    newTurnMessageId = id,
+                    newTurnServerMessageId = serverMessageId,
+                    newTurnModelID = modelID,
+                    newTurnProviderID = providerID,
+                ))
+                if (retryResult.isFailure) {
+                    // Still can't send. Set ctx directly as last resort — we're
+                    // under stateLock and the event processing coroutine will
+                    // process subsequent events against this state.
+                    logger.error { "[ACP] createAssistantMessage: eventChannel FULL after drain — setting ctx directly. id=$id" }
+                    ctx.activeMessageId = id
+                    ctx.activeServerMessageId = serverMessageId
+                    ctx.modelID = modelID
+                    ctx.providerID = providerID
+                    ctx.isStreaming = true
+                }
             }
-            // Send ResetTurn — processed before any new SSE events (FIFO channel).
-            // This ensures ctx is cleared on the event processing coroutine.
-            eventChannel.trySend(SseEvent.ResetTurn(sessionId))
         }
 
         resegmentJob?.cancel()
         resegmentJob = null
 
-        val id = serverMessageId ?: generateId()
-        ctx.activeMessageId = id
-        ctx.activeServerMessageId = serverMessageId
-        ctx.modelID = modelID
-        ctx.providerID = providerID
-        ctx.isStreaming = true
         firstTextSegmented = false
         lastAccessTime = System.currentTimeMillis()
-        logger.info { "[ACP] createAssistantMessage: id=$id, serverMessageId=$serverMessageId" }
+        logger.info { "[ACP] createAssistantMessage: id=$id, serverMessageId=$serverMessageId, fromEventProcessing=$fromEventProcessing" }
 
         val message = ChatMessage(
             id = id,
@@ -253,6 +300,7 @@ class SessionState(
     fun completeStreaming(messageId: String) = stateLock.withLock {
         if (messageId != ctx.activeMessageId) return@withLock
         freezeCurrentThinking()
+        flushRevealBuffer()
         resegmentTextPartsFinal(messageId)
         ctx.isStreaming = false
         updateMessage(messageId) { it.copy(isStreaming = false, state = MessageState.Completed) }
@@ -262,6 +310,7 @@ class SessionState(
     fun abortStreaming(reason: String) = stateLock.withLock {
         val msgId = ctx.activeMessageId ?: return@withLock
         freezeCurrentThinking()
+        flushRevealBuffer()
         ctx.errorMessage = reason
         ctx.isStreaming = false
         updateMessage(msgId) { msg ->
@@ -403,20 +452,26 @@ class SessionState(
     }
 
     fun updateServerMessageId(messageId: String, serverMessageId: String) = stateLock.withLock {
-        if (messageId != ctx.activeMessageId) {
-            logger.warn { "[ACP] updateServerMessageId MISMATCH: msg=$messageId, serverId=$serverMessageId, activeMessageId=${ctx.activeMessageId}" }
-            return@withLock
-        }
-        // Don't overwrite if already learned from an earlier SSE event (MessageFinalized).
-        // The server ID from the HTTP response and from SSE should match; if they don't,
-        // keep the SSE-learned value (it was confirmed by the event carrying it).
-        if (ctx.activeServerMessageId == null) {
-            ctx.activeServerMessageId = serverMessageId
-            logger.info { "[ACP] updateServerMessageId: msg=$messageId → serverId=$serverMessageId" }
-        } else if (ctx.activeServerMessageId != serverMessageId) {
-            logger.warn { "[ACP] updateServerMessageId: server ID mismatch — HTTP=$serverMessageId, SSE=${ctx.activeServerMessageId}. Keeping SSE value." }
-        }
+        // Always update the message's serverMessageId field — this is a message-level
+        // operation that doesn't depend on ctx (which may be set asynchronously by
+        // ResetTurn on the event-processing coroutine).
         updateMessage(messageId) { it.copy(serverMessageId = serverMessageId) }
+
+        // Only update ctx.activeServerMessageId if ctx still refers to this message.
+        // If ResetTurn hasn't been processed yet, ctx.activeMessageId may be null or
+        // point to a previous turn — in that case, the ResetTurn event carries
+        // newTurnServerMessageId=null, and the first SSE event will set it.
+        // If ctx already learned the server ID from an earlier SSE event, keep it.
+        if (messageId == ctx.activeMessageId) {
+            if (ctx.activeServerMessageId == null) {
+                ctx.activeServerMessageId = serverMessageId
+                logger.info { "[ACP] updateServerMessageId: msg=$messageId → serverId=$serverMessageId" }
+            } else if (ctx.activeServerMessageId != serverMessageId) {
+                logger.warn { "[ACP] updateServerMessageId: server ID mismatch — HTTP=$serverMessageId, SSE=${ctx.activeServerMessageId}. Keeping SSE value." }
+            }
+        } else {
+            logger.info { "[ACP] updateServerMessageId: ctx not yet synced (msg=$messageId, activeMessageId=${ctx.activeMessageId}) — message field updated, ctx will be set by ResetTurn or first SSE event" }
+        }
     }
 
     fun setLastUserText(text: String?) {
@@ -439,6 +494,8 @@ class SessionState(
         signalForwardJob = null
         ctx.pendingStopJob?.cancel()
         ctx.pendingStopJob = null
+        ctx.revealJob?.cancel()
+        ctx.revealJob = null
         eventChannel.close()
         _pendingPermission.value = null
         _pendingSelection.value = null
@@ -471,7 +528,49 @@ class SessionState(
             // Runs on the event processing coroutine, eliminating the cross-coroutine
             // race between external callers (under stateLock) and event processing.
             is SseEvent.ResetTurn -> {
+                // Drain stale events from the previous turn on the consumer side
+                // (single-reader coroutine). This is strictly more robust than a
+                // producer-side drain because there's no window between draining
+                // and the reset — both run on this coroutine.
+                //
+                // SELECTIVE DRAIN: Only drain events that belong to THIS session.
+                // Events from other sessions (child subagents, background sessions)
+                // are left in the channel to be processed normally. Draining them
+                // would cause their events to be silently lost.
+                var drainedCount = 0
+                val drainedOtherSession = mutableListOf<SseEvent>()
+                while (true) {
+                    val result = eventChannel.tryReceive()
+                    if (result.isFailure) break
+                    val evt = result.getOrNull()
+                    if (evt != null && evt.sessionId == sessionId) {
+                        drainedCount++
+                    } else if (evt != null) {
+                        // Not our session — put it back (preserve order)
+                        drainedOtherSession.add(evt)
+                    }
+                }
+                // Re-enqueue non-session events so they're not lost
+                for (evt in drainedOtherSession) {
+                    eventChannel.trySend(evt)
+                }
+                if (drainedCount > 0) {
+                    logger.info { "[ACP] ResetTurn: drained $drainedCount stale events for session $sessionId (preserved ${drainedOtherSession.size} events from other sessions)" }
+                }
                 ctx.resetTurnState()
+                // Apply the new turn's identity atomically after clearing stale state.
+                // This closes the window where activeMessageId was null between reset
+                // and the first SSE content event (which caused duplicate auto-create).
+                event.newTurnMessageId?.let { ctx.activeMessageId = it }
+                // Only set activeServerMessageId if the event carries one — don't
+                // overwrite a value that updateServerMessageId may have already set
+                // (e.g. if the HTTP response arrived and was processed before ResetTurn).
+                event.newTurnServerMessageId?.let { ctx.activeServerMessageId = it }
+                ctx.modelID = event.newTurnModelID
+                ctx.providerID = event.newTurnProviderID
+                if (event.newTurnMessageId != null) {
+                    ctx.isStreaming = true
+                }
                 return
             }
             is SseEvent.TodoUpdated -> {
@@ -541,9 +640,30 @@ class SessionState(
             else -> { /* handled below */ }
         }
 
-        // Cancel any pending debounced Stop — a new event means streaming continues
-        ctx.pendingStopJob?.cancel()
-        ctx.pendingStopJob = null
+        // Cancel pending debounced Stop ONLY for content-bearing events that indicate
+        // continued generation. Metadata events (MessageFinalized without stopReason,
+        // ToolResult, StepFinish, Snapshot, Compaction, Agent) must NOT cancel the
+        // debounce — they can arrive after the final Stop and would otherwise prevent
+        // finalization, leaving isStreaming=true forever (the "stuck generation" bug).
+        //
+        // NOTE: This list is intentionally DIFFERENT from isContentEvent (line 603-609).
+        // isContentEvent includes ToolResult/StepFinish/Snapshot/Compaction for auto-create
+        // logic. isGenerationEvent excludes them because they don't indicate the LLM is
+        // still generating text. If you add a new event type, consider BOTH lists.
+        val isGenerationEvent = event is SseEvent.TextChunk
+            || event is SseEvent.TextReplace
+            || event is SseEvent.ThinkingChunk
+            || event is SseEvent.ThinkingReplace
+            || event is SseEvent.ToolUse
+            || event is SseEvent.Patch
+            || event is SseEvent.AssistantFile
+            || event is SseEvent.AssistantImage
+            || event is SseEvent.Retry
+            || event is SseEvent.Subtask
+        if (isGenerationEvent) {
+            ctx.pendingStopJob?.cancel()
+            ctx.pendingStopJob = null
+        }
 
         // Auto-create or rotate assistant message for child/subagent sessions.
         // Their SSE events arrive while the parent is streaming, but createAssistantMessage
@@ -620,14 +740,9 @@ class SessionState(
                     }
                 }
                 ctx.thinkingBuffer.append(event.text)
-                updateMessage(msgId) { msg ->
-                    val parts = LinkedHashMap(msg.parts)
-                    parts[ctx.activeThinkingKey!!] = MessagePart.Thinking(
-                        content = ctx.thinkingBuffer.toString(),
-                        state = PartState.Streaming
-                    )
-                    msg.copy(parts = parts, isStreaming = ctx.isStreaming)
-                }
+                ctx.thinkingRevealBuffer.append(event.text)
+                ctx.thinkingSourceComplete = false
+                startThinkingRevealLoop(msgId)
             }
 
             is SseEvent.ThinkingReplace -> {
@@ -646,10 +761,16 @@ class SessionState(
                 }
                 ctx.thinkingBuffer.setLength(0)
                 ctx.thinkingBuffer.append(event.text)
+                ctx.thinkingRevealBuffer.setLength(0)
+                ctx.thinkingRevealBuffer.append(event.text)
+                ctx.thinkingRevealedLen = event.text.length
+                ctx.thinkingSourceComplete = true
+                ctx.thinkingRevealJob?.cancel()
+                ctx.thinkingRevealJob = null
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     parts[ctx.activeThinkingKey!!] = MessagePart.Thinking(
-                        content = ctx.thinkingBuffer.toString(),
+                        content = ctx.thinkingRevealBuffer.substring(0, ctx.thinkingRevealedLen),
                         state = if (ctx.activeThinkingCompleted) PartState.Completed else PartState.Streaming
                     )
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
@@ -675,9 +796,12 @@ class SessionState(
                     val userText = ctx.lastUserText
                     if (userText != null && text.startsWith(userText, ignoreCase = true)) {
                         ctx.userEchoStripped = true
-                        ctx.textBuffer.append(text.substring(userText.length).trimStart())
+                        val chunk = text.substring(userText.length).trimStart()
+                        ctx.textBuffer.append(chunk)
+                        ctx.revealBuffer.append(chunk)
                     } else {
                         ctx.textBuffer.append(text)
+                        ctx.revealBuffer.append(text)
                     }
                 } else {
                     // Track new text part: if partId changed, a new text segment started
@@ -687,9 +811,11 @@ class SessionState(
                         ctx.activeTextPartId = event.partId
                     }
                     ctx.textBuffer.append(text)
+                    ctx.revealBuffer.append(text)
                 }
+                ctx.sourceComplete = false
                 ctx.streamingText.value = ctx.textBuffer.toString()
-                scheduleResegment(msgId)
+                startRevealLoop(msgId)
             }
 
             is SseEvent.TextReplace -> {
@@ -729,10 +855,22 @@ class SessionState(
                 }
                 ctx.textBuffer.clear()
                 ctx.textBuffer.append(event.text)
+                ctx.revealBuffer.setLength(0)
+                ctx.revealBuffer.append(event.text)
+                ctx.revealedLen = event.text.length // TextReplace is a finalization echo — reveal all
+                ctx.sourceComplete = true
+        ctx.revealJob?.cancel()
+        ctx.revealJob = null
+        ctx.thinkingRevealJob?.cancel()
+        ctx.thinkingRevealJob = null
                 ctx.userEchoStripped = false
                 val userText = ctx.lastUserText
                 if (userText != null && ctx.textBuffer.toString().startsWith(userText, ignoreCase = true)) {
                     ctx.textBuffer.delete(0, userText.length)
+                    // Also strip the user echo from revealBuffer so it's not shown to the user.
+                    // revealedLen must be adjusted to match the stripped buffer length.
+                    ctx.revealBuffer.delete(0, userText.length)
+                    ctx.revealedLen = ctx.revealBuffer.length
                     ctx.userEchoStripped = true
                 }
                 ctx.firstTextChunkReceived = true
@@ -939,6 +1077,26 @@ class SessionState(
                             )
                         }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolResult path)" } }
                     }
+                    // Update the message part with the resolved pill
+                    val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
+                    updateMessage(targetMsgId) { msg ->
+                        val parts = LinkedHashMap(msg.parts)
+                        val existing = parts[event.toolCallId]
+                        if (existing is MessagePart.ToolCall) {
+                            parts[event.toolCallId] = existing.copy(
+                                pill = existing.pill.copy(
+                                    status = resolvedStatus,
+                                    title = resolvedTitle,
+                                    kind = resolvedKind,
+                                    input = newInput,
+                                    output = event.content ?: existing.pill.output,
+                                    metadata = event.metadata ?: existing.pill.metadata,
+                                ),
+                                state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed
+                            )
+                        }
+                        msg.copy(parts = parts, isStreaming = ctx.isStreaming)
+                    }
                 } else {
                     // No prior ToolUse — create pill from scratch (fast sub-agents can complete in one event)
                     val newInput = event.input
@@ -975,32 +1133,6 @@ class SessionState(
                         logger.info { "[ACP] Task tool (from ToolResult): proactively caching child session $childId" }
                         scope.launch { sessionManager.ensureSessionCached(childId) }
                     }
-                }
-                val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
-                updateMessage(targetMsgId) { msg ->
-                    val parts = LinkedHashMap(msg.parts)
-                    val existing = parts[event.toolCallId]
-                    if (existing is MessagePart.ToolCall) {
-                        val newInput = event.input ?: existing.pill.input
-                        val resolvedKind = if (existing.pill.kind == ToolKind.OTHER) {
-                            ToolMapper.detectKindFromInput(newInput)
-                        } else existing.pill.kind
-                        val resolvedTitle = newInput?.let { input ->
-                            try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
-                        } ?: existing.pill.title
-                        parts[event.toolCallId] = existing.copy(
-                            pill = existing.pill.copy(
-                                status = resolvedStatus,
-                                title = resolvedTitle,
-                                kind = resolvedKind,
-                                input = newInput,
-                                output = event.content ?: existing.pill.output,
-                                metadata = event.metadata ?: existing.pill.metadata,
-                            ),
-                            state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed
-                        )
-                    }
-                    msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
             }
 
@@ -1091,9 +1223,24 @@ class SessionState(
                     )
                 }
 
-                // Delegate finalization to shared logic (same as Stop handler)
+                // Delegate finalization to shared logic (same as Stop handler).
+                // Only finalize when the server explicitly signals completion via
+                // stopReason (the `finish` field in message.updated). The server sends
+                // message.updated events during streaming with token/cost/model updates
+                // but WITHOUT a finish field — those are intermediate updates, not
+                // finalization. Finalizing on them would prematurely complete the
+                // generation.
+                //
+                // If no stop event arrives (server bug or missing finish field), the
+                // SessionIdle backstop (line 507-518) finalizes the stream.
                 if (event.stopReason != null) {
                     finalizeStreaming(localMsgId, event.stopReason)
+                } else {
+                    // Intermediate token/cost update (no finish) — trigger local-only
+                    // context refresh so the indicator updates immediately without
+                    // waiting for StreamingCompleted. The full REST refresh happens
+                    // when the response completes (StreamingCompleted / SessionIdle).
+                    _signals.tryEmit(UiSignal.MessageUpdated(localMsgId))
                 }
             }
 
@@ -1219,9 +1366,15 @@ class SessionState(
      * SseEvent.MessageFinalized handlers. Handles freeze, resegment, tool-calls
      * filter, and debounced completion.
      *
+     * DEBOUNCE SCOPE: The 300ms debounce applies ONLY to non-"tool-calls",
+     * non-"idle" stop reasons. "tool-calls" is an intermediate stop (message
+     * continues streaming for the next tool cycle). "idle" is a terminal server
+     * signal that finalizes immediately (no debounce — debouncing would create a
+     * race window where a late metadata event could cancel the finalization).
+     *
      * DEBOUNCE RACE NOTE: The 300ms debounce is intentional. If a new event arrives
      * before the debounce completes, processEventInternal() cancels pendingStopJob
-     * (line 493), preventing premature finalization. If the debounce completes and
+     * (line 613), preventing premature finalization. If the debounce completes and
      * acquires stateLock before a new event can cancel it, finalization proceeds —
      * the subsequent event processes against the finalized message, which is correct
      * (the Stop/MessageFinalized event was the last content-bearing event). Under
@@ -1236,11 +1389,26 @@ class SessionState(
         }
 
         freezeCurrentThinking()
+        flushRevealBuffer()
         resegmentTextPartsDirect(msgId)
 
         if (stopReason == "tool-calls") {
             // Intermediate stop — tool calls starting; keep message streaming, don't mark completed
             logger.info { "[ACP] finalizeStreaming (tool-calls): intermediate — continuing stream, token data applied" }
+        } else if (stopReason == "idle") {
+            // Server explicitly declared session idle — finalize immediately without
+            // the 300ms debounce. The debounce exists to absorb late content events
+            // after a normal Stop, but SessionIdle is a terminal server signal.
+            // Debouncing here only creates a race window where a late metadata event
+            // (e.g., MessageFinalized with stopReason=null) can cancel the finalization
+            // and leave isStreaming=true forever.
+            logger.info { "[ACP] finalizeStreaming (idle): immediate finalization (no debounce)" }
+            stateLock.withLock {
+                if (!ctx.isStreaming) return@withLock
+                ctx.isStreaming = false
+                updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
+                emitStreamingCompleted(msgId)
+            }
         } else {
             val capturedMsgId = msgId
             ctx.pendingStopJob?.cancel()
@@ -1262,7 +1430,8 @@ class SessionState(
     private fun freezeCurrentThinking() {
         val key = ctx.activeThinkingKey ?: return
         if (ctx.thinkingBuffer.isEmpty()) return
-        val content = ctx.thinkingBuffer.toString()
+        flushThinkingRevealBuffer()
+        val content = ctx.thinkingRevealBuffer.substring(0, ctx.thinkingRevealedLen)
         val msgId = ctx.activeMessageId ?: return
         updateMessage(msgId) { msg ->
             val parts = LinkedHashMap(msg.parts)
@@ -1270,11 +1439,164 @@ class SessionState(
             msg.copy(parts = parts)
         }
         ctx.thinkingBuffer.setLength(0)
+        ctx.thinkingRevealBuffer.setLength(0)
+        ctx.thinkingRevealedLen = 0
         ctx.activeThinkingKey = null
         ctx.activeThinkingCompleted = false
     }
 
+    /**
+     * Start (or no-op if already running) the typewriter reveal coroutine for thinking.
+     * Mirrors [startRevealLoop] but for thinking content — updates the thinking
+     * MessagePart directly via [updateMessage] with only the revealed portion.
+     */
+    private fun startThinkingRevealLoop(msgId: String) {
+        if (ctx.thinkingRevealJob?.isActive == true) return
+        ctx.thinkingSourceComplete = false
+        ctx.thinkingRevealJob = scope.launch(Dispatchers.Default) {
+            var charBudget = 0.0
+            var lastTickMs = System.currentTimeMillis()
+            try {
+                while (true) {
+                    val target = ctx.thinkingRevealBuffer.length
+                    val backlog = target - ctx.thinkingRevealedLen
+                    if (backlog <= 0) {
+                        if (ctx.thinkingSourceComplete) break
+                        delay(50) // idle poll
+                        lastTickMs = System.currentTimeMillis()
+                        continue
+                    }
+                    val now = System.currentTimeMillis()
+                    val dtMs = (now - lastTickMs).coerceAtLeast(1)
+                    lastTickMs = now
+                    // Adaptive rate: 42 cps at rest, 125 cps normal, 500 cps catching up
+                    val rate = when {
+                        ctx.thinkingSourceComplete -> backlog.toDouble() // flush all
+                        backlog > 80 -> 500.0
+                        backlog > 30 -> 125.0
+                        else -> 42.0
+                    }
+                    charBudget += rate * (dtMs / 1000.0)
+                    val wholeChars = charBudget.toInt()
+                    if (wholeChars >= 1) {
+                        val reveal = minOf(wholeChars, backlog)
+                        ctx.thinkingRevealedLen = minOf(ctx.thinkingRevealedLen + reveal, target)
+                        charBudget -= reveal
+                        // Update the thinking MessagePart with the revealed content.
+                        val key = ctx.activeThinkingKey
+                        if (key != null) {
+                            val revealedContent = ctx.thinkingRevealBuffer.substring(0, ctx.thinkingRevealedLen)
+                            updateMessage(msgId) { msg ->
+                                val parts = LinkedHashMap(msg.parts)
+                                parts[key] = MessagePart.Thinking(
+                                    content = revealedContent,
+                                    state = PartState.Streaming
+                                )
+                                msg.copy(parts = parts, isStreaming = ctx.isStreaming)
+                            }
+                        }
+                    }
+                    val delayMs = when {
+                        ctx.thinkingSourceComplete -> 0L
+                        backlog > 80 -> 8L
+                        backlog > 30 -> 16L
+                        else -> 24L
+                    }
+                    if (delayMs > 0) delay(delayMs)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(e) { "[ACP] startThinkingRevealLoop: unexpected exception — flushing thinking reveal buffer" }
+                flushThinkingRevealBuffer()
+            }
+        }
+    }
+
+    /**
+     * Flush the thinking reveal buffer — reveal all remaining thinking text immediately
+     * and stop the reveal loop. Called by freezeCurrentThinking.
+     */
+    private fun flushThinkingRevealBuffer() {
+        ctx.thinkingSourceComplete = true
+        ctx.thinkingRevealedLen = ctx.thinkingRevealBuffer.length
+        ctx.thinkingRevealJob?.cancel()
+        ctx.thinkingRevealJob = null
+    }
+
     // ── Internal: Text Re-Segmentation ──────────────────────────────────────
+
+    /**
+     * Start (or no-op if already running) the typewriter reveal coroutine.
+     * This coroutine drains [ctx.revealBuffer] at an adaptive rate, calling
+     * [scheduleResegment] each time new characters are revealed. The effect is
+     * that text appears gradually instead of in irregular SSE-driven bursts.
+     */
+    private fun startRevealLoop(msgId: String) {
+        if (ctx.revealJob?.isActive == true) return
+        ctx.sourceComplete = false
+        ctx.revealJob = scope.launch(Dispatchers.Default) {
+            var charBudget = 0.0
+            var lastTickMs = System.currentTimeMillis()
+            try {
+                while (true) {
+                    val target = ctx.revealBuffer.length
+                    val backlog = target - ctx.revealedLen
+                    if (backlog <= 0) {
+                        if (ctx.sourceComplete) break
+                        delay(50) // idle poll
+                        lastTickMs = System.currentTimeMillis()
+                        continue
+                    }
+                    val now = System.currentTimeMillis()
+                    val dtMs = (now - lastTickMs).coerceAtLeast(1)
+                    lastTickMs = now
+                    // Adaptive rate: 42 cps at rest, 125 cps normal, 500 cps catching up
+                    val rate = when {
+                        ctx.sourceComplete -> backlog.toDouble() // flush all
+                        backlog > 80 -> 500.0
+                        backlog > 30 -> 125.0
+                        else -> 42.0
+                    }
+                    charBudget += rate * (dtMs / 1000.0)
+                    val wholeChars = charBudget.toInt()
+                    if (wholeChars >= 1) {
+                        val reveal = minOf(wholeChars, backlog)
+                        ctx.revealedLen = minOf(ctx.revealedLen + reveal, target)
+                        charBudget -= reveal
+                        // Call resegment DIRECTLY — no debounce. The reveal loop's delay
+                        // is the pacing mechanism. scheduleResegment's 50ms debounce
+                        // cancels every tick because the reveal loop ticks faster than 50ms.
+                        resegmentTextPartsDirect(msgId)
+                    }
+                    val delayMs = when {
+                        ctx.sourceComplete -> 0L
+                        backlog > 80 -> 8L
+                        backlog > 30 -> 16L
+                        else -> 24L
+                    }
+                    if (delayMs > 0) delay(delayMs)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(e) { "[ACP] startRevealLoop: unexpected exception — flushing reveal buffer" }
+                flushRevealBuffer()
+            }
+        }
+    }
+
+    /**
+     * Flush the reveal buffer — reveal all remaining text immediately and
+     * stop the reveal loop. Called by finalizeStreaming, completeStreaming,
+     * abortStreaming, and TextReplace handler.
+     */
+    private fun flushRevealBuffer() {
+        ctx.sourceComplete = true
+        ctx.revealedLen = ctx.revealBuffer.length
+        ctx.revealJob?.cancel()
+        ctx.revealJob = null
+    }
 
     private fun scheduleResegment(msgId: String) {
         if (!firstTextSegmented) {
@@ -1284,17 +1606,29 @@ class SessionState(
         }
         resegmentJob?.cancel()
         // Use Dispatchers.Default (NOT EDT) — markdown parsing is CPU-intensive.
+        // CancellationException propagates naturally when a newer resegment cancels
+        // this job (line 1306) or when the scope is cancelled — no catch needed.
         resegmentJob = scope.launch(Dispatchers.Default) {
-            try {
-                delay(DEBOUNCE_MS)
-                resegmentTextPartsDirect(msgId)
-            } catch (_: CancellationException) { /* newer event arrived */ }
+            delay(DEBOUNCE_MS)
+            resegmentTextPartsDirect(msgId)
         }
     }
 
     private fun resegmentTextPartsDirect(msgId: String, overrideIsStreaming: Boolean = ctx.isStreaming) {
         stateLock.withLock {
-            if (ctx.textBuffer.isEmpty()) {
+            // SHORT-CIRCUIT: Skip re-segmentation if revealed text hasn't changed since
+            // the last call. This eliminates redundant O(n) markdown parsing on every
+            // reveal loop tick (8-24ms) when no new text has been revealed. The reveal
+            // loop calls this on every tick, but charBudget may not produce new chars
+            // if the backlog is small or the rate is low. Without this guard, a 50k-token
+            // response would trigger O(n) segmentation on every 8ms tick regardless of
+            // whether new text was revealed.
+            if (ctx.revealedLen == ctx.lastSegmentedLen && ctx.revealedLen > 0) {
+                return@withLock
+            }
+            ctx.lastSegmentedLen = ctx.revealedLen
+
+            if (ctx.revealedLen == 0) {
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     parts.keys.removeIf { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }
@@ -1325,14 +1659,14 @@ class SessionState(
             // to avoid races with the event processing coroutine that may mutate ctx.textSegments.
             val segmentsSnapshot = ctx.textSegments.toList()
 
-            val raw = ctx.textBuffer.toString()
+            val raw = ctx.revealBuffer.substring(0, ctx.revealedLen)
 
             // Segment each text segment independently and collect parts per segment.
             // Each segment covers a slice of textBuffer: [startOffset, nextSegment.startOffset).
             val partsBySegment = mutableListOf<List<Pair<String, MessagePart>>>()
             for (segIdx in segmentsSnapshot.indices) {
-                val start = segmentsSnapshot[segIdx].startOffset
-                val end = if (segIdx + 1 < segmentsSnapshot.size) segmentsSnapshot[segIdx + 1].startOffset else raw.length
+                val start = minOf(segmentsSnapshot[segIdx].startOffset, ctx.revealedLen)
+                val end = if (segIdx + 1 < segmentsSnapshot.size) minOf(segmentsSnapshot[segIdx + 1].startOffset, ctx.revealedLen) else ctx.revealedLen
                 if (start >= end) {
                     partsBySegment.add(emptyList())
                     continue

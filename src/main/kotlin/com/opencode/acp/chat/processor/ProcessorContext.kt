@@ -56,11 +56,25 @@ class ProcessorContext {
     val textBuffer: StringBuilder = StringBuilder()
     /** Mirrors textBuffer content as a StateFlow for real-time observation by UI (e.g. task pill). */
     val streamingText = MutableStateFlow("")
+
+    // ── Typewriter reveal buffer ──────────────────────────────────────────
+    /** The full accumulated text from SSE (same as textBuffer content).
+     *  The reveal coroutine drains from here; only [revealedLen] characters
+     *  are segmented and rendered. */
+    val revealBuffer: StringBuffer = StringBuffer()
+    /** How much of revealBuffer has been revealed to the UI so far (character count). */
+    @Volatile var revealedLen: Int = 0
+    /** Job for the reveal coroutine. Cancelled on reset/finalize. */
+    @Volatile var revealJob: Job? = null
+    /** Whether the source (SSE) has stopped sending text. When true, the reveal
+     *  loop flushes remaining buffer immediately instead of continuing slow reveal. */
+    @Volatile var sourceComplete: Boolean = false
+
     /** Tracks text segments split at tool call / thinking boundaries.
      *  Each segment records where in [textBuffer] it starts and which non-text
      *  part key it should be inserted after. This enables chronological
      *  interleaving: text before a tool call stays before it, text after stays after. */
-    val textSegments: MutableList<TextSegment> = mutableListOf()
+    val textSegments: MutableList<TextSegment> = java.util.concurrent.CopyOnWriteArrayList()
 
     // ── Thinking phase state ──────────────────────────────────────────────
     /** Key for the currently active thinking phase in the parts map (e.g., "thinking_0").
@@ -75,6 +89,16 @@ class ProcessorContext {
     var activeThinkingCompleted: Boolean = false
     /** Monotonic counter for generating unique thinking keys. */
     var thinkingPhaseIndex: Int = 0
+
+    // ── Thinking typewriter reveal buffer ──────────────────────────────────
+    /** Reveal buffer for thinking — mirrors thinkingBuffer but only revealedLen chars are shown. */
+    val thinkingRevealBuffer: StringBuffer = StringBuffer()
+    /** How much of thinkingRevealBuffer has been revealed to the UI so far. */
+    @Volatile var thinkingRevealedLen: Int = 0
+    /** Job for the thinking reveal coroutine. Cancelled on freeze/reset. */
+    @Volatile var thinkingRevealJob: Job? = null
+    /** Whether the thinking source has stopped sending. When true, flush remaining buffer. */
+    @Volatile var thinkingSourceComplete: Boolean = false
 
     // ── Tool call state ───────────────────────────────────────────────────
     /** Tool call pills keyed by callId. Secondary index for updates — the primary
@@ -105,6 +129,11 @@ class ProcessorContext {
     var userEchoStripped: Boolean = false
     var streamingStartedEmitted: Boolean = false
     var streamingCompletedEmitted: Boolean = false
+    /** Length of revealBuffer at the time of the last successful resegmentTextPartsDirect call.
+     *  Used to skip redundant re-segmentation when the revealed text hasn't changed.
+     *  @Volatile because read by event processing coroutine and written by resegment
+     *  (same coroutine, but volatile ensures visibility if the pattern changes). */
+    @Volatile var lastSegmentedLen: Int = 0
     /** @Volatile because read by recoverBackgroundSessions() on Dispatchers.Default
      *  and written by event processing on Dispatchers.EDT. */
     @Volatile var activeMessageId: String? = null
@@ -128,13 +157,18 @@ class ProcessorContext {
     @Volatile var lastActivityTimeMs: Long = System.currentTimeMillis()
 
     // ── Per-event state (added directly to parts map via updateMessage) ────
-    val activePatches: MutableList<SseEvent.Patch> = mutableListOf()
+    // Use thread-safe collections for defensive safety. Primary ownership is the
+    // event processing coroutine (SINGLE-COROUTINE OWNERSHIP), but these collections
+    // may be read from other coroutines in the future. CopyOnWriteArrayList and
+    // ConcurrentHashMap provide safe concurrent reads without external synchronization,
+    // matching the pattern used for toolCallPills/toolCallIndex/toolPartStates.
+    val activePatches: java.util.concurrent.CopyOnWriteArrayList<SseEvent.Patch> = java.util.concurrent.CopyOnWriteArrayList()
     var activeAgentName: String? = null
     var activeRetry: SseEvent.Retry? = null
     var activeCompaction: SseEvent.Compaction? = null
     var activeStepFinish: SseEvent.StepFinish? = null
-    val activeAssistantFiles: MutableMap<String, SseEvent.AssistantFile> = mutableMapOf()
-    val activeAssistantImages: MutableMap<String, SseEvent.AssistantImage> = mutableMapOf()
+    val activeAssistantFiles: java.util.concurrent.ConcurrentHashMap<String, SseEvent.AssistantFile> = java.util.concurrent.ConcurrentHashMap()
+    val activeAssistantImages: java.util.concurrent.ConcurrentHashMap<String, SseEvent.AssistantImage> = java.util.concurrent.ConcurrentHashMap()
 
     /** Reset turn-specific state for a new streaming turn.
      *  NOTE: Does NOT clear toolCallIndex — it spans turns so late tool results
@@ -143,8 +177,18 @@ class ProcessorContext {
     fun resetTurnState() {
         textBuffer.clear()
         streamingText.value = ""
+        revealBuffer.setLength(0)
+        revealedLen = 0
+        revealJob?.cancel()
+        revealJob = null
+        sourceComplete = false
         textSegments.clear()
         thinkingBuffer.clear()
+        thinkingRevealBuffer.setLength(0)
+        thinkingRevealedLen = 0
+        thinkingRevealJob?.cancel()
+        thinkingRevealJob = null
+        thinkingSourceComplete = false
         activeThinkingKey = null
         activeThinkingCompleted = false
         thinkingPhaseIndex = 0
@@ -156,6 +200,7 @@ class ProcessorContext {
         userEchoStripped = false
         streamingStartedEmitted = false
         streamingCompletedEmitted = false
+        lastSegmentedLen = 0
         activeMessageId = null
         activeServerMessageId = null
         errorMessage = null

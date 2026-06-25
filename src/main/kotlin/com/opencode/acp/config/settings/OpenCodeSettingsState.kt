@@ -45,6 +45,13 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      *  LLM generation time: request queuing, tool execution, network latency, and
      *  bookkeeping. Default 30, minimum 10. */
     var longTimeoutBufferSeconds: Int = 30
+    /** Maximum time (seconds) a single tool call can run with no SSE activity before
+     *  being considered stuck. This is a safety net for lost ToolResult events — if a
+     *  tool's result is never received (e.g., child session crash, SSE event lost during
+     *  reconnect), the tool stays InProgress forever and blocks the activity monitor's
+     *  normal timeout. This ceiling fires regardless of hasRunningTools.
+     *  Default 300 (5 minutes). Range: 60-3600. */
+    var toolStuckTimeoutSeconds: Int = 300
     /** @deprecated Migrated to [responseTimeoutSeconds]. Kept for XStream backward compatibility.
      *  Can be removed once all users have migrated (i.e., after 2+ release cycles).
      *  The migration logic in loadState() handles the transition from old to new setting. */
@@ -56,7 +63,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var port: Int = 4096
     /** Whether to load all sessions at once (bypasses pagination). Shows performance warning. */
     var loadAllSessions: Boolean = false
-    /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save. */
+    /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save.
+     *  THREAD SAFETY: This ArrayList is only accessed from the EDT (XStream serialization,
+     *  recordCommand() from UI, commandHistory collection in Compose). Do NOT access from
+     *  background threads without synchronization. */
     var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
     /**
      * Tool kinds that default to expanded in the chat.
@@ -93,6 +103,15 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var toolPermissions: String = ""
 
     /**
+     * Permissions saved before Disable All, so Enable All can restore ASK
+     * settings that were active before the disable. Prevents ASK→ALLOW
+     * promotion on a disable→enable cycle across IDE restarts.
+     * Format: {"toolId":"allow",...} (tool ID → permission action string).
+     * Empty when no Disable All has been performed.
+     */
+    var savedToolPermissionsBeforeDisable: String = ""
+
+    /**
      * Discovered tools cache as JSON string.
      * Format: [{"name":"bash","description":"...","source":"builtin","serverName":"builtin"},...]
      * Allows showing previously discovered tools without re-discovery.
@@ -101,6 +120,12 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     /** Whether to show a confirmation dialog before disconnecting from the server. */
     var showDisconnectConfirmation: Boolean = true
+
+    /** Plugin log level for idea.log. One of OFF, ERROR, WARN, INFO, DEBUG, TRACE, ALL.
+     *  Default INFO — shows startup/connection/error logs. Set DEBUG/ALL for troubleshooting.
+     *  Applied at startup via [com.opencode.acp.config.settings.StartupLogConfigListener]
+     *  and on settings Apply via [OpenCodeSettingsConfigurable]. */
+    var logLevel: String = "INFO"
 
     // ── Follow Agent ──────────────────────────────────────────────────
     /**
@@ -183,12 +208,14 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     override fun loadState(state: OpenCodeSettingsState) {
         binaryPath = state.binaryPath
         permissionTimeoutSeconds = state.permissionTimeoutSeconds
-        favoriteModels = state.favoriteModels
+        // Copy ArrayLists to avoid shared references — if the persistence framework
+        // reuses the state parameter, mutations on the loaded instance would affect it.
+        favoriteModels = java.util.ArrayList(state.favoriteModels)
         inlineCodeColor = state.inlineCodeColor
         listNumberColor = state.listNumberColor
         lastSelectedModelKey = state.lastSelectedModelKey
         sidebarVisible = state.sidebarVisible
-        commandHistorySize = if (state.commandHistorySize > 0) state.commandHistorySize else 15
+        commandHistorySize = state.commandHistorySize.coerceIn(1, 100)
         // Migrate legacy sseSocketTimeoutSeconds → responseTimeoutSeconds.
         // If responseTimeoutSeconds was explicitly set (not default 300), keep it.
         // Otherwise, if sseSocketTimeoutSeconds was customized (not default 60), use that
@@ -201,19 +228,34 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             else -> 300
         }
         longTimeoutBufferSeconds = state.longTimeoutBufferSeconds.coerceAtLeast(10)
+        toolStuckTimeoutSeconds = state.toolStuckTimeoutSeconds.coerceIn(60, 3600)
         @Suppress("DEPRECATION")
         sseSocketTimeoutSeconds = state.sseSocketTimeoutSeconds
         autoConnect = state.autoConnect
         port = if (state.port in 1024..65535) state.port else 4096
         loadAllSessions = state.loadAllSessions
-        commandHistory = state.commandHistory
-        expandedToolKinds = state.expandedToolKinds.ifBlank { "EXECUTE,EDIT,READ,THINK" }
+        commandHistory = java.util.ArrayList(state.commandHistory)
+        val validKinds = com.agentclientprotocol.model.ToolKind.entries.map { it.name }.toSet()
+        expandedToolKinds = state.expandedToolKinds.split(',')
+            .map { it.trim() }
+            .filter { it in validKinds }
+            .ifEmpty { listOf("EXECUTE", "EDIT", "READ", "THINK") }
+            .joinToString(",")
         expandTaskPillsByDefault = state.expandTaskPillsByDefault
         queueInsteadOfSteer = state.queueInsteadOfSteer
         enableIntellijMcp = state.enableIntellijMcp
         mcpServerUrl = state.mcpServerUrl
-        additionalMcpServers = state.additionalMcpServers
+        additionalMcpServers = try {
+            if (state.additionalMcpServers.isNotBlank()) {
+                kotlinx.serialization.json.Json.parseToJsonElement(state.additionalMcpServers)
+                state.additionalMcpServers
+            } else ""
+        } catch (e: Exception) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] Invalid additionalMcpServers in settings, clearing" }
+            ""
+        }
         toolPermissions = state.toolPermissions
+        savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
         discoveredToolsJson = state.discoveredToolsJson
         followAgentEnabled = state.followAgentEnabled
         followReadColor = state.followReadColor
@@ -225,6 +267,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         followFetchColor = state.followFetchColor
         followOtherColor = state.followOtherColor
         showDisconnectConfirmation = state.showDisconnectConfirmation
+        logLevel = AcpLogLevel.fromName(state.logLevel).name
     }
 
     companion object {
