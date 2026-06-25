@@ -1,0 +1,5 @@
+<idea-plugin>
+    <!-- Git-specific extensions loaded only when Git4Idea is available.
+         Currently the plugin uses ChangeListManager (VCS-agnostic, from platform)
+         but Git4Idea is declared as optional for future Git-specific features. -->
+</idea-plugin>

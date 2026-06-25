@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <idea-plugin require-restart="true" version="1.0.0">
     <id>com.sigil.plugin</id>
-    <idea-version since-build="261" until-build="263.*"/>
+    <idea-version since-build="261"/>
     <name>Sigil - Coding Assistant</name>
     <vendor url="https://github.com/nievesj/sigil-coding-assistant" email="support@opencode.ai">Sigil</vendor>
     <description><![CDATA[
@@ -71,7 +71,7 @@
         <module name="intellij.libraries.skiko"/>
     </dependencies>
 
-    <depends optional="true">Git4Idea</depends>
+    <depends optional="true" config-file="git4idea.xml">Git4Idea</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <applicationConfigurable
