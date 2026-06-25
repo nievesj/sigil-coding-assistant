@@ -14,7 +14,7 @@ if (-not $env:JAVA_HOME) {
 }
 
 # --- Conventional commit versioning ---
-$repo = "nievesj/intellij-opencode-plugin"
+$repo = "nievesj/sigil-coding-assistant"
 
 # Get last PUBLISHED (non-draft) release tag only
 $ghErrFile = Join-Path $env:TEMP "gh_release_err.log"

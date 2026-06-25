@@ -4,7 +4,7 @@ import jetbrains.buildServer.configs.kotlin.triggers.vcs
 import jetbrains.buildServer.configs.kotlin.vcs.GitVcsRoot
 
 /*
-   TeamCity build configuration for the IntelliJ OpenCode Plugin.
+   TeamCity build configuration for Sigil.
    This file is stored in the repo under .teamcity/ and version-controlled.
    Secrets (LLM_API_KEY) are stored as secure params in TeamCity and
    referenced by placeholder here — the actual value is never committed.
@@ -14,7 +14,7 @@ version = "2026.1"
 
 project {
 
-    vcsRoot(IntellijOpencodePluginGitSSH)
+    vcsRoot(SigilGitSSH)
 
     buildType(Build)
 }
@@ -31,7 +31,7 @@ object Build : BuildType({
     }
 
     vcs {
-        root(IntellijOpencodePluginGitSSH)
+        root(SigilGitSSH)
     }
 
     steps {
@@ -51,9 +51,9 @@ object Build : BuildType({
     }
 })
 
-object IntellijOpencodePluginGitSSH : GitVcsRoot({
-    name = "IntellijOpencodePluginGitSSH"
-    url = "git@github.com:nievesj/intellij-opencode-plugin.git"
+object SigilGitSSH : GitVcsRoot({
+    name = "SigilGitSSH"
+    url = "git@github.com:nievesj/sigil-coding-assistant.git"
     branch = "refs/heads/main"
     authMethod = uploadedKey {
         userName = "git"

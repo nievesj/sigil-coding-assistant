@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <project>
   <modelVersion>4.0.0</modelVersion>
-  <name>IntellijOpencodePlugin Config DSL Script</name>
-  <groupId>IntellijOpencodePlugin</groupId>
-  <artifactId>IntellijOpencodePlugin_dsl</artifactId>
+  <name>Sigil Config DSL Script</name>
+  <groupId>Sigil</groupId>
+  <artifactId>Sigil_dsl</artifactId>
   <version>1.0-SNAPSHOT</version>
 
   <parent>

@@ -69,7 +69,7 @@ fun ConnectionSplashScreen(
             // OpenCode logo/icon
             Icon(
                 key = AllIconsKeys.General.Information,
-                contentDescription = "OpenCode",
+                contentDescription = "Sigil",
                 modifier = Modifier.size(ChatTheme.dims.splashLogoSize),
                 tint = ChatTheme.colors.component.splashConnected
             )
@@ -78,7 +78,7 @@ fun ConnectionSplashScreen(
 
             // Title
             Text(
-                text = "OpenCode",
+                text = "Sigil",
                 fontSize = ChatTheme.fonts.splashTitle,
                 fontWeight = ChatTheme.fontWeights.splashTitle,
                 color = ChatTheme.colors.text.inverse

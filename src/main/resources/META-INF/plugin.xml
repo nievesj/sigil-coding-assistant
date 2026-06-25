@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <idea-plugin require-restart="true" version="1.0.0">
-    <id>com.opencode.plugin</id>
+    <id>com.sigil.plugin</id>
     <idea-version since-build="261" until-build="263.*"/>
-    <name>OpenCode Plugin</name>
-    <vendor url="https://opencode.ai" email="support@opencode.ai">OpenCode</vendor>
+    <name>Sigil - Coding Assistant</name>
+    <vendor url="https://github.com/nievesj/sigil-coding-assistant" email="support@opencode.ai">Sigil</vendor>
     <description><![CDATA[
-        <p>An <a href="https://opencode.ai/">OpenCode</a> plugin for IntelliJ IDEA that integrates AI-assisted development directly into the IDE — not just a thin CLI wrapper.</p>
+        <p>Sigil — a coding assistant plugin for IntelliJ IDEA that integrates AI-assisted development directly into the IDE. Powered by <a href="https://opencode.ai/">OpenCode</a>.</p>
 
         <h3>Features</h3>
         <ul>
@@ -20,7 +20,7 @@
         <h3>Requirements</h3>
         <ul>
             <li>IntelliJ IDEA 2026.1 or newer.</li>
-            <li>The <code>opencode</code> CLI installed and available on your system PATH, or configured in the plugin settings (Settings → Tools → OpenCode).</li>
+            <li>The <code>opencode</code> CLI installed and available on your system PATH, or configured in the plugin settings (Settings → Tools → Sigil).</li>
         </ul>
 
         <h3>How it works</h3>
@@ -78,7 +78,7 @@
             parentId="tools"
             instance="com.opencode.acp.config.settings.OpenCodeSettingsConfigurable"
             id="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
-            displayName="OpenCode"/>
+            displayName="Sigil"/>
 
         <applicationConfigurable
             parentId="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
@@ -93,12 +93,12 @@
             displayName="Follow Agent"/>
 
         <toolWindow
-            id="AI Coding Assistant - OpenCode"
+            id="Sigil - Coding Assistant"
             secondary="true"
-            icon="/icons/opencode-toolwindow.svg"
+            icon="/icons/sigil-toolwindow.svg"
             factoryClass="com.opencode.acp.chat.ChatToolWindowFactory"/>
 
-        <notificationGroup id="OpenCode"
+        <notificationGroup id="Sigil"
                            displayType="BALLOON"
                            isLogByDefault="true"/>
 
@@ -132,7 +132,7 @@
     <actions>
         <!-- Review Comments: editor popup action for adding comments.
              Appears in the editor right-click menu. -->
-        <action id="OpenCode.Review.AddComment"
+        <action id="Sigil.Review.AddComment"
                 class="com.opencode.acp.review.AddReviewCommentAction"
                 text="Add Review Comment"
                 description="Add a review comment on the selected line range">
