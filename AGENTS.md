@@ -33,7 +33,7 @@ Logs for the plugin when running via `runIde` are NOT in the main IDEA log.
 They are in the sandbox directory:
 
 ```
-.intellijPlatform/sandbox/intellij-opencode-plugin/IU-2026.1/log/idea.log
+.intellijPlatform/sandbox/sigil/IU-2026.1/log/idea.log
 ```
 
 ### Installed Plugin Log Location
@@ -79,9 +79,9 @@ To enable verbose SSE logging in idea.log, add to Help â†’ Debug Log Settin
 #com.opencode.acp.adapter.OpenCodeClient=debug
 ```
 
-### Configurable Log Level (Settings → Tools → OpenCode)
+### Configurable Log Level (Settings → Tools → Sigil)
 
-The plugin has a built-in log-level dropdown in Settings → Tools → OpenCode
+The plugin has a built-in log-level dropdown in Settings → Tools → Sigil
 ("Plugin log level") that controls the Logback level for the entire
 `com.opencode.acp` package at runtime. This is the **preferred** mechanism —
 no need to manually edit Debug Log Settings.

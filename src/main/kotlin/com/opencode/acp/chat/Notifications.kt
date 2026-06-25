@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object OpenCodeNotifications {
 
-    private const val GROUP_ID = "OpenCode"
+    private const val GROUP_ID = "Sigil"
 
     /** Minimum interval (ms) between response-complete notifications. */
     private const val RESPONSE_NOTIFY_MIN_INTERVAL_MS = 5_000L
@@ -56,7 +56,7 @@ object OpenCodeNotifications {
         ApplicationManager.getApplication().invokeLater {
             Notification(
                 GROUP_ID,
-                "OpenCode",
+                "Sigil",
                 "Response complete.",
                 NotificationType.INFORMATION
             ).addAction(
@@ -84,7 +84,7 @@ object OpenCodeNotifications {
         ApplicationManager.getApplication().invokeLater {
             Notification(
                 GROUP_ID,
-                "OpenCode",
+                "Sigil",
                 "The model is asking a question — your input is needed.",
                 NotificationType.WARNING
             ).addAction(
@@ -110,7 +110,7 @@ object OpenCodeNotifications {
         ApplicationManager.getApplication().invokeLater {
             Notification(
                 GROUP_ID,
-                "OpenCode",
+                "Sigil",
                 "The model needs permission to proceed.",
                 NotificationType.WARNING
             ).addAction(

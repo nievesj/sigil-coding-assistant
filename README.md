@@ -1,14 +1,14 @@
-# What's this?
+# Sigil
 
-This is an [OpenCode](https://opencode.ai/) plugin for IntelliJ that actually integrates with the IDE instead of just wrapping the CLI.
+Sigil is a coding assistant plugin for IntelliJ that integrates with the IDE instead of just wrapping the CLI. It's powered by [OpenCode](https://opencode.ai/).
 
-Most OpenCode plugins I tried fell into one of two camps: a thin CLI wrapper with no real IDE integration, or a bloated plugin that pushes its own workflow and ideas on you. This one tries to stay out of the way.
+Most coding assistant plugins I tried fell into one of two camps: a thin CLI wrapper with no real IDE integration, or a bloated plugin that pushes its own workflow and ideas on you. This one tries to stay out of the way.
 
-The bigger problem I have with coding assistants is that they tend to take the wheel. They write code, you accept it, and you move on. That makes it easy to ship stuff you don't fully understand. This plugin focuses on review as a first-class step - you can review code OpenCode wrote inline in the editor before anything reaches GitHub or your CI. The goal is to catch mistakes early and make sure the code you commit actually meets your standards.
+The bigger problem I have with coding assistants is that they tend to take the wheel. They write code, you accept it, and you move on. That makes it easy to ship stuff you don't fully understand. This plugin focuses on review as a first-class step - you can review code the agent wrote inline in the editor before anything reaches GitHub or your CI. The goal is to catch mistakes early and make sure the code you commit actually meets your standards.
 
 ## Full disclosure
 
-This plugin was built almost entirely with open-weight LLMs - GLM 5.2, Kimi 5.6, Mimo 2.5, and DeepSeek V4. No Claude, no GPT-5, no closed-model pair programmer behind the scenes. The code, the TDD docs, and even this README were written, reviewed, and iterated through that pipeline.
+This plugin was built almost entirely with open-weight LLMs - GLM 5.2, Kimi 5.6, Mimo 2.5, and DeepSeek V4. No Claude, no GPT-5, no closed-model pair programmer behind the scenes. The code, was written, reviewed, and iterated through that pipeline.
 
 I did this as a deliberate experiment: can you build a real, shipping IntelliJ plugin using only open weights? Not a toy demo, but something with SSE streaming, MCP integration, editor gutter comments, async filesystem watchers, and a Compose UI. The answer so far is "mostly, and it's getting closer every month." Some parts took more retries than they would have with a closed model, and some prompts needed tighter scaffolding, but the result is a working plugin that I actually use day-to-day.
 
@@ -118,4 +118,4 @@ The chat UI could have been built with raw Swing, but that meant writing custom 
 
 ## Installing
 
-Download the latest ZIP from the [GitHub releases](https://github.com/nievesj/intellij-opencode-plugin/releases) page or install it from the JetBrains Marketplace, then install it through **Settings → Plugins → Install Plugin from Disk**.
+Download the latest ZIP from the [GitHub releases](https://github.com/nievesj/sigil-coding-assistant/releases) page, then install it through **Settings → Plugins → Install Plugin from Disk**.

@@ -5,4 +5,4 @@ pluginManagement {
     }
 }
 
-rootProject.name = "intellij-opencode-plugin"
+rootProject.name = "sigil"
