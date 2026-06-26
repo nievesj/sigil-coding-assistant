@@ -1,6 +1,12 @@
+param(
+    [string]$buildNumber
+)
+
 # Read major.minor from VERSION (manual changes control major.minor)
 $majorMinor = (Get-Content "VERSION" -Raw).Trim()
-$pluginVersion = "$majorMinor.$env:BUILD_COUNTER"
+# Extract patch from build number (e.g. "1.0.22" -> "22")
+$patch = $buildNumber.Split('.')[2]
+$pluginVersion = "$majorMinor.$patch"
 
 # Set TeamCity build number so subsequent steps see the correct version
 Write-Host "##teamcity[buildNumber '$pluginVersion']"
