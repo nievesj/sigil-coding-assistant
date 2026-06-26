@@ -109,7 +109,10 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
         } | ConvertTo-Json -Compress
 
         try {
-            $response = Invoke-RestMethod -Uri $llmUrl -Method Post -Body $body -ContentType "application/json" -Headers @{ "Authorization" = "Bearer $llmKey" }
+            # Use Invoke-WebRequest + explicit UTF-8 decode to avoid PS 5.1 encoding corruption
+            $webResponse = Invoke-WebRequest -Uri $llmUrl -Method Post -Body $body -ContentType "application/json" -Headers @{ "Authorization" = "Bearer $llmKey" }
+            $rawJson = [System.Text.Encoding]::UTF8.GetString($webResponse.RawContentStream.ToArray())
+            $response = $rawJson | ConvertFrom-Json
             if (-not $response.choices -or $response.choices.Count -eq 0) {
                 if ($response.error) {
                     Write-Host "LLM API returned error: $($response.error)"
@@ -150,7 +153,7 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
         }
 
         $notesFile = Join-Path $artifactsDir "release_notes.md"
-        $notes | Out-File -FilePath $notesFile -Encoding utf8 -NoNewline
+        [System.IO.File]::WriteAllText($notesFile, $notes, [System.Text.UTF8Encoding]::new($false))
 
         gh release create $tag --repo $repo --title $tag --notes-file $notesFile --draft
         if ($LASTEXITCODE -ne 0) {
@@ -176,7 +179,7 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
 
         # Publish to JetBrains Marketplace (hidden — not publicly visible after approval)
         Write-Host "Publishing plugin v$pluginVersion to JetBrains Marketplace (hidden)..."
-        .\gradlew.bat publishPlugin --no-daemon -PpluginVersion="$pluginVersion" -Phidden=true
+        .\gradlew.bat publishPlugin --no-daemon -PpluginVersion="$pluginVersion" -Phidden=true -PchangeNotesFile="$notesFile"
         if ($LASTEXITCODE -ne 0) {
             Write-Host "ERROR: publishPlugin failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
