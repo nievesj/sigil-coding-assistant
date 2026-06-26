@@ -1,10 +1,9 @@
-param(
-    [string]$buildNumber
-)
+# Build number passed as positional argument from TeamCity
+$buildNumber = $args[0]
 
 # Read major.minor from VERSION (manual changes control major.minor)
 $majorMinor = (Get-Content "VERSION" -Raw).Trim()
-# Extract patch from build number (e.g. "1.0.22" -> "22")
+# Extract patch from build number (e.g. "1.0.23" -> "23")
 $patch = $buildNumber.Split('.')[2]
 $pluginVersion = "$majorMinor.$patch"
 
