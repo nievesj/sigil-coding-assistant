@@ -1,21 +1,13 @@
 param(
-    [string]$pluginVersion
+    [string]$buildCounter
 )
 
-# Set JAVA_HOME from TeamCity agent JRE
-if (-not $env:JAVA_HOME) {
-    $env:JAVA_HOME = $env:TEAMCITY_JRE
-    if (-not $env:JAVA_HOME) {
-        $javaCmd = Get-Command "java" -ErrorAction SilentlyContinue
-        if ($javaCmd) { $env:JAVA_HOME = (Split-Path (Split-Path $javaCmd.Source)) }
-    }
-    if ($env:JAVA_HOME) {
-        Write-Host "JAVA_HOME set to: $env:JAVA_HOME"
-    } else {
-        Write-Host "ERROR: Cannot determine JAVA_HOME."
-        exit 1
-    }
-}
+# Read major.minor from VERSION (manual changes control major.minor)
+$majorMinor = (Get-Content "VERSION" -Raw).Trim()
+$pluginVersion = "$majorMinor.$buildCounter"
+
+# Set TeamCity build number so subsequent steps see the correct version
+Write-Host "##teamcity[buildNumber '$pluginVersion']"
 
 $repo = "nievesj/sigil-coding-assistant"
 $tag = "v$pluginVersion"

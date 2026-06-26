@@ -25,9 +25,6 @@ object Build : BuildType({
     buildNumberPattern = "1.0.%build.counter%"
 
     params {
-        // Pass TeamCity build number to Gradle as project property "pluginVersion"
-        // Gradle auto-reads ORG_GRADLE_PROJECT_* env vars as project properties
-        param("env.ORG_GRADLE_PROJECT_pluginVersion", "%build.number%")
         param("env.CREATE_RELEASE", "%CREATE_RELEASE%")
         param("env.LLM_API_KEY", "%LLM_API_KEY%")
         param("env.LLM_API_URL", "%LLM_API_URL%")
@@ -45,13 +42,13 @@ object Build : BuildType({
             scriptMode = file {
                 path = ".teamcity/build.ps1"
             }
-            scriptArgs = "-pluginVersion %build.number%"
+            scriptArgs = "-buildCounter %build.counter%"
         }
     }
 
     triggers {
         vcs {
-            branchFilter = "+:refs/heads/main"
+            branchFilter = "+:refs/heads/*"
             enableQueueOptimization = false
         }
     }
@@ -60,8 +57,8 @@ object Build : BuildType({
 object SigilGitSSH : GitVcsRoot({
     name = "SigilGitSSH"
     url = "git@github.com:nievesj/sigil-coding-assistant.git"
-    branch = "refs/heads/versioning-fuckery"
-    branchSpec = "+:refs/heads/versioning-fuckery"
+    branch = "refs/heads/main"
+    branchSpec = "+:refs/heads/*"
     authMethod = uploadedKey {
         userName = "git"
         uploadedKey = "GitHubPerforceSyncKey"
