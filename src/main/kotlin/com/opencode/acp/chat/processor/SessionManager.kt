@@ -54,10 +54,14 @@ class SessionManager(
     /** Mutex to serialize session switches. */
     private val switchMutex = Mutex()
 
-    /** In-flight guard for computeSessionContext — prevents stacking concurrent computations.
-     *  AtomicBoolean CAS: only one computation runs at a time; concurrent callers get the
-     *  current state. Replaces the old timestamp-based dedup guard (simpler, no time window). */
-    private val contextComputeInFlight = AtomicBoolean(false)
+    /** In-flight guard for full computeSessionContext (REST path). Prevents stacking
+     *  concurrent full computations. Local-only refreshes use [localComputeInFlight] instead
+     *  so they are not blocked by a slow REST call. */
+    private val fullComputeInFlight = AtomicBoolean(false)
+
+    /** In-flight guard for computeSessionContextLocal (no REST). Local refreshes are
+     *  cheap and should not be starved by a full computation blocked on getSession(). */
+    private val localComputeInFlight = AtomicBoolean(false)
 
     /** The currently active session ID. Null if no session is active. */
     private val _activeSessionId = MutableStateFlow<String?>(null)
@@ -712,15 +716,15 @@ class SessionManager(
         val messages = getActiveSession()?.messages?.value ?: emptyMap()
         val c = client ?: return SessionContextState.Loading
 
-        // In-flight guard: skip if another computation is already running.
-        // Replaces the timestamp-based dedup guard — simpler and correct under concurrency.
-        if (!contextComputeInFlight.compareAndSet(false, true)) {
+        // In-flight guard: skip if another full computation is already running.
+        // Uses a dedicated guard so local refreshes are not blocked.
+        if (!fullComputeInFlight.compareAndSet(false, true)) {
             return _sessionContextState.value
         }
         try {
             return computeSessionContextInternal(currentSessionId, messages, c, controlState, fetchSession = true)
         } finally {
-            contextComputeInFlight.set(false)
+            fullComputeInFlight.set(false)
         }
     }
 
@@ -730,22 +734,24 @@ class SessionManager(
      * from the local message cache only; summary/time fields reuse the last loaded
      * values (they don't change mid-stream).
      *
-     * Thread-safe via [contextComputeInFlight] — if a full computation is in flight,
-     * this returns the current state instead of stacking another computation.
+     * Thread-safe via [localComputeInFlight] — local refreshes use a separate guard
+     * from full (REST) refreshes so they are not starved during streaming.
      */
     internal suspend fun computeSessionContextLocal(controlState: ControlBarState? = null): SessionContextState {
         val currentSessionId = _activeSessionId.value ?: return SessionContextState.Loading
         val messages = getActiveSession()?.messages?.value ?: emptyMap()
         val c = client ?: return SessionContextState.Loading
 
-        // Reuse the in-flight guard so local refreshes don't stack with full refreshes
-        if (!contextComputeInFlight.compareAndSet(false, true)) {
+        // Use a separate guard so local refreshes are NOT blocked by a full computation
+        // blocked on REST getSession(). Local refreshes are cheap (no REST) and should
+        // update the indicator promptly during streaming.
+        if (!localComputeInFlight.compareAndSet(false, true)) {
             return _sessionContextState.value
         }
         try {
             return computeSessionContextInternal(currentSessionId, messages, c, controlState, fetchSession = false)
         } finally {
-            contextComputeInFlight.set(false)
+            localComputeInFlight.set(false)
         }
     }
 
@@ -865,6 +871,13 @@ class SessionManager(
             )
         )
         logger.info { "[ACP] computeSessionContext(${if (fetchSession) "full" else "local"}): session=$currentSessionId totalTokens=$totalTokens cost=$totalCost usagePercent=${"%.1f".format(usagePercent)}% model=$modelId provider=$providerId" }
+        // Staleness guard: don't publish if the active session changed during the
+        // (possibly slow) computation. Prevents session A's context from appearing
+        // under session B after a switch.
+        if (currentSessionId != _activeSessionId.value) {
+            logger.info { "[ACP] computeSessionContext: session changed during computation ($currentSessionId → ${_activeSessionId.value}) — discarding result" }
+            return result
+        }
         _sessionContextState.value = result
         return result
     }

@@ -140,6 +140,10 @@ intellijPlatform {
         // The plugin ID from plugin.xml — used by the publishPlugin task
         // Uncomment and set if not using the default from plugin.xml
         // pluginId = "com.sigil.plugin"
+        // Hidden mode: when true, the published version is not publicly visible
+        // after approval (accessible only via direct link). Controlled by CI
+        // via -Phidden=true so local builds are unaffected.
+        hidden = providers.gradleProperty("hidden").map { it.toBoolean() }.orElse(false)
     }
 }
 

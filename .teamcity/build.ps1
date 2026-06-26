@@ -1,3 +1,15 @@
+# Build number passed as positional argument from TeamCity
+$buildNumber = $args[0]
+
+# Read major.minor from VERSION (manual changes control major.minor)
+$majorMinor = (Get-Content "VERSION" -Raw).Trim()
+# Extract patch from build number (e.g. "1.0.23" -> "23")
+$patch = $buildNumber.Split('.')[2]
+$pluginVersion = "$majorMinor.$patch"
+
+# Set TeamCity build number so subsequent steps see the correct version
+Write-Host "##teamcity[buildNumber '$pluginVersion']"
+
 # Set JAVA_HOME from TeamCity agent JRE
 if (-not $env:JAVA_HOME) {
     $env:JAVA_HOME = $env:TEAMCITY_JRE
@@ -13,16 +25,11 @@ if (-not $env:JAVA_HOME) {
     }
 }
 
-param(
-    [string]$BuildNumber
-)
-
-# --- Version from TeamCity build counter ---
 $repo = "nievesj/sigil-coding-assistant"
-$tag = "v$BuildNumber"
+$tag = "v$pluginVersion"
 
-Write-Host "Build number: $BuildNumber"
-Write-Host "Git tag:      $tag"
+Write-Host "Version: $pluginVersion"
+Write-Host "Tag:     $tag"
 
 # Get commits since last release for release notes
 $ghErrFile = Join-Path $env:TEMP "gh_release_err.log"
@@ -54,9 +61,9 @@ if (Test-Path $distDir) {
     Write-Host "Cleaned build/distributions/"
 }
 
-# Build the plugin
+# Build the plugin (pass version from TeamCity to Gradle)
 Write-Host "Building plugin..."
-.\gradlew.bat buildPlugin --no-daemon
+.\gradlew.bat buildPlugin --no-daemon -PpluginVersion="$pluginVersion"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: buildPlugin failed with exit code $LASTEXITCODE"
     exit $LASTEXITCODE
@@ -76,8 +83,12 @@ Get-ChildItem -Path $artifactsDir -Filter "*.zip" | ForEach-Object {
     Write-Host "##teamcity[publishArtifacts '$($_.FullName) => .']"
 }
 
-# GitHub Draft Release with AI Release Notes
-if ($bumpType -ne "none" -and $env:CREATE_RELEASE -eq "true") {
+# GitHub Draft Release — only on main branch
+$branch = $env:TEAMCITY_BUILD_BRANCH
+if (-not $branch) { $branch = git rev-parse --abbrev-ref HEAD 2>$null }
+Write-Host "Branch: $branch"
+
+if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
     $ghAvailable = Get-Command "gh" -ErrorAction SilentlyContinue
     if (-not $ghAvailable) {
         Write-Host "gh CLI not found on this agent. Skipping release."
@@ -85,9 +96,7 @@ if ($bumpType -ne "none" -and $env:CREATE_RELEASE -eq "true") {
         $llmUrl = $env:LLM_API_URL
         $llmKey = $env:LLM_API_KEY
 
-        # Generate release notes via LLM with reasoning enabled
-        # No max_tokens limit - let the model use its full context window
-        # Commits are wrapped in XML tags and marked as untrusted data to mitigate prompt injection
+        # Generate release notes via LLM
         $body = @{
             model = "deepseek-v4-flash"
             messages = @(
@@ -113,7 +122,6 @@ if ($bumpType -ne "none" -and $env:CREATE_RELEASE -eq "true") {
                 if ($notes -and $notes.Trim().Length -gt 0) {
                     Write-Host "LLM release notes generated ($($notes.Length) chars)."
                 } else {
-                    # Content empty - model put output in reasoning field, extract it
                     $reasoning = $response.choices[0].message.reasoning
                     if ($reasoning -and $reasoning.Trim().Length -gt 0) {
                         $headerIdx = $reasoning.IndexOf("##")
@@ -131,7 +139,6 @@ if ($bumpType -ne "none" -and $env:CREATE_RELEASE -eq "true") {
             }
         } catch {
             $errMsg = $_.Exception.Message
-            # Sanitize: remove any Bearer token that might appear in the error message
             $errMsg = $errMsg -replace 'Bearer\s+[A-Za-z0-9\-_\.]+', 'Bearer [REDACTED]'
             Write-Host "LLM call failed: $errMsg"
             $notes = $null
@@ -167,7 +174,18 @@ if ($bumpType -ne "none" -and $env:CREATE_RELEASE -eq "true") {
         } else {
             Write-Host "Release $tag created as draft."
         }
+
+        # Publish to JetBrains Marketplace (hidden — not publicly visible after approval)
+        # gradle.properties was already patched with $newVersion, so publishPlugin reads it automatically
+        Write-Host "Publishing plugin v$newVersion to JetBrains Marketplace (hidden)..."
+        .\gradlew.bat publishPlugin --no-daemon -Phidden=true
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "WARNING: publishPlugin failed with exit code $LASTEXITCODE"
+            Write-Host "Marketplace publish failed, but GitHub release was created."
+        } else {
+            Write-Host "Plugin v$newVersion published to JetBrains Marketplace (hidden)."
+        }
     }
 } else {
-    Write-Host "No version bump or CREATE_RELEASE not enabled. Skipping release."
+    Write-Host "Not on main branch or CREATE_RELEASE not enabled. Skipping release."
 }

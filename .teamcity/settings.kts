@@ -25,11 +25,17 @@ object Build : BuildType({
     buildNumberPattern = "1.0.%build.counter%"
 
     params {
+        param("env.BUILD_COUNTER", "%build.counter%")
         param("env.CREATE_RELEASE", "%CREATE_RELEASE%")
         param("env.LLM_API_KEY", "%LLM_API_KEY%")
         param("env.LLM_API_URL", "%LLM_API_URL%")
         param("LLM_API_URL", "https://ollama.com/v1/chat/completions")
         param("CREATE_RELEASE", "true")
+        // Marketplace publishing — values stored as secure params in TeamCity
+        param("env.PUBLISH_TOKEN", "%PUBLISH_TOKEN%")
+        param("env.CERTIFICATE_CHAIN", "%CERTIFICATE_CHAIN%")
+        param("env.PRIVATE_KEY", "%PRIVATE_KEY%")
+        param("env.PRIVATE_KEY_PASSWORD", "%PRIVATE_KEY_PASSWORD%")
     }
 
     vcs {
@@ -42,13 +48,13 @@ object Build : BuildType({
             scriptMode = file {
                 path = ".teamcity/build.ps1"
             }
-            scriptArgs = """-BuildNumber "%build.number%" """
+            scriptArgs = "-buildCounter %build.counter%"
         }
     }
 
     triggers {
         vcs {
-            branchFilter = "+:refs/heads/main"
+            branchFilter = "+:refs/heads/*"
             enableQueueOptimization = false
         }
     }
@@ -58,6 +64,7 @@ object SigilGitSSH : GitVcsRoot({
     name = "SigilGitSSH"
     url = "git@github.com:nievesj/sigil-coding-assistant.git"
     branch = "refs/heads/main"
+    branchSpec = "+:refs/heads/*"
     authMethod = uploadedKey {
         userName = "git"
         uploadedKey = "GitHubPerforceSyncKey"
