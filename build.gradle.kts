@@ -136,7 +136,7 @@ intellijPlatform {
     }
 
     publishing {
-        token = providers.environmentVariable("PUBLISH_TOKEN")
+        token = providers.gradleProperty("publishToken")
         // The plugin ID from plugin.xml — used by the publishPlugin task
         // Uncomment and set if not using the default from plugin.xml
         // pluginId = "com.sigil.plugin"

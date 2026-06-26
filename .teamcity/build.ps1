@@ -145,9 +145,8 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
         }
 
         if (-not $notes) {
-            $nl = [char]10
-            $notes = "## Changes`n`nChanges since ${lastTag}:${nl}${nl}${commits}"
-            Write-Host "Using fallback release notes."
+            Write-Host "ERROR: Failed to generate release notes from LLM. Cannot create release."
+            exit 1
         }
 
         $notesFile = Join-Path $artifactsDir "release_notes.md"
@@ -176,15 +175,13 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
         }
 
         # Publish to JetBrains Marketplace (hidden — not publicly visible after approval)
-        # gradle.properties was already patched with $newVersion, so publishPlugin reads it automatically
-        Write-Host "Publishing plugin v$newVersion to JetBrains Marketplace (hidden)..."
+        Write-Host "Publishing plugin v$pluginVersion to JetBrains Marketplace (hidden)..."
         .\gradlew.bat publishPlugin --no-daemon -Phidden=true
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "WARNING: publishPlugin failed with exit code $LASTEXITCODE"
-            Write-Host "Marketplace publish failed, but GitHub release was created."
-        } else {
-            Write-Host "Plugin v$newVersion published to JetBrains Marketplace (hidden)."
+            Write-Host "ERROR: publishPlugin failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
         }
+        Write-Host "Plugin v$pluginVersion published to JetBrains Marketplace (hidden)."
     }
 } else {
     Write-Host "Not on main branch or CREATE_RELEASE not enabled. Skipping release."
