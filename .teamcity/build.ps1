@@ -19,6 +19,9 @@ $repo = "nievesj/sigil-coding-assistant"
 # Get last PUBLISHED (non-draft) release tag only
 $ghErrFile = Join-Path $env:TEMP "gh_release_err.log"
 $lastTag = gh release list --repo $repo --limit 50 --json tagName,isDraft --jq '[.[] | select(.isDraft == false)] | .[0].tagName' 2>$ghErrFile
+# Force to string — gh may return an array in PS 5.1
+if ($lastTag -is [array]) { $lastTag = $lastTag[0] }
+$lastTag = "$lastTag".Trim()
 if (-not $lastTag) {
     $lastTag = $null
     if (Test-Path $ghErrFile -and (Get-Content $ghErrFile -Raw).Trim().Length -gt 0) {
@@ -86,7 +89,20 @@ if (-not $versionMatch) {
     Write-Host "ERROR: Could not read pluginVersion from gradle.properties"
     exit 1
 }
-$baseVersion = $versionMatch.Matches.Groups[1].Value.Trim()
+$gradleVersion = $versionMatch.Matches.Groups[1].Value.Trim()
+
+# Use the last published tag as the base version when it exists.
+# gradle.properties is not updated after releases, so it goes stale.
+$baseVersion = $gradleVersion
+if ($lastTag) {
+    $tagVersion = $lastTag -replace '^v', ''
+    Write-Host "Comparing: lastTag='$tagVersion' gradle='$gradleVersion'"
+    if ($tagVersion -ne $gradleVersion) {
+        $baseVersion = $tagVersion
+        Write-Host "Using last published tag ($lastTag) as base - gradle.properties ($gradleVersion) is stale."
+    }
+}
+
 $versionParts = $baseVersion -split "\."
 if ($versionParts.Count -lt 3) {
     Write-Host "ERROR: pluginVersion must be MAJOR.MINOR.PATCH, got: $baseVersion"
