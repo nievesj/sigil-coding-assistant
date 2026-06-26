@@ -75,8 +75,12 @@ Get-ChildItem -Path $artifactsDir -Filter "*.zip" | ForEach-Object {
     Write-Host "##teamcity[publishArtifacts '$($_.FullName) => .']"
 }
 
-# GitHub Draft Release with AI Release Notes
-if ($env:CREATE_RELEASE -eq "true") {
+# GitHub Draft Release — only on main branch
+$branch = $env:TEAMCITY_BUILD_BRANCH
+if (-not $branch) { $branch = git rev-parse --abbrev-ref HEAD 2>$null }
+Write-Host "Branch: $branch"
+
+if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
     $ghAvailable = Get-Command "gh" -ErrorAction SilentlyContinue
     if (-not $ghAvailable) {
         Write-Host "gh CLI not found on this agent. Skipping release."
@@ -164,5 +168,5 @@ if ($env:CREATE_RELEASE -eq "true") {
         }
     }
 } else {
-    Write-Host "CREATE_RELEASE not enabled. Skipping release."
+    Write-Host "Not on main branch or CREATE_RELEASE not enabled. Skipping release."
 }
