@@ -61,6 +61,7 @@ object SigilGitSSH : GitVcsRoot({
     name = "SigilGitSSH"
     url = "git@github.com:nievesj/sigil-coding-assistant.git"
     branch = "refs/heads/main"
+    branchSpec = "+:refs/heads/versioning-fuckery"
     authMethod = uploadedKey {
         userName = "git"
         uploadedKey = "GitHubPerforceSyncKey"
