@@ -220,22 +220,16 @@ class SessionState(
                 newTurnProviderID = providerID,
             ))
             if (sendResult.isFailure) {
-                // Channel is full (1024 capacity) or closed. Try to drain old events
-                // to make room, then retry. Only drain events from OTHER sessions
-                // (same-session events are from the old turn and can be dropped).
-                val drained = mutableListOf<SseEvent>()
+                // Channel is full (1024 capacity) or closed. Drain old events to make room.
+                // All events in this channel belong to this session — drain them all.
+                var drainedCount = 0
                 repeat(64) {
                     val r = eventChannel.tryReceive()
                     if (r.isFailure) return@repeat
-                    val evt = r.getOrNull()
-                    if (evt != null && evt.sessionId != sessionId) {
-                        drained.add(evt)
-                    }
-                    // Same-session events from old turn: safely drop
+                    drainedCount++
                 }
-                // Re-enqueue non-session events
-                for (evt in drained) {
-                    eventChannel.trySend(evt)
+                if (drainedCount > 0) {
+                    logger.info { "[ACP] createAssistantMessage: drained $drainedCount events to make room for ResetTurn" }
                 }
                 // Retry the ResetTurn send
                 val retryResult = eventChannel.trySend(SseEvent.ResetTurn(
@@ -528,34 +522,19 @@ class SessionState(
             // Runs on the event processing coroutine, eliminating the cross-coroutine
             // race between external callers (under stateLock) and event processing.
             is SseEvent.ResetTurn -> {
-                // Drain stale events from the previous turn on the consumer side
-                // (single-reader coroutine). This is strictly more robust than a
-                // producer-side drain because there's no window between draining
-                // and the reset — both run on this coroutine.
-                //
-                // SELECTIVE DRAIN: Only drain events that belong to THIS session.
-                // Events from other sessions (child subagents, background sessions)
-                // are left in the channel to be processed normally. Draining them
-                // would cause their events to be silently lost.
+                // Drain ALL stale events from the previous turn. Each SessionState has its own
+                // channel — all events in it belong to this session, so there's no need to
+                // filter by sessionId. The previous selective drain + re-enqueue raced with
+                // the producer-side drain in createAssistantMessage, corrupting channel
+                // ordering and causing transient stale message snapshots.
                 var drainedCount = 0
-                val drainedOtherSession = mutableListOf<SseEvent>()
                 while (true) {
                     val result = eventChannel.tryReceive()
                     if (result.isFailure) break
-                    val evt = result.getOrNull()
-                    if (evt != null && evt.sessionId == sessionId) {
-                        drainedCount++
-                    } else if (evt != null) {
-                        // Not our session — put it back (preserve order)
-                        drainedOtherSession.add(evt)
-                    }
-                }
-                // Re-enqueue non-session events so they're not lost
-                for (evt in drainedOtherSession) {
-                    eventChannel.trySend(evt)
+                    drainedCount++
                 }
                 if (drainedCount > 0) {
-                    logger.info { "[ACP] ResetTurn: drained $drainedCount stale events for session $sessionId (preserved ${drainedOtherSession.size} events from other sessions)" }
+                    logger.info { "[ACP] ResetTurn: drained $drainedCount stale events for session $sessionId" }
                 }
                 ctx.resetTurnState()
                 // Apply the new turn's identity atomically after clearing stale state.
@@ -859,10 +838,10 @@ class SessionState(
                 ctx.revealBuffer.append(event.text)
                 ctx.revealedLen = event.text.length // TextReplace is a finalization echo — reveal all
                 ctx.sourceComplete = true
-        ctx.revealJob?.cancel()
-        ctx.revealJob = null
-        ctx.thinkingRevealJob?.cancel()
-        ctx.thinkingRevealJob = null
+                ctx.revealJob?.cancel()
+                ctx.revealJob = null
+                ctx.thinkingRevealJob?.cancel()
+                ctx.thinkingRevealJob = null
                 ctx.userEchoStripped = false
                 val userText = ctx.lastUserText
                 if (userText != null && ctx.textBuffer.toString().startsWith(userText, ignoreCase = true)) {

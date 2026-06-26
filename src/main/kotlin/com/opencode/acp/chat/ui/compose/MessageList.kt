@@ -190,10 +190,23 @@ fun MessageList(
 
     // Re-enable auto-scroll when user scrolls back to the very bottom.
     // Uses pixel-based isAtBottom to avoid the canScrollForward toggle noise.
+    // Guard: don't re-enable when the list shrank (message loss/compaction) —
+    // that would arm auto-scroll with nothing to follow. Only re-enable on
+    // legitimate user scroll-back, which happens when the list is stable or
+    // growing.
+    //
+    // NOTE: reads messagesState.value.size (a snapshot-state read) inside
+    // snapshotFlow so the flow re-emits when the message count changes.
+    // Reading the plain `messages` List (captured at first composition by
+    // LaunchedEffect(Unit)) would freeze the size at its initial value,
+    // making the grew guard a no-op.
     LaunchedEffect(Unit) {
-        snapshotFlow { isAtBottom }
-            .collect { atBottom ->
-                if (atBottom) autoScrollEnabled = true
+        var prevSize = messagesState.value.size
+        snapshotFlow { isAtBottom to messagesState.value.size }
+            .collect { (atBottom, size) ->
+                val grew = size >= prevSize
+                prevSize = size
+                if (atBottom && grew) autoScrollEnabled = true
             }
     }
 
@@ -256,13 +269,20 @@ fun MessageList(
         // Treat delta 0 (streaming growth) and delta 1 (single new message) as
         // non-bulk. delta 1 gets animation; delta 0 gets instant.
         val isStreamingGrowth = messageDelta == 0
+        // Messages removed (compaction, message.removed, or lost-message bug) — snap to
+        // the new bottom instantly. Without this, delta < 0 falls into the animated-scroll
+        // branch, which no-ops because the target is already visible, leaving autoScroll
+        // armed with nothing to follow (the "stuck scroll" symptom).
+        val isShrink = messageDelta < 0
 
         scrollMutex.withLock {
             try {
-                if (isBulkLoad || isStreamingGrowth) {
+                if (isBulkLoad || isStreamingGrowth || isShrink) {
                     // Instant snap — no animation. For bulk loads, history appears
                     // at the bottom immediately. For streaming, the content growth
                     // is the motion; animating creates a feedback loop.
+                    // For shrink (messages removed), snap to the new bottom instantly
+                    // so autoScroll tracks the shortened list.
                     // Int.MAX_VALUE offset forces scroll to the very bottom of the
                     // last item (required with Arrangement.Bottom).
                     listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
@@ -277,7 +297,7 @@ fun MessageList(
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 logger.debug(e) { "[ACP] scroll failed, retrying without offset" }
                 try {
-                    if (isBulkLoad || isStreamingGrowth) {
+                    if (isBulkLoad || isStreamingGrowth || isShrink) {
                         listState.scrollToItem(totalItems - 1)
                     } else {
                         listState.animateScrollToItem(totalItems - 1)
