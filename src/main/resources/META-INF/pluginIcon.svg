@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" shape-rendering="crispEdges">
+  <defs>
+    <linearGradient id="vGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#4A9EFF"/>
+      <stop offset="100%" stop-color="#00D4FF"/>
+    </linearGradient>
+    <radialGradient id="circleGradient" cx="50%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#86efac"/>
+      <stop offset="100%" stop-color="#22c55e"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Left inverted V -->
+  <g fill="none" stroke="url(#vGradient)" stroke-width="4.5" stroke-linecap="square" stroke-linejoin="miter">
+    <polyline points="2,35 12,5 22,35"/>
+  </g>
+
+  <!-- Right inverted V -->
+  <g fill="none" stroke="url(#vGradient)" stroke-width="4.5" stroke-linecap="square" stroke-linejoin="miter">
+    <polyline points="18,35 28,5 38,35"/>
+  </g>
+
+  <!-- Filled circle at top center -->
+  <circle cx="20" cy="5" r="3" fill="url(#circleGradient)"/>
+</svg>

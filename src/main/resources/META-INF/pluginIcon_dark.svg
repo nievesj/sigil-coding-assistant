@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" shape-rendering="crispEdges">
+  <defs>
+    <linearGradient id="vGradientDark" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#6BB3FF"/>
+      <stop offset="100%" stop-color="#33DDFF"/>
+    </linearGradient>
+    <radialGradient id="circleGradientDark" cx="50%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#A3F5B8"/>
+      <stop offset="100%" stop-color="#4ADE80"/>
+    </radialGradient>
+  </defs>
+
+  <g fill="none" stroke="url(#vGradientDark)" stroke-width="4.5" stroke-linecap="square" stroke-linejoin="miter">
+    <polyline points="2,35 12,5 22,35"/>
+  </g>
+
+  <g fill="none" stroke="url(#vGradientDark)" stroke-width="4.5" stroke-linecap="square" stroke-linejoin="miter">
+    <polyline points="18,35 28,5 38,35"/>
+  </g>
+
+  <circle cx="20" cy="5" r="3" fill="url(#circleGradientDark)"/>
+</svg>

@@ -1,3 +1,5 @@
+import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
+
 plugins {
     id("org.jetbrains.intellij.platform") version("2.16.0")
     kotlin("jvm") version "2.3.0"
@@ -53,7 +55,6 @@ dependencies {
 
     intellijPlatform {
         intellijIdea(providers.gradleProperty("platformVersion"))
-        bundledPlugin("com.intellij.java")
 
         // Jewel/Compose bundled modules
         composeUI()
@@ -116,6 +117,15 @@ intellijPlatform {
     pluginVerification {
         ides {
             recommended()
+            create(IntelliJPlatformType.PyCharm, "2026.1")
+            create(IntelliJPlatformType.WebStorm, "2026.1")
+            create(IntelliJPlatformType.GoLand, "2026.1")
+            create(IntelliJPlatformType.CLion, "2026.1")
+            create(IntelliJPlatformType.Rider, "2026.1")
+            create(IntelliJPlatformType.RubyMine, "2026.1")
+            create(IntelliJPlatformType.RustRover, "2026.1")
+            create(IntelliJPlatformType.PhpStorm, "2026.1")
+            create(IntelliJPlatformType.DataGrip, "2026.1")
         }
     }
 

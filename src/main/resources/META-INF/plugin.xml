@@ -5,7 +5,7 @@
     <name>Sigil - Coding Assistant</name>
     <vendor url="https://github.com/nievesj/sigil-coding-assistant" email="support@opencode.ai">Sigil</vendor>
     <description><![CDATA[
-        <p>Sigil — a coding assistant plugin for IntelliJ IDEA that integrates AI-assisted development directly into the IDE. Powered by <a href="https://opencode.ai/">OpenCode</a>.</p>
+        <p>Sigil — a coding assistant plugin for JetBrains IDEs that integrates AI-assisted development directly into the IDE. Powered by <a href="https://opencode.ai/">OpenCode</a>.</p>
 
         <h3>Features</h3>
         <ul>
@@ -19,7 +19,7 @@
 
         <h3>Requirements</h3>
         <ul>
-            <li>IntelliJ IDEA 2026.1 or newer.</li>
+            <li>Any JetBrains IDE 2026.1 or newer (IntelliJ IDEA, PyCharm, WebStorm, GoLand, CLion, Rider, RubyMine, RustRover, PhpStorm, DataGrip).</li>
             <li>The <code>opencode</code> CLI installed and available on your system PATH, or configured in the plugin settings (Settings → Tools → Sigil).</li>
         </ul>
 
@@ -56,7 +56,6 @@
 
     <dependencies>
         <plugin id="com.intellij.modules.platform"/>
-        <plugin id="com.intellij.java"/>
         <module name="intellij.platform.jewel.foundation"/>
         <module name="intellij.platform.jewel.ui"/>
         <module name="intellij.platform.jewel.ideLafBridge"/>
@@ -70,6 +69,8 @@
         <module name="intellij.libraries.compose.runtime.desktop"/>
         <module name="intellij.libraries.skiko"/>
     </dependencies>
+
+    <depends>com.intellij.modules.lang</depends>
 
     <depends optional="true" config-file="git4idea.xml">Git4Idea</depends>
 
