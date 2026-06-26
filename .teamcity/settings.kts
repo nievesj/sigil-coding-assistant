@@ -22,6 +22,8 @@ project {
 object Build : BuildType({
     name = "Build"
 
+    buildNumberPattern = "1.0.%build.counter%"
+
     params {
         param("env.CREATE_RELEASE", "%CREATE_RELEASE%")
         param("env.LLM_API_KEY", "%LLM_API_KEY%")

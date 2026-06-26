@@ -13,123 +13,33 @@ if (-not $env:JAVA_HOME) {
     }
 }
 
-# --- Conventional commit versioning ---
+# --- Version from TeamCity build counter ---
 $repo = "nievesj/sigil-coding-assistant"
+$tag = "v$env:BUILD_NUMBER"
 
-# Get last PUBLISHED (non-draft) release tag only
+Write-Host "Build number: $env:BUILD_NUMBER"
+Write-Host "Git tag:      $tag"
+
+# Get commits since last release for release notes
 $ghErrFile = Join-Path $env:TEMP "gh_release_err.log"
 $lastTag = gh release list --repo $repo --limit 50 --json tagName,isDraft --jq '[.[] | select(.isDraft == false)] | .[0].tagName' 2>$ghErrFile
-# Force to string — gh may return an array in PS 5.1
 if ($lastTag -is [array]) { $lastTag = $lastTag[0] }
 $lastTag = "$lastTag".Trim()
-if (-not $lastTag) {
-    $lastTag = $null
-    if (Test-Path $ghErrFile -and (Get-Content $ghErrFile -Raw).Trim().Length -gt 0) {
-        Write-Host "WARNING: gh release list produced stderr: $(Get-Content $ghErrFile -Raw)"
-    }
-}
 Remove-Item $ghErrFile -Force -ErrorAction SilentlyContinue
 
-Write-Host "Last published release tag: $lastTag"
-
-# Use git log
 $gitErrFile = Join-Path $env:TEMP "git_log_err.log"
 if ($lastTag) {
     $commits = git log "${lastTag}..HEAD" --oneline --no-decorate 2>$gitErrFile
 } else {
     $commits = git log --oneline --no-decorate 2>$gitErrFile
 }
-if (-not $commits -and (Test-Path $gitErrFile) -and (Get-Content $gitErrFile -Raw).Trim().Length -gt 0) {
-    Write-Host "WARNING: git log produced stderr: $(Get-Content $gitErrFile -Raw)"
-}
 Remove-Item $gitErrFile -Force -ErrorAction SilentlyContinue
 
-if (-not $commits -and $env:FORCE_BUILD -ne "true") {
-    Write-Host "No new commits since last release. Skipping build."
-    exit 0
-}
-
-if (-not $commits) {
-    $commits = "Force build - no new commits since $lastTag"
-}
+if (-not $commits) { $commits = "(no commits since last release)" }
 
 Write-Host "Commits since last release:"
 Write-Host $commits
 Write-Host ""
-
-# Parse commit prefixes to determine bump type
-$hasFeat = $false
-$hasPatch = $false
-$hasOther = $false
-
-$commitLines = $commits -split "`n"
-foreach ($line in $commitLines) {
-    $line = $line.Trim()
-    if ($line -match "^feat[\(\!]?") { $hasFeat = $true }
-    elseif ($line -match "^(fix|chore|refactor|perf)[\(\:]?") { $hasPatch = $true }
-    elseif ($line -match "^(docs|test|style|ci|build)[\(\:]?") { $hasOther = $true }
-    else { $hasOther = $true }
-}
-
-$bumpType = "none"
-if ($hasFeat) { $bumpType = "minor" }
-elseif ($hasPatch) { $bumpType = "patch" }
-elseif ($hasOther) { $bumpType = "patch" }
-
-if ($bumpType -eq "none" -and $env:FORCE_BUILD -eq "true") {
-    $bumpType = "patch"
-    Write-Host "Force build: forcing patch bump"
-}
-
-Write-Host "Bump type: $bumpType"
-
-# Parse current version from gradle.properties
-$versionMatch = Select-String -Path "gradle.properties" -Pattern "^pluginVersion\s*=\s*(.+)$"
-if (-not $versionMatch) {
-    Write-Host "ERROR: Could not read pluginVersion from gradle.properties"
-    exit 1
-}
-$gradleVersion = $versionMatch.Matches.Groups[1].Value.Trim()
-
-# Use the last published tag as the base version when it exists.
-# gradle.properties is not updated after releases, so it goes stale.
-$baseVersion = $gradleVersion
-if ($lastTag) {
-    $tagVersion = $lastTag -replace '^v', ''
-    Write-Host "Comparing: lastTag='$tagVersion' gradle='$gradleVersion'"
-    if ($tagVersion -ne $gradleVersion) {
-        $baseVersion = $tagVersion
-        Write-Host "Using last published tag ($lastTag) as base - gradle.properties ($gradleVersion) is stale."
-    }
-}
-
-$versionParts = $baseVersion -split "\."
-if ($versionParts.Count -lt 3) {
-    Write-Host "ERROR: pluginVersion must be MAJOR.MINOR.PATCH, got: $baseVersion"
-    exit 1
-}
-$major = [int]$versionParts[0]
-$minor = [int]$versionParts[1]
-$patch = [int]$versionParts[2]
-
-switch ($bumpType) {
-    "minor" { $minor++; $patch = 0 }
-    "patch" { $patch++ }
-    "none"  { }
-}
-
-$newVersion = "${major}.${minor}.${patch}"
-$tag = "v$newVersion"
-
-Write-Host "Base version:  $baseVersion"
-Write-Host "New version:   $newVersion"
-Write-Host "Git tag:       $tag"
-
-# Patch gradle.properties
-$gradleProps = Get-Content "gradle.properties" -Raw
-$patchedProps = $gradleProps -replace "(?m)^pluginVersion\s*=\s*.+$", "pluginVersion = $newVersion"
-Set-Content "gradle.properties" -Value $patchedProps -NoNewline
-Write-Host "Patched pluginVersion to $newVersion in gradle.properties"
 
 # Clean old build artifacts
 $checkoutDir = $env:TEAMCITY_BUILD_CHECKOUTDIR
