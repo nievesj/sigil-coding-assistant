@@ -176,7 +176,7 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
 
         # Publish to JetBrains Marketplace (hidden — not publicly visible after approval)
         Write-Host "Publishing plugin v$pluginVersion to JetBrains Marketplace (hidden)..."
-        .\gradlew.bat publishPlugin --no-daemon -Phidden=true
+        .\gradlew.bat publishPlugin --no-daemon -PpluginVersion="$pluginVersion" -Phidden=true
         if ($LASTEXITCODE -ne 0) {
             Write-Host "ERROR: publishPlugin failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
