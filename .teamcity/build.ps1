@@ -174,6 +174,16 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
         } else {
             Write-Host "Release $tag created as draft."
         }
+
+        # Publish to JetBrains Marketplace (hidden — not publicly visible after approval)
+        Write-Host "Publishing plugin v$pluginVersion to JetBrains Marketplace (hidden)..."
+        .\gradlew.bat publishPlugin --no-daemon -PpluginVersion="$pluginVersion" -Phidden=true
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "WARNING: publishPlugin failed with exit code $LASTEXITCODE"
+            Write-Host "Marketplace publish failed, but GitHub release was created."
+        } else {
+            Write-Host "Plugin v$pluginVersion published to JetBrains Marketplace (hidden)."
+        }
     }
 } else {
     Write-Host "Not on main branch or CREATE_RELEASE not enabled. Skipping release."

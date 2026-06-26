@@ -31,6 +31,11 @@ object Build : BuildType({
         param("env.LLM_API_URL", "%LLM_API_URL%")
         param("LLM_API_URL", "https://ollama.com/v1/chat/completions")
         param("CREATE_RELEASE", "true")
+        // Marketplace publishing — values stored as secure params in TeamCity
+        param("env.PUBLISH_TOKEN", "%PUBLISH_TOKEN%")
+        param("env.CERTIFICATE_CHAIN", "%CERTIFICATE_CHAIN%")
+        param("env.PRIVATE_KEY", "%PRIVATE_KEY%")
+        param("env.PRIVATE_KEY_PASSWORD", "%PRIVATE_KEY_PASSWORD%")
     }
 
     vcs {
