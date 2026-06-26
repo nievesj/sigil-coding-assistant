@@ -1,5 +1,5 @@
 import jetbrains.buildServer.configs.kotlin.*
-import jetbrains.buildServer.configs.kotlin.buildSteps.script
+import jetbrains.buildServer.configs.kotlin.buildSteps.powerShell
 import jetbrains.buildServer.configs.kotlin.triggers.vcs
 import jetbrains.buildServer.configs.kotlin.vcs.GitVcsRoot
 
@@ -37,11 +37,12 @@ object Build : BuildType({
     }
 
     steps {
-        script {
+        powerShell {
             name = "Build and Package"
-            scriptContent = """
-                powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .teamcity/build.ps1 -BuildNumber "%build.number%"
-            """.trimIndent()
+            scriptMode = file {
+                path = ".teamcity/build.ps1"
+            }
+            scriptArgs = """-BuildNumber "%build.number%" """
         }
     }
 
