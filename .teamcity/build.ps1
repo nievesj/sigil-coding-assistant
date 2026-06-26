@@ -53,9 +53,9 @@ if (Test-Path $distDir) {
     Write-Host "Cleaned build/distributions/"
 }
 
-# Build the plugin (Gradle reads pluginVersion from env.ORG_GRADLE_PROJECT_pluginVersion)
+# Build the plugin (pass version from TeamCity to Gradle)
 Write-Host "Building plugin..."
-.\gradlew.bat buildPlugin --no-daemon
+.\gradlew.bat buildPlugin --no-daemon -PpluginVersion="$pluginVersion"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: buildPlugin failed with exit code $LASTEXITCODE"
     exit $LASTEXITCODE
