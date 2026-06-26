@@ -25,6 +25,9 @@ object Build : BuildType({
     buildNumberPattern = "1.0.%build.counter%"
 
     params {
+        // Pass TeamCity build number to Gradle as project property "pluginVersion"
+        // Gradle auto-reads ORG_GRADLE_PROJECT_* env vars as project properties
+        param("env.ORG_GRADLE_PROJECT_pluginVersion", "%build.number%")
         param("env.CREATE_RELEASE", "%CREATE_RELEASE%")
         param("env.LLM_API_KEY", "%LLM_API_KEY%")
         param("env.LLM_API_URL", "%LLM_API_URL%")
@@ -42,7 +45,7 @@ object Build : BuildType({
             scriptMode = file {
                 path = ".teamcity/build.ps1"
             }
-            scriptArgs = """-BuildNumber "%build.number%" """
+            scriptArgs = "-pluginVersion %build.number%"
         }
     }
 
