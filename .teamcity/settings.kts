@@ -40,7 +40,7 @@ object Build : BuildType({
         script {
             name = "Build and Package"
             scriptContent = """
-                powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .teamcity/build.ps1
+                powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .teamcity/build.ps1 -BuildNumber "%build.number%"
             """.trimIndent()
         }
     }

@@ -13,11 +13,15 @@ if (-not $env:JAVA_HOME) {
     }
 }
 
+param(
+    [string]$BuildNumber
+)
+
 # --- Version from TeamCity build counter ---
 $repo = "nievesj/sigil-coding-assistant"
-$tag = "v$env:BUILD_NUMBER"
+$tag = "v$BuildNumber"
 
-Write-Host "Build number: $env:BUILD_NUMBER"
+Write-Host "Build number: $BuildNumber"
 Write-Host "Git tag:      $tag"
 
 # Get commits since last release for release notes
