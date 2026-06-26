@@ -112,6 +112,11 @@ intellijPlatform {
         ideaVersion {
             sinceBuild = "261"
         }
+        // Change notes for JetBrains Marketplace — read from file path passed via Gradle property
+        changeNotes = providers.gradleProperty("changeNotesFile").map { path ->
+            val f = file(path)
+            if (f.exists()) f.readText() else ""
+        }.orElse("")
     }
 
     pluginVerification {
@@ -144,11 +149,6 @@ intellijPlatform {
         // after approval (accessible only via direct link). Controlled by CI
         // via -Phidden=true so local builds are unaffected.
         hidden = providers.gradleProperty("hidden").map { it.toBoolean() }.orElse(false)
-        // Change notes for JetBrains Marketplace — read from file path passed via Gradle property
-        changeNotes = providers.gradleProperty("changeNotesFile").map { file ->
-            val f = java.io.File(file)
-            if (f.exists()) f.readText() else ""
-        }.orElse("")
     }
 }
 
