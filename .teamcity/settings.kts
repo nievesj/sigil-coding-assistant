@@ -25,6 +25,7 @@ object Build : BuildType({
     buildNumberPattern = "1.0.%build.counter%"
 
     params {
+        param("env.BUILD_COUNTER", "%build.counter%")
         param("env.CREATE_RELEASE", "%CREATE_RELEASE%")
         param("env.LLM_API_KEY", "%LLM_API_KEY%")
         param("env.LLM_API_URL", "%LLM_API_URL%")
