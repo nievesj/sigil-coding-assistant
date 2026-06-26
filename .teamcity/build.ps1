@@ -176,13 +176,14 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
         }
 
         # Publish to JetBrains Marketplace (hidden — not publicly visible after approval)
-        Write-Host "Publishing plugin v$pluginVersion to JetBrains Marketplace (hidden)..."
-        .\gradlew.bat publishPlugin --no-daemon -PpluginVersion="$pluginVersion" -Phidden=true
+        # gradle.properties was already patched with $newVersion, so publishPlugin reads it automatically
+        Write-Host "Publishing plugin v$newVersion to JetBrains Marketplace (hidden)..."
+        .\gradlew.bat publishPlugin --no-daemon -Phidden=true
         if ($LASTEXITCODE -ne 0) {
             Write-Host "WARNING: publishPlugin failed with exit code $LASTEXITCODE"
             Write-Host "Marketplace publish failed, but GitHub release was created."
         } else {
-            Write-Host "Plugin v$pluginVersion published to JetBrains Marketplace (hidden)."
+            Write-Host "Plugin v$newVersion published to JetBrains Marketplace (hidden)."
         }
     }
 } else {
