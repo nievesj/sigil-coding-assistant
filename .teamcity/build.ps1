@@ -95,7 +95,7 @@ if ($branch -eq "main" -and $env:CREATE_RELEASE -eq "true") {
 
     try {
         # Use Invoke-WebRequest + explicit UTF-8 decode to avoid PS 5.1 encoding corruption
-        $webResponse = Invoke-WebRequest -Uri $llmUrl -Method Post -Body $body -ContentType "application/json" -Headers @{ "Authorization" = "Bearer $llmKey" }
+            $webResponse = Invoke-WebRequest -Uri $llmUrl -Method Post -Body $body -ContentType "application/json" -Headers @{ "Authorization" = "Bearer $llmKey" } -UseBasicParsing
         $rawJson = [System.Text.Encoding]::UTF8.GetString($webResponse.RawContentStream.ToArray())
         $response = $rawJson | ConvertFrom-Json
         if (-not $response.choices -or $response.choices.Count -eq 0) {
