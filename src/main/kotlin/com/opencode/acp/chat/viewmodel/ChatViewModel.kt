@@ -109,12 +109,26 @@ class ChatViewModel(
     private val drainMutex = Mutex()
 
     /** Retry counts for queued messages — prevents infinite retry loops.
-     *  ConcurrentHashMap for thread-safety: clearQueue() (from EDT coroutines)
-     *  and drainQueue() (from ViewModel scope) may access concurrently. */
+     *  Uses ConcurrentHashMap for thread-safety: clearQueue() may be called from
+     *  EDT coroutines (session switch, cancel) while drainQueue() runs on the
+     *  ViewModel scope. Both are serialized by [drainMutex] for correctness, but
+     *  the ConcurrentHashMap provides a safety net against data races. */
     private val queueRetryCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     private val _readyState = MutableStateFlow(ReadyState.NOT_STARTED)
     val readyState: StateFlow<ReadyState> = _readyState.asStateFlow()
+
+    /** Manual compaction UI state — Idle / InProgress / Error. */
+    private val _compactionState = MutableStateFlow<CompactionState>(CompactionState.Idle)
+    val compactionState: StateFlow<CompactionState> = _compactionState.asStateFlow()
+
+    /** In-flight guard for compaction — prevents concurrent compaction requests
+     *  that could corrupt server-side session state on timeout+retry. */
+    private val compactionInProgress = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Whether a background compaction checkpoint is ready for instant swap. */
+    private val _checkpointReady = MutableStateFlow(false)
+    val checkpointReady: StateFlow<Boolean> = _checkpointReady.asStateFlow()
 
     private val initMutex = Mutex()
     private var initJob: Job? = null
@@ -303,7 +317,11 @@ class ChatViewModel(
                     ConnectionState.CONNECTED -> {
                         // Auto-reconnect: if readyState is NOT_STARTED after a reconnect,
                         // re-run initialization to reload agents/providers/MCP tools.
-                        if (_readyState.value == ReadyState.NOT_STARTED && initJob?.isActive != true) {
+                        // Cancel any in-progress init to prevent the old job from racing
+                        // with the new one (the old job may be about to set READY on a
+                        // stale connection).
+                        if (_readyState.value == ReadyState.NOT_STARTED) {
+                            initJob?.cancel()
                             logger.info { "[ACP] Auto-reconnect detected — re-running initialize()" }
                             initialize(projectBasePath = null)
                         }
@@ -811,6 +829,7 @@ class ChatViewModel(
 
     suspend fun computeSessionContext() {
         service.computeSessionContext(_controlState.value)
+        _checkpointReady.value = service.isCheckpointReady()
     }
 
     private suspend fun computeSessionContextLocal() {
@@ -819,6 +838,88 @@ class ChatViewModel(
 
     fun retryContextFetch() {
         scope.launch { computeSessionContext() }
+    }
+
+    /**
+     * Trigger manual compaction for the active session.
+     * Calls POST /session/{id}/summarize with auto=false.
+     *
+     * NOTE: The OpenCode server does NOT support a `guidance` field — the request
+     * body is only `{ providerID, modelID, auto }`. The TDD originally specified
+     * guidance features, but they were dropped after research confirmed the server
+     * ignores unknown fields.
+     */
+    fun compactSession() {
+        val sessionId = service.sessionId
+        if (sessionId == null) {
+            _compactionState.value = CompactionState.Error(CompactionError.NoActiveSession)
+            return
+        }
+        val client = service.connectionManager.client
+        if (client == null) {
+            _compactionState.value = CompactionState.Error(CompactionError.NotConnected)
+            return
+        }
+
+        // In-flight guard: prevent concurrent compaction requests. If the server
+        // is already processing a compaction (e.g., from a timed-out retry), sending
+        // a second request could corrupt session state.
+        if (!compactionInProgress.compareAndSet(false, true)) {
+            logger.warn { "[ACP] Manual compaction rejected — already in progress" }
+            return
+        }
+
+        logger.info { "[ACP] Manual compaction triggered for session $sessionId" }
+        _compactionState.value = CompactionState.InProgress
+
+        scope.launch {
+            try {
+                val state = _controlState.value
+                val providerID = state.selectedModel?.providerID ?: ""
+                val modelID = state.selectedModel?.modelID ?: ""
+                if (providerID.isBlank() || modelID.isBlank()) {
+                    _compactionState.value = CompactionState.Error(
+                        CompactionError.ServerError("No model selected")
+                    )
+                    return@launch
+                }
+                val success = kotlinx.coroutines.withTimeout(
+                    com.opencode.acp.chat.model.CompactionConstants.COMPACT_TIMEOUT_MS
+                ) {
+                    client.compactSession(sessionId, providerID, modelID, auto = false)
+                }
+                if (success) {
+                    _compactionState.value = CompactionState.Idle
+                    // SSE session.compacted event handles message refresh + context update
+                    logger.info { "[ACP] Manual compaction succeeded for session $sessionId" }
+                } else {
+                    _compactionState.value = CompactionState.Error(
+                        CompactionError.ServerError("Compaction failed")
+                    )
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                _compactionState.value = CompactionState.Error(CompactionError.Timeout)
+            } catch (e: java.net.ConnectException) {
+                _compactionState.value = CompactionState.Error(CompactionError.NotConnected)
+            } catch (e: Exception) {
+                val msg = e.message ?: "Unknown error"
+                // Detect timeout-like exceptions from Ktor
+                if (msg.contains("timeout", ignoreCase = true) || e is java.net.SocketTimeoutException) {
+                    _compactionState.value = CompactionState.Error(CompactionError.Timeout)
+                } else {
+                    _compactionState.value = CompactionState.Error(CompactionError.ServerError(msg))
+                }
+            } finally {
+                compactionInProgress.set(false)
+            }
+        }
+    }
+
+    /** Reset compaction state to Idle (e.g., after user dismisses an error). */
+    fun resetCompactionState() {
+        _compactionState.value = CompactionState.Idle
     }
 
     // --- Todos ---

@@ -4,6 +4,8 @@ import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.processor.PrunerConfigWriter
+import com.opencode.acp.chat.processor.PrunerResourceExtractor
 import com.opencode.acp.mcp.McpConfigWriter
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
@@ -110,6 +112,21 @@ class ProcessManager(private val scope: CoroutineScope) {
             // Clear plugin-managed entries when MCP is disabled
             val configWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), settings)
             configWriter.clearAllEntries()
+        }
+
+        // Extract sigil-pruner.ts and write pruner config BEFORE launching the binary.
+        // The OpenCode server loads plugins from .opencode/plugins/ on startup and
+        // the TS plugin reads .opencode/sigil-pruner.json on load.
+        if (settings.enableContextPruner) {
+            val extracted = PrunerResourceExtractor.extractPlugin(projectBasePath)
+            if (!extracted) {
+                logger.warn { "[ACP] ProcessManager.initialize: failed to extract sigil-pruner.ts — pruning unavailable" }
+            }
+            PrunerConfigWriter.writeConfig(projectBasePath, settings)
+        } else {
+            // Clean up pruner files when disabled
+            PrunerResourceExtractor.removePlugin(projectBasePath)
+            PrunerConfigWriter.clearConfig(projectBasePath)
         }
 
         // Launch our own binary on the chosen port

@@ -92,6 +92,9 @@ fun SessionSidebar(
     streamingSessionIds: Set<String> = emptySet(),
     pendingCreationSessionIds: Set<String> = emptySet(),
     clearAllState: ClearAllState = ClearAllState.Idle,
+    compactionState: com.opencode.acp.chat.model.CompactionState = com.opencode.acp.chat.model.CompactionState.Idle,
+    onCompact: () -> Unit = {},
+    checkpointReady: Boolean = false,
 ) {
     Column(
         modifier = modifier
@@ -150,6 +153,9 @@ fun SessionSidebar(
                 ContextPanel(
                     state = contextState,
                     onRetry = onContextRetry,
+                    compactionState = compactionState,
+                    onCompact = onCompact,
+                    checkpointReady = checkpointReady,
                     modifier = Modifier.weight(1f)
                 )
             }

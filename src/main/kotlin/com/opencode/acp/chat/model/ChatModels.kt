@@ -323,8 +323,92 @@ data class SessionContext(
     val deletions: Int,              // lines deleted (from session summary)
     val filesModified: Int,          // files modified (from session summary)
     val sessionCreated: Long,        // epoch millis
-    val lastUpdated: Long           // epoch millis
+    val lastUpdated: Long,           // epoch millis
+    /** 5-category token breakdown. Null until BreakdownComputer runs. */
+    val breakdown: ContextBreakdown? = null,
+    /** Context pressure signals (growth rate, turns until compact). Null until enough turns. */
+    val pressure: ContextPressure? = null,
 )
+
+/**
+ * Token breakdown by category for the active session.
+ * Computed from the local message cache — the server does NOT provide per-category breakdown.
+ *
+ * Classification (estimates — the server does not expose per-part token counts):
+ * - systemPromptTokens: Estimated from the first assistant message's inputTokens minus
+ *   all prior user message tokens. Approximates system prompt + tool definitions + format
+ *   tokens + attached files. Labeled "System + Tool Definitions" in the UI.
+ * - userTokens: Sum of all user message text parts (estimated via char count / calibratedCharsPerToken).
+ * - assistantTokens: Sum of all assistant message text parts (estimated via char count / calibratedCharsPerToken).
+ * - toolTokens: Sum of all tool call + tool result parts (estimated from JSON byte size / calibratedCharsPerToken).
+ * - otherTokens: reasoningTokens + cacheReadTokens + cacheWriteTokens + unclassified.
+ */
+data class ContextBreakdown(
+    val systemPromptTokens: Long,
+    val userTokens: Long,
+    val assistantTokens: Long,
+    val toolTokens: Long,
+    val otherTokens: Long,
+    val freeTokens: Long,         // contextLimit - total (can be negative when over-full)
+    val totalTokens: Long,        // sum of all categories
+    val toolBreakdown: Map<String, ToolCategoryBreakdown>,  // per-tool-name aggregation
+) {
+    /**
+     * Percentages for the proportional bar.
+     * When freeTokens < 0 (context over-full), percentages sum to >100%.
+     * The UI caps the bar at 100% and shows an overflow indicator.
+     */
+    val systemPromptPercent: Float get() = if (totalTokens > 0) systemPromptTokens.toFloat() / totalTokens * 100 else 0f
+    val userPercent: Float get() = if (totalTokens > 0) userTokens.toFloat() / totalTokens * 100 else 0f
+    val assistantPercent: Float get() = if (totalTokens > 0) assistantTokens.toFloat() / totalTokens * 100 else 0f
+    val toolPercent: Float get() = if (totalTokens > 0) toolTokens.toFloat() / totalTokens * 100 else 0f
+    val otherPercent: Float get() = if (totalTokens > 0) otherTokens.toFloat() / totalTokens * 100 else 0f
+}
+
+/**
+ * Per-tool-name token aggregation for the tool breakdown sub-view.
+ */
+data class ToolCategoryBreakdown(
+    val toolName: String,
+    val callCount: Int,
+    val estimatedTokens: Long,     // sum of input + output JSON byte sizes / 4
+    val lastCallAt: Long,           // epoch millis
+)
+
+/**
+ * Context pressure signals computed from rolling growth rate.
+ */
+data class ContextPressure(
+    val currentTokens: Long,
+    val contextLimit: Long,
+    val usagePercent: Float,
+    val growthPerTurn: Double,         // average tokens added per assistant turn (rolling window)
+    val turnsUntilCompact: Int?,       // estimated turns before auto-compact fires (null = unknown)
+    val burnRatePerMinute: Double,     // tokens per minute (wall-clock growth rate)
+    val pressureLevel: PressureLevel,
+)
+
+enum class PressureLevel {
+    COMFORTABLE,   // < 50%
+    ELEVATED,      // 50-70%
+    HIGH,          // 70-85%
+    CRITICAL       // 85%+
+}
+
+/** UI state for manual compaction. */
+sealed interface CompactionState {
+    data object Idle : CompactionState
+    data object InProgress : CompactionState
+    data class Error(val error: CompactionError) : CompactionState
+}
+
+/** Typed errors for manual compaction failures. */
+sealed interface CompactionError {
+    data object NoActiveSession : CompactionError
+    data object NotConnected : CompactionError
+    data class ServerError(val message: String) : CompactionError
+    data object Timeout : CompactionError
+}
 
 /** A single todo item from the OpenCode todowrite tool. */
 data class TodoItem(

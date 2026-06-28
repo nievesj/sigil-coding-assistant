@@ -1,7 +1,11 @@
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,9 +15,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -21,11 +30,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import com.opencode.acp.chat.model.SessionContext
-import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.chat.model.SessionContextState
+import com.opencode.acp.chat.model.CompactionState
+import com.opencode.acp.chat.model.ContextBreakdown
+import com.opencode.acp.chat.ui.theme.ChatTheme
+import com.opencode.acp.config.settings.OpenCodeSettingsState
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
+import org.jetbrains.jewel.ui.component.OutlinedButton
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 
 // ── Context Panel (sidebar tab content) ────────────────────────────────────
@@ -34,6 +48,9 @@ import org.jetbrains.jewel.foundation.theme.JewelTheme
 fun ContextPanel(
     state: SessionContextState,
     onRetry: () -> Unit,
+    compactionState: CompactionState = CompactionState.Idle,
+    onCompact: () -> Unit = {},
+    checkpointReady: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     when (state) {
@@ -41,7 +58,13 @@ fun ContextPanel(
             LoadingContent(modifier = modifier)
         }
         is SessionContextState.Loaded -> {
-            ContextDetails(context = state.context, modifier = modifier)
+            ContextDetails(
+                context = state.context,
+                compactionState = compactionState,
+                onCompact = onCompact,
+                checkpointReady = checkpointReady,
+                modifier = modifier
+            )
         }
         is SessionContextState.Error -> {
             ErrorContent(message = state.message, retryable = state.retryable, onRetry = onRetry, modifier = modifier)
@@ -91,12 +114,20 @@ private fun ErrorContent(message: String, retryable: Boolean, onRetry: () -> Uni
 }
 
 @Composable
-private fun ContextDetails(context: SessionContext, modifier: Modifier = Modifier) {
+private fun ContextDetails(
+    context: SessionContext,
+    compactionState: CompactionState = CompactionState.Idle,
+    onCompact: () -> Unit = {},
+    checkpointReady: Boolean = false,
+    modifier: Modifier = Modifier
+) {
     val sectionColor = ChatTheme.colors.component.contextPanelValue
     val labelColor = ChatTheme.colors.component.contextPanelLabel
     val valueColor = ChatTheme.colors.component.contextPanelValue
     val separator = ChatTheme.colors.component.contextPanelSeparator
     val progressBg = ChatTheme.colors.component.contextProgressBarBg
+    val showBreakdown = OpenCodeSettingsState.getInstance().showContextBreakdown
+    val compactConfirmation = OpenCodeSettingsState.getInstance().compactConfirmation
 
     Column(
         modifier = modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp),
@@ -119,7 +150,85 @@ private fun ContextDetails(context: SessionContext, modifier: Modifier = Modifie
             usagePercent = context.usagePercent,
             contextLimit = context.contextLimit,
             totalTokens = context.totalTokens,
-            progressBg = progressBg
+            progressBg = progressBg,
+            breakdown = if (showBreakdown) context.breakdown else null
+        )
+
+        if (showBreakdown && context.breakdown != null && context.breakdown.totalTokens > 0) {
+            Spacer(Modifier.height(4.dp))
+            BreakdownLegend(breakdown = context.breakdown, labelColor, valueColor)
+
+            // Tool breakdown (expandable)
+            if (context.breakdown.toolBreakdown.isNotEmpty()) {
+                var toolBreakdownExpanded by remember { mutableStateOf(false) }
+
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable { toolBreakdownExpanded = !toolBreakdownExpanded },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (toolBreakdownExpanded) "\u25BC" else "\u25B6",
+                        fontSize = ChatTheme.fonts.contextDetailLabel,
+                        color = labelColor,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = "Tool breakdown (${context.breakdown.toolBreakdown.size} tools)",
+                        fontSize = ChatTheme.fonts.contextDetailLabel,
+                        color = labelColor,
+                    )
+                }
+
+                AnimatedVisibility(
+                    visible = toolBreakdownExpanded,
+                    enter = expandVertically(expandFrom = Alignment.Top),
+                    exit = shrinkVertically(shrinkTowards = Alignment.Top)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(start = 16.dp, top = 4.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        val sortedTools = context.breakdown.toolBreakdown.values.sortedByDescending { it.estimatedTokens }
+                        for (tool in sortedTools) {
+                            LegendRow(
+                                label = "${tool.toolName} (${tool.callCount}x)",
+                                tokens = tool.estimatedTokens,
+                                percent = if (context.breakdown.totalTokens > 0)
+                                    tool.estimatedTokens.toFloat() / context.breakdown.totalTokens * 100
+                                else 0f,
+                                color = ChatTheme.colors.accent.contextRed,
+                                labelColor = labelColor,
+                                valueColor = valueColor,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Pressure forecast ──
+        if (context.pressure != null && context.pressure.turnsUntilCompact != null) {
+            Spacer(Modifier.height(6.dp))
+            DetailRow(
+                label = "Turns until compact",
+                value = "~${context.pressure.turnsUntilCompact}",
+                labelColor,
+                valueColor
+            )
+        }
+
+        Spacer(Modifier.height(10.dp))
+        HorizontalSeparator(separator)
+        Spacer(Modifier.height(10.dp))
+
+        // ── Compact Now button ──
+        CompactButtonRow(
+            compactionState = compactionState,
+            onCompact = onCompact,
+            sectionColor = sectionColor,
+            showConfirmation = compactConfirmation,
+            checkpointReady = checkpointReady,
         )
 
         Spacer(Modifier.height(10.dp))
@@ -214,8 +323,14 @@ private fun DetailRow(label: String, value: String, labelColor: Color, valueColo
 }
 
 @Composable
-private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long, progressBg: Color) {
-    val color = contextColorForPercent(usagePercent)
+private fun UsageBar(
+    usagePercent: Float,
+    contextLimit: Long,
+    totalTokens: Long,
+    progressBg: Color,
+    breakdown: ContextBreakdown? = null
+) {
+    val fallbackColor = contextColorForPercent(usagePercent)
     val displayPercent = if (usagePercent >= 100f) "${usagePercent.toInt()}%" else "${String.format("%.1f", usagePercent)}%"
     val isUnknown = contextLimit == 0L
 
@@ -229,7 +344,7 @@ private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long,
                 text = displayPercent,
                 fontSize = ChatTheme.fonts.contextPanelTitle,
                 fontWeight = ChatTheme.fontWeights.contextPercent,
-                color = color
+                color = fallbackColor
             )
             if (!isUnknown) {
                 Text(
@@ -255,14 +370,42 @@ private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long,
                     .background(progressBg)
             ) {
                 val fillFraction = (usagePercent / 100f).coerceIn(0f, 1f)
-                // Overflow indicator for >100%
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(fillFraction)
-                        .height(8.dp)
-                        .clip(RoundedCornerShape(topStart = ChatTheme.dims.contextProgressBarCornerRadius, bottomStart = ChatTheme.dims.contextProgressBarCornerRadius))
-                        .background(color)
-                )
+
+                if (breakdown != null && breakdown.totalTokens > 0) {
+                    // Show breakdown colors within the fill region.
+                    // Each category segment = its fraction of totalTokens × fillFraction.
+                    val total = breakdown.totalTokens.coerceAtLeast(1L).toFloat()
+                    val systemFrac = (breakdown.systemPromptTokens / total * fillFraction).coerceIn(0f, 1f)
+                    val userFrac = (breakdown.userTokens / total * fillFraction).coerceIn(0f, 1f)
+                    val assistantFrac = (breakdown.assistantTokens / total * fillFraction).coerceIn(0f, 1f)
+                    val toolFrac = (breakdown.toolTokens / total * fillFraction).coerceIn(0f, 1f)
+                    // otherFrac fills remaining space up to fillFraction
+                    val otherFrac = (fillFraction - systemFrac - userFrac - assistantFrac - toolFrac).coerceAtLeast(0f)
+
+                    val systemColor = ChatTheme.colors.accent.blue
+                    val userColor = ChatTheme.colors.accent.contextGreen
+                    val assistantColor = ChatTheme.colors.accent.contextYellow
+                    val toolColor = ChatTheme.colors.accent.contextRed
+                    val otherColor = ChatTheme.colors.accent.contextUnknown
+
+                    Row(Modifier.fillMaxWidth(fillFraction).height(8.dp)) {
+                        if (systemFrac > 0f) Box(Modifier.weight(systemFrac).fillMaxWidth().height(8.dp).background(systemColor))
+                        if (userFrac > 0f) Box(Modifier.weight(userFrac).fillMaxWidth().height(8.dp).background(userColor))
+                        if (assistantFrac > 0f) Box(Modifier.weight(assistantFrac).fillMaxWidth().height(8.dp).background(assistantColor))
+                        if (toolFrac > 0f) Box(Modifier.weight(toolFrac).fillMaxWidth().height(8.dp).background(toolColor))
+                        if (otherFrac > 0f) Box(Modifier.weight(otherFrac).fillMaxWidth().height(8.dp).background(otherColor))
+                    }
+                } else {
+                    // No breakdown — solid color
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(fillFraction)
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(topStart = ChatTheme.dims.contextProgressBarCornerRadius, bottomStart = ChatTheme.dims.contextProgressBarCornerRadius))
+                            .background(fallbackColor)
+                    )
+                }
+
                 if (usagePercent > 100f) {
                     Box(
                         modifier = Modifier
@@ -273,7 +416,7 @@ private fun UsageBar(usagePercent: Float, contextLimit: Long, totalTokens: Long,
                             text = "+",
                             fontSize = ChatTheme.fonts.contextProgressBarPercent,
                             fontWeight = FontWeight.Bold,
-                            color = contextColorForPercent(usagePercent)
+                            color = fallbackColor
                         )
                     }
                 }
@@ -321,3 +464,143 @@ private fun formatPanelTokens(tokens: Long): String {
 private fun formatPanelCost(cost: Double): String {
     return if (cost == 0.0) "$0.00" else "$${String.format("%.4f", cost)}"
 }
+
+// ── Breakdown Legend ────────────────────────────────────────────────────────
+
+@Composable
+private fun BreakdownLegend(breakdown: ContextBreakdown, labelColor: Color, valueColor: Color) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        LegendRow("System + Tools", breakdown.systemPromptTokens, breakdown.systemPromptPercent, ChatTheme.colors.accent.blue, labelColor, valueColor)
+        LegendRow("User", breakdown.userTokens, breakdown.userPercent, ChatTheme.colors.accent.contextGreen, labelColor, valueColor)
+        LegendRow("Assistant", breakdown.assistantTokens, breakdown.assistantPercent, ChatTheme.colors.accent.contextYellow, labelColor, valueColor)
+        LegendRow("Tool Calls", breakdown.toolTokens, breakdown.toolPercent, ChatTheme.colors.accent.contextRed, labelColor, valueColor)
+        if (breakdown.otherTokens > 0) {
+            LegendRow("Other", breakdown.otherTokens, breakdown.otherPercent, ChatTheme.colors.accent.contextUnknown, labelColor, valueColor)
+        }
+    }
+}
+
+@Composable
+private fun LegendRow(label: String, tokens: Long, percent: Float, color: Color, labelColor: Color, valueColor: Color) {
+    Row(
+        modifier = Modifier.fillMaxWidth().height(16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(modifier = Modifier.size(8.dp).clip(ChatTheme.shapes.contextProgressBarCornerRadius).background(color))
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = label,
+            fontSize = ChatTheme.fonts.contextDetailLabel,
+            color = labelColor,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            text = "${formatPanelTokens(tokens)} (${String.format("%.0f", percent)}%)",
+            fontSize = ChatTheme.fonts.contextDetailValue,
+            color = valueColor,
+        )
+    }
+}
+
+// ── Compact Button Row ──────────────────────────────────────────────────────
+
+@Composable
+private fun CompactButtonRow(
+    compactionState: CompactionState,
+    onCompact: () -> Unit,
+    sectionColor: Color,
+    showConfirmation: Boolean = false,
+    checkpointReady: Boolean = false,
+) {
+    var showDialog by remember { mutableStateOf(false) }
+
+    SectionHeader("Compaction", sectionColor)
+    when (compactionState) {
+        is CompactionState.InProgress -> {
+            Text(
+                text = "Compacting...",
+                fontSize = ChatTheme.fonts.contextDetailValue,
+                color = ChatTheme.colors.accent.contextYellow,
+            )
+        }
+        is CompactionState.Error -> {
+            val msg = when (compactionState.error) {
+                com.opencode.acp.chat.model.CompactionError.NoActiveSession -> "No active session"
+                com.opencode.acp.chat.model.CompactionError.NotConnected -> "Not connected"
+                com.opencode.acp.chat.model.CompactionError.Timeout -> "Compaction timed out"
+                is com.opencode.acp.chat.model.CompactionError.ServerError -> "Error: ${compactionState.error.message}"
+            }
+            Text(
+                text = msg,
+                fontSize = ChatTheme.fonts.contextDetailValue,
+                color = ChatTheme.colors.accent.red,
+            )
+            Spacer(Modifier.height(4.dp))
+            OutlinedButton(onClick = onCompact, enabled = true) { Text("Retry") }
+        }
+        is CompactionState.Idle -> {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(
+                    onClick = {
+                        if (showConfirmation) showDialog = true else onCompact()
+                    },
+                    enabled = true
+                ) { Text("Compact Now") }
+                if (checkpointReady) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "\u25CF Ready",
+                        fontSize = ChatTheme.fonts.contextDetailValue,
+                        color = ChatTheme.colors.accent.contextGreen,
+                    )
+                }
+            }
+        }
+    }
+
+    if (showDialog) {
+        Dialog(onDismissRequest = { showDialog = false }) {
+            Box(
+                modifier = Modifier.width(320.dp).clip(RoundedCornerShape(12.dp))
+                    .background(JewelTheme.globalColors.panelBackground)
+                    .border(1.dp, separatorColor(), RoundedCornerShape(12.dp))
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text(
+                        text = "Compact Context?",
+                        fontSize = ChatTheme.fonts.contextSectionHeader,
+                        fontWeight = FontWeight.Medium,
+                        color = ChatTheme.colors.component.contextPanelValue,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "This will summarize the conversation history. The session will be compacted on the server.",
+                        fontSize = ChatTheme.fonts.contextDetailValue,
+                        color = JewelTheme.globalColors.text.disabled,
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        OutlinedButton(
+                            onClick = { showDialog = false },
+                            enabled = true,
+                        ) { Text("Cancel") }
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                showDialog = false
+                                onCompact()
+                            },
+                            enabled = true,
+                        ) { Text("Compact") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun separatorColor(): Color = ChatTheme.colors.component.contextPanelSeparator
