@@ -47,7 +47,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.opencode.acp.chat.model.SessionContext
 import com.opencode.acp.chat.model.SessionContextState
+import com.opencode.acp.chat.model.PressureLevel
 import com.opencode.acp.chat.ui.theme.ChatTheme
+import com.opencode.acp.config.settings.OpenCodeSettingsState
 import org.jetbrains.jewel.ui.component.Text
 
 // ── Context indicator colors ──────────────────────────────────────────────────
@@ -187,7 +189,10 @@ fun ContextIndicator(
                     is SessionContextState.Loading -> "…" to colors.component.tooltipMuted
                     is SessionContextState.Loaded -> {
                         val pct = state.context.usagePercent.coerceAtLeast(0f)
-                        "${pct.toInt()}%" to contextColorForPercent(pct)
+                        val pressure = state.context.pressure
+                        // Show pressure badge if pressure level meets the notification threshold
+                        val pressureSuffix = pressureBadgeText(pressure?.pressureLevel)
+                        "${pct.toInt()}%$pressureSuffix" to contextColorForPercent(pct)
                     }
                     is SessionContextState.Error -> {
                         if (state.retryable) "!" to colors.accent.contextYellow
@@ -412,4 +417,31 @@ private fun formatTooltipTokens(tokens: Long): String {
 
 private fun formatTooltipCost(cost: Double): String {
     return if (cost == 0.0) "$0.00" else "$${String.format("%.4f", cost)}"
+}
+
+/**
+ * Returns a short pressure badge suffix to append to the percent label, or empty string
+ * if pressure is null or below the user's configured notification threshold.
+ *
+ * The badge uses a single character: "▲" for HIGH, "⚠" for CRITICAL, "·" for ELEVATED.
+ * The threshold is read from settings (NEVER / ELEVATED / HIGH / CRITICAL).
+ */
+private fun pressureBadgeText(level: PressureLevel?): String {
+    if (level == null) return ""
+    val threshold = OpenCodeSettingsState.getInstance().pressureNotificationThreshold
+    val thresholdLevel = when (threshold) {
+        "NEVER" -> null
+        "ELEVATED" -> PressureLevel.ELEVATED
+        "CRITICAL" -> PressureLevel.CRITICAL
+        else -> PressureLevel.HIGH
+    }
+    if (thresholdLevel == null) return ""
+    // Show badge if the current level is >= the threshold level (ordinal comparison)
+    if (level.ordinal < thresholdLevel.ordinal) return ""
+    return when (level) {
+        PressureLevel.COMFORTABLE -> ""
+        PressureLevel.ELEVATED -> " ·"
+        PressureLevel.HIGH -> " ▲"
+        PressureLevel.CRITICAL -> " ⚠"
+    }
 }

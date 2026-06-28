@@ -22,4 +22,16 @@ object ChatConstants {
     const val MCP_FETCH_TOOLS_TIMEOUT_MS = 5_000L
     /** Server name for the built-in IntelliJ MCP server. */
     const val MCP_SERVER_NAME_INTELLIJ = "intellij"
+
+    // ── Context Pruner ─────────────────────────────────────────────────
+    /** Resource path of the TS plugin inside the JAR. */
+    const val PRUNER_RESOURCE_PATH = "/opencode-plugins/sigil-pruner.ts"
+    /** Target filename in .opencode/plugins/. */
+    const val PRUNER_PLUGIN_FILENAME = "sigil-pruner.ts"
+    /** Config file name written by PrunerConfigWriter. */
+    const val PRUNER_CONFIG_FILENAME = "sigil-pruner.json"
+    /** Heartbeat file name written by the TS plugin. */
+    const val PRUNER_HEARTBEAT_FILENAME = "sigil-pruner.heartbeat"
+    /** API version for compatibility handshake between Kotlin config and TS plugin. */
+    const val PRUNER_API_VERSION = 1
 }

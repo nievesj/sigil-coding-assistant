@@ -621,15 +621,19 @@ class OpenCodeService(private val project: Project) : Disposable {
                     return@forEach
                 }
                 // CWE-22 path traversal guard: reject paths with .. sequences that escape
-                // known-safe locations (project directory, system temp). Clipboard images
-                // are stored in the temp directory; project files are under basePath.
+                // known-safe locations. Clipboard images are stored in
+                // <projectDir>/.opencode/attachments/ or user.home/.opencode/attachments/.
+                // Project files are under basePath. System temp directory is NOT allowed
+                // (too broad — any process can write there on shared machines).
                 val canonicalPath = fileObj.canonicalPath
                 val projectBase = project.basePath?.let { java.io.File(it).canonicalPath }
-                val tempDir = java.io.File(System.getProperty("java.io.tmpdir")).canonicalPath
+                val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
                 val isInsideProject = projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator)
-                val isInsideTemp = canonicalPath.startsWith(tempDir + java.io.File.separator)
-                if (!isInsideProject && !isInsideTemp) {
-                    logger.warn { "[ACP] Skipping attached file '${file.name}' — path escapes project/temp directory: ${file.path}" }
+                val isInsideProjectAttachments = projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)
+                val isInsideUserHomeAttachments = userHome != null && canonicalPath.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)
+                val isAllowed = isInsideProject || isInsideProjectAttachments || isInsideUserHomeAttachments
+                if (!isAllowed) {
+                    logger.warn { "[ACP] Skipping attached file '${file.name}' — path escapes allowed directories: ${file.path}" }
                     return@forEach
                 }
                 // Use canonical path for the URL to prevent symlink-based exfiltration
@@ -864,6 +868,9 @@ class OpenCodeService(private val project: Project) : Disposable {
         sessionManager.refreshActiveSessionMessages()
     }
 
+    /** Whether the background compactor has a valid checkpoint for the active session. */
+    fun isCheckpointReady(): Boolean = sessionManager.isCheckpointReady()
+
     suspend fun fetchTodos() = sessionManager.fetchTodos()
 
     suspend fun fetchAvailableCommands(): List<SlashCommand> =
@@ -904,12 +911,17 @@ class OpenCodeService(private val project: Project) : Disposable {
     override fun dispose() {
         logger.info { "[ACP] OpenCodeService.dispose() called — project closing" }
         connectionManager.shutdown()
+        // Close sessions BEFORE cancelling scope — SessionManager.close() uses
+        // tryLock() to avoid blocking EDT, and scope.cancel() will interrupt any
+        // coroutines still holding the lock (e.g., ensureSessionCached blocking on
+        // HTTP). This ordering gives clean sessions a chance to close normally
+        // before cancellation forces them shut.
+        sessionManager.close()
         scope.cancel()
         sseJob = null
         sseReconnectJob = null
         sseHealthCheckJob = null
         permissionManager.dispose()
-        sessionManager.close()
         com.opencode.acp.chat.ChatToolWindowFactory.disposeActiveComposePanelAsync()
     }
 

@@ -7,6 +7,13 @@ import com.opencode.acp.adapter.OpenCodeSession
 import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.adapter.toSessionItem
 import com.opencode.acp.chat.model.*
+import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.chat.processor.BackgroundCompactor
+import com.opencode.acp.chat.processor.BackgroundCompactorSettings
+import com.opencode.acp.chat.processor.BreakdownComputer
+import com.opencode.acp.chat.processor.ContextPressureMonitor
+import com.opencode.acp.chat.processor.FileReadCache
+import com.opencode.acp.chat.processor.ToolOutputTruncator
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
@@ -14,7 +21,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
@@ -110,6 +117,17 @@ class SessionManager(
     // ── Dependencies (injected by OpenCodeService) ──
 
     internal var client: OpenCodeClient? = null
+        set(value) {
+            field = value
+            // Recreate the background compactor when the client becomes available
+            if (value != null && backgroundCompactor == null) {
+                try {
+                    backgroundCompactor = createBackgroundCompactor()
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] Failed to create BackgroundCompactor" }
+                }
+            }
+        }
 
     /**
      * IDE project root directory.  Passed as `?directory=` query param on
@@ -119,6 +137,45 @@ class SessionManager(
      * Set by [OpenCodeService.initialize].
      */
     internal var projectBasePath: String? = null
+
+    // ── Smart Context Manager components ──
+
+    /** Tracks context pressure via rolling growth rate. Reset on session switch/compaction. */
+    internal val pressureMonitor = ContextPressureMonitor()
+
+    /** Pre-computes compaction summaries in the background for instant swap. */
+    internal var backgroundCompactor: BackgroundCompactor? = null
+        private set
+
+    /** Session-scoped cache for detecting duplicate file reads (opt-in). */
+    internal val fileReadCache = FileReadCache()
+
+    /** Whether tool output truncation is enabled (from settings, read per-call). */
+    private fun truncateToolOutputEnabled(): Boolean =
+        OpenCodeSettingsState.getInstance().truncateToolOutput
+
+    /** Tool output char limit (from settings, read per-call). */
+    private fun toolOutputCharLimit(): Int =
+        OpenCodeSettingsState.getInstance().toolOutputCharLimit
+
+    /** Whether background compaction is enabled (from settings). */
+    private fun backgroundCompactionEnabled(): Boolean =
+        OpenCodeSettingsState.getInstance().enableBackgroundCompaction
+
+    /** Creates or recreates the BackgroundCompactor with current settings. */
+    private fun createBackgroundCompactor(): BackgroundCompactor {
+        val settings = OpenCodeSettingsState.getInstance()
+        return BackgroundCompactor(
+            client = client ?: throw IllegalStateException("Client not initialized"),
+            settings = BackgroundCompactorSettings(
+                enabled = settings.enableBackgroundCompaction,
+                checkpointThresholdPercent = settings.checkpointThresholdPercent,
+                swapThresholdPercent = settings.swapThresholdPercent,
+                maxCheckpointAgeMs = com.opencode.acp.chat.model.CompactionConstants.MAX_CHECKPOINT_AGE_MS,
+            ),
+            scope = scope,
+        )
+    }
 
     // ── Global signal merging ──
 
@@ -195,6 +252,7 @@ class SessionManager(
                 _activeSessionId.value = targetSessionId
                 resetDisplayLimit()
                 updateSessionSelection(targetSessionId)
+                resetSmartContextState()
                 computeSessionContext()
                 fetchTodos()
                 logger.info { "[ACP] Switched to session $targetSessionId" }
@@ -222,21 +280,25 @@ class SessionManager(
 
         // Optimistically add the new session to the list so it appears immediately
         // in the sidebar before loadSessions() completes the server round-trip.
+        // Moved inside switchMutex to prevent concurrent createAndSwitchSession calls
+        // from clobbering each other's optimistic list updates.
         val newItem = session.toSessionItem()
-        _pendingCreationSessionIds.value = _pendingCreationSessionIds.value + session.id
-        val current = _sessionListState.value
-        if (current is SessionListState.Loaded) {
-            _sessionListState.value = current.copy(
-                sessions = listOf(newItem) + current.sessions,
-                selectedId = session.id,
-                displayLimit = _displayLimit.value
-            )
-        }
 
         switchMutex.withLock {
+            _pendingCreationSessionIds.value = _pendingCreationSessionIds.value + session.id
+            val current = _sessionListState.value
+            if (current is SessionListState.Loaded) {
+                _sessionListState.value = current.copy(
+                    sessions = listOf(newItem) + current.sessions,
+                    selectedId = session.id,
+                    displayLimit = _displayLimit.value
+                )
+            }
+
             ensureSessionCached(session.id)
             _activeSessionId.value = session.id
             updateSessionSelection(session.id)
+            resetSmartContextState()
             computeSessionContext()
             fetchTodos()
         }
@@ -282,9 +344,27 @@ class SessionManager(
             // so the user always sees sessions (the filter path may not match
             // the server's project resolution).
             if (sessionList.isEmpty() && directory != null) {
-                logger.info { "[ACP] SessionManager.loadSessions: directory filter returned 0 sessions, retrying without filter" }
+                logger.warn { "[ACP] SessionManager.loadSessions: directory filter returned 0 sessions, retrying without filter (may show cross-project sessions)" }
                 try {
-                    sessionList = c.listSessions(null)
+                    val unfilteredList = c.listSessions(null)
+                    // Filter to sessions whose directory matches the project base path
+                    // to avoid leaking other projects' sessions on a shared server.
+                    val currentProjectBase = projectBasePath
+                    sessionList = if (currentProjectBase != null) {
+                        val filtered = unfilteredList.filter { session ->
+                            session.directory?.contains(currentProjectBase) == true
+                        }
+                        if (filtered.isNotEmpty()) {
+                            logger.info { "[ACP] SessionManager.loadSessions: filtered ${unfilteredList.size} → ${filtered.size} sessions matching project" }
+                            filtered
+                        } else {
+                            // No matches after filtering — use unfiltered list as last resort
+                            logger.warn { "[ACP] SessionManager.loadSessions: no sessions match project path after filtering, showing all ${unfilteredList.size} sessions" }
+                            unfilteredList
+                        }
+                    } else {
+                        unfilteredList
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -449,6 +529,8 @@ class SessionManager(
             }
             is SseEvent.SessionCompacted -> {
                 // Server performed auto-compaction — local message cache is stale.
+                // Reset pressure monitor and clear background checkpoint (stale data).
+                onSessionCompacted()
                 // Emit signal so ViewModel can refresh messages and recompute context.
                 if (event.sessionId == _activeSessionId.value) {
                     _globalSignals.tryEmit(UiSignal.SessionCompacted(event.sessionId))
@@ -482,10 +564,25 @@ class SessionManager(
             else -> {
                 var state = sessionsLock.withLock { sessions[sessionId] }
                 if (state == null) {
-                    // Auto-cache unknown sessions when SSE events arrive (e.g. subtask streaming)
-                    logger.info { "[ACP] Auto-caching session $sessionId from SSE event" }
-                    ensureSessionCached(sessionId)
-                    state = sessionsLock.withLock { sessions[sessionId] }
+                    // Auto-cache unknown sessions when SSE events arrive (e.g. subtask streaming).
+                    // Guards:
+                    // 1. Only auto-cache if the cache has room to avoid evicting useful sessions.
+                    // 2. Only auto-cache sessions that could belong to the current project:
+                    //    skip if projectBasePath is set (project-scoped) and the session ID
+                    //    doesn't match the active session or its known children. This prevents
+                    //    loading other projects' messages into the local cache via untrusted SSE.
+                    val cacheHasRoom = sessionsLock.withLock { sessions.size < MAX_CACHED_SESSIONS }
+                    val activeId = _activeSessionId.value
+                    val mayBelongToProject = projectBasePath == null ||
+                        sessionId == activeId ||
+                        _childSessionMap.value[activeId]?.any { it.id == sessionId } == true
+                    if (cacheHasRoom && mayBelongToProject) {
+                        logger.info { "[ACP] Auto-caching session $sessionId from SSE event" }
+                        ensureSessionCached(sessionId)
+                        state = sessionsLock.withLock { sessions[sessionId] }
+                    } else {
+                        logger.debug { "[ACP] Cache full — skipping auto-cache for session $sessionId" }
+                    }
                 }
                 if (state == null) {
                     logger.warn { "[ACP] Failed to cache session $sessionId, ignoring event" }
@@ -577,27 +674,37 @@ class SessionManager(
         return sessionsLock.withLock { sessions[id] }
     }
 
+    /**
+     * Non-blocking close — never blocks EDT.
+     *
+     * CONTRACT: The caller MUST also cancel the CoroutineScope after calling this.
+     * When the lock is held, this method returns early — the in-flight coroutine
+     * (holding the lock) will finish soon, and scope.cancel() ensures all
+     * SessionState coroutines are cancelled. Without scope.cancel(), sessions
+     * leaked by the early-return path would keep their coroutines and channels open.
+     *
+     * Current call sites: only OpenCodeService.dispose(), which calls scope.cancel()
+     * immediately after. If adding new call sites, ensure scope.cancel() follows.
+     */
     fun close() {
-        // Non-blocking close — never blocks EDT.
-        // The owning scope should be cancelled BEFORE calling this method,
-        // so coroutines release locks naturally.
-        // Use tryLock() (no timeout) — returns immediately.
-        // If lock is held, skip cleanup; scope cancellation will handle it.
-        val toClose: List<SessionState> = if (sessionsLock.tryLock()) {
+        val statesToClose: List<SessionState>
+        if (sessionsLock.tryLock()) {
             try {
-                val states = sessions.values.toList()
+                statesToClose = sessions.values.toList()
                 sessions.clear()
-                states
             } finally {
                 sessionsLock.unlock()
             }
         } else {
-            // Lock held by a coroutine that will be cancelled by scope.cancel().
-            // Return empty list — the coroutines will clean up when cancelled.
-            logger.info { "[ACP] SessionManager.close: lock held — skipping cleanup (scope cancellation will handle it)" }
-            emptyList()
+            // Lock held by a coroutine doing ensureSessionCached (blocking on HTTP).
+            // DO NOT call sessionsLock.withLock here — it's a blocking call that would
+            // freeze the EDT until the HTTP request completes. The lock holder will
+            // release soon; scope.cancel() (called by the caller after this method)
+            // will clean up any remaining state.
+            logger.warn { "[ACP] SessionManager.close: lock held — skipping session cleanup (caller MUST call scope.cancel() after this)" }
+            return
         }
-        toClose.forEach { it.close() }
+        statesToClose.forEach { it.close() }
     }
 
     // ── Private: Cache Management ──
@@ -827,6 +934,31 @@ class SessionManager(
             (totalTokens.toFloat() / contextLimit.toFloat()) * 100f
         } else 0f
 
+        // ── Smart Context Manager: record turn for pressure monitoring ──
+        // Only record on the full (REST) path — local refreshes during streaming
+        // would produce noisy intermediate data points.
+        if (fetchSession && inputTokens > 0) {
+            try {
+                pressureMonitor.recordTurn(inputTokens, System.currentTimeMillis())
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] pressureMonitor.recordTurn failed" }
+            }
+        }
+
+        // ── Smart Context Manager: background compaction checkpoint ──
+        // DISABLED: The server's POST /session/{id}/summarize endpoint performs ACTUAL
+        // compaction (removes/summarizes messages), not a preview. Calling it as a
+        // "background checkpoint" compacts the session immediately — the user sees
+        // their context disappear on load when usage > 60%. There is no server API
+        // to pre-compute a summary without side effects, so the BackgroundCompactor's
+        // auto-trigger is removed. Manual compaction (/compact command, "Compact Now"
+        // button) remains fully functional. The BackgroundCompactor class is retained
+        // as dead code in case a preview API is added in the future.
+        //
+        // if (fetchSession && backgroundCompactionEnabled() && backgroundCompactor != null) {
+        //     backgroundCompactor?.maybeCheckpoint(...)
+        // }
+
         // ── Message counts: from local cache ──
         val messageCount = messages.size
         val userMessageCount = messages.values.count { it.role == MessageRole.USER }
@@ -868,6 +1000,8 @@ class SessionManager(
                 filesModified = filesModified,
                 sessionCreated = sessionCreated,
                 lastUpdated = lastUpdated,
+                breakdown = computeBreakdownSafely(messages, contextLimit, projectBasePath, totalTokens),
+                pressure = computePressureSafely(totalTokens, contextLimit, inputTokens),
             )
         )
         logger.info { "[ACP] computeSessionContext(${if (fetchSession) "full" else "local"}): session=$currentSessionId totalTokens=$totalTokens cost=$totalCost usagePercent=${"%.1f".format(usagePercent)}% model=$modelId provider=$providerId" }
@@ -945,5 +1079,99 @@ class SessionManager(
         if (modelOnlyMatch != null && modelOnlyMatch.contextWindow > 0) return modelOnlyMatch.contextWindow.toLong()
 
         return 0L
+    }
+
+    // ── Smart Context Manager helpers ──
+
+    /** Compute breakdown safely — returns null on failure (non-fatal).
+     *  If [projectDirectory] is provided, subtracts pruner-estimated tokens saved
+     *  from the tool category so the UI reflects what the LLM actually sees.
+     *  @param sessionTotalTokens the server-provided total token count, used to
+     *  normalize the breakdown so its total matches the session's token count. */
+    private fun computeBreakdownSafely(
+        messages: Map<String, ChatMessage>,
+        contextLimit: Long,
+        projectDirectory: String? = null,
+        sessionTotalTokens: Long = 0L,
+    ): com.opencode.acp.chat.model.ContextBreakdown? {
+        return try {
+            if (messages.isEmpty()) return null
+            val breakdown = BreakdownComputer.computeBreakdown(messages, contextLimit, sessionTotalTokens)
+            if (projectDirectory != null) {
+                val prunerSaved = PrunerHeartbeatReader.readTokensSaved(projectDirectory)
+                if (prunerSaved > 0) {
+                    // Subtract pruner-saved tokens from tool category (pruning targets tool outputs).
+                    // Clear the per-tool breakdown map because individual tool counts are unreliable
+                    // after pruner adjustment — the pruner doesn't record which tools were pruned,
+                    // so we can't proportionally adjust per-tool entries. The UI's tool breakdown
+                    // sub-view is hidden when the map is empty.
+                    val adjustedToolTokens = (breakdown.toolTokens - prunerSaved).coerceAtLeast(0L)
+                    val adjustedTotal = (breakdown.totalTokens - prunerSaved).coerceAtLeast(0L)
+                    return breakdown.copy(
+                        toolTokens = adjustedToolTokens,
+                        totalTokens = adjustedTotal,
+                        freeTokens = (contextLimit - adjustedTotal).coerceAtLeast(0L),
+                        toolBreakdown = emptyMap(),
+                    )
+                }
+            }
+            breakdown
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] BreakdownComputer.computeBreakdown failed" }
+            null
+        }
+    }
+
+    /** Compute pressure safely — returns null on failure or insufficient data (non-fatal). */
+    private suspend fun computePressureSafely(
+        totalTokens: Long,
+        contextLimit: Long,
+        inputTokens: Long,
+    ): com.opencode.acp.chat.model.ContextPressure? {
+        return try {
+            pressureMonitor.computePressure(totalTokens, contextLimit)
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] pressureMonitor.computePressure failed" }
+            null
+        }
+    }
+
+    /**
+     * Reset smart-context state on session switch.
+     * Called from [switchSession] and [createAndSwitchSession].
+     */
+    suspend fun resetSmartContextState() {
+        BreakdownComputer.resetCalibration()
+        pressureMonitor.reset()
+        fileReadCache.clear()
+        backgroundCompactor?.clearCheckpoint()
+    }
+
+    /**
+     * Handle server-side compaction: reset pressure monitor and clear background checkpoint.
+     * Called when the `session.compacted` SSE event fires.
+     */
+    suspend fun onSessionCompacted() {
+        pressureMonitor.onCompaction()
+        backgroundCompactor?.clearCheckpoint()
+    }
+
+    /**
+     * Truncate tool output if truncation is enabled in settings.
+     * Called by SessionState before storing tool results.
+     */
+    fun maybeTruncateToolOutput(toolName: String, output: List<JsonObject>): List<JsonObject> {
+        if (!truncateToolOutputEnabled()) return output
+        return ToolOutputTruncator.truncateIfNeeded(toolName, output, toolOutputCharLimit())
+    }
+
+    /** Whether the background compactor has a valid checkpoint for the active session. */
+    fun isCheckpointReady(): Boolean {
+        val sessionId = _activeSessionId.value ?: return false
+        val context = _sessionContextState.value
+        if (context !is SessionContextState.Loaded) return false
+        val providerId = context.context.providerID
+        val modelId = context.context.modelID
+        return backgroundCompactor?.hasValidCheckpoint(sessionId, providerId, modelId) == true
     }
 }

@@ -93,6 +93,12 @@
             id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.follow"
             displayName="Follow Agent"/>
 
+        <applicationConfigurable
+            parentId="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
+            instance="com.opencode.acp.config.settings.OpenCodeContextConfigurable"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.context"
+            displayName="Context"/>
+
         <toolWindow
             id="Sigil - Coding Assistant"
             secondary="true"

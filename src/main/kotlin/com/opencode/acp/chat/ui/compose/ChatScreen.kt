@@ -168,6 +168,7 @@ fun
         listOf(
             SlashCommand("clear", "Start a new session", AllIconsKeys.General.Add),
             SlashCommand("cancel", "Cancel current response", AllIconsKeys.Actions.Suspend),
+            SlashCommand("compact", "Compact context (summarize history to free space)", AllIconsKeys.Actions.Execute),
             SlashCommand("review-perform", "Adversarial review: add comments on changed files", AllIconsKeys.General.BalloonError),
             SlashCommand("review-perform-gaming", "Adversarial review: game-engine checklist (Unreal C++ / Unity C#)", AllIconsKeys.General.BalloonError),
             SlashCommand("review-resolve", "Fix all open review comments", AllIconsKeys.General.BalloonInformation),
@@ -186,6 +187,8 @@ fun
     // Clear-all confirmation dialog state
     var showClearAllDialog by remember { mutableStateOf(false) }
     val clearAllState by viewModel.clearAllState.collectAsState()
+    val compactionState by viewModel.compactionState.collectAsState()
+    val checkpointReady by viewModel.checkpointReady.collectAsState()
 
     // Populate initially and subscribe to file editor changes
     LaunchedEffect(project) {
@@ -374,6 +377,9 @@ fun
                         streamingSessionIds = streamingSessionIds,
                         pendingCreationSessionIds = pendingCreationSessionIds,
                         clearAllState = clearAllState,
+                        compactionState = compactionState,
+                        onCompact = { viewModel.compactSession() },
+                        checkpointReady = checkpointReady,
                     )
                     // Main chat area
                     Column(modifier = Modifier.weight(1f)) {
@@ -475,6 +481,7 @@ fun
                         when (command.name) {
                             "clear" -> viewModel.createAndSwitchSession()
                             "cancel" -> viewModel.cancel()
+                            "compact" -> viewModel.compactSession()
                             "review-perform" -> viewModel.executeReviewPerformCommand(command.args)
                             "review-perform-gaming" -> viewModel.executeReviewPerformGamingCommand(command.args)
                             "review-resolve" -> viewModel.executeReviewResolveCommand()

@@ -212,43 +212,43 @@ class SessionState(
             // The single-reader event coroutine owns both the drain and the reset.
             //
             // We do NOT set ctx fields here; the event coroutine owns them.
-            val sendResult = eventChannel.trySend(SseEvent.ResetTurn(
+            val resetEvent = SseEvent.ResetTurn(
                 sessionId = sessionId,
                 newTurnMessageId = id,
                 newTurnServerMessageId = serverMessageId,
                 newTurnModelID = modelID,
                 newTurnProviderID = providerID,
-            ))
+            )
+            val sendResult = eventChannel.trySend(resetEvent)
             if (sendResult.isFailure) {
-                // Channel is full (1024 capacity) or closed. Drain old events to make room.
-                // All events in this channel belong to this session — drain them all.
+                // Channel is full (1024 capacity) or closed. Drain ALL stale events
+                // to make room — partial drain leaves the channel full on retry.
                 var drainedCount = 0
-                repeat(64) {
+                while (true) {
                     val r = eventChannel.tryReceive()
-                    if (r.isFailure) return@repeat
+                    if (r.isFailure) break
                     drainedCount++
                 }
                 if (drainedCount > 0) {
                     logger.info { "[ACP] createAssistantMessage: drained $drainedCount events to make room for ResetTurn" }
                 }
                 // Retry the ResetTurn send
-                val retryResult = eventChannel.trySend(SseEvent.ResetTurn(
-                    sessionId = sessionId,
-                    newTurnMessageId = id,
-                    newTurnServerMessageId = serverMessageId,
-                    newTurnModelID = modelID,
-                    newTurnProviderID = providerID,
-                ))
+                val retryResult = eventChannel.trySend(resetEvent)
                 if (retryResult.isFailure) {
-                    // Still can't send. Set ctx directly as last resort — we're
-                    // under stateLock and the event processing coroutine will
-                    // process subsequent events against this state.
-                    logger.error { "[ACP] createAssistantMessage: eventChannel FULL after drain — setting ctx directly. id=$id" }
-                    ctx.activeMessageId = id
-                    ctx.activeServerMessageId = serverMessageId
-                    ctx.modelID = modelID
-                    ctx.providerID = providerID
-                    ctx.isStreaming = true
+                    // Still can't send after drain. Launch a coroutine to send
+                    // asynchronously — this avoids the data race of setting ctx fields
+                    // directly from the caller's coroutine while the event coroutine
+                    // reads them without synchronization. The launch is fire-and-forget;
+                    // if it fails (channel closed), the ResetTurn is lost but subsequent
+                    // SSE events will be dropped by processEvent()'s ClosedSendChannelException catch.
+                    logger.warn { "[ACP] createAssistantMessage: eventChannel FULL after drain — launching async send. id=$id" }
+                    scope.launch {
+                        try {
+                            eventChannel.send(resetEvent)
+                        } catch (e: Exception) {
+                            logger.error(e) { "[ACP] createAssistantMessage: async send failed — ResetTurn lost. id=$id" }
+                        }
+                    }
                 }
             }
         }
@@ -368,6 +368,7 @@ class SessionState(
      * Rebuilds the tool call index from the new message set.
      */
     fun replaceAllMessages(newMessages: List<ChatMessage>) = stateLock.withLock {
+        if (closed) return@withLock
         val current = LinkedHashMap<String, ChatMessage>()
         ctx.toolCallIndex.clear()
         newMessages.forEach { message ->
@@ -382,9 +383,18 @@ class SessionState(
 
     @Suppress("REDUNDANT_ELSE_IN_WHEN")
     fun updateToolCallStatus(toolCallId: String, status: ToolCallStatus, output: List<JsonObject>? = null) = stateLock.withLock {
+        // Apply tool output truncation if enabled in settings (opt-in).
+        // Truncation is JSON-safe: complete JSON objects are kept until the char limit,
+        // then a marker object is appended. The server can still parse the result.
+        val truncatedOutput = if (output != null) {
+            sessionManager.maybeTruncateToolOutput(
+                toolName = ctx.toolCallPills[toolCallId]?.toolName ?: "tool",
+                output = output
+            )
+        } else null
         val newPartState = when (status) {
             ToolCallStatus.COMPLETED -> PartState.Completed
-            ToolCallStatus.FAILED -> PartState.Failed(output?.toString() ?: "Tool error")
+            ToolCallStatus.FAILED -> PartState.Failed(truncatedOutput?.toString() ?: "Tool error")
             ToolCallStatus.PENDING -> PartState.Pending
             ToolCallStatus.IN_PROGRESS -> PartState.InProgress
             else -> PartState.InProgress
@@ -398,15 +408,15 @@ class SessionState(
                 val existing = parts[toolCallId]
                 if (existing is MessagePart.ToolCall) {
                     parts[toolCallId] = existing.copy(
-                        pill = existing.pill.copy(status = status, output = output ?: existing.pill.output),
+                        pill = existing.pill.copy(status = status, output = truncatedOutput ?: existing.pill.output),
                         state = newPartState
                     )
                 } else {
                     // Fallback: try to use pill from ctx.toolCallPills (has proper kind/title)
                     val existingPill = ctx.toolCallPills[toolCallId]
                     parts[toolCallId] = MessagePart.ToolCall(
-                        pill = existingPill?.copy(status = status, output = output ?: existingPill.output)
-                            ?: ToolCallPill(toolCallId = toolCallId, toolName = "tool", title = "tool", kind = ToolKind.OTHER, status = status, output = output),
+                        pill = existingPill?.copy(status = status, output = truncatedOutput ?: existingPill.output)
+                            ?: ToolCallPill(toolCallId = toolCallId, toolName = "tool", title = "tool", kind = ToolKind.OTHER, status = status, output = truncatedOutput),
                         state = newPartState
                     )
                 }
@@ -415,7 +425,7 @@ class SessionState(
         }
         val pill = ctx.toolCallPills[toolCallId]
         if (pill != null) {
-            ctx.toolCallPills[toolCallId] = pill.copy(status = status, output = output ?: pill.output)
+            ctx.toolCallPills[toolCallId] = pill.copy(status = status, output = truncatedOutput ?: pill.output)
         }
     }
 
@@ -1793,10 +1803,20 @@ class SessionState(
     internal fun extractFilePath(input: JsonObject): String? {
         for (key in listOf("file_path", "filePath", "path")) {
             val element = input[key] ?: continue
-            val path = try {
+            val rawPath = try {
                 (element as? JsonPrimitive)?.content
             } catch (_: Exception) { null }
-            if (!path.isNullOrEmpty()) return path
+            if (!rawPath.isNullOrEmpty()) {
+                // Canonicalize to resolve ../ sequences and symlinks.
+                // Callers (sendMessageInternal, EditorFollowManager) rely on this
+                // for path traversal validation — returning raw paths bypasses
+                // their boundary checks.
+                return try {
+                    java.io.File(rawPath).canonicalPath
+                } catch (_: Exception) {
+                    rawPath // fall back to raw if canonicalization fails
+                }
+            }
         }
         return null
     }
