@@ -292,12 +292,22 @@ class SessionState(
     }
 
     fun completeStreaming(messageId: String) = stateLock.withLock {
-        if (messageId != ctx.activeMessageId) return@withLock
+        if (messageId != ctx.activeMessageId) {
+            logger.warn { "[ACP] completeStreaming: SKIP messageId=$messageId != activeMessageId=${ctx.activeMessageId}" }
+            return@withLock
+        }
+        val textKeysBefore = _messages.value[messageId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
+        logger.info { "[ACP] completeStreaming: START msg=$messageId partsBefore=${_messages.value[messageId]?.parts?.size} textKeys=$textKeysBefore" }
         freezeCurrentThinking()
         flushRevealBuffer()
         resegmentTextPartsFinal(messageId)
         ctx.isStreaming = false
         updateMessage(messageId) { it.copy(isStreaming = false, state = MessageState.Completed) }
+        val textKeysAfter = _messages.value[messageId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
+        logger.info { "[ACP] completeStreaming: END msg=$messageId partsAfter=${_messages.value[messageId]?.parts?.size} textKeys=$textKeysAfter" }
+        if (textKeysBefore != null && textKeysAfter != null && textKeysBefore != textKeysAfter) {
+            logger.warn { "[ACP] completeStreaming KEYS CHANGED: msg=$messageId before=$textKeysBefore after=$textKeysAfter removed=${textKeysBefore - textKeysAfter} added=${textKeysAfter - textKeysBefore}" }
+        }
         emitStreamingCompleted(messageId)
     }
 
@@ -478,7 +488,7 @@ class SessionState(
         }
     }
 
-    fun setLastUserText(text: String?) {
+    fun setLastUserText(text: String?) = stateLock.withLock {
         ctx.lastUserText = text
     }
 
@@ -1379,7 +1389,14 @@ class SessionState(
 
         freezeCurrentThinking()
         flushRevealBuffer()
+        val partsBefore = _messages.value[msgId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
+        logger.debug { "[ACP] finalizeStreaming: BEFORE resegment msg=$msgId reason=$stopReason textKeys=$partsBefore isStreaming=${ctx.isStreaming}" }
         resegmentTextPartsDirect(msgId)
+        val partsAfter = _messages.value[msgId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
+        logger.debug { "[ACP] finalizeStreaming: AFTER resegment msg=$msgId reason=$stopReason textKeys=$partsAfter" }
+        if (partsBefore != null && partsAfter != null && partsBefore != partsAfter) {
+            logger.warn { "[ACP] finalizeStreaming KEYS CHANGED: msg=$msgId reason=$stopReason before=$partsBefore after=$partsAfter removed=${partsBefore - partsAfter} added=${partsAfter - partsBefore}" }
+        }
 
         if (stopReason == "tool-calls") {
             // Intermediate stop — tool calls starting; keep message streaming, don't mark completed
@@ -1397,6 +1414,21 @@ class SessionState(
                 ctx.isStreaming = false
                 updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
                 emitStreamingCompleted(msgId)
+            }
+        } else if (stopReason == "new_message") {
+            // A new message is starting — finalize the old one immediately.
+            // No debounce: the new message's content events are already arriving,
+            // so there's nothing to wait for. The 300ms debounce would delay the
+            // isStreaming=true→false transition on the old message, causing a mass
+            // LazyColumn dispose+recreate when it finally fires (the flicker bug).
+            //
+            // Do NOT emit StreamingCompleted here — createAssistantMessage already
+            // reset streamingCompletedEmitted via resetTurnState(), so the new
+            // message's completion will emit it. Emitting here would prematurely
+            // set _streamPhase=IDLE while the new message is actively streaming.
+            logger.info { "[ACP] finalizeStreaming (new_message): immediate finalization (no debounce, no StreamingCompleted)" }
+            stateLock.withLock {
+                updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
             }
         } else {
             val capturedMsgId = msgId
@@ -1422,6 +1454,7 @@ class SessionState(
         flushThinkingRevealBuffer()
         val content = ctx.thinkingRevealBuffer.substring(0, ctx.thinkingRevealedLen)
         val msgId = ctx.activeMessageId ?: return
+        logger.debug { "[ACP] freezeCurrentThinking: msg=$msgId key=$key contentLen=${content.length}" }
         updateMessage(msgId) { msg ->
             val parts = LinkedHashMap(msg.parts)
             parts[key] = MessagePart.Thinking(content = content, state = PartState.Completed)
@@ -1581,6 +1614,7 @@ class SessionState(
      * abortStreaming, and TextReplace handler.
      */
     private fun flushRevealBuffer() {
+        logger.debug { "[ACP] flushRevealBuffer: revealedLen=${ctx.revealedLen}→${ctx.revealBuffer.length} bufferLen=${ctx.revealBuffer.length}" }
         ctx.sourceComplete = true
         ctx.revealedLen = ctx.revealBuffer.length
         ctx.revealJob?.cancel()
@@ -1730,6 +1764,10 @@ class SessionState(
                     }
                 }
 
+            val totalNewSegParts = partsBySegment.sumOf { it.size }
+            val segFunc = if (overrideIsStreaming) "segmentHealed" else "segment"
+            logger.debug { "[ACP] resegment: msg=$msgId oldParts=${oldParts.size} preserved=${preserved.size} newSegParts=$totalNewSegParts revealedLen=${ctx.revealedLen} segments=${segmentsSnapshot.size} func=$segFunc" }
+
                 // Rebuild map: insert each segment's parts after its anchor
                 val newMap = linkedMapOf<String, MessagePart>()
                 var nextSegToInsert = 0
@@ -1755,17 +1793,32 @@ class SessionState(
                     nextSegToInsert++
                 }
 
+                if (newMap.isEmpty() && oldParts.isNotEmpty()) {
+                    logger.warn { "[ACP] resegment: EMPTY RESULT! msg=$msgId oldParts=${oldParts.size} preserved=${preserved.size} newSegParts=$totalNewSegParts revealedLen=${ctx.revealedLen} textBufferLen=${ctx.textBuffer.length}" }
+                }
+
+                // Detect key changes — if text-derived keys changed, Compose disposes+recreates
+                val oldTextKeys = oldParts.keys.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }.toSet()
+                val newTextKeys = newMap.keys.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }.toSet()
+                val keysRemoved = oldTextKeys - newTextKeys
+                val keysAdded = newTextKeys - oldTextKeys
+                if (keysRemoved.isNotEmpty() || keysAdded.isNotEmpty()) {
+                    logger.warn { "[ACP] resegment KEYS CHANGED: msg=$msgId func=$segFunc removed=$keysRemoved added=$keysAdded" }
+                }
+
                 msg.copy(parts = newMap)
             }
         }
     }
 
     private fun resegmentTextPartsFinal(msgId: String) = stateLock.withLock {
-        // Pass overrideIsStreaming=false so resegmentTextPartsDirect uses
-        // non-healed segmentation without temporarily mutating ctx.isStreaming.
-        // This avoids a thread-safety issue where the event processing coroutine
-        // could read the temporarily-false value.
-        resegmentTextPartsDirect(msgId, overrideIsStreaming = false)
+        // Use segmentHealed (same as streaming) to avoid changing part keys on
+        // finalization. Switching from segmentHealed→segment can produce different
+        // segment counts, changing keys like text_0_0→text_0_0+text_0_1, which
+        // causes Compose to dispose+recreate every visible part — the "jump" flicker.
+        // For complete content, segmentHealed and segment produce identical results;
+        // for any edge case, consistency is more important than the non-healed path.
+        resegmentTextPartsDirect(msgId, overrideIsStreaming = true)
     }
 
     companion object {
@@ -1780,7 +1833,12 @@ class SessionState(
     private fun updateMessage(messageId: String, transform: (ChatMessage) -> ChatMessage) = stateLock.withLock {
         val map = _messages.value
         val existing = map[messageId] ?: return@withLock
+        val beforePartsCount = existing.parts.size
         val result = transform(existing)
+        val afterPartsCount = result.parts.size
+        if (afterPartsCount == 0 && beforePartsCount > 0) {
+            logger.warn { "[ACP] updateMessage: EMPTY PARTS! msg=$messageId before=$beforePartsCount after=$afterPartsCount" }
+        }
         val updated = LinkedHashMap(map)
         updated[messageId] = result
         _messages.value = updated
@@ -1811,10 +1869,13 @@ class SessionState(
                 // Callers (sendMessageInternal, EditorFollowManager) rely on this
                 // for path traversal validation — returning raw paths bypasses
                 // their boundary checks.
+                // Return null on failure: a path that can't be canonicalized is
+                // untrusted (permissions, broken symlink, non-existent path).
+                // Callers already handle null gracefully (they skip the operation).
                 return try {
                     java.io.File(rawPath).canonicalPath
                 } catch (_: Exception) {
-                    rawPath // fall back to raw if canonicalization fails
+                    null
                 }
             }
         }

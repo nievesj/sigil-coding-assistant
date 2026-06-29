@@ -47,6 +47,13 @@ class OpenCodeContextConfigurable : Configurable {
     private var prunerCompressEnabledCheckbox: JBCheckBox? = null
     private var prunerCompressModeCombo: JComboBox<String>? = null
 
+    // Context Pruner: Nudge
+    private var prunerNudgeEnabledCheckbox: JBCheckBox? = null
+    private var prunerNudgeThresholdField: JBTextField? = null
+    private var prunerNudgeUrgentField: JBTextField? = null
+    private var prunerNudgeCooldownField: JBTextField? = null
+    private var prunerDefaultContextLimitField: JBTextField? = null
+
     override fun getDisplayName(): String = "Context"
 
     override fun createComponent(): JComponent {
@@ -110,6 +117,22 @@ class OpenCodeContextConfigurable : Configurable {
             selectedItem = settings.prunerCompressMode
             toolTipText = "Compression mode: 'range' compresses message ranges, 'message' compresses individual messages"
         }
+        prunerNudgeEnabledCheckbox = JBCheckBox("Enable compress nudge (system reminder when context is high)", settings.prunerNudgeEnabled).apply {
+            toolTipText = "When on, injects a system reminder prompting the model to call the compress tool " +
+                "when context usage exceeds the threshold. Two levels: gentle and urgent."
+        }
+        prunerNudgeThresholdField = JBTextField(settings.prunerNudgeThresholdPercent.toString(), 4).apply {
+            toolTipText = "Gentle nudge threshold % (30-90). Default: 60"
+        }
+        prunerNudgeUrgentField = JBTextField(settings.prunerNudgeUrgentPercent.toString(), 4).apply {
+            toolTipText = "Urgent nudge threshold % (50-99). Default: 80"
+        }
+        prunerNudgeCooldownField = JBTextField(settings.prunerNudgeCooldownTurns.toString(), 4).apply {
+            toolTipText = "Minimum turns between nudges (1-10). Default: 3"
+        }
+        prunerDefaultContextLimitField = JBTextField(settings.prunerDefaultContextLimit.toString(), 8).apply {
+            toolTipText = "Fallback context limit when the model object doesn't expose one (1000-2000000). Default: 128000"
+        }
 
         panel = FormBuilder.createFormBuilder()
             .addComponent(JBLabel("Context Display").apply { font = font.deriveFont(java.awt.Font.BOLD) })
@@ -135,11 +158,19 @@ class OpenCodeContextConfigurable : Configurable {
             .addLabeledComponent("Prune errored tool inputs after (turns):", prunerErroredToolTurnsField!!)
             .addComponent(prunerCompressEnabledCheckbox!!)
             .addLabeledComponent("Compression mode:", prunerCompressModeCombo!!)
+            .addSeparator(4)
+            .addComponent(prunerNudgeEnabledCheckbox!!)
+            .addLabeledComponent("Gentle nudge threshold (%):", prunerNudgeThresholdField!!)
+            .addLabeledComponent("Urgent nudge threshold (%):", prunerNudgeUrgentField!!)
+            .addLabeledComponent("Nudge cooldown (turns):", prunerNudgeCooldownField!!)
+            .addLabeledComponent("Default context limit:", prunerDefaultContextLimitField!!)
             .panel
 
         // Wire conditional visibility: child fields are enabled only when their parent checkbox is checked.
         truncateToolOutputCheckbox?.addItemListener { updateConditionalVisibility() }
         enableBackgroundCompactionCheckbox?.addItemListener { updateConditionalVisibility() }
+        enableContextPrunerCheckbox?.addItemListener { updateConditionalVisibility() }
+        prunerNudgeEnabledCheckbox?.addItemListener { updateConditionalVisibility() }
         updateConditionalVisibility()
 
         return panel!!
@@ -157,6 +188,18 @@ class OpenCodeContextConfigurable : Configurable {
         val bgCompactionEnabled = enableBackgroundCompactionCheckbox?.isSelected == true
         checkpointThresholdField?.isEnabled = bgCompactionEnabled
         swapThresholdField?.isEnabled = bgCompactionEnabled
+
+        val prunerEnabled = enableContextPrunerCheckbox?.isSelected == true
+        prunerMaxToolOutputMessagesField?.isEnabled = prunerEnabled
+        prunerErroredToolTurnsField?.isEnabled = prunerEnabled
+        prunerCompressEnabledCheckbox?.isEnabled = prunerEnabled
+        prunerCompressModeCombo?.isEnabled = prunerEnabled
+        prunerNudgeEnabledCheckbox?.isEnabled = prunerEnabled
+        val nudgeEnabled = prunerEnabled && prunerNudgeEnabledCheckbox?.isSelected == true
+        prunerNudgeThresholdField?.isEnabled = nudgeEnabled
+        prunerNudgeUrgentField?.isEnabled = nudgeEnabled
+        prunerNudgeCooldownField?.isEnabled = nudgeEnabled
+        prunerDefaultContextLimitField?.isEnabled = nudgeEnabled
     }
 
     override fun isModified(): Boolean {
@@ -174,7 +217,12 @@ class OpenCodeContextConfigurable : Configurable {
             prunerMaxToolOutputMessagesField?.text?.trim()?.toIntOrNull() != settings.prunerMaxToolOutputMessages ||
             prunerErroredToolTurnsField?.text?.trim()?.toIntOrNull() != settings.prunerErroredToolTurns ||
             prunerCompressEnabledCheckbox?.isSelected != settings.prunerCompressEnabled ||
-            prunerCompressModeCombo?.selectedItem?.toString() != settings.prunerCompressMode
+            prunerCompressModeCombo?.selectedItem?.toString() != settings.prunerCompressMode ||
+            prunerNudgeEnabledCheckbox?.isSelected != settings.prunerNudgeEnabled ||
+            prunerNudgeThresholdField?.text?.trim()?.toIntOrNull() != settings.prunerNudgeThresholdPercent ||
+            prunerNudgeUrgentField?.text?.trim()?.toIntOrNull() != settings.prunerNudgeUrgentPercent ||
+            prunerNudgeCooldownField?.text?.trim()?.toIntOrNull() != settings.prunerNudgeCooldownTurns ||
+            prunerDefaultContextLimitField?.text?.trim()?.toIntOrNull() != settings.prunerDefaultContextLimit
     }
 
     override fun apply() {
@@ -201,6 +249,16 @@ class OpenCodeContextConfigurable : Configurable {
         settings.prunerCompressEnabled = prunerCompressEnabledCheckbox?.isSelected ?: true
         settings.prunerCompressMode = prunerCompressModeCombo?.selectedItem?.toString()
             ?.takeIf { it in listOf("range", "message") } ?: "range"
+        // Nudge settings
+        settings.prunerNudgeEnabled = prunerNudgeEnabledCheckbox?.isSelected ?: true
+        settings.prunerNudgeThresholdPercent = prunerNudgeThresholdField?.text?.trim()?.toIntOrNull()
+            ?.coerceIn(30, 90) ?: 60
+        settings.prunerNudgeUrgentPercent = prunerNudgeUrgentField?.text?.trim()?.toIntOrNull()
+            ?.coerceIn(50, 99) ?: 80
+        settings.prunerNudgeCooldownTurns = prunerNudgeCooldownField?.text?.trim()?.toIntOrNull()
+            ?.coerceIn(1, 10) ?: 3
+        settings.prunerDefaultContextLimit = prunerDefaultContextLimitField?.text?.trim()?.toIntOrNull()
+            ?.coerceIn(1000, 2_000_000) ?: 128000
     }
 
     override fun reset() {
@@ -226,5 +284,12 @@ class OpenCodeContextConfigurable : Configurable {
         prunerErroredToolTurnsField?.text = settings.prunerErroredToolTurns.toString()
         prunerCompressEnabledCheckbox?.isSelected = settings.prunerCompressEnabled
         prunerCompressModeCombo?.selectedItem = settings.prunerCompressMode
+        // Nudge settings
+        prunerNudgeEnabledCheckbox?.isSelected = settings.prunerNudgeEnabled
+        prunerNudgeThresholdField?.text = settings.prunerNudgeThresholdPercent.toString()
+        prunerNudgeUrgentField?.text = settings.prunerNudgeUrgentPercent.toString()
+        prunerNudgeCooldownField?.text = settings.prunerNudgeCooldownTurns.toString()
+        prunerDefaultContextLimitField?.text = settings.prunerDefaultContextLimit.toString()
+        updateConditionalVisibility()
     }
 }

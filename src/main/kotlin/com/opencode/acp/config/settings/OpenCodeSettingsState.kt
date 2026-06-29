@@ -161,6 +161,20 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     /** Compression mode: "range" or "message". Whitelisted on set. */
     var prunerCompressMode: String = "range"
 
+    // ── Context Pruner: Nudge settings ────────────────────────────────
+    /** When on, injects a system reminder prompting the model to call the compress
+     *  tool when context usage exceeds the threshold. Two levels: gentle (threshold)
+     *  and urgent (urgentPercent). Cooldown prevents nagging every turn. */
+    var prunerNudgeEnabled: Boolean = true
+    /** Gentle nudge threshold (% of context limit). Clamped to 30..90 on set. */
+    var prunerNudgeThresholdPercent: Int = 60
+    /** Urgent nudge threshold (% of context limit). Clamped to 50..99 on set. */
+    var prunerNudgeUrgentPercent: Int = 80
+    /** Minimum turns between nudges. Clamped to 1..10 on set. */
+    var prunerNudgeCooldownTurns: Int = 3
+    /** Fallback context limit when the model object doesn't expose one. Clamped to 1000..2_000_000 on set. */
+    var prunerDefaultContextLimit: Int = 128000
+
     /** Plugin log level for idea.log. One of OFF, ERROR, WARN, INFO, DEBUG, TRACE, ALL.
      *  Default INFO — shows startup/connection/error logs. Set DEBUG/ALL for troubleshooting.
      *  Applied at startup via [com.opencode.acp.config.settings.StartupLogConfigListener]
@@ -333,6 +347,11 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         prunerErroredToolTurns = state.prunerErroredToolTurns.coerceIn(1, 20)
         prunerCompressEnabled = state.prunerCompressEnabled
         prunerCompressMode = state.prunerCompressMode.takeIf { it in listOf("range", "message") } ?: "range"
+        prunerNudgeEnabled = state.prunerNudgeEnabled
+        prunerNudgeThresholdPercent = state.prunerNudgeThresholdPercent.coerceIn(30, 90)
+        prunerNudgeUrgentPercent = state.prunerNudgeUrgentPercent.coerceIn(50, 99)
+        prunerNudgeCooldownTurns = state.prunerNudgeCooldownTurns.coerceIn(1, 10)
+        prunerDefaultContextLimit = state.prunerDefaultContextLimit.coerceIn(1000, 2_000_000)
         logLevel = AcpLogLevel.fromName(state.logLevel).name
     }
 

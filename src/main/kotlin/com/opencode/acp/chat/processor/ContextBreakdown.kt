@@ -5,6 +5,7 @@ import com.opencode.acp.chat.model.CompactionConstants
 import com.opencode.acp.chat.model.ContextBreakdown
 import com.opencode.acp.chat.model.MessagePart
 import com.opencode.acp.chat.model.MessageRole
+import com.opencode.acp.chat.model.OtherCategoryBreakdown
 import com.opencode.acp.chat.model.ToolCategoryBreakdown
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.serialization.json.jsonPrimitive
@@ -224,14 +225,38 @@ object BreakdownComputer {
         val reasoningTokens = messageList
             .filter { it.role == MessageRole.ASSISTANT }
             .sumOf { it.reasoningTokens }
-        val cacheReadTokens = messageList
-            .filter { it.role == MessageRole.ASSISTANT }
-            .mapNotNull { it.cacheReadTokens.takeIf { c -> c > 0 } }
-            .maxOrNull() ?: 0L  // cumulative — take the last non-zero value
+        // cacheReadTokens is cumulative (each message's value = full prompt cache read for that turn).
+        // Use max() — the last message has the highest value for monotonically increasing counts.
+        // Diagnostic: log if cacheReadTokens ever decreases (violates cumulative assumption).
+        var maxCacheRead = 0L
+        var prevCacheRead = 0L
+        for (msg in messageList.filter { it.role == MessageRole.ASSISTANT }) {
+            val cr = msg.cacheReadTokens
+            if (cr > 0) {
+                if (prevCacheRead > 0 && cr < prevCacheRead) {
+                    logger.debug { "[ACP] cacheReadTokens decreased: $prevCacheRead → $cr — treating as per-message (session may have been compacted)" }
+                }
+                maxCacheRead = maxOf(maxCacheRead, cr)
+                prevCacheRead = cr
+            }
+        }
+        val cacheReadTokens = maxCacheRead
         val cacheWriteTokens = messageList
             .filter { it.role == MessageRole.ASSISTANT }
             .sumOf { it.cacheWriteTokens }
         val otherTokens = reasoningTokens + cacheReadTokens + cacheWriteTokens
+
+        // Build other category breakdown (reasoning, cache read, cache write)
+        val otherBreakdownMap = mutableMapOf<String, OtherCategoryBreakdown>()
+        if (reasoningTokens > 0) {
+            otherBreakdownMap["Reasoning"] = OtherCategoryBreakdown("Reasoning", reasoningTokens)
+        }
+        if (cacheReadTokens > 0) {
+            otherBreakdownMap["Cache Read"] = OtherCategoryBreakdown("Cache Read", cacheReadTokens)
+        }
+        if (cacheWriteTokens > 0) {
+            otherBreakdownMap["Cache Write"] = OtherCategoryBreakdown("Cache Write", cacheWriteTokens)
+        }
 
         val rawTotal = systemPromptTokens + userTokens + assistantTokens + toolTokens + otherTokens
         val freeTokens = contextLimit - rawTotal
@@ -261,6 +286,10 @@ object BreakdownComputer {
             breakdown.copy(estimatedTokens = (breakdown.estimatedTokens * scale).toLong())
         }
 
+        val normalizedOtherBreakdown = otherBreakdownMap.mapValues { (_, breakdown) ->
+            breakdown.copy(estimatedTokens = (breakdown.estimatedTokens * scale).toLong())
+        }
+
         logger.debug {
             "[ACP] Breakdown: system=$normSystem user=$normUser assistant=$normAssistant " +
                 "tool=$normTool other=$normOther total=$normTotal free=${contextLimit - normTotal}"
@@ -275,6 +304,7 @@ object BreakdownComputer {
             freeTokens = contextLimit - normTotal,
             totalTokens = normTotal,
             toolBreakdown = normalizedToolBreakdown,
+            otherBreakdown = normalizedOtherBreakdown,
         )
     }
 

@@ -514,6 +514,65 @@ preferable (no flicker, preserved `remember` state).
 - **Files:** `MessageList.kt` (LazyColumn items key + State read), `ChatScreen.kt`
   (passes `State<Map<String, ChatMessage>>` to MessageList)
 
+### Streaming "Jump" — animateScrollToItem on New Streaming Message
+
+**Problem:** When a tool completes and a new assistant message starts streaming
+(thinking begins), all visible chat messages briefly shift upward — a visual
+"jump" or "flicker" lasting a fraction of a second. The effect is most noticeable
+when the chat has many messages (500+) and `Arrangement.Bottom` is used.
+
+**Root cause:** Three separate issues, all triggered at the `new_message` transition
+(tool completes → `MessageFinalized` with new server message ID → new assistant
+message auto-created → thinking starts):
+
+1. **`finalizeStreaming` 300ms debounce (fixed):** The `new_message` path used the
+   same 300ms debounced finalization as normal `stop` events. This delayed the old
+   message's `isStreaming=true→false` transition by 300ms, splitting state changes
+   across two frames and causing a mass LazyColumn dispose+recreate when the debounce
+   finally fired. Fix: dedicated `new_message` branch in `finalizeStreaming` that
+   finalizes immediately (no debounce) and does NOT emit `StreamingCompleted` (the
+   new message's completion will emit it — emitting here would prematurely set
+   `_streamPhase=IDLE` while the new message is actively streaming).
+
+2. **`resegmentTextPartsFinal` using `segment()` instead of `segmentHealed()` (fixed):**
+   On finalization, `resegmentTextPartsFinal` passed `overrideIsStreaming=false` to
+   use `MarkdownSegmenter.segment()` instead of `segmentHealed()`. If the segment
+   structure differed (healed closed unclosed markdown that non-healed treats as
+   literal text), part keys changed (e.g., `text_0_0` → `text_0_0 + text_0_1`), causing
+   every `key()` block in `AssistantMessage` to dispose+recreate. Fix: always use
+   `segmentHealed()` (pass `overrideIsStreaming=true`) — for complete content, both
+   produce identical results; consistency prevents key changes.
+
+3. **`animateScrollToItem` on new streaming message (fixed):** When a new message
+   appears in the list (delta == 1), the scroll coordinator used
+   `animateScrollToItem` — a 60ms-delayed animated glide to the new bottom. With
+   `Arrangement.Bottom`, this animation shifts all visible items upward, which IS
+   the visible "jump." Fix: detect `isNewStreamingMessage` (delta == 1 and last
+   message `isStreaming == true`) and use instant `scrollToItem` instead of animated.
+
+**Empty streaming messages filtered:** Assistant messages with 0 parts and
+`isStreaming=true` are filtered out of the `messages` list before LazyColumn sees
+them. They create 0-height items that trigger LazyColumn recycling of visible
+items. The message gets parts within milliseconds (first `ThinkingChunk`/`TextChunk`),
+at which point it appears in the list normally. The `ThinkingIndicator` overlay
+(pinned at the bottom of the Box) still shows activity during the gap.
+
+**Diagnostic approach (if regression):**
+- Enable DEBUG logging (Settings → Tools → Sigil → Plugin log level)
+- Search `idea.log` for `[ACP] KEYS CHANGED` — if part keys change during
+  finalization, the resegment is producing different segment structures
+- Search for `[ACP] finalizeStreaming (new_message): immediate` — if this shows
+  `debounced finalization (300ms)` instead, the immediate-finalization branch
+  is not being reached
+- Search for `[ACP] AssistantMessage: EMPTY PARTS` with `isStreaming=true` —
+  if empty streaming messages appear in the list, the filter is broken
+- Check `MessageList.kt` scroll coordinator: `isNewStreamingMessage` must use
+  instant `scrollToItem`, not `animateScrollToItem`
+
+- **Files:** `SessionState.kt` (`finalizeStreaming` new_message branch,
+  `resegmentTextPartsFinal`), `MessageList.kt` (empty message filter,
+  `isNewStreamingMessage` scroll mode, `AssistantMessage` EMPTY PARTS warning)
+
 ### IntelliJ Platform Icons (AllIcons) "” Confirmed Available
 
 Icons referenced via `AllIcons.*` that are **known to compile** in this project.

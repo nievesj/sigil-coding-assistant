@@ -352,15 +352,23 @@ class SessionManager(
                     val currentProjectBase = projectBasePath
                     sessionList = if (currentProjectBase != null) {
                         val filtered = unfilteredList.filter { session ->
-                            session.directory?.contains(currentProjectBase) == true
+                            session.directory?.let { dir ->
+                                dir == currentProjectBase ||
+                                    dir.startsWith(currentProjectBase + java.io.File.separator) ||
+                                    dir.startsWith(currentProjectBase + "/")
+                            } == true
                         }
                         if (filtered.isNotEmpty()) {
                             logger.info { "[ACP] SessionManager.loadSessions: filtered ${unfilteredList.size} → ${filtered.size} sessions matching project" }
                             filtered
                         } else {
-                            // No matches after filtering — use unfiltered list as last resort
-                            logger.warn { "[ACP] SessionManager.loadSessions: no sessions match project path after filtering, showing all ${unfilteredList.size} sessions" }
-                            unfilteredList
+                            // No matches after filtering — do NOT fall back to showing
+                            // all sessions. On a shared server, the unfiltered list may
+                            // contain sessions from other projects (data isolation leak).
+                            // Keep the empty list and let the user see "No sessions" with
+                            // the option to create a new session.
+                            logger.warn { "[ACP] SessionManager.loadSessions: no sessions match project path ($currentProjectBase) — ${unfilteredList.size} unfiltered sessions exist but are not shown (cross-project leak prevented)" }
+                            emptyList()
                         }
                     } else {
                         unfilteredList
@@ -701,7 +709,13 @@ class SessionManager(
             // freeze the EDT until the HTTP request completes. The lock holder will
             // release soon; scope.cancel() (called by the caller after this method)
             // will clean up any remaining state.
-            logger.warn { "[ACP] SessionManager.close: lock held — skipping session cleanup (caller MUST call scope.cancel() after this)" }
+            //
+            // Clear the map eagerly to release SessionState references (Channel buffers,
+            // coroutine scopes) without waiting for GC. We don't call close() on each
+            // state (that requires the lock), but scope.cancel() will cancel all their
+            // coroutines anyway.
+            sessions.clear()
+            logger.warn { "[ACP] SessionManager.close: lock held — cleared session map (caller MUST call scope.cancel() after this)" }
             return
         }
         statesToClose.forEach { it.close() }
@@ -975,6 +989,12 @@ class SessionManager(
         val sessionCreated = session?.time?.created ?: lastLoaded?.sessionCreated ?: 0L
         val lastUpdated = session?.time?.updated ?: lastLoaded?.lastUpdated ?: 0L
 
+        // Read pruner heartbeat once — used for both breakdown adjustment and SessionContext fields
+        val currentProjectBasePath = projectBasePath
+        val prunerHeartbeat = if (currentProjectBasePath != null) {
+            try { PrunerHeartbeatReader.readHeartbeat(currentProjectBasePath) } catch (_: Exception) { null }
+        } else null
+
         val result = SessionContextState.Loaded(
             context = SessionContext(
                 sessionId = currentSessionId,
@@ -1000,8 +1020,12 @@ class SessionManager(
                 filesModified = filesModified,
                 sessionCreated = sessionCreated,
                 lastUpdated = lastUpdated,
-                breakdown = computeBreakdownSafely(messages, contextLimit, projectBasePath, totalTokens),
+                breakdown = computeBreakdownSafely(messages, contextLimit, totalTokens, prunerHeartbeat),
                 pressure = computePressureSafely(totalTokens, contextLimit, inputTokens),
+                prunerTokensSaved = prunerHeartbeat?.tokensSaved ?: 0,
+                prunerOutputsPruned = prunerHeartbeat?.outputsPruned ?: 0,
+                prunerInputsPruned = prunerHeartbeat?.inputsPruned ?: 0,
+                prunerLastRunMs = prunerHeartbeat?.timestampMs ?: 0,
             )
         )
         logger.info { "[ACP] computeSessionContext(${if (fetchSession) "full" else "local"}): session=$currentSessionId totalTokens=$totalTokens cost=$totalCost usagePercent=${"%.1f".format(usagePercent)}% model=$modelId provider=$providerId" }
@@ -1091,29 +1115,27 @@ class SessionManager(
     private fun computeBreakdownSafely(
         messages: Map<String, ChatMessage>,
         contextLimit: Long,
-        projectDirectory: String? = null,
         sessionTotalTokens: Long = 0L,
+        prunerHeartbeat: PrunerHeartbeat? = null,
     ): com.opencode.acp.chat.model.ContextBreakdown? {
         return try {
             if (messages.isEmpty()) return null
             val breakdown = BreakdownComputer.computeBreakdown(messages, contextLimit, sessionTotalTokens)
-            if (projectDirectory != null) {
-                val prunerSaved = PrunerHeartbeatReader.readTokensSaved(projectDirectory)
-                if (prunerSaved > 0) {
-                    // Subtract pruner-saved tokens from tool category (pruning targets tool outputs).
-                    // Clear the per-tool breakdown map because individual tool counts are unreliable
-                    // after pruner adjustment — the pruner doesn't record which tools were pruned,
-                    // so we can't proportionally adjust per-tool entries. The UI's tool breakdown
-                    // sub-view is hidden when the map is empty.
-                    val adjustedToolTokens = (breakdown.toolTokens - prunerSaved).coerceAtLeast(0L)
-                    val adjustedTotal = (breakdown.totalTokens - prunerSaved).coerceAtLeast(0L)
-                    return breakdown.copy(
-                        toolTokens = adjustedToolTokens,
-                        totalTokens = adjustedTotal,
-                        freeTokens = (contextLimit - adjustedTotal).coerceAtLeast(0L),
-                        toolBreakdown = emptyMap(),
-                    )
-                }
+            val prunerSaved = prunerHeartbeat?.tokensSaved ?: 0L
+            if (prunerSaved > 0) {
+                // Subtract pruner-saved tokens from tool category (pruning targets tool outputs).
+                // Clear the per-tool breakdown map because individual tool counts are unreliable
+                // after pruner adjustment — the pruner doesn't record which tools were pruned,
+                // so we can't proportionally adjust per-tool entries. The UI's tool breakdown
+                // sub-view is hidden when the map is empty.
+                val adjustedToolTokens = (breakdown.toolTokens - prunerSaved).coerceAtLeast(0L)
+                val adjustedTotal = (breakdown.totalTokens - prunerSaved).coerceAtLeast(0L)
+                return breakdown.copy(
+                    toolTokens = adjustedToolTokens,
+                    totalTokens = adjustedTotal,
+                    freeTokens = (contextLimit - adjustedTotal).coerceAtLeast(0L),
+                    toolBreakdown = emptyMap(),
+                )
             }
             breakdown
         } catch (e: Exception) {
