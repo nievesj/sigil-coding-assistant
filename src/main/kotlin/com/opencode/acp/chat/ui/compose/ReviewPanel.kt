@@ -643,20 +643,26 @@ private fun ReviewRefreshBar(
         horizontalArrangement = Arrangement.End,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
+        Row(
             modifier = Modifier
-                .clip(CircleShape)
+                .clip(RoundedCornerShape(6.dp))
                 .background(if (isHovered) hoverBg else Color.Transparent)
                 .hoverable(interactionSource)
                 .clickable(onClick = onRefresh)
-                .padding(4.dp),
-            contentAlignment = Alignment.Center
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
                 key = AllIconsKeys.Actions.Refresh,
                 contentDescription = "Refresh reviews",
                 modifier = Modifier.size(14.dp),
                 tint = iconColor,
+            )
+            Text(
+                text = "Refresh",
+                fontSize = ChatTheme.fonts.reviewLoading,
+                color = iconColor,
             )
         }
     }

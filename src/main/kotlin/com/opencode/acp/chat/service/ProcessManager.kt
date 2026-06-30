@@ -3,6 +3,7 @@ package com.opencode.acp.chat.service
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.config.AcpDefaults
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.chat.model.ConnectionErrorReason
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.processor.PrunerConfigWriter
 import com.opencode.acp.chat.processor.PrunerResourceExtractor
@@ -29,9 +30,13 @@ class ProcessManager(private val scope: CoroutineScope) {
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
+    private val _connectionErrorReason = MutableStateFlow<ConnectionErrorReason?>(null)
+    val connectionErrorReason: StateFlow<ConnectionErrorReason?> = _connectionErrorReason.asStateFlow()
+
     @Volatile private var openCodeClient: OpenCodeClient? = null
     @Volatile private var openCodeProcess: Process? = null
     private var processWatcherJob: Job? = null
+    private val outputBuffer = StringBuffer()
     @Volatile var initialized: Boolean = false
         private set
 
@@ -131,47 +136,111 @@ class ProcessManager(private val scope: CoroutineScope) {
 
         // Launch our own binary on the chosen port
         if (settings.binaryPath.isNotBlank()) {
-            launchOpenCodeBinary(settings.binaryPath)
+            val launched = launchOpenCodeBinary(settings.binaryPath)
+            if (!launched) {
+                // Only set generic error if launchOpenCodeBinary didn't set a specific reason
+                if (_connectionErrorReason.value == null) _connectionErrorReason.value = ConnectionErrorReason.BinaryLaunchFailed(
+                    detail = "Could not start ${settings.binaryPath}. Check the path and permissions."
+                )
+                _connectionState.value = ConnectionState.ERROR
+                return false
+            }
         } else {
             logger.warn { "[ACP] ProcessManager.initialize: no binary path configured" }
+            _connectionErrorReason.value = ConnectionErrorReason.NoBinaryConfigured
             _connectionState.value = ConnectionState.ERROR
             return false
         }
 
-        // Poll health check with backoff until the server is ready or timeout
-        val deadline = System.currentTimeMillis() + INIT_TIMEOUT_MS
-        var attempt = 0
-        while (System.currentTimeMillis() < deadline) {
-            try {
-                if (opencodeClient.healthCheck()) {
-                    logger.info { "[ACP] ProcessManager.initialize: health check passed (attempt ${attempt + 1})" }
+        // Poll health check with backoff until the server is ready or timeout.
+        // Extracted into a local function so the TOCTOU retry (below) can re-poll
+        // without duplicating the loop body.
+        suspend fun pollHealthCheck(client: OpenCodeClient, timeoutMs: Long, label: String): Boolean {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            var attempt = 0
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    if (client.healthCheck()) {
+                        logger.info { "[ACP] ProcessManager.initialize: $label health check passed (attempt ${attempt + 1})" }
+                        return true
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: java.net.ConnectException) {
+                    // Connection refused — server not ready yet
+                } catch (e: java.net.SocketTimeoutException) {
+                    // Health check request timed out — server not ready yet
+                } catch (e: java.io.IOException) {
+                    // Transient I/O error — server not ready yet
+                }
+                attempt++
+
+                // Check if the launched process died — if so, fail fast instead of polling to timeout
+                val processStatus = checkProcessAlive()
+                if (processStatus != null) {
+                    val exitCode = try { openCodeProcess?.exitValue() ?: -1 } catch (_: Exception) { -1 }
+                    val outputTail = synchronized(outputBuffer) { outputBuffer.toString().takeIf { it.isNotBlank() } }
+                    logger.error { "[ACP] ProcessManager.initialize: $label $processStatus" }
+                    _connectionErrorReason.value = ConnectionErrorReason.ProcessExited(
+                        exitCode = exitCode,
+                        outputTail = outputTail
+                    )
+                    _connectionState.value = ConnectionState.ERROR
+                    return false
+                }
+
+                if (attempt == 1) {
+                    logger.info { "[ACP] ProcessManager.initialize: $label server not ready yet, polling..." }
+                }
+                delay(calculateInitBackoff(attempt))
+            }
+            return false
+        }
+
+        // First attempt: poll with the full timeout on the initially chosen port.
+        if (pollHealthCheck(opencodeClient, INIT_TIMEOUT_MS, "attempt 1")) {
+            _connectionErrorReason.value = null
+            _connectionState.value = ConnectionState.CONNECTED
+            initialized = true
+            return true
+        }
+
+        // TOCTOU retry: the port we chose may have been taken between findAvailablePort's
+        // test bind and the OpenCode server's actual bind. If the binary was launched and
+        // the health check timed out (process still alive, not ProcessExited), try ONE
+        // more port before giving up. This handles the race described in findAvailablePort.
+        if (launchedBinaryPath != null && checkProcessAlive() == null) {
+            val retryPort = findAvailablePort(port + 1)
+            if (retryPort != port) {
+                logger.warn { "[ACP] ProcessManager.initialize: first launch health check timed out on port $port — retrying on port $retryPort (TOCTOU retry)" }
+                // Kill the current process and relaunch on the new port
+                killProcess(openCodeProcess)
+                openCodeProcess = null
+                port = retryPort
+                // Close the old client and create a new one with the new base URL.
+                // OpenCodeClient.baseUrl is immutable, so we must recreate the client.
+                try { opencodeClient.close() } catch (_: Exception) { }
+                val retryClient = OpenCodeClient(
+                    baseUrl = "http://$host:$port",
+                    authToken = authToken
+                )
+                openCodeClient = retryClient
+                val relaunched = launchOpenCodeBinary(settings.binaryPath)
+                if (relaunched && pollHealthCheck(retryClient, 15_000L, "attempt 2 (TOCTOU retry)")) {
+                    _connectionErrorReason.value = null
                     _connectionState.value = ConnectionState.CONNECTED
                     initialized = true
                     return true
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // Connection refused or similar — server not ready yet
+                logger.warn { "[ACP] ProcessManager.initialize: TOCTOU retry on port $retryPort also failed" }
+            } else {
+                logger.warn { "[ACP] ProcessManager.initialize: no alternate port available for TOCTOU retry (tried ${port + 1}..${port + MAX_PORT_ATTEMPTS})" }
             }
-            attempt++
-
-            // Check if the launched process died — if so, fail fast instead of polling to timeout
-            val processStatus = checkProcessAlive()
-            if (processStatus != null) {
-                logger.error { "[ACP] ProcessManager.initialize: $processStatus" }
-                _connectionState.value = ConnectionState.ERROR
-                return false
-            }
-
-            if (attempt == 1) {
-                logger.info { "[ACP] ProcessManager.initialize: server not ready yet, polling..." }
-            }
-            delay(calculateInitBackoff(attempt))
         }
 
         // Timed out
         logger.warn { "[ACP] ProcessManager.initialize: server did not become healthy within ${INIT_TIMEOUT_MS / 1000}s" }
+        _connectionErrorReason.value = ConnectionErrorReason.HealthCheckTimeout
         _connectionState.value = ConnectionState.ERROR
         return false
     }
@@ -184,37 +253,60 @@ class ProcessManager(private val scope: CoroutineScope) {
 
     // --- Binary management ---
 
-    private fun launchOpenCodeBinary(binaryPath: String) {
+    private fun launchOpenCodeBinary(binaryPath: String): Boolean {
         // Kill any previously launched process before starting a new one
         if (openCodeProcess?.isAlive == true) {
             killProcess(openCodeProcess)
             openCodeProcess = null
         }
 
-        try {
-            logger.info { "Launching: $binaryPath serve --hostname $host --port $port (cwd=$projectBasePath)" }
+        return try {
+            // Validate the configured binary path before executing it. A misconfigured
+            // or compromised settings value could otherwise execute arbitrary code
+            // under the IDE's privileges.
+            val binaryFile = java.io.File(binaryPath)
+            if (!binaryFile.isFile) {
+                logger.error { "[ACP] launchOpenCodeBinary: binary path does not exist or is not a regular file: $binaryPath" }
+                return false
+            }
+            if (!binaryFile.canExecute()) {
+                logger.error { "[ACP] launchOpenCodeBinary: binary path is not executable: $binaryPath" }
+                return false
+            }
+
+            logger.info { "Launching: ${binaryFile.canonicalPath} serve --hostname $host --port $port (cwd=$projectBasePath)" }
             val pb = ProcessBuilder(binaryPath, "serve", "--hostname", host, "--port", port.toString())
                 .directory(java.io.File(projectBasePath))
                 .redirectErrorStream(true)
                 .apply {
                     environment().putIfAbsent("OPENCODE_CLIENT", "cli")
                 }
-            openCodeProcess = pb.start()
+            // Capture the specific Process instance so the stdout-drain thread
+            // reads from this exact process rather than the mutable @Volatile
+            // openCodeProcess var (which may be reassigned by a later launch).
+            val proc = pb.start()
+            openCodeProcess = proc
             launchedBinaryPath = binaryPath
-            logger.info { "OpenCode process started (PID: ${openCodeProcess?.pid()})" }
+            logger.info { "OpenCode process started (PID: ${proc.pid()})" }
 
             // Drain stdout/stderr to a buffer so we can report it if the process dies
-            val outputBuffer = StringBuffer()
+            outputBuffer.setLength(0)
             Thread({
                 try {
-                    openCodeProcess?.inputStream?.bufferedReader()?.use { reader ->
-                        reader.lines().forEach { line ->
+                    proc.inputStream.bufferedReader().use { reader ->
+                        while (proc.isAlive) {
+                            val line = reader.readLine() ?: break
                             logger.debug { "[opencode] $line" }
                             synchronized(outputBuffer) {
                                 if (outputBuffer.length < 4096) {
                                     outputBuffer.append(line).append('\n')
                                 }
                             }
+                        }
+                        // Drain any remaining lines after process exits
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            logger.debug { "[opencode] $line" }
                         }
                     }
                 } catch (_: Exception) { }
@@ -230,8 +322,11 @@ class ProcessManager(private val scope: CoroutineScope) {
 
             // Start process watcher to detect unexpected death and auto-restart
             startProcessWatcher()
+            true
         } catch (e: Exception) {
             logger.error(e) { "Failed to launch OpenCode binary at $binaryPath" }
+            outputBuffer.append(e.message)
+            false
         }
     }
 
@@ -260,13 +355,19 @@ class ProcessManager(private val scope: CoroutineScope) {
             // and scope is still active.
             if (isActive && launchedBinaryPath != null) {
                 logger.info { "[ACP] Process watcher: auto-restarting opencode..." }
-                launchOpenCodeBinary(launchedBinaryPath!!)
+                val restarted = launchOpenCodeBinary(launchedBinaryPath!!)
                 if (initialized) {
                     _connectionState.value = ConnectionState.RECONNECTING
                     initialized = false
                     // Reset MCP registration state — the new server instance
                     // won't have dynamic registrations from the previous instance.
                     onMcpReset?.invoke()
+                }
+                if (!restarted) {
+                    _connectionErrorReason.value = ConnectionErrorReason.BinaryLaunchFailed(
+                        detail = "Could not restart $launchedBinaryPath"
+                    )
+                    _connectionState.value = ConnectionState.ERROR
                 }
             }
         }
@@ -283,6 +384,13 @@ class ProcessManager(private val scope: CoroutineScope) {
      * [startPort] (will fail later at health-check time with a clear error).
      */
     private fun findAvailablePort(startPort: Int): Int {
+        // NOTE: This has an intentional time-of-check/time-of-use (TOCTOU) race —
+        // the port can be taken by another process between this test bind and the
+        // OpenCode server's actual bind. We accept this because re-trying the next
+        // candidate port on a server bind failure would require parsing the
+        // server's stdout for a bind error, which is fragile. Instead, if the port
+        // is taken between test and use, the OpenCode server fails to bind and the
+        // health-check timeout (INIT_TIMEOUT_MS) surfaces a clear error to the user.
         for (candidate in startPort until (startPort + MAX_PORT_ATTEMPTS)) {
             try {
                 ServerSocket(candidate).use { /* port is available */ }
@@ -315,9 +423,18 @@ class ProcessManager(private val scope: CoroutineScope) {
                 // large or has stuck child processes. Without a timeout, this blocks
                 // the EDT indefinitely during IDE restart/plugin update.
                 val taskkill = Runtime.getRuntime().exec(arrayOf("taskkill", "/F", "/T", "/PID", pid.toString()))
-                if (!taskkill.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                if (taskkill.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                    val exitCode = taskkill.exitValue()
+                    if (exitCode != 0) {
+                        val stderr = try { taskkill.inputStream.bufferedReader().readText().take(200) } catch (_: Exception) { "" }
+                        logger.warn { "[ACP] taskkill exited with code $exitCode for PID $pid — stderr: $stderr" }
+                        // Still fall through to destroyForcibly as a fallback
+                        process.destroyForcibly()
+                    }
+                } else {
                     logger.warn { "[ACP] taskkill timed out after 5s for PID $pid — falling back to destroyForcibly" }
                     taskkill.destroyForcibly()
+                    process.destroyForcibly()
                 }
             } else {
                 process.destroyForcibly()
@@ -344,6 +461,7 @@ class ProcessManager(private val scope: CoroutineScope) {
         val client = openCodeClient
         openCodeClient = null
         initialized = false
+        _connectionErrorReason.value = null
         _connectionState.value = ConnectionState.DISCONNECTED
         if (client != null) {
             Thread({
@@ -361,6 +479,13 @@ class ProcessManager(private val scope: CoroutineScope) {
      */
     fun resetForRetry() {
         logger.info { "[ACP] ProcessManager.resetForRetry() called" }
+        // Cancel the process watcher BEFORE nulling openCodeProcess. Otherwise the
+        // old watcher holds a reference to the previous process and, when that
+        // process exits, auto-restarts it via launchOpenCodeBinary() — racing with
+        // the new initialize() call from retryConnection() and leaving two opencode
+        // server processes running.
+        processWatcherJob?.cancel()
+        processWatcherJob = null
         val processToKill = openCodeProcess
         openCodeProcess = null
         if (processToKill != null) {
@@ -369,6 +494,7 @@ class ProcessManager(private val scope: CoroutineScope) {
             }, "opencode-kill-retry").apply { isDaemon = true; start() }
         }
         initialized = false
+        _connectionErrorReason.value = null
         _connectionState.value = ConnectionState.DISCONNECTED
     }
 

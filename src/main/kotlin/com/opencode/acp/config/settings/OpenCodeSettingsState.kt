@@ -31,6 +31,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     var listNumberColor: String = "#6BBE50"
     /** Last selected model key in format "providerID/modelID". */
     var lastSelectedModelKey: String = ""
+    /** Last selected agent ID. Persisted across IDE restarts. */
+    var lastSelectedAgent: String = ""
+    /** Last selected thinking effort name (ThinkingEffort enum name). Persisted across IDE restarts. */
+    var lastSelectedThinkingEffort: String = ""
     /** Whether the session sidebar is visible. Persisted across tool window reopens. */
     var sidebarVisible: Boolean = true
     /** Maximum number of entries kept in the input command history. */
