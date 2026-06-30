@@ -17,6 +17,7 @@ import javax.swing.JPanel
 class OpenCodeSettingsPanel {
 
     val binaryPathField: TextFieldWithBrowseButton = TextFieldWithBrowseButton().apply {
+        @Suppress("DEPRECATION")
         addBrowseFolderListener(
             TextBrowseFolderListener(
                 FileChooserDescriptor(true, false, false, false, false, false)
@@ -129,6 +130,16 @@ class OpenCodeSettingsPanel {
             "TRACE = everything, ALL = no filtering."
     }
 
+    /** Animation throttle FPS — target frame rate for glow/pulse/shimmer animations.
+     *  Lower values reduce GPU pressure (DirectContextKt._nFlushAndSubmit stalls on Windows).
+     *  60 = full vsync, 30 = half pressure (default), 15 = quarter pressure. */
+    val animationThrottleFpsField: JBTextField = JBTextField("30", 3).apply {
+        toolTipText = "Target FPS for streaming animations (glow, pulse, shimmer).\n" +
+            "60 = full vsync (original smoothness), 30 = half GPU pressure (default, visually identical),\n" +
+            "15 = quarter pressure (may look slightly less smooth).\n" +
+            "Lower this if you experience IDE freezes during streaming on Windows."
+    }
+
     private fun toolKindLabel(kind: ToolKind): String = when (kind) {
         ToolKind.EXECUTE -> "Shell (Execute)"
         ToolKind.EDIT -> "Edit (Write)"
@@ -184,6 +195,7 @@ class OpenCodeSettingsPanel {
         .addComponent(showDisconnectCheckbox)
         .addSeparator(5)
         .addLabeledComponent("Plugin log level:", logLevelCombo, 5)
+        .addLabeledComponent("Animation FPS (GPU throttle):", animationThrottleFpsField, 5)
         .addSeparator(5)
         .addTooltip("Tool pills expanded by default:")
         .apply { 
@@ -209,6 +221,7 @@ class OpenCodeSettingsPanel {
         queueInsteadOfSteerCheckbox.isSelected = settings.queueInsteadOfSteer
         showDisconnectCheckbox.isSelected = settings.showDisconnectConfirmation
         logLevelCombo.selectedItem = AcpLogLevel.fromName(settings.logLevel).name
+        animationThrottleFpsField.text = settings.animationThrottleFps.toString()
         // Initialize ToolKind checkboxes from settings
         ToolKind.entries.forEach { kind ->
             toolKindCheckboxes.getValue(kind).isSelected = settings.isToolKindDefaultExpanded(kind)
@@ -217,7 +230,11 @@ class OpenCodeSettingsPanel {
     }
 
     fun applyTo(settings: OpenCodeSettingsState) {
-        // Validate numeric fields and warn on invalid input
+        // Validate numeric fields and warn on invalid input.
+        // Non-parseable values (e.g., "abc", "12.5" for an Int field) are detected
+        // via toIntOrNull() returning null. Out-of-range values (e.g., 99999 for a
+        // port) are handled by coerceIn() below. Invalid fields are reset to their
+        // coerced/default values so the UI matches what will be applied.
         val invalidFields = mutableListOf<String>()
         if (portField.text.trim().toIntOrNull() == null && portField.text.trim().isNotBlank()) invalidFields.add("Server port")
         if (timeoutField.text.trim().toIntOrNull() == null && timeoutField.text.trim().isNotBlank()) invalidFields.add("Permission timeout")
@@ -270,6 +287,7 @@ class OpenCodeSettingsPanel {
         settings.showDisconnectConfirmation = showDisconnectCheckbox.isSelected
         val selectedLevel = logLevelCombo.selectedItem as? String
         settings.logLevel = if (selectedLevel != null && AcpLogLevel.entries.any { it.name == selectedLevel }) selectedLevel else "INFO"
+        settings.animationThrottleFps = animationThrottleFpsField.text.trim().toIntOrNull()?.coerceIn(15, 60) ?: 30
         // Persist ToolKind expansion defaults
         val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes.getValue(it).isSelected }.map { it.name }
         settings.expandedToolKinds = expandedKinds.joinToString(",")
@@ -298,6 +316,7 @@ class OpenCodeSettingsPanel {
                 queueInsteadOfSteerCheckbox.isSelected != settings.queueInsteadOfSteer ||
                 showDisconnectCheckbox.isSelected != settings.showDisconnectConfirmation ||
                 (logLevelCombo.selectedItem as? String ?: "INFO") != settings.logLevel ||
+                animationThrottleFpsField.text.trim().toIntOrNull()?.coerceIn(15, 60) != settings.animationThrottleFps ||
                 expandedKinds != currentExpandedKinds ||
                 expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault
     }

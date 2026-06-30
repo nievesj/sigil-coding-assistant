@@ -32,11 +32,8 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
         /** Legacy accessor for single-project scenarios. Returns the panel
          *  for the first project that has one, or null. */
-        var activeComposePanel: androidx.compose.ui.awt.ComposePanel?
+        val activeComposePanel: androidx.compose.ui.awt.ComposePanel?
             get() = activePanels.values.firstOrNull()
-            internal set(value) {
-                // No-op for backward compatibility — callers should use per-project API
-            }
 
         /** Register a ComposePanel for a specific project. */
         internal fun registerPanel(project: Project, panel: androidx.compose.ui.awt.ComposePanel) {
@@ -58,7 +55,15 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
                 val (project, panel) = iterator.next()
                 iterator.remove()
                 Thread({
-                    try { panel.isVisible = false; panel.dispose() } catch (_: Exception) {}
+                    try { panel.isVisible = false; panel.dispose() } catch (e: Exception) {
+                        // Log the exception so failed disposes are visible in idea.log.
+                        // Previously this was silently swallowed, making native resource
+                        // leaks invisible. On IDE restart the JVM exits so leaks are
+                        // reclaimed, but on tool window close+reopen without restart,
+                        // undisposed panels leak native (Skiko) resources.
+                        com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
+                            .warn("[ACP] disposeActiveComposePanelAsync: ComposePanel.dispose() failed: ${e.message}")
+                    }
                 }, "opencode-compose-dispose-${project.name}").apply { isDaemon = true; start() }
             }
         }
@@ -66,13 +71,11 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
     }
 
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
-        // Force Skiko software rendering BEFORE any ComposePanel is created.
-        // Skiko on Windows defaults to Direct3D (DirectX 12). The GPU context
-        // can hang during JVM exit if the render thread is mid-frame, preventing
-        // IDE restart after plugin update. Software rendering has no GPU resources.
-        // Best-effort: only effective if Skiko classes haven't been loaded yet.
-        // For reliable software rendering, set -Dskiko.renderApi=SOFTWARE as a JVM argument.
-        System.setProperty("skiko.renderApi", "SOFTWARE")
+        // Skiko renderer selection happens at class-load time, before this method
+        // runs, so a runtime System.setProperty("skiko.renderApi", "SOFTWARE")
+        // here is a no-op. The renderer is controlled by the JVM argument
+        // -Dskiko.renderApi=SOFTWARE set in build.gradle.kts (runIde task) and
+        // in the user's idea64.exe.vmoptions for installed builds.
 
         val service = project.service<OpenCodeService>()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)

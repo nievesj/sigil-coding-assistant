@@ -117,6 +117,20 @@ class ReviewCommentManager(private val project: Project) : Disposable {
 
         // Initial .tmp file cleanup (orphaned writes from a previous crash).
         scope.launch { repository.cleanupOrphanTempFiles() }
+
+        // Detect and strip UTF-8 BOM from .review/ JSON files written by external
+        // tools (LLM agents, CI, editors). The reader already strips BOM at parse
+        // time for resilience, but this fixes the files on disk so they don't
+        // cause issues for other consumers or generate repeated parse warnings.
+        scope.launch {
+            val fixed = repository.stripBomFromReviewFiles()
+            if (fixed > 0) {
+                // Re-load the index if we fixed any files — the initial loadAll()
+                // (from ReviewCommentStartupActivity or ChatToolWindowFactory) may
+                // have already run and parsed the BOM-prefixed files as null.
+                loadAll()
+            }
+        }
     }
 
     // ── Self-write suppression (C2) ──
@@ -458,8 +472,11 @@ class ReviewCommentManager(private val project: Project) : Disposable {
             if (existing == null) return@updateFile null
             val target = existing.comments.find { it.id == commentId } ?: return@updateFile null
             val reply = target.replies.find { it.id == replyId } ?: return@updateFile null
-            if (reply.author != "user") {
-                logger.warn { "[ACP] deleteReply: reply $replyId is not user-authored — rejected" }
+            val aiAuthors = setOf("ai-review", "system", "assistant", "ai")
+            val isUserAuthored = reply.author.equals("user", ignoreCase = true) &&
+                reply.author.lowercase() !in aiAuthors
+            if (!isUserAuthored) {
+                logger.warn { "[ACP] deleteReply: reply $replyId is not user-authored (author=${reply.author}) — rejected" }
                 return@updateFile null
             }
             existing.copy(

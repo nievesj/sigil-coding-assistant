@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.runtime.Composable
@@ -27,9 +28,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -40,7 +43,10 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -48,6 +54,7 @@ import androidx.compose.foundation.Image as ComposeImage
 import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
@@ -74,13 +81,106 @@ fun ModelPickerPanel(
     val searchState = remember { TextFieldState() }
     val searchFocusRequester = remember { FocusRequester() }
     val searchQuery = searchState.text.toString()
+    val density = LocalDensity.current
 
-    // Track favorites version to trigger recomposition when favorites change
+    // Track favorites version to trigger recomposition when favorites change.
+    // favoritesList is a State<List<ProviderModel>> so that the LazyColumn item
+    // content lambdas re-invoke on reorder (per AGENTS.md: items(count, key) with
+    // stable keys does NOT re-invoke item lambdas unless they read a State<T>).
     var favoritesVersion by remember { mutableIntStateOf(0) }
+    var favoritesList by remember { mutableStateOf(emptyList<ProviderModel>()) }
 
     // Group models: favorites first, then by provider
     val grouped = remember(models, searchQuery, favoritesVersion) {
         buildModelGroups(models, settings, searchQuery)
+    }
+    // Sync favoritesList whenever grouped.favorites changes (initial load, search
+    // filter, star toggle). Live swaps update favoritesList directly in onDragDelta
+    // for synchronous refresh (LaunchedEffect would lag by a frame and race with
+    // the next onDrag callback).
+    LaunchedEffect(grouped.favorites) {
+        favoritesList = grouped.favorites
+    }
+
+    // ── Drag-to-reorder state ──────────────────────────────────────────────
+    // draggedIndex: index within grouped.favorites of the item being dragged (null when idle)
+    // dragOffsetPx: accumulated vertical drag offset in pixels (used for live swap detection)
+    // The drag handle reports its row's pixel height via onRowHeight so we can
+    // compute swap thresholds without relying on LazyListState layout info.
+    var draggedIndex by remember { mutableStateOf<Int?>(null) }
+    var dragOffsetPx by remember { mutableStateOf(0f) }
+    var rowHeightPx by remember { mutableStateOf(32f * density.density) }
+    val listState = rememberLazyListState()
+
+    /** Called on each drag delta. Swaps the dragged item with its neighbor when
+     *  the offset crosses a full row height past the current position. Only one
+     *  swap per call — subsequent swaps happen on the next onDrag callback (which
+     *  fires very frequently, so multi-row drags still feel responsive). This
+     *  avoids stale-list bugs from multiple swaps against a single grouped snapshot.
+     *  After a swap, favoritesList is updated synchronously so the next onDrag
+     *  callback sees the new order immediately (no LaunchedEffect frame lag).
+     *
+     *  SIDE EFFECT: Each swap calls settings.reorderFavoriteModel(), which writes
+     *  to the application-level OpenCodeSettingsState. PersistentStateComponent
+     *  doesn't write to disk on every field change (it flushes periodically), so
+     *  rapid drags don't cause excessive I/O — but the settings are mutated
+     *  immediately in memory. */
+    fun onDragDelta(deltaY: Float) {
+        dragOffsetPx += deltaY
+        val idx = draggedIndex ?: return
+        val favs = favoritesList
+        if (favs.isEmpty()) return
+        // Swap up: offset is negative beyond one row height
+        if (dragOffsetPx <= -rowHeightPx && idx > 0) {
+            val fromKey = "${favs[idx].providerID}/${favs[idx].modelID}"
+            val toKey = "${favs[idx - 1].providerID}/${favs[idx - 1].modelID}"
+            val fromPersisted = settings.favoriteModels.indexOf(fromKey)
+            val toPersisted = settings.favoriteModels.indexOf(toKey)
+            if (fromPersisted >= 0 && toPersisted >= 0) {
+                settings.reorderFavoriteModel(fromPersisted, toPersisted)
+                // Synchronously update the visible list so the next onDrag sees
+                // the new order. grouped will catch up on recomposition.
+                favoritesList = favs.toMutableList().apply {
+                    val tmp = this[idx]; this[idx] = this[idx - 1]; this[idx - 1] = tmp
+                }
+                favoritesVersion++
+            }
+            draggedIndex = idx - 1
+            dragOffsetPx += rowHeightPx
+            return
+        }
+        // Swap down: offset is positive beyond one row height
+        if (dragOffsetPx >= rowHeightPx && idx < favs.size - 1) {
+            val fromKey = "${favs[idx].providerID}/${favs[idx].modelID}"
+            val toKey = "${favs[idx + 1].providerID}/${favs[idx + 1].modelID}"
+            val fromPersisted = settings.favoriteModels.indexOf(fromKey)
+            val toPersisted = settings.favoriteModels.indexOf(toKey)
+            if (fromPersisted >= 0 && toPersisted >= 0) {
+                settings.reorderFavoriteModel(fromPersisted, toPersisted)
+                favoritesList = favs.toMutableList().apply {
+                    val tmp = this[idx]; this[idx] = this[idx + 1]; this[idx + 1] = tmp
+                }
+                favoritesVersion++
+            }
+            draggedIndex = idx + 1
+            dragOffsetPx -= rowHeightPx
+            return
+        }
+    }
+
+    fun startDrag(index: Int) {
+        draggedIndex = index
+        dragOffsetPx = 0f
+    }
+
+    fun endDrag() {
+        draggedIndex = null
+        dragOffsetPx = 0f
+    }
+
+    fun cancelDrag() {
+        draggedIndex = null
+        dragOffsetPx = 0f
     }
 
     // Collapsible section state — providers collapsed by default when favorites exist
@@ -135,6 +235,7 @@ fun ModelPickerPanel(
 
         // ── Model list ──────────────────────────────────────────────────────
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f, fill = false)
@@ -152,11 +253,17 @@ fun ModelPickerPanel(
                     )
                 }
                 if (favoritesExpanded) {
+                    // Read the State inside the item lambda so the snapshot system
+                    // re-invokes the lambda when favoritesList changes (reorder).
+                    // Per AGENTS.md: items(count, key) with stable keys does NOT
+                    // re-invoke item lambdas unless they read a State<T>.
                     items(
-                        count = grouped.favorites.size,
-                        key = { "${grouped.favorites[it].providerID}/${grouped.favorites[it].modelID}" },
+                        count = favoritesList.size,
+                        key = { "${favoritesList[it].providerID}/${favoritesList[it].modelID}" },
                     ) { index ->
-                        val model = grouped.favorites[index]
+                        // Read the State INSIDE the lambda — creates a snapshot
+                        // subscription that invalidates the item on reorder.
+                        val model = favoritesList[index]
                         ModelRow(
                             model = model,
                             isSelected = model == selectedModel,
@@ -166,6 +273,12 @@ fun ModelPickerPanel(
                                 favoritesVersion++
                             },
                             onClick = { onModelSelected(model) },
+                            showDragHandle = true,
+                            isDragging = draggedIndex == index,
+                            onDragStart = { startDrag(index) },
+                            onDragMove = { deltaY -> onDragDelta(deltaY) },
+                            onDragEnd = { endDrag() },
+                            onDragCancel = { cancelDrag() },
                         )
                     }
                 }
@@ -228,6 +341,9 @@ fun ModelPickerPanel(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FooterHint("↑↓ navigate")
                 FooterHint("Tab switch agent")
+                if (grouped.favorites.size > 1) {
+                    FooterHint("⠿ drag favorites to reorder")
+                }
             }
         }
     }
@@ -299,6 +415,12 @@ private fun ModelRow(
     isFavorite: Boolean,
     onToggleFavorite: () -> Unit,
     onClick: () -> Unit,
+    showDragHandle: Boolean = false,
+    isDragging: Boolean = false,
+    onDragStart: () -> Unit = {},
+    onDragMove: (Float) -> Unit = {},
+    onDragEnd: () -> Unit = {},
+    onDragCancel: () -> Unit = {},
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
@@ -309,78 +431,101 @@ private fun ModelRow(
         else -> Color.Transparent
     }
 
+    val rowModifier = Modifier
+        .fillMaxWidth()
+        .height(32.dp)
+        .then(if (isDragging) Modifier.alpha(0.4f) else Modifier)
+
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(32.dp)
-            .clip(ChatTheme.shapes.pickerRowCornerRadius)
-            .background(bgColor)
-            .hoverable(interactionSource)
-            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
-            .padding(horizontal = 12.dp),
+        modifier = rowModifier,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // Provider icon (text-based fallback)
-        ProviderIcon(
-            providerId = model.providerIconId,
-            modifier = Modifier.size(16.dp),
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-
-        // Model name
-        Text(
-            text = model.modelID,
-            fontSize = ChatTheme.fonts.pickerModelName,
-            color = if (isSelected) Color.White else ChatTheme.colors.text.secondary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-
-        // Feature indicator icons
-        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-            if (model.reasoning) {
-                Icon(
-                    key = AllIconsKeys.Actions.Lightning,
-                    contentDescription = "Reasoning",
-                    modifier = Modifier.size(10.dp),
-                    tint = ChatTheme.colors.component.starGold,
-                )
-            }
-            if (hasVisionCapability(model)) {
-                Icon(
-                    key = AllIconsKeys.Actions.Search,
-                    contentDescription = "Vision",
-                    modifier = Modifier.size(10.dp),
-                    tint = ChatTheme.colors.component.capabilityVision,
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.width(4.dp))
-
-        // Context window
-        if (model.contextWindow > 0) {
-            Text(
-                text = formatContextWindow(model.contextWindow),
-                fontSize = ChatTheme.fonts.pickerContextWindow,
-                color = ChatTheme.colors.text.muted,
-                modifier = Modifier.padding(start = 4.dp),
+        // Drag handle (favorites only) — placed OUTSIDE the clickable content
+        // area so the parent's clickable modifier does not intercept the pointer
+        // events needed to start the drag gesture.
+        if (showDragHandle) {
+            DragHandle(
+                onDragStart = onDragStart,
+                onDragMove = onDragMove,
+                onDragEnd = onDragEnd,
+                onDragCancel = onDragCancel,
             )
-            Spacer(modifier = Modifier.width(6.dp))
         }
 
-        // Star toggle
-        Icon(
-            key = if (isFavorite) AllIconsKeys.Nodes.Favorite else AllIconsKeys.Nodes.Favorite,
-            contentDescription = if (isFavorite) "Remove from favorites" else "Add to favorites",
+        // Clickable content area (provider icon, model name, indicators, star)
+        Row(
             modifier = Modifier
-                .size(14.dp)
-                .clip(ChatTheme.shapes.modelPickerButtonShape)
-                .clickable(onClick = onToggleFavorite)
-                .padding(horizontal = 2.dp),
-            tint = if (isFavorite) ChatTheme.colors.component.starGold else ChatTheme.colors.component.starMuted,
-        )
+                .weight(1f)
+                .height(32.dp)
+                .clip(ChatTheme.shapes.pickerRowCornerRadius)
+                .background(bgColor)
+                .hoverable(interactionSource)
+                .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Provider icon (text-based fallback)
+            ProviderIcon(
+                providerId = model.providerIconId,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+
+            // Model name
+            Text(
+                text = model.modelID,
+                fontSize = ChatTheme.fonts.pickerModelName,
+                color = if (isSelected) Color.White else ChatTheme.colors.text.secondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+
+            // Feature indicator icons
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                if (model.reasoning) {
+                    Icon(
+                        key = AllIconsKeys.Actions.Lightning,
+                        contentDescription = "Reasoning",
+                        modifier = Modifier.size(10.dp),
+                        tint = ChatTheme.colors.component.starGold,
+                    )
+                }
+                if (hasVisionCapability(model)) {
+                    Icon(
+                        key = AllIconsKeys.Actions.Search,
+                        contentDescription = "Vision",
+                        modifier = Modifier.size(10.dp),
+                        tint = ChatTheme.colors.component.capabilityVision,
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.width(4.dp))
+
+            // Context window
+            if (model.contextWindow > 0) {
+                Text(
+                    text = formatContextWindow(model.contextWindow),
+                    fontSize = ChatTheme.fonts.pickerContextWindow,
+                    color = ChatTheme.colors.text.muted,
+                    modifier = Modifier.padding(start = 4.dp),
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+            }
+
+            // Star toggle
+            Icon(
+                key = AllIconsKeys.Nodes.Favorite,
+                contentDescription = if (isFavorite) "Remove from favorites" else "Add to favorites",
+                modifier = Modifier
+                    .size(14.dp)
+                    .clip(ChatTheme.shapes.modelPickerButtonShape)
+                    .clickable(onClick = onToggleFavorite)
+                    .padding(horizontal = 2.dp),
+                tint = if (isFavorite) ChatTheme.colors.component.starGold else ChatTheme.colors.component.starMuted,
+            )
+        }
     }
 }
 
@@ -457,7 +602,15 @@ private fun buildModelGroups(
             model.displayName.contains(searchQuery, ignoreCase = true)
     }
 
-    val favorites = filtered.filter { settings.isFavoriteModel(it.providerID, it.modelID) }
+    val favorites = filtered
+        .filter { settings.isFavoriteModel(it.providerID, it.modelID) }
+        // Sort by the user's custom order in favoriteModels (preserves drag/drop
+        // reordering). Models not in favoriteModels (shouldn't happen after
+        // cleanupStaleFavorites) sort to the end.
+        .sortedBy { model ->
+            val key = OpenCodeSettingsState.modelKey(model.providerID, model.modelID)
+            settings.favoriteModels.indexOf(key).let { if (it < 0) Int.MAX_VALUE else it }
+        }
     val nonFavorites = filtered.filter { !settings.isFavoriteModel(it.providerID, it.modelID) }
 
     val providers = nonFavorites
@@ -499,4 +652,81 @@ private fun hasVisionCapability(model: ProviderModel): Boolean {
         id.contains("kimi-k2.6") ||
         id.contains("kimi-k2") ||
         name.contains("vision")
+}
+
+// ── Drag-to-reorder support ─────────────────────────────────────────────────
+
+private val dragLogger = KotlinLogging.logger("com.opencode.acp.chat.ui.compose.ModelPickerPanel")
+
+/**
+ * Drag handle composable for reordering favorites. Renders a small grip icon
+ * that brightens on hover. Drag is initiated via [detectDragGestures] (mouse-
+ * friendly: starts on pointer drag, no long-press required). A quick click on
+ * the handle does not start a drag — the gesture detector only fires on actual
+ * drag movement past the touch slop, preserving row click-through for selection.
+ */
+@OptIn(ExperimentalJewelApi::class)
+@Composable
+private fun DragHandle(
+    onDragStart: () -> Unit,
+    onDragMove: (Float) -> Unit,
+    onDragEnd: () -> Unit,
+    onDragCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val handleInteraction = remember { MutableInteractionSource() }
+    val isHovered by handleInteraction.collectIsHoveredAsState()
+    val tint = if (isHovered) ChatTheme.colors.text.secondary else ChatTheme.colors.text.muted
+
+    // Capture the latest callbacks so the pointerInput block (keyed on Unit, so
+    // it is NOT recreated on recomposition) always invokes the current lambdas.
+    // Without this, after a live swap triggers favoritesVersion++ and recomposition,
+    // the drag gesture would keep calling the stale onDragMove capturing the old
+    // grouped list, breaking subsequent swaps.
+    val currentOnDragStart by rememberUpdatedState(onDragStart)
+    val currentOnDragMove by rememberUpdatedState(onDragMove)
+    val currentOnDragEnd by rememberUpdatedState(onDragEnd)
+    val currentOnDragCancel by rememberUpdatedState(onDragCancel)
+
+    Box(
+        modifier = modifier
+            .size(width = 20.dp, height = 32.dp)
+            .hoverable(handleInteraction)
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragStart = {
+                        dragLogger.debug { "[ACP] ModelPicker drag start" }
+                        currentOnDragStart()
+                    },
+                    onDrag = { _, dragAmount ->
+                        dragLogger.debug { "[ACP] ModelPicker drag move: deltaY=${dragAmount.y}" }
+                        currentOnDragMove(dragAmount.y)
+                    },
+                    onDragEnd = {
+                        dragLogger.debug { "[ACP] ModelPicker drag end" }
+                        currentOnDragEnd()
+                    },
+                    onDragCancel = {
+                        dragLogger.debug { "[ACP] ModelPicker drag cancel" }
+                        currentOnDragCancel()
+                    },
+                )
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        // Two short horizontal lines as a grip glyph
+        Column(
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            repeat(2) {
+                Box(
+                    modifier = Modifier
+                        .width(10.dp)
+                        .height(1.5.dp)
+                        .background(tint, CircleShape),
+                )
+            }
+        }
+    }
 }

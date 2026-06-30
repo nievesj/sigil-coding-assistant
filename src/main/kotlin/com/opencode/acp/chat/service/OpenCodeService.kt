@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -194,6 +195,12 @@ class OpenCodeService(private val project: Project) : Disposable {
                 mcpToolDiscovery = com.opencode.acp.mcp.McpToolDiscovery(client.mcpHttpClient)
             )
             logger.info { "[ACP] ToolRegistry created" }
+
+            // Auto-discover tools in the background so the settings panel has
+            // real tool data when opened. MCP servers may not have been ready
+            // during the first initialize() call (JetBrains MCP Server starts
+            // asynchronously), so this also serves as a retry.
+            discoverToolsInBackground()
         } catch (e: Exception) {
             logger.warn(e) { "[ACP] MCP initialization failed — chat will work without MCP" }
         }
@@ -218,6 +225,68 @@ class OpenCodeService(private val project: Project) : Disposable {
      */
     suspend fun reinitializeMcp() {
         initializeMcp()
+    }
+
+    /**
+     * Discover tools from OpenCode and all connected MCP servers in the background.
+     * Called after MCP initialization (both initial and re-init) to populate the
+     * ToolRegistry with real tool data. Also loads persisted permissions so the
+     * settings panel shows correct enabled/permission state when opened.
+     *
+     * This runs on the service scope — callers don't need to wait for it.
+     * If MCP servers aren't connected yet (e.g., JetBrains MCP Server still
+     * starting), discovery will find only built-in tools. The user can click
+     * "Discover Tools" in settings to retry once the server is ready.
+     */
+    private fun discoverToolsInBackground() {
+        val registry = toolRegistry ?: return
+        val client = connectionManager.client ?: return
+        val mcpMgr = mcpManager ?: return
+        scope.launch {
+            try {
+                val baseUrl = "http://127.0.0.1:${connectionManager.port}"
+                val mcpUrls = mcpMgr.getServerUrls()
+                logger.info { "[ACP] discoverToolsInBackground: starting discovery (${mcpUrls.size} MCP servers connected)" }
+                val tools = registry.discoverAll(baseUrl, mcpUrls)
+                logger.info { "[ACP] discoverToolsInBackground: discovered ${tools.size} tools" }
+
+                // Load persisted permissions so the registry has the user's
+                // saved enabled/permission state. The settings panel reads
+                // from the registry when opened.
+                val settings = OpenCodeSettingsState.getInstance()
+                if (settings.toolPermissions.isNotBlank()) {
+                    val persisted = parsePersistedToolPermissions(settings.toolPermissions)
+                    if (persisted.isNotEmpty()) {
+                        registry.loadEnabledAndPermissions(persisted.mapValues { (_, pair) ->
+                            Pair(pair.first, com.opencode.acp.mcp.ToolPermission.fromActionString(pair.second))
+                        })
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] discoverToolsInBackground: failed" }
+            }
+        }
+    }
+
+    /**
+     * Parse persisted tool permissions JSON into a map of toolName → (enabled, permission).
+     */
+    private fun parsePersistedToolPermissions(perms: String): Map<String, Pair<Boolean, String>> {
+        if (perms.isBlank()) return emptyMap()
+        return try {
+            val obj = kotlinx.serialization.json.Json.parseToJsonElement(perms).jsonObject
+            obj.entries.associate { (toolName, element) ->
+                val toolObj = element.jsonObject
+                val enabled = toolObj["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
+                val permission = toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow"
+                toolName to Pair(enabled, permission)
+            }
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions" }
+            emptyMap()
+        }
     }
 
     /**
@@ -500,6 +569,13 @@ class OpenCodeService(private val project: Project) : Disposable {
 
                         if (lastIsAssistant) {
                             // Safety check: detect in-progress tool calls (TDD section 11 Risk 3).
+                            // ASSUMPTION: The server returns messages in chronological order, so the
+                            // last message is the most recent. This check only inspects the last
+                            // message's parts — if an earlier assistant message has in-progress
+                            // tools but the last message is a different assistant message, those
+                            // tools are not detected. In practice the server returns messages in
+                            // order, so this is safe. If the server ever reorders messages, this
+                            // check should scan all recent assistant messages.
                             val hasInProgressTools = lastMessage.parts
                                 .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
                                 .any { toolUse ->
@@ -688,7 +764,11 @@ class OpenCodeService(private val project: Project) : Disposable {
                     // PartState.Pending (waiting for user permission) also counts as active —
                     // the server IS working, just blocked on user input. Without this, the
                     // monitor would false-positive timeout while the user reads the permission prompt.
-                    val hasRunningTools = monitorSession.ctx.toolPartStates.values.any {
+                    // Snapshot the values list to avoid ConcurrentModificationException
+                    // if the event processing coroutine mutates the map during iteration.
+                    // This is a best-effort read — exact correctness is not required (per isStreaming KDoc).
+                    val partStatesSnapshot = monitorSession.ctx.toolPartStates.values.toList()
+                    val hasRunningTools = partStatesSnapshot.any {
                         it is PartState.InProgress || it is PartState.Pending
                     }
                     if (hasRunningTools) {
@@ -700,9 +780,12 @@ class OpenCodeService(private val project: Project) : Disposable {
                         // ensures recovery.
                         val toolStuckTimeoutSec = OpenCodeSettingsState.getInstance().state.toolStuckTimeoutSeconds
                         val toolStuckTimeoutMs = toolStuckTimeoutSec.coerceIn(60, 3600) * 1000L
-                        val oldestToolStartMs = monitorSession.ctx.toolCallPills.entries
+                        // Snapshot entries to avoid ConcurrentModificationException.
+                        val pillsSnapshot = monitorSession.ctx.toolCallPills.entries.toList()
+                        val statesSnapshot = monitorSession.ctx.toolPartStates
+                        val oldestToolStartMs = pillsSnapshot
                             .filter {
-                                val state = monitorSession.ctx.toolPartStates[it.key]
+                                val state = statesSnapshot[it.key]
                                 state is PartState.InProgress || state is PartState.Pending
                             }
                             .mapNotNull { it.value.startTimeMs }

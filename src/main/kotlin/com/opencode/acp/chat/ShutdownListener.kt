@@ -49,10 +49,20 @@ class ShutdownListener : AppLifecycleListener {
                             logger.info { "[ACP] Cleaned up user.home symlink ${orphanDir.absolutePath}" }
                         }
                     } else {
-                        if (orphanDir.deleteRecursively()) {
-                            logger.info { "[ACP] Cleaned up user.home ${orphanDir.absolutePath}" }
+                        // Safety check: ensure the canonical path is still inside user.home
+                        // before deleting. This catches symlinks on parent directories that
+                        // the isSymbolicLink check on opencodeDir would miss.
+                        val canonicalOrphan = orphanDir.canonicalFile
+                        val canonicalHome = File(userHome).canonicalFile
+                        if (canonicalOrphan.path.startsWith(canonicalHome.path + File.separator) ||
+                            canonicalOrphan.path == canonicalHome.path) {
+                            if (orphanDir.deleteRecursively()) {
+                                logger.info { "[ACP] Cleaned up user.home ${orphanDir.absolutePath}" }
+                            } else {
+                                logger.warn { "[ACP] Partial deletion of user.home ${orphanDir.absolutePath}" }
+                            }
                         } else {
-                            logger.warn { "[ACP] Partial deletion of user.home ${orphanDir.absolutePath}" }
+                            logger.warn { "[ACP] Skipping user.home cleanup — canonical path escapes user.home: ${canonicalOrphan.path}" }
                         }
                     }
                 }
@@ -65,19 +75,10 @@ class ShutdownListener : AppLifecycleListener {
             // CRITICAL: Dispose ComposePanel on a daemon thread, NOT on EDT.
             // ComposePanel.dispose() blocks if Skiko's render thread is mid-frame,
             // causing EDT to freeze → IDE lockup.
-            val panel = ChatToolWindowFactory.activeComposePanel
-            ChatToolWindowFactory.activeComposePanel = null
-            if (panel != null) {
-                logger.info { "[ACP] ShutdownListener: async disposing ComposePanel=$panel" }
-                Thread({
-                    try {
-                        panel.isVisible = false
-                        panel.dispose()
-                    } catch (e: Exception) {
-                        logger.warn { "[ACP] ShutdownListener: ComposePanel.dispose() failed: ${e.message}" }
-                    }
-                }, "opencode-compose-shutdown-dispose").apply { isDaemon = true; start() }
-            }
+            // Use the per-project async dispose API — disposes ALL registered panels
+            // across all projects on daemon threads, then clears the registry.
+            logger.info { "[ACP] ShutdownListener: async disposing all ComposePanels" }
+            ChatToolWindowFactory.disposeActiveComposePanelAsync()
         }
     }
 }

@@ -21,7 +21,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.text.selection.SelectionContainer
+
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -54,6 +54,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.layout.ContentScale
+
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -80,10 +81,9 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.opencode.acp.chat.model.ChatFileChange
 import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.MessagePart
-import com.opencode.acp.chat.model.MessageRenderPhase
 import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.MessageState
-import com.opencode.acp.chat.model.renderPhase
+import com.opencode.acp.chat.model.PartState
 import org.jetbrains.jewel.bridge.retrieveColorOrUnspecified
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.foundation.code.highlighting.NoOpCodeHighlighter
@@ -119,7 +119,14 @@ fun MessageList(
     // The item content lambda reads messagesState.value directly (below) to
     // create a per-item snapshot subscription — this is what drives recomposition
     // when a message's parts change, without needing the LazyColumn key to change.
-    val messages = messagesState.value.values.toList()
+    //
+    // Filter out empty streaming assistant messages — they create 0-height LazyColumn
+    // items that trigger mass recycling of visible items (the "jump" flicker). The
+    // message gets parts within milliseconds; the ThinkingIndicator overlay still
+    // shows activity during the gap.
+    val messages = messagesState.value.values.filter { msg ->
+        !(msg.role == MessageRole.ASSISTANT && msg.parts.isEmpty() && msg.isStreaming)
+    }.toList()
     val listState = rememberLazyListState()
 
     // Auto-scroll state: starts ON, stays ON until user manually scrolls up.
@@ -160,31 +167,42 @@ fun MessageList(
 
     // Detect user scroll toward older messages (up). previousScrollIndex/Offset
     // are plain local vars (not Compose state) to avoid recompositions.
+    //
+    // KEY INSIGHT: With Arrangement.Bottom, when content grows (pill expand,
+    // streaming text), items shift upward — firstVisibleItemScrollOffset
+    // decreases. The old approach (sumOf visible item sizes) was unreliable
+    // because the sum can DECREASE when fewer items fit after expansion.
+    //
+    // The correct discriminator is isScrollInProgress: content growth does NOT
+    // set it (programmatic scrolls hold scrollMutex, so the guard returns early).
+    // Only a genuine user drag sets isScrollInProgress without scrollMutex locked.
+    // We combine this with distance-from-bottom: if the gap between the last
+    // visible item's bottom and the viewport bottom increased AND the user is
+    // actively dragging, it's a real scroll-up.
     LaunchedEffect(Unit) {
-        var previousScrollIndex = listState.firstVisibleItemIndex
-        var previousScrollOffset = listState.firstVisibleItemScrollOffset
+        var previousDistanceFromBottom = 0
         snapshotFlow {
-            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
-        }.collect { (index, offset) ->
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()
+            if (lastVisible == null) 0
+            else info.viewportEndOffset - (lastVisible.offset + lastVisible.size)
+        }.collect { distanceFromBottom ->
             if (scrollMutex.isLocked) {
                 // Programmatic scroll in progress — ignore.
-                previousScrollIndex = index
-                previousScrollOffset = offset
+                previousDistanceFromBottom = distanceFromBottom
                 return@collect
             }
-            // Use pixel-based isAtBottom instead of canScrollForward — the latter
-            // toggles rapidly during streaming, causing false "moved up" detection.
             if (isAtBottom) {
                 autoScrollEnabled = true
-            } else {
-                val movedUp = index < previousScrollIndex ||
-                    (index == previousScrollIndex && offset < previousScrollOffset)
-                if (movedUp) {
-                    autoScrollEnabled = false
-                }
+            } else if (listState.isScrollInProgress &&
+                       distanceFromBottom > previousDistanceFromBottom + 8) {
+                // Genuine user scroll-up: gap from last item bottom to viewport
+                // bottom increased AND list is actively being scrolled by user
+                // (not programmatic — scrollMutex is not locked). The +8 pixel
+                // threshold absorbs rounding noise from Arrangement.Bottom.
+                autoScrollEnabled = false
             }
-            previousScrollIndex = index
-            previousScrollOffset = offset
+            previousDistanceFromBottom = distanceFromBottom
         }
     }
 
@@ -218,11 +236,19 @@ fun MessageList(
     // https://github.com/ggml-org/llama.cpp/commit/e58add7
     LaunchedEffect(Unit) {
         var lastHeight = 0
+        var lastSeenIndex = -1
         snapshotFlow {
             val info = listState.layoutInfo
             val lastItem = info.visibleItemsInfo.lastOrNull()
             (lastItem?.index ?: -1) to (lastItem?.size ?: 0)
         }.collect { (lastIndex, lastSize) ->
+            // Reset baseline when the last visible item identity changes.
+            // Without this, switching to a shorter last item would never
+            // trigger a scroll (lastSize < lastHeight).
+            if (lastIndex != lastSeenIndex) {
+                lastHeight = 0
+                lastSeenIndex = lastIndex
+            }
             if (lastSize > lastHeight && lastIndex == listState.layoutInfo.totalItemsCount - 1 && autoScrollEnabled) {
                 scrollRequest++
             }
@@ -259,13 +285,13 @@ fun MessageList(
         if (!autoScrollEnabled) return@LaunchedEffect
         val totalItems = messages.size + queuedMessages.size + if (queuedMessages.isNotEmpty() && messages.isNotEmpty()) 1 else 0
         if (totalItems <= 0) return@LaunchedEffect
-
         // Determine scroll mode by comparing message count delta.
         val messageDelta = messages.size - prevMessageCount
         prevMessageCount = messages.size
         val isBulkLoad = messageDelta > 1 || (prevMessageCount == messages.size && messages.size > 1 && scrollRequest == 1)
         // isBulkLoad: session switch loaded N messages at once (delta > 1),
         // or first render with existing messages (prevCount=0, now >1).
+
         // Treat delta 0 (streaming growth) and delta 1 (single new message) as
         // non-bulk. delta 1 gets animation; delta 0 gets instant.
         val isStreamingGrowth = messageDelta == 0
@@ -275,14 +301,22 @@ fun MessageList(
         // armed with nothing to follow (the "stuck scroll" symptom).
         val isShrink = messageDelta < 0
 
+        // New message appearing (delta == 1) during streaming — use instant scroll.
+        // The animated scroll causes all visible items to shift upward (the "jump"),
+        // which is visually jarring during streaming. Instant scroll snaps to the
+        // new bottom without animating the shift.
+        val isNewStreamingMessage = messageDelta == 1 && messages.lastOrNull()?.isStreaming == true
+
         scrollMutex.withLock {
             try {
-                if (isBulkLoad || isStreamingGrowth || isShrink) {
+                if (isBulkLoad || isStreamingGrowth || isShrink || isNewStreamingMessage) {
                     // Instant snap — no animation. For bulk loads, history appears
                     // at the bottom immediately. For streaming, the content growth
                     // is the motion; animating creates a feedback loop.
                     // For shrink (messages removed), snap to the new bottom instantly
                     // so autoScroll tracks the shortened list.
+                    // For new streaming messages, instant scroll avoids the visual
+                    // "jump" caused by animating all visible items shifting upward.
                     // Int.MAX_VALUE offset forces scroll to the very bottom of the
                     // last item (required with Arrangement.Bottom).
                     listState.scrollToItem(totalItems - 1, Int.MAX_VALUE)
@@ -297,7 +331,7 @@ fun MessageList(
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 logger.debug(e) { "[ACP] scroll failed, retrying without offset" }
                 try {
-                    if (isBulkLoad || isStreamingGrowth || isShrink) {
+                    if (isBulkLoad || isStreamingGrowth || isShrink || isNewStreamingMessage) {
                         listState.scrollToItem(totalItems - 1)
                     } else {
                         listState.animateScrollToItem(totalItems - 1)
@@ -319,14 +353,37 @@ fun MessageList(
         withFrameNanos { }
     }
 
+    // Pinned activity indicator — shown at the bottom of the chat for the
+    // entire duration the last assistant message is streaming. The label
+    // dynamically reflects what the LLM is doing (Thinking…, Running bash…,
+    // Writing…). Uses derivedStateOf reading messagesState.value directly
+    // (not the captured `messages` list) to avoid recomputing on every
+    // streaming chunk.
+    val activityLabel by remember {
+        derivedStateOf {
+            val last = messagesState.value.values.lastOrNull()
+            if (last != null && last.role == MessageRole.ASSISTANT && last.isStreaming) {
+                deriveActivityLabel(last)
+            } else {
+                null
+            }
+        }
+    }
+
     Box(modifier = modifier) {
-        SelectionContainer {
-            // Arrangement.Bottom anchors items to the BOTTOM of the viewport.
-            // fillMaxSize() is CRITICAL — without it, the LazyColumn wraps content
-            // height and Arrangement.Bottom has no effect.
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize().padding(end = 12.dp, start = 8.dp, top = 8.dp, bottom = 8.dp),
+        // SelectionContainer is intentionally NOT wrapping the LazyColumn.
+        // During programmatic scrollToItem (streaming growth), Compose's selection
+        // system briefly highlights all visible text — a "blue box with text"
+        // flash lasting ~half a second. Scoping selection to individual messages
+        // (inside MessageItem) prevents the global selection glitch.
+        // Arrangement.Bottom anchors items to the BOTTOM of the viewport.
+        // fillMaxSize() is CRITICAL — without it, the LazyColumn wraps content
+        // height and Arrangement.Bottom has no effect.
+        // Fixed bottom padding reserves space for the indicator overlay so
+        // content doesn't jump when the indicator appears/disappears.
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize().padding(end = 12.dp, start = 8.dp, top = 8.dp, bottom = 44.dp),
                 verticalArrangement = Arrangement.Bottom,
             ) {
                 items(
@@ -366,13 +423,11 @@ fun MessageList(
                         if (index < queuedMessages.size - 1) {
                             Spacer(modifier = Modifier.height(8.dp))
                         }
-                    }
                 }
             }
         }
 
-        // Scrollbar OUTSIDE SelectionContainer — SelectionContainer consumes pointer events,
-        // so the scrollbar must be a sibling, not a child.
+        // Scrollbar — sibling of LazyColumn (not a child, so it receives pointer events).
         VerticalScrollbar(
             modifier = Modifier.align(Alignment.TopEnd).fillMaxHeight(),
             scrollState = listState,
@@ -411,21 +466,41 @@ fun MessageList(
                 )
             }
         }
+
+        // Pinned activity indicator — fixed at the bottom of the chat viewport.
+        // Only visible during the initial "thinking" phase (no content parts yet).
+        // Once the message has content, per-part UI handles display and this
+        // suppresses itself to avoid visual duplication.
+        val label = activityLabel
+        if (label != null) {
+            ThinkingIndicator(
+                label = label,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 20.dp, bottom = 8.dp)
+            )
+        }
     }
 }
 
 @Composable
-fun MessageItem(message: ChatMessage, project: Project? = null, onImagePreview: ((String) -> Unit)? = null, getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null) {
+fun MessageItem(
+    message: ChatMessage,
+    project: Project? = null,
+    onImagePreview: ((String) -> Unit)? = null,
+    getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
+    modifier: Modifier = Modifier,
+) {
     when (message.role) {
-        MessageRole.USER -> UserMessage(message, onImagePreview)
-        MessageRole.ASSISTANT -> AssistantMessage(message, project, getStreamingText = getStreamingText)
+        MessageRole.USER -> UserMessage(message, onImagePreview, modifier)
+        MessageRole.ASSISTANT -> AssistantMessage(message, project, getStreamingText = getStreamingText, modifier = modifier)
     }
 }
 
 @Composable
-fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null) {
+fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null, modifier: Modifier = Modifier) {
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.End
     ) {
         // Display attached images if any
@@ -465,7 +540,7 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
                 }
             }
         }
-        
+
         // Display text content if any
         val textContent = message.parts.values.filterIsInstance<MessagePart.Text>().joinToString("") { it.content }
         if (textContent.isNotBlank()) {
@@ -490,11 +565,18 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
 }
 
 @Composable
-fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null) {
+fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null, modifier: Modifier = Modifier) {
      val streamingAlpha = if (message.isStreaming) 0.85f else 1f
 
+     if (message.parts.isEmpty()) {
+         logger.warn { "[ACP] AssistantMessage: EMPTY PARTS! msg=${message.id} isStreaming=${message.isStreaming} state=${message.state}" }
+     }
+
      // Set up markdown styling once for the entire message (needed by Text and Code parts)
-     val currentProject = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+     // Cache the fallback project to avoid repeated ProjectManager lookups on every recomposition.
+     val currentProject = project ?: remember {
+         com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+     }
      val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
      val defaultGreen = ChatTheme.colors.accent.green
      val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
@@ -553,59 +635,54 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
          markdownProcessor = markdownProcessor,
          codeHighlighter = codeHighlighter,
      ) {
-          Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
-               // Render parts in LinkedHashMap insertion order — the order events arrived.
-               // Pre-compute part presence to avoid LazyColumn stale-closure bugs
-               val hasThinking = message.parts.values.any { it is MessagePart.Thinking }
-               // Pre-compute: if message has any ToolCall parts, suppress Patch/FileChange cards
+           Column(modifier = modifier.fillMaxWidth().graphicsLayer { alpha = streamingAlpha }) {
+                // Render parts in LinkedHashMap insertion order — the order events arrived.
+                // Pre-compute: if message has any ToolCall parts, suppress Patch/FileChange cards
                // (ToolPill already shows file info, line counts, and expandable content)
                val hasToolCallInMessage = message.parts.values.any { it is MessagePart.ToolCall }
                var hasToolCall = hasToolCallInMessage
-                // Standalone thinking indicator — rendered BEFORE the for-loop so it
-                // appears at the TOP of the Column, at the same position where
-                // CollapsibleThinkingPill will appear once the thinking part arrives.
-                // This eliminates the position-swap flicker (indicator at bottom →
-                // pill at top) by making the transition an in-place content swap.
-                when (message.renderPhase()) {
-                    MessageRenderPhase.THINKING -> if (!hasThinking) ThinkingIndicator()
-                    else -> { /* HAS_CONTENT or COMPLETE — no standalone indicator needed */ }
-                }
-               // Render parts in LinkedHashMap insertion order — chronological event order.
-               // resegmentTextPartsDirect preserves insertion positions via textSegments.
-              for ((key, part) in message.parts.entries) {
-                 when (part) {
-                        is MessagePart.Thinking -> {
-                            key(key) {
-                               CollapsibleThinkingPill(
-                                   content = part.content,
-                                   state = part.state,
-                               )
-                           }
-                       }
-                       is MessagePart.ToolCall -> {
-                           hasToolCall = true
-                           key(key) { ToolPill(part.pill, getStreamingText = getStreamingText) }
-                       }
-                     is MessagePart.Text -> {
-                         key(key) {
-                             val parsedBlocks = remember(part.content) {
-                                 val raw = markdownProcessor.processMarkdownDocument(part.content)
-                                 clampOrderedLists(raw)
+                // Render parts in LinkedHashMap insertion order — chronological event order.
+                // resegmentTextPartsDirect preserves insertion positions via textSegments.
+                // NOTE: The standalone "thinking…" indicator is NOT rendered here. It is
+                // pinned at the bottom of the MessageList Box, decoupled from the message's
+                // composition tree. This eliminates the flicker caused by the
+                // ThinkingIndicator ↔ CollapsibleThinkingPill structural swap.
+                for ((key, part) in message.parts.entries) {
+                   when (part) {
+                          is MessagePart.Thinking -> {
+                              key(key) {
+                                 CollapsibleThinkingPill(
+                                     content = part.content,
+                                     state = part.state,
+                                 )
                              }
-                             Markdown(
-                                 markdownBlocks = parsedBlocks,
-                                 markdown = part.content,
-                                 modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
-                                 selectable = true,
-                                  onUrlClick = { url -> openUrlSafely(url) },
-                             )
                          }
-                     }
-                      is MessagePart.Code -> key(key) {
-                          Box(modifier = Modifier.padding(vertical = 8.dp)) {
-                              ChatFencedCodeBlock(content = part.content, language = part.language)
+                         is MessagePart.ToolCall -> {
+                             hasToolCall = true
+                             key(key) {
+                                 ToolPill(part.pill, getStreamingText = getStreamingText)
+                             }
+                         }
+                      is MessagePart.Text -> {
+                          key(key) {
+                              val parsedBlocks = remember(part.content) {
+                                  val raw = markdownProcessor.processMarkdownDocument(part.content)
+                                  clampOrderedLists(raw)
+                              }
+                              Markdown(
+                                  markdownBlocks = parsedBlocks,
+                                  markdown = part.content,
+                                  modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
+                                  selectable = true,
+                                   onUrlClick = { url -> openUrlSafely(url) },
+                              )
                           }
                       }
+                       is MessagePart.Code -> key(key) {
+                           Box(modifier = Modifier.padding(vertical = 8.dp)) {
+                               ChatFencedCodeBlock(content = part.content, language = part.language)
+                           }
+                       }
                      is MessagePart.Table -> key(key) { ChatTable(rawMarkdown = part.rawMarkdown, modifier = Modifier.fillMaxWidth()) }
                      is MessagePart.Patch -> if (!hasToolCall) key(key) {
                          Column(
@@ -739,8 +816,8 @@ private fun StepFinishPill(stepFinish: MessagePart.StepFinish) {
 }
 
 private fun formatTokenCount(count: Long): String = when {
-    count >= 1_000_000 -> "${"%.1f".format(count / 1_000_000.0)}M"
-    count >= 1_000 -> "${"%.1f".format(count / 1_000.0)}k"
+    count >= 1_000_000 -> "${String.format(java.util.Locale.US, "%.1f", count / 1_000_000.0)}M"
+    count >= 1_000 -> "${String.format(java.util.Locale.US, "%.1f", count / 1_000.0)}k"
     else -> count.toString()
 }
 
@@ -980,6 +1057,47 @@ private fun FileChangeCard(
  * This function walks the block tree and replaces any [OrderedList] with
  * `startFrom <= 0` with a fresh instance using `startFrom = 1`.
  */
+/**
+ * Derives a human-readable activity label from the streaming assistant
+ * message's current parts. Used by the pinned activity indicator at the
+ * bottom of the chat to show what the LLM is doing right now.
+ *
+ * Priority (last active part wins):
+ * 1. Tool call awaiting permission → "Awaiting permission…"
+ * 2. Tool call in progress         → "Running {toolName}…"
+ * 3. Thinking part streaming       → "Thinking…"
+ * 4. Text part present             → "Writing…"
+ * 5. No content yet                → "Thinking…"
+ */
+private fun deriveActivityLabel(message: ChatMessage): String {
+    val parts = message.parts.values
+
+    // Check for tool calls — find the most recent one that's active
+    val toolCalls = parts.filterIsInstance<MessagePart.ToolCall>()
+    if (toolCalls.isNotEmpty()) {
+        val lastTool = toolCalls.last()
+        when (lastTool.state) {
+            PartState.Pending -> return "Awaiting permission…"
+            PartState.InProgress -> {
+                val name = lastTool.pill.toolName
+                return "Running $name…"
+            }
+            else -> { /* completed/failed — fall through to check other parts */ }
+        }
+    }
+
+    // Check for active thinking
+    val hasActiveThinking = parts.any { it is MessagePart.Thinking && it.state is PartState.Streaming }
+    if (hasActiveThinking) return "Thinking…"
+
+    // Check for text content (LLM is writing the response)
+    val hasText = parts.any { it is MessagePart.Text }
+    if (hasText) return "Writing…"
+
+    // No content parts yet — still waiting for first token
+    return "Thinking…"
+}
+
 private fun clampOrderedLists(blocks: List<MarkdownBlock>): List<MarkdownBlock> =
     blocks.map { block -> clampBlock(block) }
 

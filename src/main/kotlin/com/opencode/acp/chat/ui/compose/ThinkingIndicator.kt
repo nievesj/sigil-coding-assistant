@@ -71,13 +71,27 @@ private fun ThinkingHeader(
 }
 
 @Composable
-fun ThinkingIndicator(modifier: Modifier = Modifier) {
-    // Renders the same header as CollapsibleThinkingPill during streaming
-    // (expanded = true, streaming = true) so the indicator→pill transition
-    // is an in-place content swap — the header stays identical, only
-    // content appears below it.
+fun ThinkingIndicator(
+    label: String = "Thinking…",
+    modifier: Modifier = Modifier,
+) {
+    // Pinned status indicator at the bottom of the chat. Shows a spinner +
+    // dynamic label reflecting what the LLM is currently doing. The label
+    // is derived from the streaming message's parts by the caller.
     Column(modifier = modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
-        ThinkingHeader(expanded = true, streaming = true)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.padding(vertical = 2.dp),
+        ) {
+            CircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingStreamingSpinnerSize))
+            Text(
+                text = label,
+                fontStyle = FontStyle.Italic,
+                color = ChatTheme.colors.component.thinkingChevron,
+                style = TextStyle(fontSize = ChatTheme.fonts.thinkingLabel),
+            )
+        }
     }
 }
 

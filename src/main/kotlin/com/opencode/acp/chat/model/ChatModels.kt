@@ -328,6 +328,11 @@ data class SessionContext(
     val breakdown: ContextBreakdown? = null,
     /** Context pressure signals (growth rate, turns until compact). Null until enough turns. */
     val pressure: ContextPressure? = null,
+    /** Sigil context pruner stats from the heartbeat file. 0 when pruner is disabled or hasn't run. */
+    val prunerTokensSaved: Long = 0,
+    val prunerOutputsPruned: Long = 0,
+    val prunerInputsPruned: Long = 0,
+    val prunerLastRunMs: Long = 0,
 )
 
 /**
@@ -352,6 +357,7 @@ data class ContextBreakdown(
     val freeTokens: Long,         // contextLimit - total (can be negative when over-full)
     val totalTokens: Long,        // sum of all categories
     val toolBreakdown: Map<String, ToolCategoryBreakdown>,  // per-tool-name aggregation
+    val otherBreakdown: Map<String, OtherCategoryBreakdown> = emptyMap(),  // reasoning, cache read/write
 ) {
     /**
      * Percentages for the proportional bar.
@@ -373,6 +379,14 @@ data class ToolCategoryBreakdown(
     val callCount: Int,
     val estimatedTokens: Long,     // sum of input + output JSON byte sizes / 4
     val lastCallAt: Long,           // epoch millis
+)
+
+/**
+ * Per-category breakdown within the "Other" category (reasoning, cache read, cache write).
+ */
+data class OtherCategoryBreakdown(
+    val categoryName: String,
+    val estimatedTokens: Long,
 )
 
 /**

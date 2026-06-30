@@ -116,6 +116,7 @@ class OpenCodeMcpPanel {
     /** Scroll pane for tool permissions panel. */
     val toolPermissionsScrollPane: JScrollPane = JScrollPane(toolPermissionsPanel).apply {
         preferredSize = Dimension(0, 300)
+        verticalScrollBar.unitIncrement = 45  // Scroll one tool row per wheel notch
     }
 
     /** Button to discover available tools from OpenCode and MCP servers. */
@@ -227,21 +228,24 @@ class OpenCodeMcpPanel {
      */
     private fun syncBatchEnabledToRegistry(toolNames: Set<String>, enabled: Boolean) {
         if (toolNames.isEmpty()) return
-        val project = ProjectManager.getInstance().openProjects.firstOrNull() ?: return
-        val service = try {
-            project.service<com.opencode.acp.chat.service.OpenCodeService>()
-        } catch (e: Exception) {
-            return
-        }
-        val registry = service.toolRegistry ?: return
-        service.scope.launch {
-            try {
-                registry.syncEnabled(toolNames, enabled)
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
+        // Sync to ALL open projects — the settings panel is application-level,
+        // but ToolRegistry lives on the project-scoped OpenCodeService.
+        for (project in ProjectManager.getInstance().openProjects) {
+            val service = try {
+                project.service<com.opencode.acp.chat.service.OpenCodeService>()
             } catch (e: Exception) {
-                io.github.oshai.kotlinlogging.KotlinLogging.logger {}
-                    .warn(e) { "[ACP] Failed to sync batch enable/disable to ToolRegistry" }
+                continue
+            }
+            val registry = service.toolRegistry ?: continue
+            service.scope.launch {
+                try {
+                    registry.syncEnabled(toolNames, enabled)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                        .warn(e) { "[ACP] Failed to sync batch enable/disable to ToolRegistry" }
+                }
             }
         }
     }
@@ -256,10 +260,16 @@ class OpenCodeMcpPanel {
         loadDiscoveredToolsCache(settings.discoveredToolsJson)
         loadToolPermissionsFromSettings(settings.toolPermissions)
         updateMcpStatusLabel()
+        applyFilters()
+        updateToolCountLabel()
     }
 
     fun applyTo(settings: OpenCodeSettingsState) {
         val additionalJson = additionalMcpServersField.text.trim()
+        // Validate additionalMcpServers separately — a validation failure should only
+        // skip that field, not block the entire apply (which would silently lose the
+        // user's valid changes to enableIntellijMcp, mcpServerUrl, and toolPermissions).
+        var additionalServersValid = true
         if (additionalJson.isNotBlank()) {
             try {
                 val element = kotlinx.serialization.json.Json.parseToJsonElement(additionalJson)
@@ -270,23 +280,27 @@ class OpenCodeMcpPanel {
                     val name = obj["name"]?.jsonPrimitive?.contentOrNull
                     val url = obj["url"]?.jsonPrimitive?.contentOrNull
                     if (name.isNullOrBlank() || url.isNullOrBlank()) {
-                        showStatus("MCP server #${index + 1}: 'name' and 'url' are required", false)
-                        return
+                        showStatus("MCP server #${index + 1}: 'name' and 'url' are required — additional servers not saved", false)
+                        additionalServersValid = false
+                        break
                     }
                     if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                        showStatus("MCP server '$name': URL must start with http:// or https://", false)
-                        return
+                        showStatus("MCP server '$name': URL must start with http:// or https:// — additional servers not saved", false)
+                        additionalServersValid = false
+                        break
                     }
                 }
             } catch (e: Exception) {
-                showStatus("Invalid JSON in additional MCP servers: ${e.message}", false)
-                return
+                showStatus("Invalid JSON in additional MCP servers: ${e.message} — additional servers not saved", false)
+                additionalServersValid = false
             }
         }
-        // All validation passed — safe to apply settings.
+        // Apply all settings — additionalMcpServers is only updated if validation passed.
         settings.enableIntellijMcp = enableIntellijMcpCheckbox.isSelected
         settings.mcpServerUrl = mcpServerUrlField.text.trim()
-        settings.additionalMcpServers = additionalJson
+        if (additionalServersValid) {
+            settings.additionalMcpServers = additionalJson
+        }
         if (allToolsData.isNotEmpty()) {
             // Use generateToolPermissionsJson() — the same serialization path as isModified().
             // This ensures the JSON compared in isModified() matches what is persisted here,
@@ -397,13 +411,10 @@ class OpenCodeMcpPanel {
 
     private fun createToolRow(toolName: String, info: ToolInfo): JPanel {
         val row = JPanel(GridBagLayout()).apply {
-            maximumSize = Dimension(Int.MAX_VALUE, 45)
-            border = BorderFactory.createEmptyBorder(2, 5, 2, 5)
+            // No maximumSize height cap — row height is driven by description wrapping
+            border = BorderFactory.createEmptyBorder(3, 4, 3, 4)
         }
-        val gbc = GridBagConstraints().apply {
-            fill = GridBagConstraints.HORIZONTAL
-            insets = java.awt.Insets(2, 5, 2, 5)
-        }
+
         val enabledCheckbox = JBCheckBox().apply {
             isSelected = info.enabled
             toolTipText = "Enable/disable $toolName"
@@ -411,8 +422,6 @@ class OpenCodeMcpPanel {
                 val enabled = isSelected
                 toolEnabledCheckboxes[toolName]?.isSelected = enabled
                 allToolsData[toolName]?.let { old ->
-                    // Unchecking sets DENY for convenience; checking restores ALLOW
-                    // (or preserves the current permission if it was already ALLOW/ASK)
                     val newPermission = if (!enabled) {
                         ToolPermission.DENY
                     } else if (old.permission == ToolPermission.DENY) {
@@ -422,28 +431,37 @@ class OpenCodeMcpPanel {
                     }
                     allToolsData[toolName] = old.copy(enabled = enabled, permission = newPermission)
                 }
-                // Update combo to reflect the permission change (visual sync only)
                 toolPermissionComboBoxes[toolName]?.selectedItem = allToolsData[toolName]?.permission?.toActionString() ?: "allow"
                 updateToolCountLabel()
             }
         }
         toolEnabledCheckboxes[toolName] = enabledCheckbox
 
-        val textPanel = JPanel().apply { layout = BoxLayout(this, BoxLayout.Y_AXIS) }
-        val nameLabel = JBLabel(toolName).apply { toolTipText = info.description }
-        val descLabel = JBLabel(info.description).apply { foreground = JBColor.GRAY; toolTipText = info.description }
-        textPanel.add(nameLabel)
-        textPanel.add(descLabel)
+        val nameLabel = JBLabel(toolName).apply {
+            toolTipText = info.description
+            font = font.deriveFont(java.awt.Font.BOLD, 11f)
+            // Fixed preferred width so the name column doesn't collapse or grow
+            preferredSize = Dimension(180, preferredSize.height)
+        }
+
+        // HTML-wrapped description: Swing's HTML renderer word-wraps automatically
+        // and the label's preferred height grows to fit the wrapped text.
+        val escapedDesc = info.description
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
+        val descLabel = JBLabel("<html><body><p style='margin:0; color:gray; font-size:10pt'>$escapedDesc</p></body></html>").apply {
+            toolTipText = info.description
+        }
 
         val permissionCombo = JComboBox(arrayOf("allow", "ask", "deny")).apply {
             selectedItem = info.permission.toActionString()
-            preferredSize = Dimension(80, 25)
+            preferredSize = Dimension(75, 22)
+            minimumSize = Dimension(75, 22)
             toolTipText = "Permission level for $toolName"
             addActionListener {
                 val permission = ToolPermission.fromActionString(selectedItem?.toString() ?: "allow")
-                // Only update permission — enabled is controlled by the checkbox.
-                // They are independent: a tool can be enabled=false, permission=allow
-                // (disabled in UI but allowed if invoked by other means).
                 allToolsData[toolName]?.let { old ->
                     allToolsData[toolName] = old.copy(permission = permission)
                 }
@@ -452,9 +470,45 @@ class OpenCodeMcpPanel {
         }
         toolPermissionComboBoxes[toolName] = permissionCombo
 
-        gbc.gridx = 0; gbc.weightx = 0.0; row.add(enabledCheckbox, gbc)
-        gbc.gridx = 1; gbc.weightx = 1.0; row.add(textPanel, gbc)
-        gbc.gridx = 2; gbc.weightx = 0.0; row.add(permissionCombo, gbc)
+        // ── GridBagLayout: 4 columns ──────────────────────────────────────
+        // Col 0: Checkbox      (fixed, no grow)
+        // Col 1: Name label    (fixed ~180px, no grow)
+        // Col 2: Description   (weightx=1.0, grows horizontally, wraps)
+        // Col 3: Permission    (fixed, no grow)
+        val baseInsets = java.awt.Insets(0, 2, 0, 2)
+
+        row.add(enabledCheckbox, GridBagConstraints().apply {
+            gridx = 0; gridy = 0
+            weightx = 0.0; weighty = 0.0
+            fill = GridBagConstraints.NONE
+            anchor = GridBagConstraints.LINE_START
+            insets = baseInsets
+        })
+
+        row.add(nameLabel, GridBagConstraints().apply {
+            gridx = 1; gridy = 0
+            weightx = 0.0; weighty = 0.0
+            fill = GridBagConstraints.NONE
+            anchor = GridBagConstraints.LINE_START
+            insets = baseInsets
+        })
+
+        row.add(descLabel, GridBagConstraints().apply {
+            gridx = 2; gridy = 0
+            weightx = 1.0; weighty = 0.0
+            fill = GridBagConstraints.HORIZONTAL
+            anchor = GridBagConstraints.LINE_START
+            insets = baseInsets
+        })
+
+        row.add(permissionCombo, GridBagConstraints().apply {
+            gridx = 3; gridy = 0
+            weightx = 0.0; weighty = 0.0
+            fill = GridBagConstraints.NONE
+            anchor = GridBagConstraints.LINE_END
+            insets = baseInsets
+        })
+
         return row
     }
 
@@ -490,25 +544,21 @@ class OpenCodeMcpPanel {
                 val toolObj = element.jsonObject
                 val enabled = toolObj["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
                 val permission = ToolPermission.fromActionString(toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow")
+                // Try exact key match first (normal case after successful discovery)
                 val existing = allToolsData[toolName]
+                    // Fallback: match by ToolInfo.id (handles stale toolPermissions
+                    // saved with prefixed names like "intellij_build_project" when
+                    // the discovered cache uses raw names like "build_project").
+                    ?: allToolsData.values.find { it.id == toolName }
                 if (existing != null) {
+                    // Preserve source/serverName from the discovered cache — only
+                    // update enabled/permission from saved settings.
                     allToolsData[toolName] = existing.copy(enabled = enabled, permission = permission)
-                } else {
-                    // Tool not in cache — create placeholder with unknown source.
-                    // Source will be corrected when discovery runs (the discovered
-                    // tools cache cross-references source/serverName, and live
-                    // discovery populates the correct source). Do NOT infer source
-                    // from the tool name — built-in tools like "ast_grep_search"
-                    // contain underscores and would be misclassified as MCP.
-                    allToolsData[toolName] = ToolInfo.create(
-                        name = toolName,
-                        description = "Pending discovery: $toolName",
-                        source = ToolSource.BUILTIN,
-                        serverName = "builtin",
-                        enabled = enabled,
-                        permission = permission
-                    )
                 }
+                // If the tool is not in the discovered cache, skip it.
+                // Only real, actively-discovered tools are shown — no placeholders.
+                // The permission will be re-applied after the next discovery run
+                // (ToolRegistry.loadPermissions matches by both id and name).
             }
         } catch (e: Exception) {
             io.github.oshai.kotlinlogging.KotlinLogging.logger {}

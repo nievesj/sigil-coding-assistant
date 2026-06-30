@@ -514,6 +514,65 @@ preferable (no flicker, preserved `remember` state).
 - **Files:** `MessageList.kt` (LazyColumn items key + State read), `ChatScreen.kt`
   (passes `State<Map<String, ChatMessage>>` to MessageList)
 
+### Streaming "Jump" — animateScrollToItem on New Streaming Message
+
+**Problem:** When a tool completes and a new assistant message starts streaming
+(thinking begins), all visible chat messages briefly shift upward — a visual
+"jump" or "flicker" lasting a fraction of a second. The effect is most noticeable
+when the chat has many messages (500+) and `Arrangement.Bottom` is used.
+
+**Root cause:** Three separate issues, all triggered at the `new_message` transition
+(tool completes → `MessageFinalized` with new server message ID → new assistant
+message auto-created → thinking starts):
+
+1. **`finalizeStreaming` 300ms debounce (fixed):** The `new_message` path used the
+   same 300ms debounced finalization as normal `stop` events. This delayed the old
+   message's `isStreaming=true→false` transition by 300ms, splitting state changes
+   across two frames and causing a mass LazyColumn dispose+recreate when the debounce
+   finally fired. Fix: dedicated `new_message` branch in `finalizeStreaming` that
+   finalizes immediately (no debounce) and does NOT emit `StreamingCompleted` (the
+   new message's completion will emit it — emitting here would prematurely set
+   `_streamPhase=IDLE` while the new message is actively streaming).
+
+2. **`resegmentTextPartsFinal` using `segment()` instead of `segmentHealed()` (fixed):**
+   On finalization, `resegmentTextPartsFinal` passed `overrideIsStreaming=false` to
+   use `MarkdownSegmenter.segment()` instead of `segmentHealed()`. If the segment
+   structure differed (healed closed unclosed markdown that non-healed treats as
+   literal text), part keys changed (e.g., `text_0_0` → `text_0_0 + text_0_1`), causing
+   every `key()` block in `AssistantMessage` to dispose+recreate. Fix: always use
+   `segmentHealed()` (pass `overrideIsStreaming=true`) — for complete content, both
+   produce identical results; consistency prevents key changes.
+
+3. **`animateScrollToItem` on new streaming message (fixed):** When a new message
+   appears in the list (delta == 1), the scroll coordinator used
+   `animateScrollToItem` — a 60ms-delayed animated glide to the new bottom. With
+   `Arrangement.Bottom`, this animation shifts all visible items upward, which IS
+   the visible "jump." Fix: detect `isNewStreamingMessage` (delta == 1 and last
+   message `isStreaming == true`) and use instant `scrollToItem` instead of animated.
+
+**Empty streaming messages filtered:** Assistant messages with 0 parts and
+`isStreaming=true` are filtered out of the `messages` list before LazyColumn sees
+them. They create 0-height items that trigger LazyColumn recycling of visible
+items. The message gets parts within milliseconds (first `ThinkingChunk`/`TextChunk`),
+at which point it appears in the list normally. The `ThinkingIndicator` overlay
+(pinned at the bottom of the Box) still shows activity during the gap.
+
+**Diagnostic approach (if regression):**
+- Enable DEBUG logging (Settings → Tools → Sigil → Plugin log level)
+- Search `idea.log` for `[ACP] KEYS CHANGED` — if part keys change during
+  finalization, the resegment is producing different segment structures
+- Search for `[ACP] finalizeStreaming (new_message): immediate` — if this shows
+  `debounced finalization (300ms)` instead, the immediate-finalization branch
+  is not being reached
+- Search for `[ACP] AssistantMessage: EMPTY PARTS` with `isStreaming=true` —
+  if empty streaming messages appear in the list, the filter is broken
+- Check `MessageList.kt` scroll coordinator: `isNewStreamingMessage` must use
+  instant `scrollToItem`, not `animateScrollToItem`
+
+- **Files:** `SessionState.kt` (`finalizeStreaming` new_message branch,
+  `resegmentTextPartsFinal`), `MessageList.kt` (empty message filter,
+  `isNewStreamingMessage` scroll mode, `AssistantMessage` EMPTY PARTS warning)
+
 ### IntelliJ Platform Icons (AllIcons) "” Confirmed Available
 
 Icons referenced via `AllIcons.*` that are **known to compile** in this project.
@@ -877,6 +936,51 @@ setting the property in `createToolWindowContent()` is likely a no-op.
   to GDI on incompatible hardware
 
 **Full investigation:** `docs/tdd/Done/ide-hang-investigation.md`
+
+### Follow Agent — Expanded: EXECUTE and SEARCH Tool Coverage
+
+Follow Agent now covers **all tool kinds**, not just file-based ones (READ, EDIT, DELETE, MOVE).
+
+**EXECUTE tools (bash/shell commands):** When the agent runs a command, a read-only
+`ConsoleView` opens in the Run tool window showing the agent name, model, working
+directory, the command (as `$ <command>`), and the command output (stdout in normal
+color, stderr in error color, exit status footer). The command is NOT re-executed —
+the agent already ran it on the OpenCode server. We display the output the agent received.
+
+- **Manager:** `CommandFollowManager` (project-level service)
+- **Entry points:** `followCommand()` (on ToolUse), `followCommandResult()` + `finishCommand()` (on ToolResult)
+- **Throttling:** 2-second cooldown between opening new console tabs
+- **Tab limit:** Max 5 concurrent console tabs (oldest evicted)
+- **Settings:** `followCommandsInConsole` (default: true when Follow Agent is on)
+- **ToolPill button:** Console icon on EXECUTE pills — activates the Run tool window
+
+**SEARCH tools (grep/glob/find):** When the agent searches, IntelliJ's native "Find in
+Files" opens with the agent's search pattern, directory scope, and file mask. The IDE
+re-runs the search live, so results reflect current file state (not the agent's
+potentially stale snapshot). The user gets an interactive result set they can navigate,
+filter, and group.
+
+- **Manager:** `SearchFollowManager` (project-level service)
+- **Entry point:** `followSearch()` (on ToolUse) — calls `FindInProjectManager.startFindInProject(findModel)`
+- **Throttling:** 2-second cooldown between opening Find in Files
+- **Settings:** `followSearchesInFindWindow` (default: true when Follow Agent is on)
+- **ToolPill button:** Search icon on SEARCH pills — re-triggers Find in Files via `reopenSearch()`
+- **FindModel scope:** Uses `directoryName` property (not `directory`) for directory-scoped search
+- **No DataContext needed:** `startFindInProject()` runs the search directly without a dialog,
+  unlike `findInProject()` which shows the Find dialog first
+
+**Integration in SessionState.kt:**
+- ToolUse handler (line ~976): EXECUTE → `CommandFollowManager.followCommand()`, SEARCH → `SearchFollowManager.followSearch()`
+- Duplicate ToolUse handler (line ~912): Same additions for when input arrives on the "running" event
+- ToolResult handler (line ~1070): EXECUTE → `CommandFollowManager.followCommandResult()` + `finishCommand()`
+
+**Settings UI (Settings → Tools → Sigil → Follow Agent):**
+- "Show agent commands in Run console" checkbox
+- "Open Find in Files for agent searches" checkbox
+- Both default to true (if the user opted into Follow Agent, they want full coverage)
+
+**Key files:** `CommandFollowManager.kt`, `SearchFollowManager.kt`, `SessionState.kt`,
+`OpenCodeSettingsState.kt`, `OpenCodeFollowConfigurable.kt`, `ToolPill.kt`
 
 ---
 

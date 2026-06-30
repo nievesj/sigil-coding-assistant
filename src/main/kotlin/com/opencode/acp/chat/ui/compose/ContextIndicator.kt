@@ -1,11 +1,6 @@
 package com.opencode.acp.chat.ui.compose
 
-import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.TooltipArea
@@ -72,22 +67,21 @@ fun contextColorForPercent(percent: Float): Color {
  * Returns a [State<Float>] that pulses between 1f and 0.5f when [isStreaming] is true,
  * or a constant 1f when not streaming.
  *
- * The infinite transition is only created when streaming, avoiding unnecessary
- * animation overhead. The state is read inside draw scopes to prevent
+ * Uses [rememberThrottledInfiniteAnimation] instead of [rememberInfiniteTransition] to
+ * reduce GPU command flush pressure. The throttle FPS is configurable via Settings →
+ * Tools → Sigil → "Animation FPS". The state is read inside draw scopes to prevent
  * recomposition on every animation frame.
  */
 @Composable
 private fun rememberPulsingAlpha(isStreaming: Boolean, pulseMs: Int): State<Float> {
     return if (isStreaming) {
-        val infiniteTransition = rememberInfiniteTransition(label = "contextPulse")
-        infiniteTransition.animateFloat(
+        rememberThrottledInfiniteAnimation(
+            active = isStreaming,
             initialValue = 1f,
             targetValue = 0.5f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = pulseMs, easing = LinearEasing),
-                repeatMode = RepeatMode.Reverse
-            ),
-            label = "contextPulseAlpha"
+            durationMillis = pulseMs,
+            repeatMode = RepeatMode.Reverse,
+            label = "contextPulse",
         )
     } else {
         remember { mutableFloatStateOf(1f) }
@@ -426,9 +420,10 @@ private fun formatTooltipCost(cost: Double): String {
  * The badge uses a single character: "▲" for HIGH, "⚠" for CRITICAL, "·" for ELEVATED.
  * The threshold is read from settings (NEVER / ELEVATED / HIGH / CRITICAL).
  */
+@Composable
 private fun pressureBadgeText(level: PressureLevel?): String {
     if (level == null) return ""
-    val threshold = OpenCodeSettingsState.getInstance().pressureNotificationThreshold
+    val threshold = remember { OpenCodeSettingsState.getInstance().pressureNotificationThreshold }
     val thresholdLevel = when (threshold) {
         "NEVER" -> null
         "ELEVATED" -> PressureLevel.ELEVATED

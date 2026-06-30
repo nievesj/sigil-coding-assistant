@@ -157,54 +157,6 @@ private fun ContextDetails(
         if (showBreakdown && context.breakdown != null && context.breakdown.totalTokens > 0) {
             Spacer(Modifier.height(4.dp))
             BreakdownLegend(breakdown = context.breakdown, labelColor, valueColor)
-
-            // Tool breakdown (expandable)
-            if (context.breakdown.toolBreakdown.isNotEmpty()) {
-                var toolBreakdownExpanded by remember { mutableStateOf(false) }
-
-                Spacer(Modifier.height(4.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth().clickable { toolBreakdownExpanded = !toolBreakdownExpanded },
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (toolBreakdownExpanded) "\u25BC" else "\u25B6",
-                        fontSize = ChatTheme.fonts.contextDetailLabel,
-                        color = labelColor,
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        text = "Tool breakdown (${context.breakdown.toolBreakdown.size} tools)",
-                        fontSize = ChatTheme.fonts.contextDetailLabel,
-                        color = labelColor,
-                    )
-                }
-
-                AnimatedVisibility(
-                    visible = toolBreakdownExpanded,
-                    enter = expandVertically(expandFrom = Alignment.Top),
-                    exit = shrinkVertically(shrinkTowards = Alignment.Top)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(start = 16.dp, top = 4.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
-                    ) {
-                        val sortedTools = context.breakdown.toolBreakdown.values.sortedByDescending { it.estimatedTokens }
-                        for (tool in sortedTools) {
-                            LegendRow(
-                                label = "${tool.toolName} (${tool.callCount}x)",
-                                tokens = tool.estimatedTokens,
-                                percent = if (context.breakdown.totalTokens > 0)
-                                    tool.estimatedTokens.toFloat() / context.breakdown.totalTokens * 100
-                                else 0f,
-                                color = ChatTheme.colors.accent.contextRed,
-                                labelColor = labelColor,
-                                valueColor = valueColor,
-                            )
-                        }
-                    }
-                }
-            }
         }
 
         // ── Pressure forecast ──
@@ -212,7 +164,7 @@ private fun ContextDetails(
             Spacer(Modifier.height(6.dp))
             DetailRow(
                 label = "Turns until compact",
-                value = "~${context.pressure.turnsUntilCompact}",
+                value = if (context.pressure.turnsUntilCompact == 0) "Compaction imminent" else "~${context.pressure.turnsUntilCompact} turns",
                 labelColor,
                 valueColor
             )
@@ -234,6 +186,22 @@ private fun ContextDetails(
         Spacer(Modifier.height(10.dp))
         HorizontalSeparator(separator)
         Spacer(Modifier.height(10.dp))
+
+        // ── Pruner section ──
+        if (OpenCodeSettingsState.getInstance().enableContextPruner) {
+            PrunerSection(
+                tokensSaved = context.prunerTokensSaved,
+                outputsPruned = context.prunerOutputsPruned,
+                inputsPruned = context.prunerInputsPruned,
+                lastRunMs = context.prunerLastRunMs,
+                labelColor = labelColor,
+                valueColor = valueColor,
+                sectionColor = sectionColor,
+            )
+            Spacer(Modifier.height(10.dp))
+            HorizontalSeparator(separator)
+            Spacer(Modifier.height(10.dp))
+        }
 
         // ── Tokens section ──
         SectionHeader("Tokens", sectionColor)
@@ -331,7 +299,7 @@ private fun UsageBar(
     breakdown: ContextBreakdown? = null
 ) {
     val fallbackColor = contextColorForPercent(usagePercent)
-    val displayPercent = if (usagePercent >= 100f) "${usagePercent.toInt()}%" else "${String.format("%.1f", usagePercent)}%"
+    val displayPercent = if (usagePercent >= 100f) "${usagePercent.toInt()}%" else "${String.format(java.util.Locale.US, "%.1f", usagePercent)}%"
     val isUnknown = contextLimit == 0L
 
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -456,26 +424,121 @@ private fun formatPanelTokens(tokens: Long): String {
     return when {
         tokens == 0L -> "0"
         tokens < 1000L -> tokens.toString()
-        tokens < 1_000_000L -> "${String.format("%.1f", tokens / 1000.0)}k"
-        else -> "${String.format("%.1f", tokens / 1_000_000.0)}M"
+        tokens < 1_000_000L -> "${String.format(java.util.Locale.US, "%.1f", tokens / 1000.0)}k"
+        else -> "${String.format(java.util.Locale.US, "%.1f", tokens / 1_000_000.0)}M"
     }
 }
 
 private fun formatPanelCost(cost: Double): String {
-    return if (cost == 0.0) "$0.00" else "$${String.format("%.4f", cost)}"
+    return if (cost == 0.0) "$0.00" else "$${String.format(java.util.Locale.US, "%.4f", cost)}"
 }
 
 // ── Breakdown Legend ────────────────────────────────────────────────────────
 
 @Composable
 private fun BreakdownLegend(breakdown: ContextBreakdown, labelColor: Color, valueColor: Color) {
+    var toolBreakdownExpanded by remember { mutableStateOf(true) }
+    var otherBreakdownExpanded by remember { mutableStateOf(true) }
+
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         LegendRow("System + Tools", breakdown.systemPromptTokens, breakdown.systemPromptPercent, ChatTheme.colors.accent.blue, labelColor, valueColor)
         LegendRow("User", breakdown.userTokens, breakdown.userPercent, ChatTheme.colors.accent.contextGreen, labelColor, valueColor)
         LegendRow("Assistant", breakdown.assistantTokens, breakdown.assistantPercent, ChatTheme.colors.accent.contextYellow, labelColor, valueColor)
+
+        // Tool Calls row + inline expandable breakdown
         LegendRow("Tool Calls", breakdown.toolTokens, breakdown.toolPercent, ChatTheme.colors.accent.contextRed, labelColor, valueColor)
+        if (breakdown.toolBreakdown.isNotEmpty()) {
+            Spacer(Modifier.height(2.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth().clickable { toolBreakdownExpanded = !toolBreakdownExpanded },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (toolBreakdownExpanded) "\u25BC" else "\u25B6",
+                    fontSize = ChatTheme.fonts.contextDetailLabel,
+                    color = labelColor,
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = "Tool breakdown (${breakdown.toolBreakdown.size} tools)",
+                    fontSize = ChatTheme.fonts.contextDetailLabel,
+                    color = labelColor,
+                )
+            }
+
+            AnimatedVisibility(
+                visible = toolBreakdownExpanded,
+                enter = expandVertically(expandFrom = Alignment.Top),
+                exit = shrinkVertically(shrinkTowards = Alignment.Top)
+            ) {
+                Column(
+                    modifier = Modifier.padding(start = 16.dp, top = 2.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    val sortedTools = breakdown.toolBreakdown.values.sortedByDescending { it.estimatedTokens }
+                    for (tool in sortedTools) {
+                        LegendRow(
+                            label = "${tool.toolName} (${tool.callCount}x)",
+                            tokens = tool.estimatedTokens,
+                            percent = if (breakdown.totalTokens > 0)
+                                tool.estimatedTokens.toFloat() / breakdown.totalTokens * 100
+                            else 0f,
+                            color = ChatTheme.colors.accent.contextRed,
+                            labelColor = labelColor,
+                            valueColor = valueColor,
+                        )
+                    }
+                }
+            }
+        }
+
+        // Other row + inline expandable breakdown
         if (breakdown.otherTokens > 0) {
             LegendRow("Other", breakdown.otherTokens, breakdown.otherPercent, ChatTheme.colors.accent.contextUnknown, labelColor, valueColor)
+            if (breakdown.otherBreakdown.isNotEmpty()) {
+                Spacer(Modifier.height(2.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable { otherBreakdownExpanded = !otherBreakdownExpanded },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (otherBreakdownExpanded) "\u25BC" else "\u25B6",
+                        fontSize = ChatTheme.fonts.contextDetailLabel,
+                        color = labelColor,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = "Other breakdown (${breakdown.otherBreakdown.size} categories)",
+                        fontSize = ChatTheme.fonts.contextDetailLabel,
+                        color = labelColor,
+                    )
+                }
+
+                AnimatedVisibility(
+                    visible = otherBreakdownExpanded,
+                    enter = expandVertically(expandFrom = Alignment.Top),
+                    exit = shrinkVertically(shrinkTowards = Alignment.Top)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(start = 16.dp, top = 2.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        val sortedOther = breakdown.otherBreakdown.values.sortedByDescending { it.estimatedTokens }
+                        for (category in sortedOther) {
+                            LegendRow(
+                                label = category.categoryName,
+                                tokens = category.estimatedTokens,
+                                percent = if (breakdown.totalTokens > 0)
+                                    category.estimatedTokens.toFloat() / breakdown.totalTokens * 100
+                                else 0f,
+                                color = ChatTheme.colors.accent.contextUnknown,
+                                labelColor = labelColor,
+                                valueColor = valueColor,
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -495,7 +558,7 @@ private fun LegendRow(label: String, tokens: Long, percent: Float, color: Color,
             modifier = Modifier.weight(1f)
         )
         Text(
-            text = "${formatPanelTokens(tokens)} (${String.format("%.0f", percent)}%)",
+            text = "${formatPanelTokens(tokens)} (${String.format(java.util.Locale.US, "%.0f", percent)}%)",
             fontSize = ChatTheme.fonts.contextDetailValue,
             color = valueColor,
         )
@@ -604,3 +667,44 @@ private fun CompactButtonRow(
 
 @Composable
 private fun separatorColor(): Color = ChatTheme.colors.component.contextPanelSeparator
+
+// ── Pruner Section ─────────────────────────────────────────────────────────
+
+@Composable
+private fun PrunerSection(
+    tokensSaved: Long,
+    outputsPruned: Long,
+    inputsPruned: Long,
+    lastRunMs: Long,
+    labelColor: Color,
+    valueColor: Color,
+    sectionColor: Color,
+) {
+    SectionHeader("Context Pruner", sectionColor)
+    if (tokensSaved == 0L && outputsPruned == 0L && inputsPruned == 0L) {
+        DetailRow(
+            label = "Status",
+            value = "Active (no pruning yet)",
+            labelColor,
+            valueColor,
+        )
+    } else {
+        DetailRow(
+            label = "Tokens saved",
+            value = formatPanelTokens(tokensSaved),
+            labelColor,
+            valueColor,
+            bold = true,
+        )
+        DetailRow(label = "Outputs pruned", value = "$outputsPruned", labelColor, valueColor)
+        DetailRow(label = "Inputs pruned", value = "$inputsPruned", labelColor, valueColor)
+    }
+    if (lastRunMs > 0) {
+        DetailRow(
+            label = "Last run",
+            value = formatRelativeTime(lastRunMs),
+            labelColor,
+            valueColor,
+        )
+    }
+}

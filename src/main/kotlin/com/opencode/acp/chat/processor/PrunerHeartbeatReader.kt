@@ -31,6 +31,14 @@ object PrunerHeartbeatReader {
             val heartbeatPath = resolveHeartbeatPath(projectDirectory)
             if (!Files.exists(heartbeatPath)) return 0L
 
+            // Guard against corrupted/huge files — heartbeat should be ~100 bytes JSON.
+            // Without this, disk corruption filling the file with garbage could OOM.
+            val size = Files.size(heartbeatPath)
+            if (size > 10_000) {
+                logger.warn { "[ACP] PrunerHeartbeatReader: heartbeat file suspiciously large ($size bytes), skipping" }
+                return 0L
+            }
+
             val content = Files.readString(heartbeatPath).trim()
             if (content.isEmpty()) return 0L
 
@@ -55,13 +63,32 @@ object PrunerHeartbeatReader {
             val heartbeatPath = resolveHeartbeatPath(projectDirectory)
             if (!Files.exists(heartbeatPath)) return null
 
+            // Guard against corrupted/huge files — heartbeat should be ~100 bytes JSON.
+            val size = Files.size(heartbeatPath)
+            if (size > 10_000) {
+                logger.warn { "[ACP] PrunerHeartbeatReader: heartbeat file suspiciously large ($size bytes), skipping" }
+                return null
+            }
+
             val content = Files.readString(heartbeatPath).trim()
             if (content.isEmpty()) return null
 
-            val tokensSaved = tryParseJson(content) ?: return null
-            // If we got tokens from JSON, parse the full object
-            // (tryParseJson already validated it's JSON)
-            PrunerHeartbeat(tokensSaved = tokensSaved)
+            val element = kotlinx.serialization.json.Json.parseToJsonElement(content)
+            val obj = element as? kotlinx.serialization.json.JsonObject ?: return null
+            val tokensSaved = (obj["tokensSaved"] as? kotlinx.serialization.json.JsonPrimitive)
+                ?.content?.toLongOrNull() ?: return null
+            val outputsPruned = (obj["outputsPruned"] as? kotlinx.serialization.json.JsonPrimitive)
+                ?.content?.toLongOrNull() ?: 0L
+            val inputsPruned = (obj["inputsPruned"] as? kotlinx.serialization.json.JsonPrimitive)
+                ?.content?.toLongOrNull() ?: 0L
+            val timestamp = (obj["timestamp"] as? kotlinx.serialization.json.JsonPrimitive)
+                ?.content?.toLongOrNull() ?: 0L
+            PrunerHeartbeat(
+                tokensSaved = tokensSaved,
+                outputsPruned = outputsPruned,
+                inputsPruned = inputsPruned,
+                timestampMs = timestamp,
+            )
         } catch (e: Exception) {
             null
         }
@@ -89,4 +116,7 @@ object PrunerHeartbeatReader {
 
 data class PrunerHeartbeat(
     val tokensSaved: Long,
+    val outputsPruned: Long = 0,
+    val inputsPruned: Long = 0,
+    val timestampMs: Long = 0,
 )

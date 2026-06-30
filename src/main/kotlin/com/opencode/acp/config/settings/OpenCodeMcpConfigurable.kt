@@ -98,6 +98,8 @@ class OpenCodeMcpConfigurable : Configurable {
                 } catch (e: Exception) {
                     logger.error(e) { "[ACP] Failed to write tool permissions" }
                 }
+            } else {
+                logger.warn { "[ACP] Cannot write tool permissions — no open project" }
             }
         }
 
@@ -147,6 +149,11 @@ class OpenCodeMcpConfigurable : Configurable {
 
     /**
      * Discover available tools using ToolRegistry (single discovery path).
+     *
+     * Before discovery, checks MCP server connection status. If MCP servers
+     * are disconnected, attempts to re-initialize them first (so the user
+     * doesn't have to leave settings to retry). Shows a clear warning if MCP
+     * tools can't be discovered because the server is down.
      */
     private fun discoverTools() {
         val settings = OpenCodeSettingsState.getInstance()
@@ -182,25 +189,50 @@ class OpenCodeMcpConfigurable : Configurable {
 
         service.scope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
+                // ── Retry MCP connection before discovery ──────────────────────
+                // If MCP servers are not connected, try to re-initialize them
+                // so the user doesn't have to leave settings to retry. This is
+                // especially important because the MCP server (IntelliJ's built-in)
+                // may not have been ready when the plugin first initialized.
+                val mcpManager = service.mcpManager
+                if (mcpManager != null) {
+                    val statuses = mcpManager.serverStatuses.value
+                    val anyConnected = statuses.values.any { it.state == com.opencode.acp.mcp.McpConnectionState.CONNECTED }
+                    if (!anyConnected && statuses.isNotEmpty()) {
+                        logger.info { "[ACP] discoverTools: MCP servers not connected — retrying initialization" }
+                        try {
+                            mcpManager.initialize()
+                        } catch (e: Exception) {
+                            logger.warn(e) { "[ACP] discoverTools: MCP re-initialization failed" }
+                        }
+                    }
+                }
+
                 val baseUrl = "http://127.0.0.1:${service.connectionManager.port}"
                 val mcpUrls = service.mcpManager?.getServerUrls() ?: emptyMap()
+                val mcpServerCount = mcpUrls.size
                 val tools = registry.discoverAll(baseUrl, mcpUrls)
 
                 // Merge persisted permissions after discovery
                 val persisted = parsePersistedToolPermissions(settings.toolPermissions)
                 if (persisted.isNotEmpty()) {
-                    registry.loadPermissions(persisted.mapValues { (_, pair) ->
-                        val (_, permissionStr) = pair
-                        ToolPermission.fromActionString(permissionStr)
+                    registry.loadEnabledAndPermissions(persisted.mapValues { (_, pair) ->
+                        val (enabled, permissionStr) = pair
+                        Pair(enabled, ToolPermission.fromActionString(permissionStr))
                     })
                 }
 
                 val allTools = registry.getAllTools()
+                val mcpToolCount = allTools.count { it.source == ToolSource.MCP }
 
                 ApplicationManager.getApplication().invokeLater({
                     // Guard: skip if the settings dialog was disposed while discovery was in flight
                     if (!panelRef.panel.isDisplayable) return@invokeLater
-                    // Pass ToolInfo directly — no conversion needed
+                    // Key by tool.name (raw name like "build_project") — this
+                    // matches the discovered tools cache format. The panel handles
+                    // compound-key fallback in loadToolPermissionsFromSettings via
+                    // id-based lookup when the persisted toolPermissions uses
+                    // prefixed keys like "intellij_build_project".
                     val toolMap = allTools.associate { tool -> tool.name to tool }
                     panelRef.updateToolPermissions(toolMap)
                     panelRef.discoverToolsButton.isEnabled = true
@@ -211,8 +243,22 @@ class OpenCodeMcpConfigurable : Configurable {
                     if (allTools.isEmpty()) {
                         panelRef.showToolPermissionsStatus(
                             "No tools found. Ensure the OpenCode server is running on port ${settings.port}.", false)
+                    } else if (mcpServerCount == 0 && settings.enableIntellijMcp) {
+                        // MCP is enabled but no MCP servers connected — warn the user
+                        panelRef.showToolPermissionsStatus(
+                            "Discovered ${allTools.size} built-in tools, but no MCP tools — " +
+                            "the IntelliJ MCP server is not connected. " +
+                            "Check the MCP SSE URL in settings and that MCP Server is enabled in " +
+                            "Settings → Tools → MCP Server.", false)
+                    } else if (mcpToolCount == 0 && mcpServerCount > 0) {
+                        // MCP servers connected but no tools discovered — partial failure
+                        panelRef.showToolPermissionsStatus(
+                            "Discovered ${allTools.size} tools, but MCP servers ($mcpServerCount) " +
+                            "returned no tools. The MCP server may not expose any tools.", false)
                     } else {
-                        panelRef.showToolPermissionsStatus("Discovered ${allTools.size} tools successfully.", true)
+                        val mcpMsg = if (mcpToolCount > 0) " ($mcpToolCount from MCP)" else ""
+                        panelRef.showToolPermissionsStatus(
+                            "Discovered ${allTools.size} tools$mcpMsg successfully.", true)
                     }
                 }, modality)
             } catch (e: CancellationException) {
@@ -262,15 +308,35 @@ class OpenCodeMcpConfigurable : Configurable {
     }
 
     /**
-     * Get the active project. Uses [ProjectManager.openProjects.firstOrNull]
-     * which returns the most recently opened project. In multi-project windows,
-     * this may not match the focused project — the Configurable API does not
-     * carry a project reference, and WindowManager does not expose a focused-project
-     * accessor. For this settings dialog, the first open project is the best
-     * available approximation.
+     * Get the active project. Prefers the tracked [focusedProject] (set via
+     * [com.opencode.acp.chat.ChatToolWindowFactory] or a focus listener) when
+     * available and not disposed. Falls back to [ProjectManager.openProjects.firstOrNull]
+     * — the most recently opened project — when no focused project is tracked.
+     *
+     * In multi-project windows, the Configurable API does not carry a project
+     * reference, so the companion [focusedProject] is the best available
+     * approximation of the focused project.
      */
     private fun getActiveProject(): com.intellij.openapi.project.Project? {
+        // Prefer the tracked focused project (set via FocusChangeListener or tool window
+        // activation). Falls back to the first open project if no focused project is tracked.
+        val focused = focusedProject
+        if (focused != null && !focused.isDisposed) return focused
         return ProjectManager.getInstance().openProjects.firstOrNull()
+    }
+
+    companion object {
+        /**
+         * The currently focused project, set by [com.opencode.acp.chat.ChatToolWindowFactory]
+         * or a focus listener. Used by the settings configurable to resolve the correct
+         * project for MCP config writes and tool permission application.
+         *
+         * In multi-project windows, the Configurable API does not carry a project
+         * reference, so this companion variable is the best available approximation.
+         * Falls back to the first open project when null.
+         */
+        @Volatile
+        var focusedProject: com.intellij.openapi.project.Project? = null
     }
 
 }

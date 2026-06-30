@@ -110,6 +110,13 @@ object PrunerConfigWriter {
      *     "enabled": true,
      *     "mode": "range",
      *     "protectedTools": ["task", "skill", "todowrite", "todoread", "write", "edit"]
+     *   },
+     *   "nudge": {
+     *     "enabled": true,
+     *     "thresholdPercent": 60,
+     *     "urgentPercent": 80,
+     *     "cooldownTurns": 3,
+     *     "defaultContextLimit": 128000
      *   }
      * }
      * ```
@@ -133,6 +140,13 @@ object PrunerConfigWriter {
                         add(JsonPrimitive(it))
                     }
                 })
+            })
+            put("nudge", buildJsonObject {
+                put("enabled", JsonPrimitive(settings.prunerNudgeEnabled))
+                put("thresholdPercent", JsonPrimitive(settings.prunerNudgeThresholdPercent))
+                put("urgentPercent", JsonPrimitive(settings.prunerNudgeUrgentPercent))
+                put("cooldownTurns", JsonPrimitive(settings.prunerNudgeCooldownTurns))
+                put("defaultContextLimit", JsonPrimitive(settings.prunerDefaultContextLimit))
             })
         }
     }

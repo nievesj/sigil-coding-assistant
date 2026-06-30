@@ -9,7 +9,9 @@ import com.opencode.acp.chat.ui.compose.MarkdownSegment
 import com.opencode.acp.chat.ui.compose.MarkdownSegmenter
 import com.opencode.acp.chat.ui.compose.StreamHealer
 import com.opencode.acp.chat.util.EDT
+import com.opencode.acp.follow.CommandFollowManager
 import com.opencode.acp.follow.EditorFollowManager
+import com.opencode.acp.follow.SearchFollowManager
 import com.opencode.acp.chat.util.generateId
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -221,35 +223,20 @@ class SessionState(
             )
             val sendResult = eventChannel.trySend(resetEvent)
             if (sendResult.isFailure) {
-                // Channel is full (1024 capacity) or closed. Drain ALL stale events
-                // to make room — partial drain leaves the channel full on retry.
-                var drainedCount = 0
-                while (true) {
-                    val r = eventChannel.tryReceive()
-                    if (r.isFailure) break
-                    drainedCount++
-                }
-                if (drainedCount > 0) {
-                    logger.info { "[ACP] createAssistantMessage: drained $drainedCount events to make room for ResetTurn" }
-                }
-                // Retry the ResetTurn send
-                val retryResult = eventChannel.trySend(resetEvent)
-                if (retryResult.isFailure) {
-                    // Still can't send after drain. Launch a coroutine to send
-                    // asynchronously — this avoids the data race of setting ctx fields
-                    // directly from the caller's coroutine while the event coroutine
-                    // reads them without synchronization. The launch is fire-and-forget;
-                    // if it fails (channel closed), the ResetTurn is lost but subsequent
-                    // SSE events will be dropped by processEvent()'s ClosedSendChannelException catch.
-                    logger.warn { "[ACP] createAssistantMessage: eventChannel FULL after drain — launching async send. id=$id" }
-                    scope.launch {
-                        try {
-                            eventChannel.send(resetEvent)
-                        } catch (e: Exception) {
-                            logger.error(e) { "[ACP] createAssistantMessage: async send failed — ResetTurn lost. id=$id" }
-                        }
-                    }
-                }
+                // Channel is full (1024 capacity) or closed. Do NOT drain the channel
+                // and do NOT write ctx fields directly — that would race with the event
+                // processing coroutine, which mutates ctx fields WITHOUT acquiring
+                // stateLock (it relies on single-writer serialization via the channel).
+                //
+                // Instead, drop the ResetTurn. The event processing coroutine's
+                // auto-create logic (the `needsNewMessage` check in processEventInternal)
+                // will create the assistant message when the first content-bearing SSE
+                // event arrives, using the serverMessageId from that event. This is the
+                // same path used for child/subagent sessions and is well-tested.
+                //
+                // The only downside is that ctx.isStreaming won't be true until the first
+                // event arrives, but that's a sub-millisecond window in practice.
+                logger.warn { "[ACP] createAssistantMessage: eventChannel FULL — ResetTurn dropped, auto-create will handle it. id=$id" }
             }
         }
 
@@ -292,12 +279,22 @@ class SessionState(
     }
 
     fun completeStreaming(messageId: String) = stateLock.withLock {
-        if (messageId != ctx.activeMessageId) return@withLock
+        if (messageId != ctx.activeMessageId) {
+            logger.warn { "[ACP] completeStreaming: SKIP messageId=$messageId != activeMessageId=${ctx.activeMessageId}" }
+            return@withLock
+        }
+        val textKeysBefore = _messages.value[messageId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
+        logger.info { "[ACP] completeStreaming: START msg=$messageId partsBefore=${_messages.value[messageId]?.parts?.size} textKeys=$textKeysBefore" }
         freezeCurrentThinking()
         flushRevealBuffer()
         resegmentTextPartsFinal(messageId)
         ctx.isStreaming = false
         updateMessage(messageId) { it.copy(isStreaming = false, state = MessageState.Completed) }
+        val textKeysAfter = _messages.value[messageId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
+        logger.info { "[ACP] completeStreaming: END msg=$messageId partsAfter=${_messages.value[messageId]?.parts?.size} textKeys=$textKeysAfter" }
+        if (textKeysBefore != null && textKeysAfter != null && textKeysBefore != textKeysAfter) {
+            logger.warn { "[ACP] completeStreaming KEYS CHANGED: msg=$messageId before=$textKeysBefore after=$textKeysAfter removed=${textKeysBefore - textKeysAfter} added=${textKeysAfter - textKeysBefore}" }
+        }
         emitStreamingCompleted(messageId)
     }
 
@@ -353,6 +350,7 @@ class SessionState(
             // Clean up tool call index for the removed message
             entry.value.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
                 ctx.toolCallIndex.remove(part.pill.toolCallId)
+                ctx.toolCallPills.remove(part.pill.toolCallId)
             }
             current.remove(entry.key)
             _messages.value = current
@@ -371,10 +369,12 @@ class SessionState(
         if (closed) return@withLock
         val current = LinkedHashMap<String, ChatMessage>()
         ctx.toolCallIndex.clear()
+        ctx.toolCallPills.clear()
         newMessages.forEach { message ->
             current[message.id] = message
             message.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
                 ctx.toolCallIndex[part.pill.toolCallId] = message.id
+                ctx.toolCallPills[part.pill.toolCallId] = part.pill
             }
         }
         _messages.value = current
@@ -478,7 +478,7 @@ class SessionState(
         }
     }
 
-    fun setLastUserText(text: String?) {
+    fun setLastUserText(text: String?) = stateLock.withLock {
         ctx.lastUserText = text
     }
 
@@ -921,6 +921,62 @@ class SessionState(
                                 )
                             }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (duplicate-ToolUse path)" } }
                         }
+
+                        // Follow Agent: EXECUTE tools — open a read-only Run console.
+                        val dupKind = if (existingPill.kind == ToolKind.OTHER) {
+                            ToolMapper.detectKindFromInput(event.input)
+                        } else existingPill.kind
+                        if (dupKind == ToolKind.EXECUTE) {
+                            val command = try {
+                                event.input["command"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            val workdir = try {
+                                event.input["workdir"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            val description = try {
+                                event.input["description"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            if (command != null) {
+                                runCatching {
+                                    CommandFollowManager.getInstance(project).followCommand(
+                                        project = project,
+                                        toolCallId = event.toolCallId,
+                                        command = command,
+                                        workdir = workdir,
+                                        description = description,
+                                        agentName = ctx.activeAgentName,
+                                        modelName = ctx.modelID,
+                                    )
+                                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: command console skipped (duplicate path)" } }
+                            }
+                        }
+                        // Follow Agent: SEARCH tools — open Find in Files.
+                        if (dupKind == ToolKind.SEARCH) {
+                            val pattern = try {
+                                event.input["pattern"]?.jsonPrimitive?.contentOrNull
+                                    ?: event.input["query"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            val searchPath = try {
+                                event.input["path"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            val includeGlob = try {
+                                event.input["include"]?.jsonPrimitive?.contentOrNull
+                                    ?: event.input["glob"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            if (pattern != null) {
+                                runCatching {
+                                    SearchFollowManager.getInstance(project).followSearch(
+                                        project = project,
+                                        pattern = pattern,
+                                        searchPath = searchPath,
+                                        includeGlob = includeGlob,
+                                        isRegex = false,
+                                        agentName = ctx.activeAgentName,
+                                        modelName = ctx.modelID,
+                                    )
+                                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: Find in Files skipped (duplicate path)" } }
+                            }
+                        }
                     }
 
                     // For task tools: proactively cache the child session if we just learned the sessionId
@@ -978,6 +1034,60 @@ class SessionState(
                             startTimeMs = pill.startTimeMs,
                         )
                     }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolUse path)" } }
+                }
+
+                // Follow Agent: EXECUTE tools — open a read-only Run console showing the command.
+                if (toolKind == ToolKind.EXECUTE && event.input != null) {
+                    val command = try {
+                        event.input["command"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    val workdir = try {
+                        event.input["workdir"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    val description = try {
+                        event.input["description"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    if (command != null) {
+                        runCatching {
+                            CommandFollowManager.getInstance(project).followCommand(
+                                project = project,
+                                toolCallId = event.toolCallId,
+                                command = command,
+                                workdir = workdir,
+                                description = description,
+                                agentName = ctx.activeAgentName,
+                                modelName = ctx.modelID,
+                            )
+                        }.onFailure { logger.debug(it) { "[ACP] Follow Agent: command console skipped" } }
+                    }
+                }
+
+                // Follow Agent: SEARCH tools — open IntelliJ's native Find in Files.
+                if (toolKind == ToolKind.SEARCH && event.input != null) {
+                    val pattern = try {
+                        event.input["pattern"]?.jsonPrimitive?.contentOrNull
+                            ?: event.input["query"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    val searchPath = try {
+                        event.input["path"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    val includeGlob = try {
+                        event.input["include"]?.jsonPrimitive?.contentOrNull
+                            ?: event.input["glob"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    if (pattern != null) {
+                        runCatching {
+                            SearchFollowManager.getInstance(project).followSearch(
+                                project = project,
+                                pattern = pattern,
+                                searchPath = searchPath,
+                                includeGlob = includeGlob,
+                                isRegex = false,
+                                agentName = ctx.activeAgentName,
+                                modelName = ctx.modelID,
+                            )
+                        }.onFailure { logger.debug(it) { "[ACP] Follow Agent: Find in Files skipped" } }
+                    }
                 }
 
                 if (toolKind == ToolKind.EDIT && event.input != null) {
@@ -1065,6 +1175,22 @@ class SessionState(
                                 project, event.toolCallId, event.content, ToolKind.SEARCH
                             )
                         }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolResult path)" } }
+                    }
+                    // Follow Agent: for execute tools, print output into the Run console.
+                    if (resolvedKind == ToolKind.EXECUTE) {
+                        runCatching {
+                            CommandFollowManager.getInstance(project).followCommandResult(
+                                project = project,
+                                toolCallId = event.toolCallId,
+                                output = event.content,
+                                isError = event.isError,
+                            )
+                            CommandFollowManager.getInstance(project).finishCommand(
+                                project = project,
+                                toolCallId = event.toolCallId,
+                                isError = event.isError,
+                            )
+                        }.onFailure { logger.debug(it) { "[ACP] Follow Agent: command result skipped" } }
                     }
                     // Update the message part with the resolved pill
                     val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
@@ -1379,7 +1505,14 @@ class SessionState(
 
         freezeCurrentThinking()
         flushRevealBuffer()
+        val partsBefore = _messages.value[msgId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
+        logger.debug { "[ACP] finalizeStreaming: BEFORE resegment msg=$msgId reason=$stopReason textKeys=$partsBefore isStreaming=${ctx.isStreaming}" }
         resegmentTextPartsDirect(msgId)
+        val partsAfter = _messages.value[msgId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
+        logger.debug { "[ACP] finalizeStreaming: AFTER resegment msg=$msgId reason=$stopReason textKeys=$partsAfter" }
+        if (partsBefore != null && partsAfter != null && partsBefore != partsAfter) {
+            logger.warn { "[ACP] finalizeStreaming KEYS CHANGED: msg=$msgId reason=$stopReason before=$partsBefore after=$partsAfter removed=${partsBefore - partsAfter} added=${partsAfter - partsBefore}" }
+        }
 
         if (stopReason == "tool-calls") {
             // Intermediate stop — tool calls starting; keep message streaming, don't mark completed
@@ -1397,6 +1530,21 @@ class SessionState(
                 ctx.isStreaming = false
                 updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
                 emitStreamingCompleted(msgId)
+            }
+        } else if (stopReason == "new_message") {
+            // A new message is starting — finalize the old one immediately.
+            // No debounce: the new message's content events are already arriving,
+            // so there's nothing to wait for. The 300ms debounce would delay the
+            // isStreaming=true→false transition on the old message, causing a mass
+            // LazyColumn dispose+recreate when it finally fires (the flicker bug).
+            //
+            // Do NOT emit StreamingCompleted here — createAssistantMessage already
+            // reset streamingCompletedEmitted via resetTurnState(), so the new
+            // message's completion will emit it. Emitting here would prematurely
+            // set _streamPhase=IDLE while the new message is actively streaming.
+            logger.info { "[ACP] finalizeStreaming (new_message): immediate finalization (no debounce, no StreamingCompleted)" }
+            stateLock.withLock {
+                updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
             }
         } else {
             val capturedMsgId = msgId
@@ -1422,6 +1570,7 @@ class SessionState(
         flushThinkingRevealBuffer()
         val content = ctx.thinkingRevealBuffer.substring(0, ctx.thinkingRevealedLen)
         val msgId = ctx.activeMessageId ?: return
+        logger.debug { "[ACP] freezeCurrentThinking: msg=$msgId key=$key contentLen=${content.length}" }
         updateMessage(msgId) { msg ->
             val parts = LinkedHashMap(msg.parts)
             parts[key] = MessagePart.Thinking(content = content, state = PartState.Completed)
@@ -1581,6 +1730,7 @@ class SessionState(
      * abortStreaming, and TextReplace handler.
      */
     private fun flushRevealBuffer() {
+        logger.debug { "[ACP] flushRevealBuffer: revealedLen=${ctx.revealedLen}→${ctx.revealBuffer.length} bufferLen=${ctx.revealBuffer.length}" }
         ctx.sourceComplete = true
         ctx.revealedLen = ctx.revealBuffer.length
         ctx.revealJob?.cancel()
@@ -1730,6 +1880,10 @@ class SessionState(
                     }
                 }
 
+            val totalNewSegParts = partsBySegment.sumOf { it.size }
+            val segFunc = if (overrideIsStreaming) "segmentHealed" else "segment"
+            logger.debug { "[ACP] resegment: msg=$msgId oldParts=${oldParts.size} preserved=${preserved.size} newSegParts=$totalNewSegParts revealedLen=${ctx.revealedLen} segments=${segmentsSnapshot.size} func=$segFunc" }
+
                 // Rebuild map: insert each segment's parts after its anchor
                 val newMap = linkedMapOf<String, MessagePart>()
                 var nextSegToInsert = 0
@@ -1755,17 +1909,32 @@ class SessionState(
                     nextSegToInsert++
                 }
 
+                if (newMap.isEmpty() && oldParts.isNotEmpty()) {
+                    logger.warn { "[ACP] resegment: EMPTY RESULT! msg=$msgId oldParts=${oldParts.size} preserved=${preserved.size} newSegParts=$totalNewSegParts revealedLen=${ctx.revealedLen} textBufferLen=${ctx.textBuffer.length}" }
+                }
+
+                // Detect key changes — if text-derived keys changed, Compose disposes+recreates
+                val oldTextKeys = oldParts.keys.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }.toSet()
+                val newTextKeys = newMap.keys.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }.toSet()
+                val keysRemoved = oldTextKeys - newTextKeys
+                val keysAdded = newTextKeys - oldTextKeys
+                if (keysRemoved.isNotEmpty() || keysAdded.isNotEmpty()) {
+                    logger.warn { "[ACP] resegment KEYS CHANGED: msg=$msgId func=$segFunc removed=$keysRemoved added=$keysAdded" }
+                }
+
                 msg.copy(parts = newMap)
             }
         }
     }
 
     private fun resegmentTextPartsFinal(msgId: String) = stateLock.withLock {
-        // Pass overrideIsStreaming=false so resegmentTextPartsDirect uses
-        // non-healed segmentation without temporarily mutating ctx.isStreaming.
-        // This avoids a thread-safety issue where the event processing coroutine
-        // could read the temporarily-false value.
-        resegmentTextPartsDirect(msgId, overrideIsStreaming = false)
+        // Use segmentHealed (same as streaming) to avoid changing part keys on
+        // finalization. Switching from segmentHealed→segment can produce different
+        // segment counts, changing keys like text_0_0→text_0_0+text_0_1, which
+        // causes Compose to dispose+recreate every visible part — the "jump" flicker.
+        // For complete content, segmentHealed and segment produce identical results;
+        // for any edge case, consistency is more important than the non-healed path.
+        resegmentTextPartsDirect(msgId, overrideIsStreaming = true)
     }
 
     companion object {
@@ -1780,7 +1949,12 @@ class SessionState(
     private fun updateMessage(messageId: String, transform: (ChatMessage) -> ChatMessage) = stateLock.withLock {
         val map = _messages.value
         val existing = map[messageId] ?: return@withLock
+        val beforePartsCount = existing.parts.size
         val result = transform(existing)
+        val afterPartsCount = result.parts.size
+        if (afterPartsCount == 0 && beforePartsCount > 0) {
+            logger.warn { "[ACP] updateMessage: EMPTY PARTS! msg=$messageId before=$beforePartsCount after=$afterPartsCount" }
+        }
         val updated = LinkedHashMap(map)
         updated[messageId] = result
         _messages.value = updated
@@ -1811,10 +1985,13 @@ class SessionState(
                 // Callers (sendMessageInternal, EditorFollowManager) rely on this
                 // for path traversal validation — returning raw paths bypasses
                 // their boundary checks.
+                // Return null on failure: a path that can't be canonicalized is
+                // untrusted (permissions, broken symlink, non-existent path).
+                // Callers already handle null gracefully (they skip the operation).
                 return try {
                     java.io.File(rawPath).canonicalPath
                 } catch (_: Exception) {
-                    rawPath // fall back to raw if canonicalization fails
+                    null
                 }
             }
         }
