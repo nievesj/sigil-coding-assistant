@@ -45,11 +45,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
@@ -127,7 +123,7 @@ suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? 
                 com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
                     deferred.complete(readClipboardOnEdt())
                 }
-                deferred.await()
+                kotlinx.coroutines.withTimeoutOrNull(5000) { deferred.await() }
             } catch (e: Exception) {
                 null
             }
@@ -162,7 +158,7 @@ suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? 
                 else -> null
             }
         } catch (e: Exception) {
-
+            logger.debug(e) { "[ACP] readClipboardContent: failed to read clipboard" }
             null
         }
     }
@@ -235,7 +231,7 @@ private fun readClipboardOnEdt(): Any? {
         }
 
     } catch (e: Exception) {
-
+        logger.debug(e) { "[ACP] readClipboardOnEdt: clipboard access failed" }
     }
     return null
 }
@@ -572,14 +568,15 @@ fun InputArea(
             // per frame inside drawBehind, so the composable body does not recompose
             // on every animation frame — only the draw scope re-executes.
             if (isStreaming) {
-                val infiniteTransition = rememberInfiniteTransition(label = "glow")
-                val rotation = infiniteTransition.animateFloat(
+                // Throttled glow rotation — replaces rememberInfiniteTransition to reduce
+                // GPU command flush pressure. See rememberThrottledInfiniteAnimation docs.
+                val rotation = rememberThrottledInfiniteAnimation(
+                    active = isStreaming,
                     initialValue = 0f,
                     targetValue = 360f,
-                    animationSpec = infiniteRepeatable(
-                        animation = tween(ChatTheme.animations.glowPulseMs, easing = LinearEasing)
-                    ),
-                    label = "rotation"
+                    durationMillis = ChatTheme.animations.glowPulseMs,
+                    repeatMode = RepeatMode.Restart,
+                    label = "glow",
                 )
                 val density = LocalDensity.current
                 val cornerRadiusPx = with(density) { ChatTheme.dims.inputCornerRadius.toPx() }

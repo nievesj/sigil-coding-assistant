@@ -54,12 +54,7 @@ import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
-import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
@@ -315,7 +310,11 @@ private data class TreeItem(
 /**
  * Builds a flat list from a tree of sessions, preserving parent-child order.
  * Parents appear first, then their children indented one level deeper.
- * Orphaned children (parent not in list) are promoted to top level.
+ * Orphaned children (parent not in the list) are promoted to top level.
+ *
+ * Cycle safety: The `processed` set (line ~327) prevents infinite recursion
+ * if the session tree has a cycle (e.g., A→B→A parent links from a server data bug).
+ * Each session is visited at most once.
  */
 private fun buildSessionTree(sessions: List<SessionItem>): List<TreeItem> {
     val sessionMap = sessions.associateBy { it.id }
@@ -366,34 +365,22 @@ private fun defaultExpandedParents(
     selectedId: String?,
 ): Set<String> {
     if (selectedId == null) return emptySet()
-    // Find the selected item's ancestor chain
     val selectedIdx = fullTree.indexOfFirst { it.session.id == selectedId }
     if (selectedIdx < 0) return emptySet()
-    // Walk backwards to find the root parent of the selected item
-    val selectedDepth = fullTree[selectedIdx].depth
-    var rootParentIdx = selectedIdx
-    for (i in selectedIdx downTo 0) {
-        if (fullTree[i].depth == 0) {
-            rootParentIdx = i
-            break
-        }
-        if (fullTree[i].depth < fullTree[rootParentIdx].depth) {
-            rootParentIdx = i
-        }
-    }
-    // Expand all ancestors along the path from root to selected
+    // Walk backwards from the selected item, collecting ALL ancestors
+    // (items with strictly decreasing depth). Each ancestor that has
+    // children must be expanded so the selected item is visible.
     val expanded = mutableSetOf<String>()
-    var curIdx = rootParentIdx
-    while (curIdx < fullTree.size) {
-        val item = fullTree[curIdx]
-        if (item.hasChildren) {
-            expanded.add(item.session.id)
-        }
-        // Move to next item — if it's a child of current, continue
-        if (curIdx + 1 < fullTree.size && fullTree[curIdx + 1].depth > item.depth) {
-            curIdx++
-        } else {
-            break
+    var currentDepth = fullTree[selectedIdx].depth
+    for (i in selectedIdx downTo 0) {
+        val item = fullTree[i]
+        if (item.depth < currentDepth) {
+            // This is an ancestor — it must be expanded
+            if (item.hasChildren) {
+                expanded.add(item.session.id)
+            }
+            currentDepth = item.depth
+            if (currentDepth == 0) break
         }
     }
     return expanded
@@ -429,6 +416,10 @@ private fun SessionList(
     // Compute visible items by walking the tree with indices (O(n) instead of
     // the previous O(n²) filter that used indexOf + subList per item).
     // An item is visible if all its ancestors are expanded.
+    // NOTE: The inner ancestor-walk is O(depth) per item, so overall O(n * depth).
+    // For typical session trees (depth 2-3) this is effectively O(n). Deep subagent
+    // chains (depth 10+) would degrade — if that becomes common, precompute a
+    // parent-index map for O(1) ancestor lookup.
     val visibleItems = remember(fullTree, expandedIds.toMap()) {
         fullTree.filterIndexed { idx, item ->
             if (item.depth == 0) return@filterIndexed true
@@ -715,9 +706,13 @@ private fun SessionRow(
 
 /**
  * Applies a horizontal-gradient shimmer band when [indicator] is CREATING or STREAMING.
- * Uses [composed] so the infinite transition is only created when [indicator] is not
+ * Uses [composed] so the throttled animation is only created when [indicator] is not
  * [SessionIndicator.NONE] — no animation runs for idle sessions. The shimmer progress
  * [State] is read inside [drawBehind] to avoid recomposition every animation frame.
+ *
+ * Uses [rememberThrottledInfiniteAnimation] instead of [rememberInfiniteTransition] to
+ * reduce GPU command flush pressure. The throttle FPS is configurable via Settings →
+ * Tools → Sigil → "Animation FPS".
  */
 private fun Modifier.sessionShimmer(indicator: SessionIndicator): Modifier = composed {
     if (indicator == SessionIndicator.NONE) return@composed Modifier
@@ -726,15 +721,13 @@ private fun Modifier.sessionShimmer(indicator: SessionIndicator): Modifier = com
     val soft = ChatTheme.colors.component.glowStart
     val peak = ChatTheme.colors.component.glowPeak
 
-    val transition = rememberInfiniteTransition(label = "shimmer")
-    val shimmerProgressState = transition.animateFloat(
+    val shimmerProgressState = rememberThrottledInfiniteAnimation(
+        active = true,  // already gated by the NONE check above
         initialValue = -0.4f,
         targetValue = 1.4f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1500, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "shimmerProgress"
+        durationMillis = ChatTheme.animations.shimmerSweepMs,
+        repeatMode = RepeatMode.Restart,
+        label = "shimmer",
     )
 
     Modifier.drawBehind {

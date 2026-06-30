@@ -28,6 +28,8 @@ import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ToolCallPill
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.follow.EditorFollowManager
+import com.opencode.acp.follow.CommandFollowManager
+import com.opencode.acp.follow.SearchFollowManager
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -42,6 +44,7 @@ fun ToolPill(
     pill: ToolCallPill,
     modifier: Modifier = Modifier,
     getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
+    project: com.intellij.openapi.project.Project? = null,
 ) {
     // Default expanded from settings — task pills use dedicated setting, others use ToolKind setting
     val settings = OpenCodeSettingsState.getInstance()
@@ -141,13 +144,12 @@ fun ToolPill(
             // Shown whenever the pill has a resolvable file path. Disabled (no-op)
             // when Follow Agent is off — keeps the affordance discoverable while
             // preventing accidental file opens from a feature the user hasn't opted into.
-            val followEnabled = remember {
-                OpenCodeSettingsState.getInstance().followAgentEnabled
-            }
+            val followEnabled = OpenCodeSettingsState.getInstance().followAgentEnabled
             val openInEditorPath = remember(pill.kind, pill.input) {
                 pill.input?.let { input ->
                     val path = input.getString("file_path")
                         ?: input.getString("filePath")
+                        ?: input.getString("old_file_path")
                         ?: input.getString("path")
                     path?.takeIf { it.isNotBlank() }
                 }
@@ -161,13 +163,15 @@ fun ToolPill(
                         .size(20.dp)
                         .padding(2.dp)
                         .clickable(enabled = followEnabled) {
-                            val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-                            if (project != null) {
+                            val proj = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+                            if (proj != null) {
                                 val line = try {
-                                    pill.input?.get("offset")?.jsonPrimitive?.intOrNull ?: 0
+                                    pill.input?.get("offset")?.jsonPrimitive?.intOrNull
+                                        ?: pill.input?.get("start_line")?.jsonPrimitive?.intOrNull
+                                        ?: 0
                                 } catch (_: Exception) { 0 }
-                                EditorFollowManager.getInstance(project).openFileAtLine(
-                                    project = project,
+                                EditorFollowManager.getInstance(proj).openFileAtLine(
+                                    project = proj,
                                     filePath = openInEditorPath,
                                     line = line,
                                     focus = true,
@@ -177,6 +181,65 @@ fun ToolPill(
                     tint = if (followEnabled) ChatTheme.colors.component.taskRunning
                            else ChatTheme.colors.component.taskPending,
                 )
+            }
+
+            // Open-in-console icon button for EXECUTE tools (Follow Agent).
+            // Opens the Run tool window console tab for this command.
+            if (pill.kind == ToolKind.EXECUTE) {
+                Spacer(Modifier.width(6.dp))
+                Icon(
+                    key = AllIconsKeys.Nodes.Console,
+                    contentDescription = if (followEnabled) "Open in Run console" else "Follow Agent disabled",
+                    modifier = Modifier
+                        .size(20.dp)
+                        .padding(2.dp)
+                        .clickable(enabled = followEnabled) {
+                            val proj = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+                            if (proj != null) {
+                                CommandFollowManager.getInstance(proj)
+                                    .activateConsole(proj, pill.toolCallId)
+                            }
+                        },
+                    tint = if (followEnabled) ChatTheme.colors.component.taskRunning
+                           else ChatTheme.colors.component.taskPending,
+                )
+            }
+
+            // Open-in-Find icon button for SEARCH tools (Follow Agent).
+            // Re-triggers Find in Files with the agent's search parameters.
+            if (pill.kind == ToolKind.SEARCH) {
+                val searchPattern = remember(pill.input) {
+                    try {
+                        pill.input?.get("pattern")?.jsonPrimitive?.contentOrNull
+                            ?: pill.input?.get("query")?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                }
+                if (searchPattern != null) {
+                    Spacer(Modifier.width(6.dp))
+                    Icon(
+                        key = AllIconsKeys.Actions.Search,
+                        contentDescription = if (followEnabled) "Open in Find in Files" else "Follow Agent disabled",
+                        modifier = Modifier
+                            .size(20.dp)
+                            .padding(2.dp)
+                            .clickable(enabled = followEnabled) {
+                                val proj = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+                                if (proj != null) {
+                                    val sPath = try {
+                                        pill.input?.get("path")?.jsonPrimitive?.contentOrNull
+                                    } catch (_: Exception) { null }
+                                    val sGlob = try {
+                                        pill.input?.get("include")?.jsonPrimitive?.contentOrNull
+                                            ?: pill.input?.get("glob")?.jsonPrimitive?.contentOrNull
+                                    } catch (_: Exception) { null }
+                                    SearchFollowManager.getInstance(proj)
+                                        .reopenSearch(proj, searchPattern, sPath, sGlob, isRegex = false)
+                                }
+                            },
+                        tint = if (followEnabled) ChatTheme.colors.component.taskRunning
+                               else ChatTheme.colors.component.taskPending,
+                    )
+                }
             }
 
             // Line delta (+N / -N)
@@ -438,17 +501,6 @@ private fun formatOutput(output: List<JsonObject>): String {
             "$key=$content"
         }
     }
-}
-
-private fun formatInputAsText(input: JsonObject): String {
-    val skip = setOf("content", "command", "description", "file_path", "path", "old_file_path",
-        "old_string", "new_string", "old", "new", "workdir", "timeout")
-    return input.entries
-        .filter { it.key !in skip }
-        .joinToString("\n") { (key, value) ->
-            val content = try { value.jsonPrimitive.content } catch (_: Exception) { value.toString() }
-            "$key=$content"
-        }
 }
 
 private fun toolKindLabel(kind: ToolKind): String = when (kind) {

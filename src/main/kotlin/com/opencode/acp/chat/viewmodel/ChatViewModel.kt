@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -445,7 +446,7 @@ class ChatViewModel(
                             // Merge persisted permissions after discovery
                             val persisted = loadPersistedPermissions()
                             if (persisted.isNotEmpty()) {
-                                registry.loadPermissions(persisted)
+                                registry.loadEnabledAndPermissions(persisted)
                             }
                             // Update McpManager tool counts from discovered tools
                             service.mcpManager?.updateToolCounts(registry)
@@ -747,8 +748,11 @@ class ChatViewModel(
                 // by the next drain.
                 val alreadyRequeued = _queuedMessages.value.any { it.id == next.id }
                 if (!alreadyRequeued) {
-                    _queuedMessages.value = _queuedMessages.value + next
-                    logger.warn { "[ACP] drainQueue: re-queued failed message (attempt $retryCount/$MAX_QUEUE_RETRIES) — ${result.message}" }
+                    // Re-insert at the FRONT of the queue to preserve send order.
+                    // Appending to the end would reorder this message after any
+                    // messages the user sent during the retry delay window.
+                    _queuedMessages.value = listOf(next) + _queuedMessages.value
+                    logger.warn { "[ACP] drainQueue: re-queued failed message at front of queue (attempt $retryCount/$MAX_QUEUE_RETRIES) — ${result.message}" }
                 } else {
                     // Already re-queued by a concurrent drain — just update the retry count
                     logger.debug { "[ACP] drainQueue: message ${next.id} already re-queued, skipping duplicate add (attempt $retryCount/$MAX_QUEUE_RETRIES)" }
@@ -796,10 +800,13 @@ class ChatViewModel(
                     prompt.options.getOrNull(idx)?.label
                 }
                 val answers = mutableListOf<List<String>>()
-                val answer = selectedLabels.toMutableList()
-                response.customInput?.let { answer.add(it) }
-                if (answer.isNotEmpty()) {
-                    answers.add(answer)
+                if (selectedLabels.isNotEmpty()) {
+                    answers.add(selectedLabels)
+                }
+                response.customInput?.let { custom ->
+                    if (custom.isNotBlank()) {
+                        answers.add(listOf(custom))
+                    }
                 }
                 if (answers.isEmpty()) {
                     service.rejectQuestion(prompt.promptId, prompt.sessionId)
@@ -1195,7 +1202,7 @@ class ChatViewModel(
 
     // --- Permission persistence ---
 
-    private fun loadPersistedPermissions(): Map<String, ToolPermission> {
+    private fun loadPersistedPermissions(): Map<String, Pair<Boolean, ToolPermission>> {
         val settings = OpenCodeSettingsState.getInstance()
         val permsJson = settings.toolPermissions
         if (permsJson.isBlank()) return emptyMap()
@@ -1203,8 +1210,9 @@ class ChatViewModel(
             val obj = Json.parseToJsonElement(permsJson).jsonObject
             obj.entries.associate { (toolName, element) ->
                 val toolObj = element.jsonObject
+                val enabled = toolObj["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
                 val permStr = toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow"
-                toolName to ToolPermission.fromActionString(permStr)
+                toolName to Pair(enabled, ToolPermission.fromActionString(permStr))
             }
         } catch (e: Exception) {
             logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — corrupted settings, clearing" }

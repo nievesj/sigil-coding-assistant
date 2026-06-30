@@ -175,6 +175,13 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     /** Fallback context limit when the model object doesn't expose one. Clamped to 1000..2_000_000 on set. */
     var prunerDefaultContextLimit: Int = 128000
 
+    /** Target FPS for throttled infinite animations (glow, pulse, shimmer).
+     *  Lower values reduce GPU command flush pressure (DirectContextKt._nFlushAndSubmit stalls)
+     *  by generating fewer Skiko frames per second. 60 = full vsync (original behavior),
+     *  30 = half pressure (default, visually identical for slow animations), 15 = quarter pressure.
+     *  Clamped to 15..60 on load. */
+    var animationThrottleFps: Int = 30
+
     /** Plugin log level for idea.log. One of OFF, ERROR, WARN, INFO, DEBUG, TRACE, ALL.
      *  Default INFO — shows startup/connection/error logs. Set DEBUG/ALL for troubleshooting.
      *  Applied at startup via [com.opencode.acp.config.settings.StartupLogConfigListener]
@@ -189,6 +196,19 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * have not opted in.
      */
     var followAgentEnabled: Boolean = false
+    /**
+     * When Follow Agent is enabled, also show agent-executed commands in a read-only
+     * console in the Run tool window. Default true — if the user opted into Follow Agent,
+     * they want to see command output too.
+     */
+    var followCommandsInConsole: Boolean = true
+
+    /**
+     * When Follow Agent is enabled, also open IntelliJ's native Find in Files when the
+     * agent performs a search. Default true — gives the user an interactive result set
+     * they can navigate, filter, and group.
+     */
+    var followSearchesInFindWindow: Boolean = true
     /** Highlight color for READ tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
     var followReadColor: String = "#5078C888"
     /** Highlight color for EDIT tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
@@ -283,8 +303,6 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         }
         longTimeoutBufferSeconds = state.longTimeoutBufferSeconds.coerceAtLeast(10)
         toolStuckTimeoutSeconds = state.toolStuckTimeoutSeconds.coerceIn(60, 3600)
-        @Suppress("DEPRECATION")
-        sseSocketTimeoutSeconds = state.sseSocketTimeoutSeconds
         // Clear deprecated field after migration to prevent it from being
         // re-persisted to XML on every IDE restart (reduces settings churn).
         @Suppress("DEPRECATION")
@@ -319,6 +337,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
         discoveredToolsJson = state.discoveredToolsJson
         followAgentEnabled = state.followAgentEnabled
+        followCommandsInConsole = state.followCommandsInConsole
         followReadColor = state.followReadColor
         followEditColor = state.followEditColor
         followSearchColor = state.followSearchColor
@@ -327,6 +346,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         followMoveColor = state.followMoveColor
         followFetchColor = state.followFetchColor
         followOtherColor = state.followOtherColor
+        followSearchesInFindWindow = state.followSearchesInFindWindow
         showDisconnectConfirmation = state.showDisconnectConfirmation
         // Context & Compaction settings (with clamping for corrupt/out-of-range values)
         truncateToolOutput = state.truncateToolOutput
@@ -352,6 +372,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         prunerNudgeUrgentPercent = state.prunerNudgeUrgentPercent.coerceIn(50, 99)
         prunerNudgeCooldownTurns = state.prunerNudgeCooldownTurns.coerceIn(1, 10)
         prunerDefaultContextLimit = state.prunerDefaultContextLimit.coerceIn(1000, 2_000_000)
+        animationThrottleFps = state.animationThrottleFps.coerceIn(15, 60)
         logLevel = AcpLogLevel.fromName(state.logLevel).name
     }
 
@@ -370,16 +391,43 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     fun toggleFavoriteModel(providerID: String, modelID: String) {
         val key = modelKey(providerID, modelID)
-        if (favoriteModels.contains(key)) {
-            favoriteModels.remove(key)
-        } else {
-            favoriteModels.add(key)
+        // Replace the ArrayList reference atomically (per project convention for
+        // commandHistory) — never mutate in-place to avoid XStream serialization races.
+        favoriteModels = java.util.ArrayList(favoriteModels).apply {
+            if (contains(key)) remove(key) else add(key)
         }
     }
 
     /** Remove stale favorites for models that no longer exist. Only runs when models are loaded. */
     fun cleanupStaleFavorites(allModels: List<ProviderModel>) {
         val validKeys = allModels.map { modelKey(it.providerID, it.modelID) }.toSet()
-        favoriteModels.removeAll { it !in validKeys }
+        favoriteModels = java.util.ArrayList(favoriteModels.filter { it in validKeys })
+    }
+
+    /**
+     * Reorder a favorite by moving it from [fromIndex] to [toIndex] within [favoriteModels].
+     * No-op if indices are equal or out of bounds. The list reference is replaced atomically; the
+     * PersistentStateComponent persists the new order on IDE state flush.
+     */
+    fun reorderFavoriteModel(fromIndex: Int, toIndex: Int) {
+        if (fromIndex == toIndex) return
+        if (fromIndex !in favoriteModels.indices) return
+        // Replace the ArrayList reference atomically — never mutate in-place.
+        favoriteModels = java.util.ArrayList(favoriteModels).apply {
+            val key = removeAt(fromIndex)
+            val clamped = toIndex.coerceIn(0, size)
+            add(clamped, key)
+        }
+    }
+
+    /**
+     * Move a favorite identified by [key] to [toIndex] within [favoriteModels].
+     * Used by the search-filtered drag path where visible indices differ from
+     * persisted indices. No-op if the key is not found.
+     */
+    fun moveFavoriteToIndex(key: String, toIndex: Int) {
+        val fromIndex = favoriteModels.indexOf(key)
+        if (fromIndex < 0) return
+        reorderFavoriteModel(fromIndex, toIndex)
     }
 }

@@ -23,7 +23,6 @@ If you're curious how open weights compare for practical software work, this rep
 *The main chat interface with sessions on the left and the conversation in the middle. Tool pills and markdown responses show up inline.*
 
 ## What it does
-
 - **AI chat inside the IDE** - Ask questions, paste code, attach files, and get answers in a side panel. Responses render markdown, code blocks, and inline tool usage.
 - **Sessions** - Keep conversations organized. Each session tracks its own token usage and estimated cost.
 - **Context panel** - See how much context you're using, what model is active, and a rough cost breakdown.
@@ -58,6 +57,7 @@ The review feature is one of the more useful parts. There are a few commands tha
 - **`/review-recheck`** — re-runs the review with awareness of existing comments and your replies, so the agent can verify whether unresolved issues were actually fixed.
 
 When a review finishes, you get:
+
 
 - A **Review tab** that lists files, comment counts, and line change summaries.
 - **Inline comments** in the editor gutter that you can resolve, reply to, delete, or add your own comments for the AI to address.

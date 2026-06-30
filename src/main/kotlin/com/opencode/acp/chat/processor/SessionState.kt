@@ -9,7 +9,9 @@ import com.opencode.acp.chat.ui.compose.MarkdownSegment
 import com.opencode.acp.chat.ui.compose.MarkdownSegmenter
 import com.opencode.acp.chat.ui.compose.StreamHealer
 import com.opencode.acp.chat.util.EDT
+import com.opencode.acp.follow.CommandFollowManager
 import com.opencode.acp.follow.EditorFollowManager
+import com.opencode.acp.follow.SearchFollowManager
 import com.opencode.acp.chat.util.generateId
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -221,35 +223,20 @@ class SessionState(
             )
             val sendResult = eventChannel.trySend(resetEvent)
             if (sendResult.isFailure) {
-                // Channel is full (1024 capacity) or closed. Drain ALL stale events
-                // to make room — partial drain leaves the channel full on retry.
-                var drainedCount = 0
-                while (true) {
-                    val r = eventChannel.tryReceive()
-                    if (r.isFailure) break
-                    drainedCount++
-                }
-                if (drainedCount > 0) {
-                    logger.info { "[ACP] createAssistantMessage: drained $drainedCount events to make room for ResetTurn" }
-                }
-                // Retry the ResetTurn send
-                val retryResult = eventChannel.trySend(resetEvent)
-                if (retryResult.isFailure) {
-                    // Still can't send after drain. Launch a coroutine to send
-                    // asynchronously — this avoids the data race of setting ctx fields
-                    // directly from the caller's coroutine while the event coroutine
-                    // reads them without synchronization. The launch is fire-and-forget;
-                    // if it fails (channel closed), the ResetTurn is lost but subsequent
-                    // SSE events will be dropped by processEvent()'s ClosedSendChannelException catch.
-                    logger.warn { "[ACP] createAssistantMessage: eventChannel FULL after drain — launching async send. id=$id" }
-                    scope.launch {
-                        try {
-                            eventChannel.send(resetEvent)
-                        } catch (e: Exception) {
-                            logger.error(e) { "[ACP] createAssistantMessage: async send failed — ResetTurn lost. id=$id" }
-                        }
-                    }
-                }
+                // Channel is full (1024 capacity) or closed. Do NOT drain the channel
+                // and do NOT write ctx fields directly — that would race with the event
+                // processing coroutine, which mutates ctx fields WITHOUT acquiring
+                // stateLock (it relies on single-writer serialization via the channel).
+                //
+                // Instead, drop the ResetTurn. The event processing coroutine's
+                // auto-create logic (the `needsNewMessage` check in processEventInternal)
+                // will create the assistant message when the first content-bearing SSE
+                // event arrives, using the serverMessageId from that event. This is the
+                // same path used for child/subagent sessions and is well-tested.
+                //
+                // The only downside is that ctx.isStreaming won't be true until the first
+                // event arrives, but that's a sub-millisecond window in practice.
+                logger.warn { "[ACP] createAssistantMessage: eventChannel FULL — ResetTurn dropped, auto-create will handle it. id=$id" }
             }
         }
 
@@ -363,6 +350,7 @@ class SessionState(
             // Clean up tool call index for the removed message
             entry.value.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
                 ctx.toolCallIndex.remove(part.pill.toolCallId)
+                ctx.toolCallPills.remove(part.pill.toolCallId)
             }
             current.remove(entry.key)
             _messages.value = current
@@ -381,10 +369,12 @@ class SessionState(
         if (closed) return@withLock
         val current = LinkedHashMap<String, ChatMessage>()
         ctx.toolCallIndex.clear()
+        ctx.toolCallPills.clear()
         newMessages.forEach { message ->
             current[message.id] = message
             message.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
                 ctx.toolCallIndex[part.pill.toolCallId] = message.id
+                ctx.toolCallPills[part.pill.toolCallId] = part.pill
             }
         }
         _messages.value = current
@@ -931,6 +921,62 @@ class SessionState(
                                 )
                             }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (duplicate-ToolUse path)" } }
                         }
+
+                        // Follow Agent: EXECUTE tools — open a read-only Run console.
+                        val dupKind = if (existingPill.kind == ToolKind.OTHER) {
+                            ToolMapper.detectKindFromInput(event.input)
+                        } else existingPill.kind
+                        if (dupKind == ToolKind.EXECUTE) {
+                            val command = try {
+                                event.input["command"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            val workdir = try {
+                                event.input["workdir"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            val description = try {
+                                event.input["description"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            if (command != null) {
+                                runCatching {
+                                    CommandFollowManager.getInstance(project).followCommand(
+                                        project = project,
+                                        toolCallId = event.toolCallId,
+                                        command = command,
+                                        workdir = workdir,
+                                        description = description,
+                                        agentName = ctx.activeAgentName,
+                                        modelName = ctx.modelID,
+                                    )
+                                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: command console skipped (duplicate path)" } }
+                            }
+                        }
+                        // Follow Agent: SEARCH tools — open Find in Files.
+                        if (dupKind == ToolKind.SEARCH) {
+                            val pattern = try {
+                                event.input["pattern"]?.jsonPrimitive?.contentOrNull
+                                    ?: event.input["query"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            val searchPath = try {
+                                event.input["path"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            val includeGlob = try {
+                                event.input["include"]?.jsonPrimitive?.contentOrNull
+                                    ?: event.input["glob"]?.jsonPrimitive?.contentOrNull
+                            } catch (_: Exception) { null }
+                            if (pattern != null) {
+                                runCatching {
+                                    SearchFollowManager.getInstance(project).followSearch(
+                                        project = project,
+                                        pattern = pattern,
+                                        searchPath = searchPath,
+                                        includeGlob = includeGlob,
+                                        isRegex = false,
+                                        agentName = ctx.activeAgentName,
+                                        modelName = ctx.modelID,
+                                    )
+                                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: Find in Files skipped (duplicate path)" } }
+                            }
+                        }
                     }
 
                     // For task tools: proactively cache the child session if we just learned the sessionId
@@ -988,6 +1034,60 @@ class SessionState(
                             startTimeMs = pill.startTimeMs,
                         )
                     }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolUse path)" } }
+                }
+
+                // Follow Agent: EXECUTE tools — open a read-only Run console showing the command.
+                if (toolKind == ToolKind.EXECUTE && event.input != null) {
+                    val command = try {
+                        event.input["command"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    val workdir = try {
+                        event.input["workdir"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    val description = try {
+                        event.input["description"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    if (command != null) {
+                        runCatching {
+                            CommandFollowManager.getInstance(project).followCommand(
+                                project = project,
+                                toolCallId = event.toolCallId,
+                                command = command,
+                                workdir = workdir,
+                                description = description,
+                                agentName = ctx.activeAgentName,
+                                modelName = ctx.modelID,
+                            )
+                        }.onFailure { logger.debug(it) { "[ACP] Follow Agent: command console skipped" } }
+                    }
+                }
+
+                // Follow Agent: SEARCH tools — open IntelliJ's native Find in Files.
+                if (toolKind == ToolKind.SEARCH && event.input != null) {
+                    val pattern = try {
+                        event.input["pattern"]?.jsonPrimitive?.contentOrNull
+                            ?: event.input["query"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    val searchPath = try {
+                        event.input["path"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    val includeGlob = try {
+                        event.input["include"]?.jsonPrimitive?.contentOrNull
+                            ?: event.input["glob"]?.jsonPrimitive?.contentOrNull
+                    } catch (_: Exception) { null }
+                    if (pattern != null) {
+                        runCatching {
+                            SearchFollowManager.getInstance(project).followSearch(
+                                project = project,
+                                pattern = pattern,
+                                searchPath = searchPath,
+                                includeGlob = includeGlob,
+                                isRegex = false,
+                                agentName = ctx.activeAgentName,
+                                modelName = ctx.modelID,
+                            )
+                        }.onFailure { logger.debug(it) { "[ACP] Follow Agent: Find in Files skipped" } }
+                    }
                 }
 
                 if (toolKind == ToolKind.EDIT && event.input != null) {
@@ -1075,6 +1175,22 @@ class SessionState(
                                 project, event.toolCallId, event.content, ToolKind.SEARCH
                             )
                         }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolResult path)" } }
+                    }
+                    // Follow Agent: for execute tools, print output into the Run console.
+                    if (resolvedKind == ToolKind.EXECUTE) {
+                        runCatching {
+                            CommandFollowManager.getInstance(project).followCommandResult(
+                                project = project,
+                                toolCallId = event.toolCallId,
+                                output = event.content,
+                                isError = event.isError,
+                            )
+                            CommandFollowManager.getInstance(project).finishCommand(
+                                project = project,
+                                toolCallId = event.toolCallId,
+                                isError = event.isError,
+                            )
+                        }.onFailure { logger.debug(it) { "[ACP] Follow Agent: command result skipped" } }
                     }
                     // Update the message part with the resolved pill
                     val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId

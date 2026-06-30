@@ -109,12 +109,18 @@ class ReviewCommentRepository(
 
     /** Read a single JSON file. Returns null if the file doesn't exist, the
      *  project has no base path, or the file is unparseable. On parse
-     *  failure the broken file is moved aside so it doesn't block re-reads. */
+     *  failure the broken file is moved aside so it doesn't block re-reads.
+     *
+     *  BOM handling: Files written by external tools (LLM agents, CI) may have
+     *  a UTF-8 BOM (0xEF 0xBB 0xBF) at the start. [readText] includes the BOM
+     *  in the returned string as '\uFEFF', which causes kotlinx.serialization's
+     *  JSON parser to fail ("Expected start of the object '{', but had '?'").
+     *  Strip the BOM before parsing. */
     suspend fun readFile(sourcePath: String): ReviewFile? = withContext(Dispatchers.IO) {
         val jsonPath = jsonPathFor(sourcePath) ?: return@withContext null
         if (!jsonPath.exists()) return@withContext null
         try {
-            val content = jsonPath.readText()
+            val content = jsonPath.readText().removePrefix("\uFEFF")
             parser.parseReviewFile(content)
         } catch (e: Exception) {
             logger.warn(e) { "[ACP] Failed to read .review file for $sourcePath" }
@@ -155,7 +161,7 @@ class ReviewCommentRepository(
         // Verify etag still matches what we read earlier.
         if (jsonPath.exists()) {
             try {
-                val current = jsonPath.readText()
+                val current = jsonPath.readText().removePrefix("\uFEFF")
                 val currentFile = parser.parseReviewFile(current)
                 if (currentFile != null && currentFile.etag != expectedEtag) {
                     return@withContext false  // etag mismatch — caller retries
@@ -262,6 +268,9 @@ class ReviewCommentRepository(
         val oldJson = jsonPathFor(oldSourcePath) ?: return
         val newJson = jsonPathFor(newSourcePath) ?: return
         if (!oldJson.exists()) return
+        // No-op if old and new paths are the same — prevents acquiring the same
+        // Mutex twice (kotlinx.coroutines.sync.Mutex is NOT reentrant → deadlock).
+        if (oldSourcePath == newSourcePath) return
         // Acquire both locks in consistent order (sorted lexicographically) to prevent deadlock.
         // Uses String's natural ordering (Unicode codepoint comparison), which is deterministic
         // and locale-independent for ASCII file paths. If non-ASCII paths are introduced,
@@ -273,7 +282,7 @@ class ReviewCommentRepository(
         } else {
             first = newSourcePath; second = oldSourcePath
         }
-            lockFor(first).withLock {
+        lockFor(first).withLock {
                 lockFor(second).withLock {
                     withContext(Dispatchers.IO) {
                         try {
@@ -320,6 +329,80 @@ class ReviewCommentRepository(
         } catch (e: Exception) {
             logger.warn(e) { "[ACP] Failed to clean up orphan .json.tmp files" }
         }
+    }
+
+    /**
+     * Detect and strip UTF-8 BOM (0xEF 0xBB 0xBF) from `.review/` JSON files.
+     *
+     * External writers (LLM agents, CI, text editors) may emit files with a
+     * UTF-8 BOM. While [readFile] strips the BOM at parse time for resilience,
+     * leaving BOM-prefixed files on disk causes:
+     * - Other consumers (git diffs, shell tools, external parsers) to see the BOM
+     * - The "broken file" move-aside path in [readFile] to trigger on every load
+     *   attempt (the file is never actually moved because the move fails, but the
+     *   parse warning fires every time — log noise)
+     * - Potential issues if a future code path reads raw bytes without BOM stripping
+     *
+     * This scan rewrites BOM-prefixed files in place (atomic temp-file rename,
+     * same pattern as [writeFile]) so the on-disk files are clean UTF-8 without BOM.
+     * Called once on startup from [ReviewCommentManager.init], alongside
+     * [cleanupOrphanTempFiles].
+     *
+     * Returns the number of files fixed.
+     */
+    suspend fun stripBomFromReviewFiles(): Int = withContext(Dispatchers.IO) {
+        val root = reviewRoot ?: return@withContext 0
+        if (!root.exists() || !root.isDirectory()) return@withContext 0
+        var fixed = 0
+        try {
+            // Collect BOM-prefixed files first, then process them with proper
+            // suspend context (forEach inside Files.walk is NOT a coroutine body,
+            // so Mutex.withLock cannot be called there).
+            val bomFiles = mutableListOf<Pair<java.nio.file.Path, ByteArray>>()
+            java.nio.file.Files.walk(root).use { stream ->
+                stream.filter { java.nio.file.Files.isRegularFile(it) }
+                    .filter { it.name.endsWith(".json") && !it.name.endsWith(".json.tmp") }
+                    .forEach { path ->
+                        try {
+                            val bytes = java.nio.file.Files.readAllBytes(path)
+                            // UTF-8 BOM: 0xEF 0xBB 0xBF
+                            if (bytes.size >= 3 &&
+                                bytes[0] == 0xEF.toByte() &&
+                                bytes[1] == 0xBB.toByte() &&
+                                bytes[2] == 0xBF.toByte()
+                            ) {
+                                bomFiles.add(path to bytes)
+                            }
+                        } catch (e: Exception) {
+                            logger.warn(e) { "[ACP] Failed to read ${path.fileName} for BOM check" }
+                        }
+                    }
+            }
+            // Process BOM files with per-path Mutex serialization (suspend-safe).
+            for ((path, bytes) in bomFiles) {
+                // Compute source path for per-path Mutex serialization.
+                // This prevents racing with concurrent updateFile() calls
+                // for the same source path (the class's concurrency contract
+                // requires all plugin writes to be serialized per path).
+                val relative = root.relativize(path).toString().replace('\\', '/')
+                val sourcePath = relative.substringBeforeLast(".json")
+                lockFor(sourcePath).withLock {
+                    // Strip BOM: write the remaining bytes via temp-file rename (atomic)
+                    val stripped = bytes.copyOfRange(3, bytes.size)
+                    val tmpPath = path.resolveSibling("${path.fileName}.nobom.tmp")
+                    java.nio.file.Files.write(tmpPath, stripped)
+                    tmpPath.moveTo(path, overwrite = true)
+                    fixed++
+                    logger.info { "[ACP] Stripped UTF-8 BOM from ${path.fileName} (${bytes.size} → ${stripped.size} bytes)" }
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] Failed to scan .review files for BOM" }
+        }
+        if (fixed > 0) {
+            logger.info { "[ACP] Stripped BOM from $fixed .review/ file(s)" }
+        }
+        fixed
     }
 
     companion object {

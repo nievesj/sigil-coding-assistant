@@ -156,8 +156,27 @@ class ToolRegistry(
             discoverBuiltinTools(opencodeBaseUrl, newTools)
             discoverMcpTools(mcpServerUrls, newTools)
 
-            // Phase 2: Atomic swap — build new snapshot, assign under lock
+            // Phase 2: Atomic swap — merge persisted permissions from the old
+            // snapshot into the new one, then assign under lock. This prevents
+            // loadPermissions() changes from being silently overwritten when
+            // discoverAll() completes (the race where loadPermissions runs during
+            // the HTTP discovery phase and its changes are lost on swap).
             toolsMutex.withLock {
+                val oldSnapshot = _toolsSnapshot
+                // Re-apply permissions from the old snapshot to matching tools in the new set.
+                // Match by both compound id and raw name to handle all key formats.
+                for ((oldId, oldTool) in oldSnapshot) {
+                    // Try exact id match first
+                    val newTool = newTools[oldId]
+                        // Then try raw name match (handles tools whose serverName changed)
+                        ?: newTools.values.find { it.name == oldTool.name }
+                    if (newTool != null) {
+                        newTools[newTool.id] = newTool.copy(
+                            enabled = oldTool.enabled,
+                            permission = oldTool.permission
+                        )
+                    }
+                }
                 _toolsSnapshot = newTools.toMap()  // Immutable snapshot
             }
 
@@ -257,7 +276,6 @@ class ToolRegistry(
 
         for ((serverName, toolDescriptors) in mcpTools) {
             for (tool in toolDescriptors) {
-                val fullToolName = "${serverName}_${tool.name}"
                 val toolInfo = ToolInfo.create(
                     name = tool.name,
                     description = tool.description,
@@ -379,6 +397,10 @@ class ToolRegistry(
      * Matches by raw name OR compound id, applying to ALL matches. This handles
      * the case where two MCP servers expose tools with the same raw name (e.g.,
      * both server A and server B have "create_file") — both are updated.
+     *
+     * NOTE: The per-tool checkbox in the settings panel uses the compound id
+     * (ToolInfo.id) as the map key, so individual toggles ARE server-specific.
+     * Only this batch operation (Enable All / Disable All) has this limitation.
      */
     suspend fun syncEnabled(toolNames: Set<String>, enabled: Boolean) = toolsMutex.withLock {
         val newSnapshot = _toolsSnapshot.toMutableMap()
@@ -435,6 +457,9 @@ class ToolRegistry(
      * Both formats are handled. Each key is matched against BOTH ToolInfo.id
      * AND ToolInfo.name, applying to ALL matching tools. This handles the case
      * where two MCP servers expose tools with the same raw name.
+     *
+     * Only restores [ToolPermission] — the [ToolInfo.enabled] flag is left at
+     * its discovery default (true). Use [loadEnabledAndPermissions] to restore both.
      */
     suspend fun loadPermissions(permissions: Map<String, ToolPermission>) = toolsMutex.withLock {
         val current = _toolsSnapshot.toMutableMap()
@@ -443,6 +468,30 @@ class ToolRegistry(
             val matchingTools = current.values.filter { it.id == key || it.name == key }
             for (tool in matchingTools) {
                 current[tool.id] = tool.copy(permission = permission)
+            }
+        }
+        _toolsSnapshot = current.toMap()  // Immutable snapshot
+    }
+
+    /**
+     * Load persisted enabled state AND permissions into the registry. Must be
+     * called after [discoverAll] to preserve user customizations. Acquires the
+     * mutex to prevent concurrent modification with [discoverAll].
+     *
+     * The map keys follow the same matching rules as [loadPermissions] — both
+     * raw names and compound IDs are matched against [ToolInfo.id] and [ToolInfo.name].
+     *
+     * This is the preferred method over [loadPermissions] when the caller has
+     * both the enabled flag and the permission level, because it preserves the
+     * user's enable/disable selections across re-discovery.
+     */
+    suspend fun loadEnabledAndPermissions(state: Map<String, Pair<Boolean, ToolPermission>>) = toolsMutex.withLock {
+        val current = _toolsSnapshot.toMutableMap()
+        for ((key, pair) in state) {
+            val (enabled, permission) = pair
+            val matchingTools = current.values.filter { it.id == key || it.name == key }
+            for (tool in matchingTools) {
+                current[tool.id] = tool.copy(enabled = enabled, permission = permission)
             }
         }
         _toolsSnapshot = current.toMap()  // Immutable snapshot

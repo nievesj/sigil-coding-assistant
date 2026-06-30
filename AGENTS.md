@@ -937,6 +937,51 @@ setting the property in `createToolWindowContent()` is likely a no-op.
 
 **Full investigation:** `docs/tdd/Done/ide-hang-investigation.md`
 
+### Follow Agent — Expanded: EXECUTE and SEARCH Tool Coverage
+
+Follow Agent now covers **all tool kinds**, not just file-based ones (READ, EDIT, DELETE, MOVE).
+
+**EXECUTE tools (bash/shell commands):** When the agent runs a command, a read-only
+`ConsoleView` opens in the Run tool window showing the agent name, model, working
+directory, the command (as `$ <command>`), and the command output (stdout in normal
+color, stderr in error color, exit status footer). The command is NOT re-executed —
+the agent already ran it on the OpenCode server. We display the output the agent received.
+
+- **Manager:** `CommandFollowManager` (project-level service)
+- **Entry points:** `followCommand()` (on ToolUse), `followCommandResult()` + `finishCommand()` (on ToolResult)
+- **Throttling:** 2-second cooldown between opening new console tabs
+- **Tab limit:** Max 5 concurrent console tabs (oldest evicted)
+- **Settings:** `followCommandsInConsole` (default: true when Follow Agent is on)
+- **ToolPill button:** Console icon on EXECUTE pills — activates the Run tool window
+
+**SEARCH tools (grep/glob/find):** When the agent searches, IntelliJ's native "Find in
+Files" opens with the agent's search pattern, directory scope, and file mask. The IDE
+re-runs the search live, so results reflect current file state (not the agent's
+potentially stale snapshot). The user gets an interactive result set they can navigate,
+filter, and group.
+
+- **Manager:** `SearchFollowManager` (project-level service)
+- **Entry point:** `followSearch()` (on ToolUse) — calls `FindInProjectManager.startFindInProject(findModel)`
+- **Throttling:** 2-second cooldown between opening Find in Files
+- **Settings:** `followSearchesInFindWindow` (default: true when Follow Agent is on)
+- **ToolPill button:** Search icon on SEARCH pills — re-triggers Find in Files via `reopenSearch()`
+- **FindModel scope:** Uses `directoryName` property (not `directory`) for directory-scoped search
+- **No DataContext needed:** `startFindInProject()` runs the search directly without a dialog,
+  unlike `findInProject()` which shows the Find dialog first
+
+**Integration in SessionState.kt:**
+- ToolUse handler (line ~976): EXECUTE → `CommandFollowManager.followCommand()`, SEARCH → `SearchFollowManager.followSearch()`
+- Duplicate ToolUse handler (line ~912): Same additions for when input arrives on the "running" event
+- ToolResult handler (line ~1070): EXECUTE → `CommandFollowManager.followCommandResult()` + `finishCommand()`
+
+**Settings UI (Settings → Tools → Sigil → Follow Agent):**
+- "Show agent commands in Run console" checkbox
+- "Open Find in Files for agent searches" checkbox
+- Both default to true (if the user opted into Follow Agent, they want full coverage)
+
+**Key files:** `CommandFollowManager.kt`, `SearchFollowManager.kt`, `SessionState.kt`,
+`OpenCodeSettingsState.kt`, `OpenCodeFollowConfigurable.kt`, `ToolPill.kt`
+
 ---
 
 ## Deferred Features

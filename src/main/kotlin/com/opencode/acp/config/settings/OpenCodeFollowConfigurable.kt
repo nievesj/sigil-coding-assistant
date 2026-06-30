@@ -24,6 +24,8 @@ class OpenCodeFollowConfigurable : Configurable {
 
     private var panel: JPanel? = null
     private var followEnabledCheckBox: JBCheckBox? = null
+    private var followCommandsInConsoleCheckBox: JBCheckBox? = null
+    private var followSearchesInFindWindowCheckBox: JBCheckBox? = null
 
     /** Per-row model: holds the text field and remembers the ToolKind it edits. */
     private data class ColorRow(val kind: ToolKind, val textField: JBTextField)
@@ -39,8 +41,22 @@ class OpenCodeFollowConfigurable : Configurable {
             settings.followAgentEnabled
         )
 
+        followCommandsInConsoleCheckBox = JBCheckBox(
+            "Show agent commands in Run console",
+            settings.followCommandsInConsole
+        )
+        followCommandsInConsoleCheckBox?.toolTipText = "When Follow Agent is on, display agent-executed commands and their output in a read-only Run console"
+
+        followSearchesInFindWindowCheckBox = JBCheckBox(
+            "Open Find in Files for agent searches",
+            settings.followSearchesInFindWindow
+        )
+        followSearchesInFindWindowCheckBox?.toolTipText = "When Follow Agent is on, open IntelliJ's native Find in Files when the agent searches"
+
         val builder = FormBuilder()
             .addComponent(followEnabledCheckBox!!)
+            .addComponent(followCommandsInConsoleCheckBox!!)
+            .addComponent(followSearchesInFindWindowCheckBox!!)
             .addVerticalGap(8)
             .addSeparator()
             .addVerticalGap(4)
@@ -75,12 +91,16 @@ class OpenCodeFollowConfigurable : Configurable {
     override fun isModified(): Boolean {
         val settings = OpenCodeSettingsState.getInstance()
         if (followEnabledCheckBox?.isSelected != settings.followAgentEnabled) return true
+        if (followCommandsInConsoleCheckBox?.isSelected != settings.followCommandsInConsole) return true
+        if (followSearchesInFindWindowCheckBox?.isSelected != settings.followSearchesInFindWindow) return true
         return colorRows.any { (kind, field) -> field.text.trim() != settings.getFollowColor(kind) }
     }
 
     override fun apply() {
         val settings = OpenCodeSettingsState.getInstance()
         settings.followAgentEnabled = followEnabledCheckBox?.isSelected ?: false
+        settings.followCommandsInConsole = followCommandsInConsoleCheckBox?.isSelected ?: settings.followCommandsInConsole
+        settings.followSearchesInFindWindow = followSearchesInFindWindowCheckBox?.isSelected ?: settings.followSearchesInFindWindow
         for ((kind, field) in colorRows) {
             // Persist whatever the user typed; FollowColorProvider.getColor() falls
             // back to "no highlight" on bad input. We do not coerce to default here —
@@ -92,6 +112,8 @@ class OpenCodeFollowConfigurable : Configurable {
     override fun reset() {
         val settings = OpenCodeSettingsState.getInstance()
         followEnabledCheckBox?.isSelected = settings.followAgentEnabled
+        followCommandsInConsoleCheckBox?.isSelected = settings.followCommandsInConsole
+        followSearchesInFindWindowCheckBox?.isSelected = settings.followSearchesInFindWindow
         for ((kind, field) in colorRows) {
             field.text = settings.getFollowColor(kind)
         }
@@ -99,7 +121,7 @@ class OpenCodeFollowConfigurable : Configurable {
 
     private fun isValidHex(hex: String): Boolean {
         val h = hex.removePrefix("#")
-        if (h.length != 6 && h.length != 8) return false
+        if (h.length != 8) return false  // #RRGGBBAA — alpha required (per label)
         return h.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
     }
 

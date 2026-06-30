@@ -158,10 +158,23 @@ tasks.buildSearchableOptions {
 }
 
 tasks.runIde {
-    jvmArgs = listOf(
-        "-Dopencode.platform.version=${providers.gradleProperty("platformVersion").get()}",
-        "-Didea.auto.reload.plugins=true"
-    )
+    jvmArgs = buildList {
+        add("-Dopencode.platform.version=${providers.gradleProperty("platformVersion").get()}")
+        add("-Didea.auto.reload.plugins=true")
+        // Skiko debug logging — only enabled with -PskikoDebug=true
+        if (providers.gradleProperty("skikoDebug").getOrElse("false").toBoolean()) {
+            add("-Dskiko.log=debug")
+        }
+        // Skiko renderer: do NOT set skiko.renderApi=SOFTWARE.
+        // SOFTWARE mode forces Skiko to render to a BufferedImage, which Swing
+        // then blits to screen via GDIBlitLoops.nativeBlit() → GDI BitBlt → DWM
+        // composition. That is the exact code path that hangs the EDT for 60+
+        // seconds (DWM composition deadlock). Without this flag, Skiko defaults
+        // to Direct3D on Windows, rendering directly to a GPU swap chain and
+        // presenting via DXGI Present() — GDI BitBlt is never called.
+        // The D3D exit-hang (GPU context teardown) is handled by async
+        // ComposePanel disposal on a daemon thread (disposeActiveComposePanelAsync).
+    }
 }
 
 kotlin {

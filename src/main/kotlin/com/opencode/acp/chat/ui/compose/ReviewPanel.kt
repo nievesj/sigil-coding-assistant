@@ -221,41 +221,53 @@ fun ReviewPanel(
     }
 
     // Render based on state
-    when (val s = state) {
-        is ReviewState.Loading -> ReviewLoadingContent(modifier)
-        is ReviewState.Empty -> ReviewEmptyContent(modifier)
-        is ReviewState.Error -> ReviewErrorContent(
-            message = s.message,
-            retryable = s.retryable,
-            onRetry = { refreshSignal.value = refreshSignal.value + 1 },
-            modifier = modifier
-        )
-        is ReviewState.Loaded -> ReviewFileListContent(
-            files = s.files,
-            commentCounts = s.commentCounts,
-            openCommentsByFile = s.openCommentsByFile,
-            onFileClick = { _, _, virtualFile ->
-                if (virtualFile != null) {
-                    openFileInEditor(project, virtualFile)
+    Column(modifier = modifier.fillMaxSize()) {
+        // Refresh button row — always visible so the user can force a re-read of
+        // .review/ files even when the file watcher misses an external write.
+        ReviewRefreshBar(
+            onRefresh = {
+                scope.launch {
+                    ReviewCommentManager.getInstance(project).loadAll()
+                    refreshSignal.update { it + 1 }
                 }
-            },
-            onOpenFile = { filePath, status, virtualFile ->
-                when (status) {
-                    FileChangeStatus.UNTRACKED -> {
-                        // Use virtualFile directly — ChangedFile already stores it.
-                        if (virtualFile != null) {
-                            openFileInEditor(project, virtualFile)
-                        }
+            }
+        )
+        when (val s = state) {
+            is ReviewState.Loading -> ReviewLoadingContent(Modifier.fillMaxSize())
+            is ReviewState.Empty -> ReviewEmptyContent(Modifier.fillMaxSize())
+            is ReviewState.Error -> ReviewErrorContent(
+                message = s.message,
+                retryable = s.retryable,
+                onRetry = { refreshSignal.value = refreshSignal.value + 1 },
+                modifier = Modifier.fillMaxSize()
+            )
+            is ReviewState.Loaded -> ReviewFileListContent(
+                files = s.files,
+                commentCounts = s.commentCounts,
+                openCommentsByFile = s.openCommentsByFile,
+                onFileClick = { _, _, virtualFile ->
+                    if (virtualFile != null) {
+                        openFileInEditor(project, virtualFile)
                     }
-                    else -> openDiffForPath(project, filePath, virtualFile, scope)
-                }
-            },
-            onCommentClick = { filePath, line ->
-                EditorFollowManager.getInstance(project)
-                    .openFileAtLine(project, filePath, line, focus = true)
-            },
-            modifier = modifier
-        )
+                },
+                onOpenFile = { filePath, status, virtualFile ->
+                    when (status) {
+                        FileChangeStatus.UNTRACKED -> {
+                            // Use virtualFile directly — ChangedFile already stores it.
+                            if (virtualFile != null) {
+                                openFileInEditor(project, virtualFile)
+                            }
+                        }
+                        else -> openDiffForPath(project, filePath, virtualFile, scope)
+                    }
+                },
+                onCommentClick = { filePath, line ->
+                    EditorFollowManager.getInstance(project)
+                        .openFileAtLine(project, filePath, line, focus = true)
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
     }
 }
 
@@ -592,7 +604,7 @@ internal fun getFileTypeIcon(fileName: String): org.jetbrains.jewel.ui.icon.Icon
         "go" -> AllIconsKeys.Language.GO
         "scala" -> AllIconsKeys.Language.Scala
         "php" -> AllIconsKeys.Language.Php
-        "gradle", "gradle.kts" -> AllIconsKeys.Nodes.Folder  // Fallback for Gradle
+        "gradle" -> AllIconsKeys.Nodes.Folder  // Fallback for Gradle
         "properties" -> AllIconsKeys.FileTypes.Text
         "gitignore" -> AllIconsKeys.FileTypes.Text
         "svg" -> AllIconsKeys.FileTypes.Image
@@ -602,6 +614,53 @@ internal fun getFileTypeIcon(fileName: String): org.jetbrains.jewel.ui.icon.Icon
 }
 
 // ── State composables ──────────────────────────────────────────────────────────
+
+/**
+ * Thin header bar with a refresh button. Lets the user force a re-read of
+ * `.review/` files from disk when the file watcher misses an external write
+ * (e.g., the LLM agent writes a file while the VFS is mid-refresh, or the
+ * `.review/` directory is created by an external tool that doesn't trigger
+ * a VFS event the plugin's AsyncFileListener catches).
+ *
+ * The button calls [ReviewCommentManager.loadAll] (which walks the disk
+ * directly via `java.nio.file.Files.walk`, bypassing VFS) and then bumps
+ * `refreshSignal` to re-fetch the changed-files list from VCS.
+ */
+@Composable
+private fun ReviewRefreshBar(
+    onRefresh: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isHovered by interactionSource.collectIsHoveredAsState()
+    val hoverBg = ChatTheme.colors.component.hoverBg
+    val iconColor = if (isHovered) ChatTheme.colors.text.link else ChatTheme.colors.text.secondary
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.End,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .clip(CircleShape)
+                .background(if (isHovered) hoverBg else Color.Transparent)
+                .hoverable(interactionSource)
+                .clickable(onClick = onRefresh)
+                .padding(4.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                key = AllIconsKeys.Actions.Refresh,
+                contentDescription = "Refresh reviews",
+                modifier = Modifier.size(14.dp),
+                tint = iconColor,
+            )
+        }
+    }
+}
 
 @Composable
 private fun ReviewLoadingContent(modifier: Modifier = Modifier) {
@@ -728,8 +787,17 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
             // PCE must be rethrown — swallowing it breaks cancellation propagation
             // (IntelliJ contract: ProcessCanceledException is control flow, not an error).
             throw e
-        } catch (e: Throwable) {
-            // Catch Throwable (not Exception) to handle NoClassDefFoundError from optional plugins.
+        } catch (e: OutOfMemoryError) {
+            // JVM-level errors must propagate — never swallow these.
+            throw e
+        } catch (e: StackOverflowError) {
+            throw e
+        } catch (e: NoClassDefFoundError) {
+            // Missing optional dependency — indicates a broken plugin installation.
+            // Log at ERROR level so the user is aware of the configuration issue.
+            com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
+                .error("[ACP] Failed to open diff viewer for $filePath — missing dependency: ${e.message}")
+        } catch (e: Exception) {
             // Log for diagnostics — silently swallowing makes diff-open failures invisible.
             com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
                 .warn("[ACP] Failed to open diff viewer for $filePath: ${e.message}")
