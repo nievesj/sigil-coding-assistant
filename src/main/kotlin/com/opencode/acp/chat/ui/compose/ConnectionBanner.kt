@@ -12,6 +12,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.opencode.acp.chat.model.ConnectionErrorReason
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Icon
@@ -22,23 +23,40 @@ import org.jetbrains.jewel.ui.icons.AllIconsKeys
 @Composable
 fun ConnectionBanner(
     state: ConnectionState,
+    errorReason: ConnectionErrorReason? = null,
     onRetry: () -> Unit
 ) {
     if (state == ConnectionState.CONNECTED) return
 
+    val bannerText = when (state) {
+        ConnectionState.DISCONNECTED -> "Not connected to OpenCode"
+        ConnectionState.CONNECTING -> "Connecting..."
+        ConnectionState.RECONNECTING -> "Reconnecting..."
+        ConnectionState.ERROR -> when (errorReason) {
+            is ConnectionErrorReason.NoBinaryConfigured -> "No OpenCode binary configured"
+            is ConnectionErrorReason.BinaryLaunchFailed -> "Failed to launch OpenCode binary"
+            is ConnectionErrorReason.ProcessExited -> "OpenCode process stopped (exit ${errorReason.exitCode})"
+            is ConnectionErrorReason.HealthCheckTimeout -> "OpenCode server did not respond in time"
+            is ConnectionErrorReason.ReconnectionFailed -> "Reconnection failed"
+            is ConnectionErrorReason.Other -> errorReason.detail ?: "Connection failed"
+            null -> "Connection failed"
+        }
+        ConnectionState.CONNECTED -> "" // unreachable — early return at line 29
+    }
+
     when (state) {
         ConnectionState.DISCONNECTED -> BannerRow(
-            text = "Not connected to OpenCode",
+            text = bannerText,
             retryLink = onRetry
         )
         ConnectionState.CONNECTING -> BannerRow(
-            text = "Connecting..."
+            text = bannerText
         )
         ConnectionState.RECONNECTING -> BannerRow(
-            text = "Reconnecting..."
+            text = bannerText
         )
         ConnectionState.ERROR -> BannerRow(
-            text = "Connection failed",
+            text = bannerText,
             isError = true,
             retryLink = onRetry
         )

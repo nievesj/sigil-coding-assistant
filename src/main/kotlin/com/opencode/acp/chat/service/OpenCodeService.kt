@@ -12,7 +12,6 @@ import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
 import com.opencode.acp.chat.util.normalizeAttachmentMime
-import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.mcp.McpConfigWriter
 import com.opencode.acp.mcp.McpConnectionStatus
@@ -45,7 +44,17 @@ import java.util.concurrent.atomic.AtomicLong
 class OpenCodeService(private val project: Project) : Disposable {
 
     private val logger = KotlinLogging.logger {}
-    internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, throwable ->
+        logger.error(throwable) { "[ACP] Uncaught coroutine exception in OpenCodeService scope" }
+        // Emit an error signal so the UI can surface "internal error" instead of
+        // silently hanging. SessionManager._globalSignals (the flow the ViewModel
+        // collects for cross-session errors) is private with no public/internal
+        // emitter, and emitSessionSignal routes to a different flow (_allSessionSignals)
+        // that only handles StreamingCompleted. Routing through it would not reach
+        // the UI error display, so we rely on logging alone — the critical fix that
+        // ensures exceptions are visible in idea.log with full stack traces instead
+        // of being swallowed by the JVM default handler.
+    })
 
     // ── Sub-components ─────────────────────────────────────────────────────
 
@@ -73,6 +82,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     val signals: SharedFlow<UiSignal> = sessionManager.activeSignals
     val globalSignals: SharedFlow<UiSignal> = sessionManager.globalSignals
     val connectionState: StateFlow<ConnectionState> = connectionManager.connectionState
+    val connectionErrorReason: StateFlow<ConnectionErrorReason?> = connectionManager.connectionErrorReason
     val sessionListState: StateFlow<SessionListState> = sessionManager.sessionListState
     val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = sessionManager.childSessionMap
     val todoItems: StateFlow<List<TodoItem>> = sessionManager.todoItems
@@ -183,7 +193,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             mcpManager = McpManager(client, settings, scope, client.mcpHttpClient)
             val configs = mcpManager!!.resolveConfigs()
             if (configs.isEmpty()) {
-                logger.info { "[ACP] MCP: no servers configured (enableIntellijMcp=${settings.enableIntellijMcp}, additionalMcpServers='${settings.additionalMcpServers.take(50)}')" }
+                logger.info { "[ACP] MCP: no servers configured (enableIntellijMcp=${settings.enableIntellijMcp}, additionalMcpServersLen=${settings.additionalMcpServers.length})" }
                 return
             }
             logger.info { "[ACP] MCP: initializing ${configs.size} server(s): ${configs.map { it.name }}" }
@@ -224,6 +234,9 @@ class OpenCodeService(private val project: Project) : Disposable {
      * Creates a fresh McpManager and runs discovery/registration.
      */
     suspend fun reinitializeMcp() {
+        // Disconnect the existing manager before replacing it to avoid leaking
+        // SSE connections, HTTP clients, and in-flight registrations.
+        disconnectAllMcp()
         initializeMcp()
     }
 
@@ -272,8 +285,9 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     /**
      * Parse persisted tool permissions JSON into a map of toolName → (enabled, permission).
+     * Internal so ChatViewModel can delegate to it instead of duplicating the logic.
      */
-    private fun parsePersistedToolPermissions(perms: String): Map<String, Pair<Boolean, String>> {
+    internal fun parsePersistedToolPermissions(perms: String): Map<String, Pair<Boolean, String>> {
         if (perms.isBlank()) return emptyMap()
         return try {
             val obj = kotlinx.serialization.json.Json.parseToJsonElement(perms).jsonObject
@@ -284,7 +298,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                 toolName to Pair(enabled, permission)
             }
         } catch (e: Exception) {
-            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions" }
+            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — clearing corrupted value" }
+            try {
+                OpenCodeSettingsState.getInstance().toolPermissions = ""
+            } catch (_: Exception) { /* don't let clearing fail the parse call */ }
             emptyMap()
         }
     }
@@ -319,14 +336,20 @@ class OpenCodeService(private val project: Project) : Disposable {
     /** Reset MCP state on OpenCode server restart. Called by ProcessManager. */
     fun resetMcpOnServerRestart() {
         scope.launch {
-            mcpManager?.resetOnServerRestart()
-            // Re-write config file in case it was stale, then re-register via POST /mcp
-            val settings = OpenCodeSettingsState.getInstance()
-            val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
-                ?: java.nio.file.Path.of(".")
-            val configWriter = McpConfigWriter(projectPath, settings)
-            if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
-                configWriter.write()
+            try {
+                mcpManager?.resetOnServerRestart()
+                // Re-write config file in case it was stale, then re-register via POST /mcp
+                val settings = OpenCodeSettingsState.getInstance()
+                val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
+                    ?: java.nio.file.Path.of(".")
+                val configWriter = McpConfigWriter(projectPath, settings)
+                if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
+                    configWriter.write()
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] resetMcpOnServerRestart failed" }
             }
         }
     }
@@ -369,7 +392,10 @@ class OpenCodeService(private val project: Project) : Disposable {
         sseHealthCheckJob = null
         sseJob?.cancel()
         sseJob = null
-        connectionManager.disconnect()
+        // Use shutdown() (not disconnect()) to also kill the launched opencode process.
+        // The user clicked "Stop" — they expect everything to stop, including the process
+        // we own. disconnect() would leave the process running as a zombie on the port.
+        connectionManager.shutdown()
     }
 
     // ── SSE subscription (single global, routes by sessionId) ───────────────
@@ -568,18 +594,13 @@ class OpenCodeService(private val project: Project) : Disposable {
                         val lastIsAssistant = lastMessage?.info?.role == "assistant"
 
                         if (lastIsAssistant) {
-                            // Safety check: detect in-progress tool calls (TDD section 11 Risk 3).
-                            // ASSUMPTION: The server returns messages in chronological order, so the
-                            // last message is the most recent. This check only inspects the last
-                            // message's parts — if an earlier assistant message has in-progress
-                            // tools but the last message is a different assistant message, those
-                            // tools are not detected. In practice the server returns messages in
-                            // order, so this is safe. If the server ever reorders messages, this
-                            // check should scan all recent assistant messages.
-                            val hasInProgressTools = lastMessage.parts
+                            // Safety check: detect in-progress tool calls across ALL fetched messages,
+                            // not just the last one. The server returns messages in chronological order
+                            // in practice, but scanning all fetched messages is safer and bounded (limit=5).
+                            val hasInProgressTools = messages.flatMap { it.parts }
                                 .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
                                 .any { toolUse ->
-                                    lastMessage.parts
+                                    messages.flatMap { it.parts }
                                         .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
                                         .none { it.toolUseId == toolUse.id }
                                 }
@@ -592,6 +613,8 @@ class OpenCodeService(private val project: Project) : Disposable {
                             val activeMsgId = session.ctx.activeMessageId
                             if (activeMsgId != null) {
                                 session.completeStreaming(activeMsgId)
+                            } else {
+                                logger.warn { "[ACP] recoverBackgroundSessions: session $sessionId has no activeMessageId — cannot finalize, session may remain in streaming state" }
                             }
                             session.responseDeferred?.complete(Unit)
                             session.responseDeferred = null
@@ -610,10 +633,10 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     private suspend fun handleSseEvent(event: SseEvent) {
         val summary = when (event) {
-            is SseEvent.TextChunk -> "TextChunk(sid=${event.sessionId}, mid=${event.messageId}, text=${event.text.take(30)})"
-            is SseEvent.ThinkingChunk -> "ThinkingChunk(sid=${event.sessionId}, mid=${event.messageId}, text=${event.text.take(30)})"
+            is SseEvent.TextChunk -> "TextChunk(sid=${event.sessionId}, mid=${event.messageId}, text.len=${event.text.length})"
+            is SseEvent.ThinkingChunk -> "ThinkingChunk(sid=${event.sessionId}, mid=${event.messageId}, text.len=${event.text.length})"
             is SseEvent.Stop -> "Stop(sid=${event.sessionId}, mid=${event.messageId}, reason=${event.stopReason})"
-            is SseEvent.Error -> "Error(sid=${event.sessionId}, mid=${event.messageId}, msg=${event.message.take(50)})"
+            is SseEvent.Error -> "Error(sid=${event.sessionId}, mid=${event.messageId}, msg.len=${event.message.length})"
             is SseEvent.ToolUse -> "ToolUse(sid=${event.sessionId}, mid=${event.messageId}, call=${event.toolCallId})"
             is SseEvent.ToolResult -> "ToolResult(sid=${event.sessionId}, mid=${event.messageId}, call=${event.toolCallId})"
             is SseEvent.Permission -> "Permission(sid=${event.sessionId}, mid=${event.messageId}, tool=${event.toolCallId})"
@@ -782,7 +805,7 @@ class OpenCodeService(private val project: Project) : Disposable {
                         val toolStuckTimeoutMs = toolStuckTimeoutSec.coerceIn(60, 3600) * 1000L
                         // Snapshot entries to avoid ConcurrentModificationException.
                         val pillsSnapshot = monitorSession.ctx.toolCallPills.entries.toList()
-                        val statesSnapshot = monitorSession.ctx.toolPartStates
+                        val statesSnapshot = monitorSession.ctx.toolPartStates.toMap()
                         val oldestToolStartMs = pillsSnapshot
                             .filter {
                                 val state = statesSnapshot[it.key]
@@ -821,9 +844,12 @@ class OpenCodeService(private val project: Project) : Disposable {
             }
             // If the monitor completed the deferred (timeout), isStreaming is now false
             // and the message was aborted. Check for that case.
-            val wasAborted = activeSession != null && !activeSession.ctx.isStreaming && activeSession.ctx.errorMessage != null
-            return if (wasAborted) {
-                SendMessageResult.Error(activeSession.ctx.errorMessage ?: "Response timed out")
+            // Re-fetch the active session — the reference captured at L680 may be stale
+            // if the session was evicted/switched during the long-running send.
+            val currentSession = sessionManager.getActiveSession()
+            val wasAborted = currentSession != null && !currentSession.ctx.isStreaming && currentSession.ctx.errorMessage != null
+            return if (wasAborted && currentSession != null) {
+                SendMessageResult.Error(currentSession.ctx.errorMessage ?: "Response timed out")
             } else {
                 SendMessageResult.Success(assistantMsgId)
             }
@@ -845,7 +871,9 @@ class OpenCodeService(private val project: Project) : Disposable {
             sessionManager.abortStreaming(errorMsg)
             return SendMessageResult.Error(errorMsg)
         } finally {
-            activeSession?.responseDeferred = null
+            // Re-fetch the active session — the reference captured at L680 may be stale
+            // if the session was evicted/switched during the long-running send.
+            sessionManager.getActiveSession()?.responseDeferred = null
         }
     }
 
@@ -870,10 +898,14 @@ class OpenCodeService(private val project: Project) : Disposable {
     suspend fun cancel() {
         val client = connectionManager.client
         val currentSessionId = sessionManager.activeSessionId.value
+        // Capture the active session reference at the same time as the session ID so
+        // the deferred we complete belongs to the session that was active when cancel
+        // started — not a potentially different session if the user switched mid-cancel.
+        val activeSession = sessionManager.getActiveSession()
         if (client != null && currentSessionId != null) {
             client.abortSession(currentSessionId)
         }
-        sessionManager.getActiveSession()?.let { session ->
+        activeSession?.let { session ->
             session.responseDeferred?.complete(Unit)
             session.responseDeferred = null
         }

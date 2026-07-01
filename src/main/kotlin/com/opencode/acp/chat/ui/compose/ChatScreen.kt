@@ -37,6 +37,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ChatInputState
+import com.opencode.acp.chat.model.ConnectionErrorReason
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.model.ReadyState
 import com.opencode.acp.chat.model.SelectionResponse
@@ -63,10 +64,21 @@ private fun computeRecentFiles(project: Project): List<RecentFile> {
 
     val openPaths = openFiles.map { it.path }.toSet()
 
-    val closedFiles = com.intellij.openapi.fileEditor.impl.EditorHistoryManager.getInstance(project).fileList
-        .filter { it.isValid && !it.isDirectory && it.path !in openPaths }
-        .takeLast(15)
-        .map { RecentFile(name = it.name, path = it.path) }
+    // NOTE: EditorHistoryManager is an internal `impl` package API and may change
+    // or be removed on platform upgrades. Wrap in try/catch so the plugin degrades
+    // gracefully (returns empty list for closed files) instead of crashing.
+    val closedFiles = try {
+        com.intellij.openapi.fileEditor.impl.EditorHistoryManager.getInstance(project).fileList
+            .filter { it.isValid && !it.isDirectory && it.path !in openPaths }
+            .takeLast(15)
+            .map { RecentFile(name = it.name, path = it.path) }
+    } catch (e: NoClassDefFoundError) {
+        emptyList()
+    } catch (e: LinkageError) {
+        emptyList()
+    } catch (e: Exception) {
+        emptyList()
+    }
 
     return openFiles + closedFiles
 }
@@ -101,29 +113,34 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
     val baseDir = localFileSystem.findFileByPath(basePath) ?: return results
 
     // Bounded recursive traversal: depth limit prevents deep recursion on
-    // huge directory trees, and maxVisited caps total work to avoid holding
-    // the read lock for too long on large projects.
+    // huge directory trees, and maxNodes caps total nodes (directories + files)
+    // inspected to avoid holding the read lock for too long on large projects.
     val maxDepth = 10
-    val maxVisited = 5000
+    val maxNodes = 5000
     var visited = 0
 
     fun searchDir(dir: VirtualFile, depth: Int) {
-        if (results.size >= maxResults || depth > maxDepth || visited >= maxVisited) return
+        if (results.size >= maxResults || depth > maxDepth || visited >= maxNodes) return
         visited++
         val children = dir.children ?: return
         for (child in children) {
-            if (results.size >= maxResults || visited >= maxVisited) return
-            if (child.isDirectory) {
-                // Skip hidden and build directories
+            if (results.size >= maxResults || visited >= maxNodes) return
+            if (child.isDirectory && !isSymLink(child)) {
+                // Skip hidden and build directories; don't follow symlinks (path traversal / cycles)
                 if (!child.name.startsWith(".") && child.name !in setOf("build", "node_modules", ".git", "out", "target")) {
                     searchDir(child, depth + 1)
                 }
-            } else if (child.isValid) {
+            } else if (child.isValid && !isSymLink(child)) {
                 visited++
                 val nameLower = child.name.lowercase()
                 if (nameLower.contains(query.lowercase()) && child.path !in seen) {
-                    seen.add(child.path)
-                    results.add(RecentFile(name = child.name, path = child.path))
+                    // Reject symlinks that escape the project base path
+                    val canonicalChild = try { java.io.File(child.path).canonicalPath } catch (_: Exception) { child.path }
+                    val canonicalBase = try { java.io.File(basePath).canonicalPath } catch (_: Exception) { basePath }
+                    if (canonicalChild.startsWith(canonicalBase + java.io.File.separator) || canonicalChild == canonicalBase) {
+                        seen.add(child.path)
+                        results.add(RecentFile(name = child.name, path = child.path))
+                    }
                 }
             }
         }
@@ -137,6 +154,21 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
     return results.take(maxResults)
 }
 
+/**
+ * Returns true if [file] is a symlink. Uses `java.nio.file.Files.isSymbolicLink`
+ * on the local path so it works against the public [VirtualFile] API (the
+ * `isSymlink()` method is only on the internal `VirtualFileSystemEntry` impl).
+ * Non-local VFS schemes (jar://, http://, etc.) cannot be symlinks.
+ */
+private fun isSymLink(file: VirtualFile): Boolean {
+    if (file.fileSystem !is com.intellij.openapi.vfs.LocalFileSystem) return false
+    return try {
+        java.nio.file.Files.isSymbolicLink(java.io.File(file.path).toPath())
+    } catch (_: Exception) {
+        false
+    }
+}
+
 @Composable
 fun
         ChatScreen(
@@ -145,6 +177,7 @@ fun
 ) {
     val messagesState = viewModel.messages.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
+    val connectionErrorReason by viewModel.connectionErrorReason.collectAsState()
     val readyState by viewModel.readyState.collectAsState()
     val controlState by viewModel.controlState.collectAsState()
     val inputState by viewModel.inputState.collectAsState()
@@ -205,6 +238,7 @@ fun
         // Debounced: rapid file operations (multi-file paste, git checkout) coalesce
         // into a single recomputation after a 100ms quiet period, avoiding UI flicker
         // from repeated clear()+addAll() calls.
+        var refreshJob: kotlinx.coroutines.Job? = null
         val connection = project.messageBus.connect()
         connection.subscribe(FileEditorManagerListener.FILE_EDITOR_MANAGER, object : FileEditorManagerListener {
             override fun fileOpened(source: FileEditorManager, file: VirtualFile) {
@@ -215,7 +249,6 @@ fun
                 scheduleRecentFilesRefresh()
             }
 
-            var refreshJob: kotlinx.coroutines.Job? = null
             private fun scheduleRecentFilesRefresh() {
                 refreshJob?.cancel()
                 refreshJob = scope.launch {
@@ -233,6 +266,7 @@ fun
         try {
             kotlinx.coroutines.awaitCancellation()
         } finally {
+            refreshJob?.cancel()
             connection.disconnect()
         }
     }
@@ -278,7 +312,7 @@ fun
         val chooser = FileChooserFactory.getInstance().createFileChooser(descriptor, project, null)
         val files = chooser.choose(project)
         files.forEach { file ->
-            addFileAttachment(file, attachedFiles)
+            addFileAttachment(file, attachedFiles, requireImage = true)
         }
     }
 
@@ -287,8 +321,15 @@ fun
         val vfs = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
         var vf = vfs.findFileByPath(recentFile.path)
         if (vf == null) {
-            // Try via URL for non-local paths (jar://, etc.)
-            vf = com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl("file://${recentFile.path}")
+            // Fallback for non-local paths. If the path is already a VFS URL
+            // (e.g. jar://, http://), resolve it directly; otherwise treat it
+            // as a local filesystem path.
+            vf = if (recentFile.path.contains("://")) {
+                com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(recentFile.path)
+            } else {
+                com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+                    .findFileByIoFile(java.io.File(recentFile.path))
+            }
         }
         if (vf != null) {
             addFileAttachment(vf, attachedFiles)
@@ -319,6 +360,7 @@ fun
         if (!isFullyReady) {
             ConnectionSplashScreen(
                 connectionState = connectionState,
+                connectionErrorReason = connectionErrorReason,
                 readyState = readyState,
                 onConnect = { 
                     viewModel.scope.launch { viewModel.connect(project.basePath) }
@@ -331,6 +373,9 @@ fun
                 },
                 onCancel = {
                     viewModel.cancelInitialization()
+                },
+                onOpenSettings = {
+                    com.opencode.acp.config.settings.OpenCodeSettingsConfigurable.showSettingsDialog(project)
                 },
                 modifier = Modifier.fillMaxSize()
             )
@@ -390,6 +435,7 @@ fun
                         // Connection banner (shows/hides based on state)
                         ConnectionBanner(
                             state = connectionState,
+                            errorReason = connectionErrorReason,
                             onRetry = { viewModel.scope.launch { viewModel.retryConnection(project.basePath) } }
                         )
 
@@ -526,7 +572,7 @@ fun
         // Image preview overlay — centered in the entire plugin window.
         // Only the dark background dismisses the preview; clicking the image itself does not.
         previewImagePath?.let { path ->
-            var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+            var bitmap by remember(path) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
             LaunchedEffect(path) {
                 bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(path) }
             }
@@ -576,9 +622,17 @@ fun
  */
 private fun addFileAttachment(
     file: VirtualFile,
-    attachedFiles: MutableList<AttachedFile>
+    attachedFiles: MutableList<AttachedFile>,
+    requireImage: Boolean = false
 ) {
     try {
+        if (requireImage) {
+            val ext = file.extension?.lowercase() ?: ""
+            if (ext !in setOf("png", "jpg", "jpeg", "gif", "bmp", "svg", "webp")) {
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] addFileAttachment: rejecting non-image file from image dialog: ${file.name} (.$ext)" }
+                return
+            }
+        }
         val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(file.name)
         attachedFiles.add(AttachedFile(name = file.name, path = file.path, mime = mime))
     } catch (e: Exception) {

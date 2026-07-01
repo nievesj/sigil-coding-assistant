@@ -2,7 +2,11 @@ package com.opencode.acp.chat.model
 
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.util.LinkedHashMap
+
+/** Logger for [CommandHistoryEntry] parallel-list mismatch diagnostics. */
+private val commandHistoryLogger = KotlinLogging.logger {}
 
 /** Attached file/image in a user message. */
 data class AttachedFile(
@@ -50,6 +54,22 @@ class CommandHistoryEntry {
     /** Reconstruct the original [AttachedFile] list. */
     fun toAttachedFiles(): List<AttachedFile> = buildList {
         val n = minOf(attachedFileNames.size, attachedFilePaths.size, attachedFileMimes.size)
+        if (attachedFileNames.size != n || attachedFilePaths.size != n || attachedFileMimes.size != n) {
+            commandHistoryLogger.warn {
+                "[ACP] CommandHistoryEntry.toAttachedFiles() parallel list mismatch: " +
+                    "names=${attachedFileNames.size}, paths=${attachedFilePaths.size}, " +
+                    "mimes=${attachedFileMimes.size} — truncating to $n entries. " +
+                    "Extra entries in the longer list(s) are dropped."
+            }
+        }
+        @Suppress("DEPRECATION")
+        if (attachedFileDataUris.isNotEmpty()) {
+            commandHistoryLogger.warn {
+                "[ACP] CommandHistoryEntry.toAttachedFiles(): entry has ${attachedFileDataUris.size} " +
+                    "legacy attachedFileDataUris (pre-rev2 format) — these are ignored. " +
+                    "Text: '${text.take(40)}'"
+            }
+        }
         for (i in 0 until n) {
             add(
                 AttachedFile(
@@ -219,6 +239,31 @@ enum class ConnectionState {
 }
 
 /**
+ * Distinguishes *why* a connection reached [ConnectionState.ERROR] or failed,
+ * so the UI can show targeted guidance instead of a generic "Connection failed".
+ */
+sealed interface ConnectionErrorReason {
+    /** No OpenCode binary path is configured in Settings. */
+    data object NoBinaryConfigured : ConnectionErrorReason
+    /** The configured binary failed to launch (file not found, permissions, etc.). */
+    data class BinaryLaunchFailed(val detail: String?) : ConnectionErrorReason
+    /** The launched process exited before the server became healthy. */
+    data class ProcessExited(val exitCode: Int, val outputTail: String?) : ConnectionErrorReason
+    /** The server did not pass the health check within the startup timeout. */
+    data object HealthCheckTimeout : ConnectionErrorReason
+    /** Connection lost after successful init (reconnection failure). */
+    data class ReconnectionFailed(val detail: String?) : ConnectionErrorReason
+    /**
+     * Any other connection failure not covered above.
+     *
+     * Currently unused (no call site constructs this), but retained for future
+     * error categories. UI `when` arms handle it explicitly (not via `else`) so
+     * the compiler enforces exhaustive matching.
+     */
+    data class Other(val detail: String?) : ConnectionErrorReason
+}
+
+/**
  * Readiness state for the UI transition to chat.
  * Owned by ChatViewModel — gates the splash → chat transition
  * alongside ConnectionState.CONNECTED.
@@ -363,6 +408,12 @@ data class ContextBreakdown(
      * Percentages for the proportional bar.
      * When freeTokens < 0 (context over-full), percentages sum to >100%.
      * The UI caps the bar at 100% and shows an overflow indicator.
+     *
+     * WARNING: These percentages are ESTIMATES derived from estimated category
+     * token counts (the server does not expose per-part token counts). They are
+     * internally consistent (sum to 100% when not over-full) but should NOT be
+     * treated as precise measurements. Use for proportional display only, not
+     * for billing or capacity planning.
      */
     val systemPromptPercent: Float get() = if (totalTokens > 0) systemPromptTokens.toFloat() / totalTokens * 100 else 0f
     val userPercent: Float get() = if (totalTokens > 0) userTokens.toFloat() / totalTokens * 100 else 0f
@@ -448,8 +499,15 @@ data class TodoItem(
  * - Thinking parts are prefixed with `> ` (blockquote style)
  * - Error parts are prefixed with "Error: "
  * - ToolCall, FileChange, and Subagent parts are skipped (not markdown-renderable)
+ *
+ * **WARNING:** This output is NOT escaped and is intended for display/clipboard/debug only.
+ * Do NOT pass `rawMarkdownForClipboard` back into an LLM context — use `escapedForPrompt` instead.
+ * Untrusted message content can contain markdown fences or directive-like syntax that
+ * acts as prompt injection. The content is intentionally NOT escaped because this is a
+ * raw representation of the message parts for clipboard/debug purposes, not a sanitized
+ * prompt input.
  */
-val ChatMessage.fullMarkdownContent: String
+val ChatMessage.rawMarkdownForClipboard: String
     get() = buildString {
         parts.values.forEach { part ->
             when (part) {
@@ -473,6 +531,30 @@ val ChatMessage.fullMarkdownContent: String
                 is MessagePart.StepFinish -> { /* skip — informational */ }
             }
         }
+    }
+
+/**
+ * Returns a content-neutralized markdown representation of a ChatMessage, safe
+ * for inclusion in LLM prompts. Wraps each part in fenced delimiters and escapes
+ * directive-like syntax (markdown headings, code fences, HTML tags) so that
+ * untrusted message content cannot act as prompt injection.
+ *
+ * Use this instead of [rawMarkdownForClipboard] when feeding message content
+ * back into an LLM context (e.g., for summarization, context inclusion, or
+ * multi-shot review prompts).
+ */
+val ChatMessage.escapedForPrompt: String
+    get() {
+        val raw = rawMarkdownForClipboard
+        // Escape code fences so untrusted content can't break out of a fenced block
+        // and inject directives. Replace triple-backtick sequences with a safe alias.
+        val fenceEscaped = raw.replace("```", "´´´")
+        // Escape markdown heading markers at line start so untrusted content can't
+        // inject headings like "### System: ignore previous instructions".
+        val headingEscaped = fenceEscaped.replace(Regex("(?m)^(#{1,6}\\s)"), "\\$1")
+        // Escape HTML-like tags so untrusted content can't inject HTML directives
+        val htmlEscaped = headingEscaped.replace("<", "&lt;").replace(">", "&gt;")
+        return htmlEscaped
     }
 
 /** Sidebar tab identifiers. */

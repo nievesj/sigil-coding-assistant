@@ -1,5 +1,7 @@
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -33,7 +35,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -54,10 +60,6 @@ import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.ui.composed
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.window.Dialog
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -122,8 +124,9 @@ fun SessionSidebar(
                         message = state.message,
                         onRetry = onRetry
                     )
+
                     is SessionListState.Loaded -> {
-                        if (state.sessions.isEmpty()) {
+                        if (state.displayedSessions.isEmpty()) {
                             EmptyContent()
                         } else {
                             SessionList(
@@ -144,6 +147,7 @@ fun SessionSidebar(
                     }
                 }
             }
+
             SidebarTab.CONTEXT -> {
                 ContextPanel(
                     state = contextState,
@@ -154,6 +158,7 @@ fun SessionSidebar(
                     modifier = Modifier.weight(1f)
                 )
             }
+
             SidebarTab.REVIEW -> {
                 ReviewPanel(
                     project = project,
@@ -318,7 +323,7 @@ private data class TreeItem(
  */
 private fun buildSessionTree(sessions: List<SessionItem>): List<TreeItem> {
     val sessionMap = sessions.associateBy { it.id }
-    val childrenMap = sessions.filter { it.parentID != null }.groupBy { it.parentID!! }
+    val childrenMap = sessions.mapNotNull { s -> s.parentID?.let { p -> s to p } }.groupBy({ it.second }, { it.first })
     val processed = mutableSetOf<String>()
     val result = mutableListOf<TreeItem>()
 
@@ -335,7 +340,7 @@ private fun buildSessionTree(sessions: List<SessionItem>): List<TreeItem> {
         }
     }
 
-    // Add parent sessions (no parentID) first, sorted by creation time
+    // Add parent sessions (no parentID) first, sorted by most-recently-updated (updatedAt desc)
     val parents = sessions
         .filter { it.parentID == null }
         .sortedByDescending { it.updatedAt }
@@ -421,22 +426,26 @@ private fun SessionList(
     // chains (depth 10+) would degrade — if that becomes common, precompute a
     // parent-index map for O(1) ancestor lookup.
     val visibleItems = remember(fullTree, expandedIds.toMap()) {
+        // Precompute parent index: for each item at index i, parentIdx[i] = index of nearest
+        // preceding item with strictly smaller depth (the ancestor), or -1 if none.
+        val parentIdx = IntArray(fullTree.size) { -1 }
+        for (i in fullTree.indices) {
+            var p = i - 1
+            while (p >= 0 && fullTree[p].depth >= fullTree[i].depth) p--
+            parentIdx[i] = p
+        }
         fullTree.filterIndexed { idx, item ->
             if (item.depth == 0) return@filterIndexed true
-            // Walk backwards from idx to find ancestors. Each ancestor must be expanded.
+            // Walk up the ancestor chain via parentIdx — each ancestor must be expanded
             var i = idx
             while (i > 0) {
-                // Find the nearest preceding item with smaller depth (an ancestor)
-                var parentIdx = i - 1
-                while (parentIdx >= 0 && fullTree[parentIdx].depth >= fullTree[i].depth) {
-                    parentIdx--
-                }
-                if (parentIdx < 0) break
-                val parent = fullTree[parentIdx]
+                val p = parentIdx[i]
+                if (p < 0) break
+                val parent = fullTree[p]
                 if (expandedIds[parent.session.id] != true) {
                     return@filterIndexed false
                 }
-                i = parentIdx
+                i = p
             }
             true
         }
@@ -550,7 +559,6 @@ private fun SessionRow(
             .padding(horizontal = 4.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(bgColor)
-            .sessionShimmer(indicator)
             .border(
                 width = if (isSelected) 1.dp else 0.dp,
                 color = if (isSelected) retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.3f) else Color.Transparent,
@@ -570,12 +578,16 @@ private fun SessionRow(
                         .clickable(onClick = onToggle),
                     contentAlignment = Alignment.Center,
                 ) {
-                Icon(
-                    key = if (isExpanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
-                    contentDescription = if (isExpanded) "Collapse" else "Expand",
-                        modifier = Modifier.size(16.dp),
-                        tint = iconTint,
-                    )
+                    if (indicator != SessionIndicator.NONE) {
+                        SessionSpinner(modifier = Modifier.size(16.dp), tint = iconTint)
+                    } else {
+                        Icon(
+                            key = if (isExpanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
+                            contentDescription = if (isExpanded) "Collapse" else "Expand",
+                            modifier = Modifier.size(16.dp),
+                            tint = iconTint,
+                        )
+                    }
                 }
                 Spacer(Modifier.width(4.dp))
             } else if (depth > 0) {
@@ -584,12 +596,16 @@ private fun SessionRow(
                     modifier = Modifier.size(24.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        key = AllIconsKeys.Actions.Forward,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = iconTint,
-                    )
+                    if (indicator != SessionIndicator.NONE) {
+                        SessionSpinner(modifier = Modifier.size(14.dp), tint = iconTint)
+                    } else {
+                        Icon(
+                            key = AllIconsKeys.Actions.Forward,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = iconTint,
+                        )
+                    }
                 }
                 Spacer(Modifier.width(4.dp))
             } else {
@@ -598,12 +614,16 @@ private fun SessionRow(
                     modifier = Modifier.size(24.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        key = AllIconsKeys.FileTypes.Text,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = iconTint,
-                    )
+                    if (indicator != SessionIndicator.NONE) {
+                        SessionSpinner(modifier = Modifier.size(14.dp), tint = iconTint)
+                    } else {
+                        Icon(
+                            key = AllIconsKeys.FileTypes.Text,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = iconTint,
+                        )
+                    }
                 }
                 Spacer(Modifier.width(4.dp))
             }
@@ -702,50 +722,49 @@ private fun SessionRow(
     }
 }
 
-// ── Shimmer Modifier ─────────────────────────────────────────────────────────
+// ── Session Spinner ──────────────────────────────────────────────────────────
 
 /**
- * Applies a horizontal-gradient shimmer band when [indicator] is CREATING or STREAMING.
- * Uses [composed] so the throttled animation is only created when [indicator] is not
- * [SessionIndicator.NONE] — no animation runs for idle sessions. The shimmer progress
- * [State] is read inside [drawBehind] to avoid recomposition every animation frame.
+ * A small rotating arc spinner shown in place of the session row's leading icon
+ * while [SessionIndicator] is CREATING or STREAMING. When the indicator is NONE,
+ * the caller renders the normal icon instead.
  *
- * Uses [rememberThrottledInfiniteAnimation] instead of [rememberInfiniteTransition] to
- * reduce GPU command flush pressure. The throttle FPS is configurable via Settings →
- * Tools → Sigil → "Animation FPS".
+ * Uses [rememberThrottledInfiniteAnimation] to reduce GPU command flush pressure.
+ * The throttle FPS is configurable via Settings → Tools → Sigil → "Animation FPS".
  */
-private fun Modifier.sessionShimmer(indicator: SessionIndicator): Modifier = composed {
-    if (indicator == SessionIndicator.NONE) return@composed Modifier
-
-    val edge = Color.Transparent
-    val soft = ChatTheme.colors.component.glowStart
-    val peak = ChatTheme.colors.component.glowPeak
-
-    val shimmerProgressState = rememberThrottledInfiniteAnimation(
-        active = true,  // already gated by the NONE check above
-        initialValue = -0.4f,
-        targetValue = 1.4f,
-        durationMillis = ChatTheme.animations.shimmerSweepMs,
+@Composable
+private fun SessionSpinner(modifier: Modifier = Modifier, tint: Color = Color.Gray) {
+    val rotationState = rememberThrottledInfiniteAnimation(
+        active = true,
+        initialValue = 0f,
+        targetValue = 360f,
+        durationMillis = 1000,
         repeatMode = RepeatMode.Restart,
-        label = "shimmer",
+        label = "sessionSpinner",
     )
 
-    Modifier.drawBehind {
-        val progress = shimmerProgressState.value
-        val bandWidth = size.width * 0.5f
-        val startX = progress * size.width - bandWidth
-        drawRect(
-            brush = Brush.horizontalGradient(
-                colors = listOf(
-                    edge,
-                    soft,
-                    peak,
-                    soft,
-                    edge
-                ),
-                startX = startX,
-                endX = startX + bandWidth
-            )
+    Canvas(modifier = modifier) {
+        val stroke = size.minDimension * 0.12f
+        val diameter = size.width
+        val radius = diameter / 2f - stroke / 2f
+
+        drawArc(
+            color = tint.copy(alpha = 0.25f),
+            startAngle = 0f,
+            sweepAngle = 360f,
+            useCenter = false,
+            topLeft = Offset(stroke / 2f, stroke / 2f),
+            size = Size(diameter - stroke, diameter - stroke),
+            style = Stroke(width = stroke, cap = StrokeCap.Round)
+        )
+        drawArc(
+            color = tint,
+            startAngle = rotationState.value - 90f,
+            sweepAngle = 90f,
+            useCenter = false,
+            topLeft = Offset(stroke / 2f, stroke / 2f),
+            size = Size(diameter - stroke, diameter - stroke),
+            style = Stroke(width = stroke, cap = StrokeCap.Round)
         )
     }
 }
@@ -842,8 +861,9 @@ private fun SessionListFooter(
                 is com.opencode.acp.chat.model.ClearAllResult.Partial -> "Deleted ${clearAllState.result.deleted}, ${clearAllState.result.failed} failed"
                 is com.opencode.acp.chat.model.ClearAllResult.Failed -> clearAllState.result.message
             }
+
             is ClearAllState.Idle -> if (hasMore) "$visibleCount of $totalCount sessions loaded"
-                                    else "All $totalCount sessions loaded"
+            else "All $totalCount sessions loaded"
         }
         Text(
             text = statusText,
