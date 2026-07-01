@@ -66,6 +66,8 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+private val sidebarLogger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+
 // ── SessionSidebar ──────────────────────────────────────────────────────────
 
 @Composable
@@ -88,6 +90,7 @@ fun SessionSidebar(
     commentChangeSignal: kotlinx.coroutines.flow.StateFlow<com.opencode.acp.review.ReviewIndex>,
     streamingSessionIds: Set<String> = emptySet(),
     pendingCreationSessionIds: Set<String> = emptySet(),
+    hiddenChildIds: Set<String> = emptySet(),
     clearAllState: ClearAllState = ClearAllState.Idle,
     compactionState: com.opencode.acp.chat.model.CompactionState = com.opencode.acp.chat.model.CompactionState.Idle,
     onCompact: () -> Unit = {},
@@ -126,11 +129,14 @@ fun SessionSidebar(
                     )
 
                     is SessionListState.Loaded -> {
-                        if (state.displayedSessions.isEmpty()) {
+                        // Pass full sessions list (top-level + children) so buildSessionTree
+                        // can build the complete parent/child tree. Hidden children are filtered
+                        // inside buildSessionTree via hiddenChildIds.
+                        if (state.sessions.isEmpty()) {
                             EmptyContent()
                         } else {
                             SessionList(
-                                sessions = state.displayedSessions,
+                                sessions = state.sessions,
                                 totalCount = state.topLevelSessions.size,
                                 hasMore = state.hasMore,
                                 selectedId = state.selectedId,
@@ -140,6 +146,7 @@ fun SessionSidebar(
                                 onClearAll = onClearAll,
                                 streamingSessionIds = streamingSessionIds,
                                 pendingCreationSessionIds = pendingCreationSessionIds,
+                                hiddenChildIds = hiddenChildIds,
                                 listState = listState,
                                 clearAllState = clearAllState,
                             )
@@ -316,19 +323,30 @@ private data class TreeItem(
  * Builds a flat list from a tree of sessions, preserving parent-child order.
  * Parents appear first, then their children indented one level deeper.
  * Orphaned children (parent not in the list) are promoted to top level.
+ * Hidden children (completed child sessions) are filtered out before building.
  *
  * Cycle safety: The `processed` set (line ~327) prevents infinite recursion
  * if the session tree has a cycle (e.g., A→B→A parent links from a server data bug).
  * Each session is visited at most once.
  */
-private fun buildSessionTree(sessions: List<SessionItem>): List<TreeItem> {
-    val sessionMap = sessions.associateBy { it.id }
-    val childrenMap = sessions.mapNotNull { s -> s.parentID?.let { p -> s to p } }.groupBy({ it.second }, { it.first })
+private fun buildSessionTree(
+    sessions: List<SessionItem>,
+    hiddenChildIds: Set<String> = emptySet(),
+): List<TreeItem> {
+    // Filter out hidden children BEFORE building the tree.
+    // Hidden children are skipped entirely; their parent still renders (with other visible
+    // children, or as a leaf if all children are hidden).
+    val visibleSessions = sessions.filter { it.id !in hiddenChildIds }
+    val sessionMap = visibleSessions.associateBy { it.id }
+    val childrenMap = visibleSessions.mapNotNull { s -> s.parentID?.let { p -> s to p } }.groupBy({ it.second }, { it.first })
     val processed = mutableSetOf<String>()
     val result = mutableListOf<TreeItem>()
 
     fun addWithChildren(session: SessionItem, depth: Int) {
-        if (session.id in processed) return
+        if (session.id in processed) {
+            sidebarLogger.warn { "[ACP] buildSessionTree: cycle detected for session ${session.id}" }
+            return
+        }
         processed.add(session.id)
         val children = childrenMap[session.id]
             ?.filter { it.id !in processed }
@@ -341,7 +359,7 @@ private fun buildSessionTree(sessions: List<SessionItem>): List<TreeItem> {
     }
 
     // Add parent sessions (no parentID) first, sorted by most-recently-updated (updatedAt desc)
-    val parents = sessions
+    val parents = visibleSessions
         .filter { it.parentID == null }
         .sortedByDescending { it.updatedAt }
     for (parent in parents) {
@@ -349,7 +367,7 @@ private fun buildSessionTree(sessions: List<SessionItem>): List<TreeItem> {
     }
 
     // Add any orphaned children (parent not in the list) at top level
-    for (session in sessions) {
+    for (session in visibleSessions) {
         if (session.id !in processed) {
             val hasParent = session.parentID != null && session.parentID in sessionMap
             if (!hasParent) {
@@ -403,19 +421,83 @@ private fun SessionList(
     onClearAll: () -> Unit,
     streamingSessionIds: Set<String> = emptySet(),
     pendingCreationSessionIds: Set<String> = emptySet(),
+    hiddenChildIds: Set<String> = emptySet(),
     listState: LazyListState = rememberLazyListState(),
     clearAllState: ClearAllState = ClearAllState.Idle,
 ) {
-    val fullTree = remember(sessions) { buildSessionTree(sessions) }
+    val fullTree = remember(sessions, hiddenChildIds) { buildSessionTree(sessions, hiddenChildIds) }
 
-    // Track which parent IDs are expanded using snapshot state.
-    // Reset when sessions or selectedId change.
-    val expandedIds = remember(sessions, selectedId) {
-        mutableStateMapOf<String, Boolean>().apply {
-            for (pid in defaultExpandedParents(fullTree, selectedId)) {
-                put(pid, true)
+    // Persist expand/collapse state across session switches.
+    // Keyed on nothing (persists for the lifetime of SessionList) — selectedId
+    // changes merge new ancestors via LaunchedEffect below instead of wiping state.
+    val expandedIds = remember { mutableStateMapOf<String, Boolean>() }
+
+    // Track parents the user explicitly collapsed — suppresses auto-expand for them.
+    val userCollapsed = remember { mutableStateMapOf<String, Boolean>() }
+
+    // Merge ancestors of the newly selected session into expandedIds without
+    // clearing existing manual expand/collapse state. Respects userCollapsed.
+    LaunchedEffect(selectedId, fullTree) {
+        for (pid in defaultExpandedParents(fullTree, selectedId)) {
+            if (pid !in expandedIds && userCollapsed[pid] != true) {
+                expandedIds[pid] = true
             }
         }
+    }
+
+    // Auto-expand parent when a NEW child appears — either actively streaming
+    // (any parent) or under the selected/active session (regardless of streaming
+    // status, to handle fast-completing subtasks that finish before loadSessions()
+    // returns and the streaming flag is cleared).
+    // On initial load, previousChildMap is empty — skip the first emission to
+    // avoid mass-expanding all parents that happen to have children.
+    val previousChildMap = remember { mutableStateOf<Map<String, List<SessionItem>>>(emptyMap()) }
+    val childSessionMap = remember(sessions) {
+        sessions.filter { it.parentID != null }.groupBy { it.parentID!! }
+    }
+    var initialized = remember { mutableStateOf(false) }
+    LaunchedEffect(childSessionMap, streamingSessionIds) {
+        if (!initialized.value) {
+            // First emission — seed previousChildMap without triggering auto-expand.
+            // This prevents all parents from expanding on initial connect.
+            previousChildMap.value = childSessionMap
+            initialized.value = true
+            return@LaunchedEffect
+        }
+        val newChildParents = mutableSetOf<String>()
+        childSessionMap.forEach { (parentId, children) ->
+            val visibleChildren = children.filter { it.id !in hiddenChildIds }
+            if (visibleChildren.isNotEmpty()) {
+                val prev = previousChildMap.value[parentId].orEmpty()
+                val prevVisible = prev.filter { it.id !in hiddenChildIds }
+                // Only expand when genuinely new children appeared (size grew)
+                if (visibleChildren.size > prevVisible.size) {
+                    // Auto-expand if this parent has actively streaming children...
+                    val hasStreamingChild = visibleChildren.any { it.id in streamingSessionIds }
+                    // ...or if this is the selected/active session (handles fast-completing
+                    // subtasks where the child finishes before loadSessions() returns).
+                    val isSelectedParent = parentId == selectedId
+                    if (hasStreamingChild || isSelectedParent) {
+                        newChildParents += parentId
+                    }
+                }
+            }
+        }
+        for (parentId in newChildParents) {
+            if (userCollapsed[parentId] != true && parentId !in expandedIds) {
+                expandedIds[parentId] = true
+            }
+        }
+        previousChildMap.value = childSessionMap
+    }
+
+    // Compute the capped set of child session IDs allowed to show a spinner.
+    // Child sessions beyond the cap show a static icon (SessionIndicator.NONE-equivalent).
+    // This avoids GDI nativeBlit hang risk from too many concurrent animations (AGENTS.md).
+    val streamingChildIds = remember(streamingSessionIds, sessions, hiddenChildIds) {
+        val childIds = sessions.filter { it.parentID != null && it.id !in hiddenChildIds }.map { it.id }.toSet()
+        val streamingChildren = streamingSessionIds.filter { it in childIds }
+        streamingChildren.take(com.opencode.acp.chat.model.ChatConstants.MAX_VISIBLE_CHILD_SPINNERS).toSet()
     }
 
     // Compute visible items by walking the tree with indices (O(n) instead of
@@ -425,7 +507,14 @@ private fun SessionList(
     // For typical session trees (depth 2-3) this is effectively O(n). Deep subagent
     // chains (depth 10+) would degrade — if that becomes common, precompute a
     // parent-index map for O(1) ancestor lookup.
-    val visibleItems = remember(fullTree, expandedIds.toMap()) {
+    //
+    // Use expandedIds.entries.toSet() as the remember key instead of
+    // expandedIds.toMap() — toMap() creates a new Map instance on every call,
+    // which would cause remember to recompute on every recomposition. The
+    // entries.toSet() approach creates a stable Set that only changes when
+    // the actual entries change.
+    val expandedKey = expandedIds.entries.toSet()
+    val visibleItems = remember(fullTree, expandedKey) {
         // Precompute parent index: for each item at index i, parentIdx[i] = index of nearest
         // preceding item with strictly smaller depth (the ancestor), or -1 if none.
         val parentIdx = IntArray(fullTree.size) { -1 }
@@ -465,9 +554,10 @@ private fun SessionList(
                 val item = visibleItems[index]
                 val isExpanded = expandedIds[item.session.id] == true
                 val sessionId = item.session.id
+                val isChild = item.session.parentID != null
                 val indicator = when {
                     sessionId in pendingCreationSessionIds -> SessionIndicator.CREATING
-                    sessionId in streamingSessionIds -> SessionIndicator.STREAMING
+                    sessionId in streamingSessionIds && (!isChild || sessionId in streamingChildIds) -> SessionIndicator.STREAMING
                     else -> SessionIndicator.NONE
                 }
                 SessionRow(
@@ -479,8 +569,13 @@ private fun SessionList(
                     indicator = indicator,
                     onClick = { onSessionSelected(sessionId) },
                     onToggle = {
-                        if (expandedIds[sessionId] == true) expandedIds[sessionId] = false
-                        else expandedIds[sessionId] = true
+                        if (expandedIds[sessionId] == true) {
+                            expandedIds[sessionId] = false
+                            userCollapsed[sessionId] = true
+                        } else {
+                            expandedIds[sessionId] = true
+                            userCollapsed.remove(sessionId)
+                        }
                     },
                     onArchive = { onSessionArchived(sessionId) },
                 )
@@ -489,8 +584,10 @@ private fun SessionList(
 
         // Fixed footer at bottom of sidebar — always visible, no scrolling required
         if (totalCount > 0) {
+            // visibleCount shows only top-level sessions (children are indented under parents)
+            val topLevelVisible = visibleItems.count { it.depth == 0 }
             SessionListFooter(
-                visibleCount = sessions.size,
+                visibleCount = topLevelVisible,
                 totalCount = totalCount,
                 hasMore = hasMore,
                 onLoadMore = onLoadMore,
@@ -648,35 +745,53 @@ private fun SessionRow(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
-                    // Archive button — centered, slightly larger, with a visible hover highlight
-                    val archiveHoverBg = retrieveColorOrUnspecified("Component.errorFocusColor").copy(alpha = 0.12f)
-                    Box(
-                        modifier = Modifier
-                            .size(24.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(if (isHovered) archiveHoverBg else Color.Transparent)
-                            .clickable(onClick = onArchive),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            key = AllIconsKeys.Actions.Close,
-                            contentDescription = "Archive",
-                            modifier = Modifier.size(18.dp),
-                            tint = if (isHovered) {
-                                retrieveColorOrUnspecified("Component.errorFocusColor")
-                            } else {
-                                retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.45f)
-                            },
-                        )
+                    // Archive button — only for top-level sessions (child sessions are auto-removed)
+                    if (session.parentID == null) {
+                        val archiveHoverBg = retrieveColorOrUnspecified("Component.errorFocusColor").copy(alpha = 0.12f)
+                        Box(
+                            modifier = Modifier
+                                .size(24.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(if (isHovered) archiveHoverBg else Color.Transparent)
+                                .clickable(onClick = onArchive),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                key = AllIconsKeys.Actions.Close,
+                                contentDescription = "Archive",
+                                modifier = Modifier.size(18.dp),
+                                tint = if (isHovered) {
+                                    retrieveColorOrUnspecified("Component.errorFocusColor")
+                                } else {
+                                    retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.45f)
+                                },
+                            )
+                        }
                     }
                 }
 
-                // Metadata row: timestamp + cost + tokens
+                // Metadata row: [Sub-task ·] timestamp · cost · tokens
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    // "Sub-task" label for child sessions
+                    if (session.parentID != null) {
+                        Text(
+                            text = "Sub-task",
+                            fontSize = 11.sp,
+                            color = metaColor,
+                            maxLines = 1,
+                        )
+                        Text(
+                            text = "\u00B7",
+                            fontSize = 11.sp,
+                            color = sepColor,
+                            maxLines = 1,
+                        )
+                    }
+
                     // Timestamp
                     Text(
                         text = formatRelativeTime(session.updatedAt),
@@ -970,6 +1085,9 @@ internal fun formatRelativeTime(epochMillis: Long): String {
         hours < 24 -> "${hours}h ago"
         hours < 48 -> "Yesterday"
         else -> {
+            // Create a new SimpleDateFormat on each call — SimpleDateFormat is
+            // NOT thread-safe and Compose recomposition can happen on different
+            // threads. The overhead is negligible for a formatting helper.
             val sdf = SimpleDateFormat("MM/dd", Locale.US)
             sdf.format(Date(epochMillis))
         }

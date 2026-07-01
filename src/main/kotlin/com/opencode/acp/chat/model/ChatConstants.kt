@@ -34,4 +34,10 @@ object ChatConstants {
     const val PRUNER_HEARTBEAT_FILENAME = "sigil-pruner.heartbeat"
     /** API version for compatibility handshake between Kotlin config and TS plugin. */
     const val PRUNER_API_VERSION = 1
+
+    // ── Child Sessions ──────────────────────────────────────────────────
+    /** Maximum number of concurrently-animating child session spinners.
+     *  Caps animation count to avoid GDI nativeBlit hang risk (AGENTS.md).
+     *  Child sessions beyond this cap show a static forward-arrow icon instead. */
+    const val MAX_VISIBLE_CHILD_SPINNERS = 5
 }

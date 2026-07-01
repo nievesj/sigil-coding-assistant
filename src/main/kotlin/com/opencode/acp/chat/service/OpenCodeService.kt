@@ -44,16 +44,27 @@ import java.util.concurrent.atomic.AtomicLong
 class OpenCodeService(private val project: Project) : Disposable {
 
     private val logger = KotlinLogging.logger {}
+
+    // Late-binding reference for error surfacing — set after sessionManager is created.
+    // This breaks the initialization circular dependency: scope's CoroutineExceptionHandler
+    // needs sessionManager, but sessionManager needs scope.
+    @Volatile private var errorSurfacer: ((String) -> Unit)? = null
+
     internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, throwable ->
         logger.error(throwable) { "[ACP] Uncaught coroutine exception in OpenCodeService scope" }
-        // Emit an error signal so the UI can surface "internal error" instead of
-        // silently hanging. SessionManager._globalSignals (the flow the ViewModel
-        // collects for cross-session errors) is private with no public/internal
-        // emitter, and emitSessionSignal routes to a different flow (_allSessionSignals)
-        // that only handles StreamingCompleted. Routing through it would not reach
-        // the UI error display, so we rely on logging alone — the critical fix that
-        // ensures exceptions are visible in idea.log with full stack traces instead
-        // of being swallowed by the JVM default handler.
+        // Surface critical errors to the UI via the global signals flow.
+        // SessionManager._globalSignals is collected by the ViewModel and routed
+        // to the SessionError handler, which resets _streamPhase and removes the
+        // streaming session indicator. This prevents the UI from appearing stuck
+        // when a background coroutine crashes.
+        if (throwable !is CancellationException) {
+            try {
+                errorSurfacer?.invoke(throwable.message ?: throwable.javaClass.simpleName)
+            } catch (_: Exception) {
+                // Don't let the error-surfacing mechanism itself throw —
+                // the original exception is already logged.
+            }
+        }
     })
 
     // ── Sub-components ─────────────────────────────────────────────────────
@@ -61,7 +72,10 @@ class OpenCodeService(private val project: Project) : Disposable {
     val connectionManager = ProcessManager(scope).apply {
         onMcpReset = { resetMcpOnServerRestart() }
     }
-    val sessionManager = SessionManager(scope, project)
+    val sessionManager = SessionManager(scope, project).also {
+        // Wire the error surfer now that sessionManager exists.
+        errorSurfacer = { msg -> it.emitGlobalError(msg) }
+    }
     val commandManager = CommandManager(
         clientProvider = { connectionManager.client },
         sessionIdProvider = { sessionManager.activeSessionId.value }
@@ -89,6 +103,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     val sessionContextState: StateFlow<SessionContextState> = sessionManager.sessionContextState
     val streamingSessionIds: StateFlow<Set<String>> = sessionManager.streamingSessionIds
     val pendingCreationSessionIds: StateFlow<Set<String>> = sessionManager.pendingCreationSessionIds
+    val hiddenChildSessionIds: StateFlow<Set<String>> = sessionManager.hiddenChildSessionIds
     val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = sessionManager.sessionCachedFlow
 
     // ── Internal state ─────────────────────────────────────────────────────
@@ -298,10 +313,12 @@ class OpenCodeService(private val project: Project) : Disposable {
                 toolName to Pair(enabled, permission)
             }
         } catch (e: Exception) {
-            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — clearing corrupted value" }
-            try {
-                OpenCodeSettingsState.getInstance().toolPermissions = ""
-            } catch (_: Exception) { /* don't let clearing fail the parse call */ }
+            // Log the failure — the corrupted value will be overwritten naturally
+            // when the user next saves settings. Don't destructively clear it here
+            // because this parse function is called from background coroutines
+            // (discoverToolsInBackground) where a transient race could destroy
+            // valid saved permissions.
+            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — value will be overwritten on next settings save" }
             emptyMap()
         }
     }
@@ -380,11 +397,20 @@ class OpenCodeService(private val project: Project) : Disposable {
      *  Used by ChatViewModel on cancel/switch/error. Idempotent. */
     fun removeStreamingSession(sessionId: String) = sessionManager.removeStreamingSession(sessionId)
 
+    /** Un-hide a child session (e.g., when switching to it via ToolPill "open child"). */
+    fun unhideChildSession(sessionId: String) = sessionManager.unhideChildSession(sessionId)
+
     // ── Connection stop ─────────────────────────────────────────────────────
 
     /** Stop all connection activity: cancel SSE reconnection loop, cancel SSE
-     *  subscription, and disconnect the HTTP client. Called by the "Stop" button
-     *  on the splash screen when the user wants to abort reconnection. */
+     *  subscription, and shut down the HTTP client + server process. Called by:
+     *  - The "Stop" button on the splash screen (user wants to abort reconnection)
+     *  - cancelInitialization() (user wants to abort the initial connection attempt)
+     *  - The "Disconnect" button in the input area (user wants to disconnect)
+     *
+     *  In all cases, killing the server process is correct because the plugin
+     *  owns the process — it was launched by ProcessManager.initialize(). The
+     *  user can reconnect via the "Connect" button which re-launches the server. */
     fun stopConnection() {
         sseReconnectJob?.cancel()
         sseReconnectJob = null
@@ -476,6 +502,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                 } else {
                     logger.warn { "[ACP] SSE health check failed (server unhealthy) after ${silenceMs}ms silence — triggering reconnection" }
                     sseJob?.cancel()
+                    // Trigger reconnection explicitly — launchSseJob's post-catch
+                    // logic checks isActive which is false after cancellation, so
+                    // it won't call triggerGlobalSseReconnect() on its own.
+                    triggerGlobalSseReconnect()
                     break
                 }
             } catch (e: CancellationException) {
@@ -483,6 +513,8 @@ class OpenCodeService(private val project: Project) : Disposable {
             } catch (_: Exception) {
                 logger.warn { "[ACP] SSE health check failed (request error) after ${silenceMs}ms silence — triggering reconnection" }
                 sseJob?.cancel()
+                // Trigger reconnection explicitly — same reason as above.
+                triggerGlobalSseReconnect()
                 break
             }
         }
@@ -498,7 +530,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             while (isActive) {
                 val base = ChatConstants.RECONNECT_DELAY_MS
                 val max = ChatConstants.RECONNECT_MAX_DELAY_MS
-                val exponential = (base * (1L shl sseReconnectAttempt.coerceAtMost(10))).coerceAtMost(max)
+                val exponential = (base * (1L shl sseReconnectAttempt.coerceIn(0, 10))).coerceAtMost(max)
                 val jitter = (exponential * kotlin.random.Random.nextDouble(0.0, 0.2)).toLong()
                 val delayMs = (exponential + jitter).coerceAtMost(max)
 
@@ -529,8 +561,13 @@ class OpenCodeService(private val project: Project) : Disposable {
                 sseHealthCheckJob?.cancel()
                 // Wait for old jobs to finish before launching new ones to prevent
                 // stale StreamingCompleted signals from completing the new turn's deferred.
-                sseJob?.join()
-                sseHealthCheckJob?.join()
+                // Use withTimeoutOrNull to avoid hanging if the old job is stuck on
+                // a half-open TCP connection (no socket timeout per AGENTS.md).
+                // If the join times out, the old job becomes a zombie — but it's harmless:
+                // sseJob?.cancel() was already called above, and the scope will reclaim it
+                // on dispose. The zombie can't process new events (its TCP stream is dead).
+                withTimeoutOrNull(5000) { sseJob?.join() }
+                withTimeoutOrNull(5000) { sseHealthCheckJob?.join() }
                 val reconnectTime = System.currentTimeMillis()
                 sseLastEventTimeMs.set(reconnectTime)
                 logger.info { "[ACP] SSE reconnected at $reconnectTime" }
@@ -582,28 +619,37 @@ class OpenCodeService(private val project: Project) : Disposable {
 
         logger.info { "[ACP] recoverBackgroundSessions: checking ${streamingSessions.size} streaming sessions" }
 
-        // Parallelize REST fetches — each session needs a separate listMessages call.
-        // Sequential fetches would take N * RTT; parallel fetches take ~1 * RTT.
-        coroutineScope {
+        // Use supervisorScope instead of coroutineScope so that one failed
+        // async block (e.g., CancellationException from session eviction)
+        // does NOT cancel the other recovery attempts. Each async block
+        // catches its own exceptions internally, but supervisorScope ensures
+        // structured concurrency without cross-cancellation.
+        kotlinx.coroutines.supervisorScope {
             val deferreds = streamingSessions.map { session ->
                 async {
                     val sessionId = session.sessionId
                     try {
-                        val messages = client.listMessages(sessionId, limit = 5)
+                        // Fetch 20 messages (not 5) for the in-progress tool check.
+                        // A ToolUse beyond a 5-message window (e.g., a long-running subtask
+                        // that spawned its own messages) would be missed, causing premature
+                        // finalization. 20 is a balance between safety and REST payload size.
+                        val messages = client.listMessages(sessionId, limit = 20)
                         val lastMessage = messages.lastOrNull()
                         val lastIsAssistant = lastMessage?.info?.role == "assistant"
 
                         if (lastIsAssistant) {
                             // Safety check: detect in-progress tool calls across ALL fetched messages,
                             // not just the last one. The server returns messages in chronological order
-                            // in practice, but scanning all fetched messages is safer and bounded (limit=5).
+                            // in practice, but scanning all fetched messages is safer and bounded (limit=20).
+                            // O(n) instead of O(n²): build a Set of completed tool IDs first,
+                            // then check ToolUse membership.
+                            val completedToolIds = messages.flatMap { it.parts }
+                                .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
+                                .map { it.toolUseId }
+                                .toSet()
                             val hasInProgressTools = messages.flatMap { it.parts }
                                 .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
-                                .any { toolUse ->
-                                    messages.flatMap { it.parts }
-                                        .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
-                                        .none { it.toolUseId == toolUse.id }
-                                }
+                                .any { it.id !in completedToolIds }
 
                             if (hasInProgressTools) {
                                 logger.info { "[ACP] recoverBackgroundSessions: session $sessionId has in-progress tools — skipping finalization (will recover via SSE)" }
@@ -735,6 +781,28 @@ class OpenCodeService(private val project: Project) : Disposable {
                     logger.warn { "[ACP] Skipping attached file '${file.name}' — path escapes allowed directories: ${file.path}" }
                     return@forEach
                 }
+                // Denylist: reject known-sensitive path segments even if inside allowed directories.
+                // Prevents accidental exfiltration of secrets, credentials, and VCS metadata
+                // via prompt injection or social engineering.
+                // Uses path-segment matching (not substring) to avoid false positives like
+                // a project directory named "my.idea" or a source dir named "build/".
+                val denylistSegments = setOf(
+                    ".env", ".env.local", ".env.production",
+                    ".git", ".hg", ".svn",
+                    ".idea",
+                    "node_modules",
+                    "build", "target", "out",
+                )
+                val pathSegments = canonicalPath.lowercase()
+                    .split(java.io.File.separatorChar, '/')
+                    .filter { it.isNotEmpty() }
+                val isDenylisted = pathSegments.any { it in denylistSegments }
+                // Only apply denylist to the broad isInsideProject path —
+                // .opencode/attachments/ is explicitly user-managed and safe.
+                if (isDenylisted && isInsideProject && !isInsideProjectAttachments) {
+                    logger.warn { "[ACP] Skipping attached file '${file.name}' — path matches denylist segment (sensitive location): ${file.path}" }
+                    return@forEach
+                }
                 // Use canonical path for the URL to prevent symlink-based exfiltration
                 val url = com.opencode.acp.util.pathToFileUrl(canonicalPath)
                 if (url == null) {
@@ -787,10 +855,12 @@ class OpenCodeService(private val project: Project) : Disposable {
                     // PartState.Pending (waiting for user permission) also counts as active —
                     // the server IS working, just blocked on user input. Without this, the
                     // monitor would false-positive timeout while the user reads the permission prompt.
-                    // Snapshot the values list to avoid ConcurrentModificationException
-                    // if the event processing coroutine mutates the map during iteration.
-                    // This is a best-effort read — exact correctness is not required (per isStreaming KDoc).
-                    val partStatesSnapshot = monitorSession.ctx.toolPartStates.values.toList()
+                    // Acquire stateLock for a consistent snapshot of tool states and pills.
+                    // Without the lock, the event processing coroutine could mutate these maps
+                    // mid-snapshot, producing an inconsistent view (e.g., a tool appears
+                    // InProgress in partStates but Completed in pills). The lock is ReentrantLock
+                    // and the read is O(n) — brief enough to not cause contention.
+                    val (partStatesSnapshot, pillsSnapshot, statesSnapshot) = monitorSession.snapshotToolState()
                     val hasRunningTools = partStatesSnapshot.any {
                         it is PartState.InProgress || it is PartState.Pending
                     }
@@ -803,9 +873,6 @@ class OpenCodeService(private val project: Project) : Disposable {
                         // ensures recovery.
                         val toolStuckTimeoutSec = OpenCodeSettingsState.getInstance().state.toolStuckTimeoutSeconds
                         val toolStuckTimeoutMs = toolStuckTimeoutSec.coerceIn(60, 3600) * 1000L
-                        // Snapshot entries to avoid ConcurrentModificationException.
-                        val pillsSnapshot = monitorSession.ctx.toolCallPills.entries.toList()
-                        val statesSnapshot = monitorSession.ctx.toolPartStates.toMap()
                         val oldestToolStartMs = pillsSnapshot
                             .filter {
                                 val state = statesSnapshot[it.key]
@@ -860,10 +927,12 @@ class OpenCodeService(private val project: Project) : Disposable {
             throw e
         } catch (e: Exception) {
             val errorMsg = when {
-                e.message?.contains("timeout", ignoreCase = true) == true ->
+                e is kotlinx.coroutines.TimeoutCancellationException ->
                     "Request timed out. Check that the server is running."
-                e.message?.contains("connect", ignoreCase = true) == true ->
+                e is java.net.ConnectException ->
                     "Connection lost to server."
+                e is java.net.SocketTimeoutException ->
+                    "Request timed out. Check that the server is running."
                 e.message?.contains("refused", ignoreCase = true) == true ->
                     "Connection refused by server."
                 else -> "Error: ${e.message ?: e.javaClass.simpleName}"
