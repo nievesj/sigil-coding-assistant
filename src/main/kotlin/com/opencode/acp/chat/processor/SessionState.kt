@@ -62,6 +62,11 @@ class SessionState(
     /** Whether this SessionState has been closed (evicted or shutdown). */
     @Volatile private var closed = false
 
+    /** Public read-only accessor for the closed flag.
+     *  Used by SessionManager.activeMessages to filter out closed sessions
+     *  so the UI doesn't display stale data after eviction. */
+    val isClosed: Boolean get() = closed
+
     /** Messages for this session. Keyed by message ID. */
     private val _messages = MutableStateFlow<LinkedHashMap<String, ChatMessage>>(LinkedHashMap())
     val messages: StateFlow<Map<String, ChatMessage>> = _messages.asStateFlow()
@@ -156,6 +161,29 @@ class SessionState(
             _signals.collect { signal ->
                 sessionManager.emitSessionSignal(sessionId, signal)
             }
+        }
+    }
+
+    /** Snapshot tool states and pills under stateLock for consistent reads from
+     *  external coroutines (e.g., activity monitor in OpenCodeService).
+     *
+     *  Without the lock, the event processing coroutine could mutate these maps
+     *  mid-snapshot, producing an inconsistent view (e.g., a tool appears
+     *  InProgress in partStates but Completed in pills). The lock is ReentrantLock
+     *  and the read is O(n) — brief enough to not cause contention.
+     *
+     *  Returns a Triple of:
+     *   1. partStates values (List<PartState>)
+     *   2. toolCallPills entries (List<Map.Entry<String, ToolCallPill>>)
+     *   3. toolPartStates map copy (Map<String, PartState>)
+     */
+    internal fun snapshotToolState(): Triple<List<PartState>, List<Map.Entry<String, ToolCallPill>>, Map<String, PartState>> {
+        return stateLock.withLock {
+            Triple(
+                ctx.toolPartStates.values.toList(),
+                ctx.toolCallPills.entries.toList(),
+                ctx.toolPartStates.toMap(),
+            )
         }
     }
 
@@ -532,20 +560,12 @@ class SessionState(
             // Runs on the event processing coroutine, eliminating the cross-coroutine
             // race between external callers (under stateLock) and event processing.
             is SseEvent.ResetTurn -> {
-                // Drain ALL stale events from the previous turn. Each SessionState has its own
-                // channel — all events in it belong to this session, so there's no need to
-                // filter by sessionId. The previous selective drain + re-enqueue raced with
-                // the producer-side drain in createAssistantMessage, corrupting channel
-                // ordering and causing transient stale message snapshots.
-                var drainedCount = 0
-                while (true) {
-                    val result = eventChannel.tryReceive()
-                    if (result.isFailure) break
-                    drainedCount++
-                }
-                if (drainedCount > 0) {
-                    logger.info { "[ACP] ResetTurn: drained $drainedCount stale events for session $sessionId" }
-                }
+                // Do NOT drain the channel — draining can discard new-turn SSE events that
+                // arrived between ResetTurn send and this handler executing (the window includes
+                // the network round-trip for sendMessageAsync). Stale events from the previous
+                // turn are processed normally but skipped by the server-ID routing check below
+                // (activeServerId != null && eventServerId != activeServerId → SKIP), because
+                // ctx was reset and the stale events carry the old turn's messageId.
                 ctx.resetTurnState()
                 // Apply the new turn's identity atomically after clearing stale state.
                 // This closes the window where activeMessageId was null between reset
@@ -1214,15 +1234,31 @@ class SessionState(
                     }
                 } else {
                     // No prior ToolUse — create pill from scratch (fast sub-agents can complete in one event)
+                    logger.warn { "[ACP] ToolResult without prior ToolUse for callID=${event.toolCallId} — deriving toolName from kind" }
                     val newInput = event.input
                     val baseKind = ToolMapper.toAcpKind("tool")
                     val resolvedKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(newInput) else baseKind
+                    // Derive a human-readable tool name from the kind since the ToolUse (which carries
+                    // the real toolName) was missed. This is a best-effort fallback — the icon is
+                    // already correct via resolvedKind, this just improves the text label.
+                    val derivedToolName = when (resolvedKind) {
+                        ToolKind.READ -> "read"
+                        ToolKind.EDIT -> "edit"
+                        ToolKind.DELETE -> "delete"
+                        ToolKind.MOVE -> "move"
+                        ToolKind.EXECUTE -> "bash"
+                        ToolKind.SEARCH -> "search"
+                        ToolKind.FETCH -> "fetch"
+                        ToolKind.THINK -> "think"
+                        ToolKind.SWITCH_MODE -> "switch_mode"
+                        else -> "tool"
+                    }
                     val resolvedTitle = newInput?.let { input ->
                         try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
-                    } ?: "tool"
+                    } ?: derivedToolName
                     val newPill = ToolCallPill(
                         toolCallId = event.toolCallId,
-                        toolName = "tool",
+                        toolName = derivedToolName,
                         title = resolvedTitle,
                         kind = resolvedKind,
                         status = resolvedStatus,
@@ -1310,7 +1346,12 @@ class SessionState(
                     if (ctx.activeServerMessageId == null && ctx.activeMessageId != null && ctx.isStreaming) {
                         // We're streaming but haven't received the server message ID yet.
                         // This MessageFinalized event carries it — adopt it.
-                        logger.info { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${ctx.activeMessageId} (activeServerId was null)" }
+                        // WARNING: This adoption is unconditional. If a stale MessageFinalized from a
+                        // previous turn arrives late (SSE reordering), it would be adopted as the current
+                        // message's server ID, causing subsequent events for the real message to be skipped.
+                        // The updateServerMessageId() path (line ~478) logs a mismatch warning when the
+                        // HTTP response arrives with a different ID — that's the safety net.
+                        logger.warn { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${ctx.activeMessageId} (activeServerId was null) — verify this matches the HTTP response" }
                         ctx.activeServerMessageId = serverMsgId
                     } else {
                         logger.debug { "[ACP] MessageFinalized for non-active message $serverMsgId — skipping (activeLocal=${ctx.activeMessageId}, activeServer=${ctx.activeServerMessageId})" }

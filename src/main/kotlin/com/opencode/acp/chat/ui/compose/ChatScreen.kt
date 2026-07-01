@@ -50,6 +50,7 @@ import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -122,6 +123,14 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
     fun searchDir(dir: VirtualFile, depth: Int) {
         if (results.size >= maxResults || depth > maxDepth || visited >= maxNodes) return
         visited++
+        // Check for cancellation periodically to allow write actions to interrupt
+        // the read action. Without this, holding the read lock for 5000 nodes
+        // can starve write actions (file saves, project config changes).
+        if (visited % 500 == 0) {
+            // ProgressManager.checkCanceled() throws ProcessCanceledException
+            // which must be rethrown, not swallowed.
+            com.intellij.openapi.progress.ProgressManager.checkCanceled()
+        }
         val children = dir.children ?: return
         for (child in children) {
             if (results.size >= maxResults || visited >= maxNodes) return
@@ -134,8 +143,12 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
                 visited++
                 val nameLower = child.name.lowercase()
                 if (nameLower.contains(query.lowercase()) && child.path !in seen) {
-                    // Reject symlinks that escape the project base path
-                    val canonicalChild = try { java.io.File(child.path).canonicalPath } catch (_: Exception) { child.path }
+                    // Reject symlinks that escape the project base path.
+                    // On canonicalization failure, reject the file — a path that can't be
+                    // canonicalized is untrusted (broken symlink, restricted path, or a
+                    // symlink that resolves outside the project). Falling back to the raw
+                    // path would bypass the boundary check via symlinks.
+                    val canonicalChild = try { java.io.File(child.path).canonicalPath } catch (_: Exception) { continue }
                     val canonicalBase = try { java.io.File(basePath).canonicalPath } catch (_: Exception) { basePath }
                     if (canonicalChild.startsWith(canonicalBase + java.io.File.separator) || canonicalChild == canonicalBase) {
                         seen.add(child.path)
@@ -164,7 +177,14 @@ private fun isSymLink(file: VirtualFile): Boolean {
     if (file.fileSystem !is com.intellij.openapi.vfs.LocalFileSystem) return false
     return try {
         java.nio.file.Files.isSymbolicLink(java.io.File(file.path).toPath())
-    } catch (_: Exception) {
+    } catch (_: java.nio.file.InvalidPathException) {
+        // Path has invalid characters — treat as non-symlink (safe default)
+        false
+    } catch (_: SecurityException) {
+        // Security manager denied access — treat as non-symlink
+        false
+    } catch (_: java.io.IOException) {
+        // I/O error checking symlink — treat as non-symlink
         false
     }
 }
@@ -190,11 +210,12 @@ fun
     val todoItems by viewModel.todoItems.collectAsState()
     val streamingSessionIds by viewModel.streamingSessionIds.collectAsState()
     val pendingCreationSessionIds by viewModel.pendingCreationSessionIds.collectAsState()
+    val hiddenChildSessionIds by viewModel.hiddenChildSessionIds.collectAsState()
     val availableCommands by viewModel.availableCommands.collectAsState()
     val commandHistory by viewModel.commandHistory.collectAsState()
     val queuedMessages by viewModel.queuedMessages.collectAsState()
     val followAgentEnabled by viewModel.followAgentEnabled.collectAsState()
-    var selectedSidebarTab by remember { mutableStateOf(SidebarTab.SESSIONS) }
+    val selectedSidebarTab by viewModel.selectedSidebarTab.collectAsState()
 
     // Local (non-server) slash commands — always shown first
     val localCommands = remember {
@@ -231,8 +252,10 @@ fun
         val initial = withContext(Dispatchers.IO) {
             readAction { computeRecentFiles(project) }
         }
-        recentFiles.clear()
-        recentFiles.addAll(initial)
+        withContext(Dispatchers.Main) {
+            recentFiles.clear()
+            recentFiles.addAll(initial)
+        }
 
         // Listen for file open/close events to update the list reactively.
         // Debounced: rapid file operations (multi-file paste, git checkout) coalesce
@@ -256,8 +279,10 @@ fun
                     val updated = withContext(Dispatchers.IO) {
                         readAction { computeRecentFiles(project) }
                     }
-                    recentFiles.clear()
-                    recentFiles.addAll(updated)
+                    withContext(Dispatchers.Main) {
+                        recentFiles.clear()
+                        recentFiles.addAll(updated)
+                    }
                 }
             }
         })
@@ -338,18 +363,35 @@ fun
 
     val onRemoveFile: (Int) -> Unit = { index -> attachedFiles.removeAt(index) }
 
-    // Search results for project files — computed when user types in attach menu search
+    // Search results for project files — computed when user types in attach menu search.
+    // Track the current search job so a new keystroke cancels the previous in-flight
+    // search — otherwise stale broad-query results can overwrite the current narrow-query
+    // results (race: slow broad query finishes after fast narrow query).
     val searchResults = remember { mutableStateListOf<RecentFile>() }
+    var searchJob by remember { mutableStateOf<Job?>(null) }
     val onSearch: (String) -> Unit = { query ->
+        searchJob?.cancel()
         if (query.isBlank()) {
             searchResults.clear()
+            searchJob = null
         } else {
-            scope.launch {
-                val results = withContext(Dispatchers.IO) {
-                    readAction { searchProjectFiles(project, query) }
+            searchJob = scope.launch {
+                try {
+                    val results = withContext(Dispatchers.IO) {
+                        readAction { searchProjectFiles(project, query) }
+                    }
+                    searchResults.clear()
+                    searchResults.addAll(results)
+                } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
+                    // checkCanceled() inside searchProjectFiles threw — search was
+                    // interrupted by a write action or cancelled by a new keystroke.
+                    // Rethrow so the coroutine cancellation propagates correctly.
+                    throw e
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] File search failed" }
                 }
-                searchResults.clear()
-                searchResults.addAll(results)
             }
         }
     }
@@ -401,7 +443,7 @@ fun
                         state = sessionListState,
                         contextState = sessionContextState,
                         selectedTab = selectedSidebarTab,
-                        onTabSelected = { selectedSidebarTab = it },
+                        onTabSelected = { viewModel.selectSidebarTab(it) },
                         onNewSession = { viewModel.scope.launch { viewModel.createAndSwitchSession() } },
                         onSessionSelected = { viewModel.scope.launch { viewModel.switchSession(it) } },
                         onSessionArchived = { viewModel.scope.launch { viewModel.archiveSession(it) } },
@@ -421,6 +463,7 @@ fun
                         commentChangeSignal = viewModel.commentChangeSignal,
                         streamingSessionIds = streamingSessionIds,
                         pendingCreationSessionIds = pendingCreationSessionIds,
+                        hiddenChildIds = hiddenChildSessionIds,
                         clearAllState = clearAllState,
                         compactionState = compactionState,
                         onCompact = { viewModel.compactSession() },
@@ -507,7 +550,7 @@ fun
                 onShowContextDetails = {
                     // Open sidebar and switch to context tab
                     if (!isSidebarVisible) viewModel.toggleSidebar()
-                    selectedSidebarTab = SidebarTab.CONTEXT
+                    viewModel.selectSidebarTab(SidebarTab.CONTEXT)
                 },
                 onRetryContext = { viewModel.retryContextFetch() },
                 attachedFiles = attachedFiles,

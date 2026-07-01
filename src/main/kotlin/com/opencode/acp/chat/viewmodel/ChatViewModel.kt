@@ -57,6 +57,7 @@ class ChatViewModel(
     val sessionContextState: StateFlow<SessionContextState> = service.sessionContextState
     val streamingSessionIds: StateFlow<Set<String>> = service.streamingSessionIds
     val pendingCreationSessionIds: StateFlow<Set<String>> = service.pendingCreationSessionIds
+    val hiddenChildSessionIds: StateFlow<Set<String>> = service.hiddenChildSessionIds
     val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = service.sessionCachedFlow
 
     // --- UI-specific state ---
@@ -80,6 +81,11 @@ class ChatViewModel(
 
     private val _isSidebarVisible = MutableStateFlow(OpenCodeSettingsState.getInstance().sidebarVisible)
     val isSidebarVisible: StateFlow<Boolean> = _isSidebarVisible.asStateFlow()
+
+    /** Sidebar tab selection — survives tool window disposal/recreation within
+     *  the same IDE session. Resets to SESSIONS on IDE restart (not persisted to settings). */
+    private val _selectedSidebarTab = MutableStateFlow(SidebarTab.SESSIONS)
+    val selectedSidebarTab: StateFlow<SidebarTab> = _selectedSidebarTab.asStateFlow()
 
     private val _commandHistory = MutableStateFlow<List<CommandHistoryEntry>>(emptyList())
     val commandHistory: StateFlow<List<CommandHistoryEntry>> = _commandHistory.asStateFlow()
@@ -111,7 +117,13 @@ class ChatViewModel(
     /** Lock for non-suspend queue mutations (queueMessage/removeQueuedMessage/
      *  editQueuedMessage/clearQueue). These are called from EDT callbacks and cannot
      *  use the suspend `drainMutex.withLock`. A plain ReentrantLock avoids signature
-     *  changes while preventing the read-modify-write race with drainQueue. */
+     *  changes while preventing the read-modify-write race with drainQueue.
+     *
+     *  LOCK ORDERING CONSTRAINT: Always acquire `queueLock` BEFORE `drainMutex` if
+     *  both are needed. Currently, `drainQueue` acquires `drainMutex` first, then
+     *  `queueLock` inside — this is safe because no EDT caller acquires `drainMutex`.
+     *  DO NOT add `drainMutex` acquisition inside a `queueLock`-held block without
+     *  reversing the order, or a deadlock will occur. */
     private val queueLock = java.util.concurrent.locks.ReentrantLock()
 
     /** Retry counts for queued messages — prevents infinite retry loops.
@@ -538,18 +550,30 @@ class ChatViewModel(
         OpenCodeSettingsState.getInstance().sidebarVisible = newValue
     }
 
+    fun selectSidebarTab(tab: SidebarTab) {
+        _selectedSidebarTab.value = tab
+    }
+
     // --- Session actions ---
 
     suspend fun loadSessions() = service.loadSessions()
 
     suspend fun switchSession(sessionId: String) {
-        // Remove old session from streaming set before switching
-        service.sessionId?.let { service.removeStreamingSession(it) }
         service.switchSession(sessionId)
-        // After switching, assume NOT streaming — SSE events will set it to true if needed.
-        // Don't read activeSession?.isStreaming because adoptStreamingContext() unconditionally
-        // marks the last assistant message as streaming, which is wrong for completed responses.
-        _streamPhase.value = StreamPhase.IDLE
+        // Un-hide the target session if it was a hidden child (ToolPill "open child" path).
+        service.unhideChildSession(sessionId)
+        // Derive _streamPhase from the new session's actual streaming state.
+        val isCreating = service.pendingCreationSessionIds.value.contains(sessionId)
+        val isActiveStreaming = service.streamingSessionIds.value.contains(sessionId)
+        _streamPhase.value = when {
+            isActiveStreaming -> StreamPhase.STREAMING
+            // Use IDLE for pending-creation sessions — the session is being created
+            // on the server, not sending a message. Using SENDING would show a
+            // misleading stop button. The phase will transition to STREAMING when
+            // the first message is sent and StreamingStarted fires.
+            isCreating -> StreamPhase.IDLE
+            else -> StreamPhase.IDLE
+        }
         clearQueue()
 
         // Sync prompt state from the new session's persistent StateFlows
@@ -564,7 +588,6 @@ class ChatViewModel(
     }
 
     suspend fun createAndSwitchSession(title: String? = null) {
-        service.sessionId?.let { service.removeStreamingSession(it) }
         service.createAndSwitchSession(title)
         // New session — definitely not streaming yet
         _streamPhase.value = StreamPhase.IDLE
@@ -583,9 +606,14 @@ class ChatViewModel(
             val loaded = sessionListState.value as? SessionListState.Loaded ?: return@launch
             val totalCount = loaded.topLevelSessions.count { it.id != service.sessionId }
             // Skip the InProgress(0, N) state — clearAllSessions() performs all
-            // deletions in a single suspend call, so intermediate progress is
-            // never visible. Going directly to Done avoids the misleading
-            // "Deleting 0 of N..." flash.
+            // deletions in a single suspend call (sequential REST DELETE per session),
+            // so intermediate progress is never visible. Going directly to Done avoids
+            // the misleading "Deleting 0 of N..." flash.
+            // NOTE: For large session counts (50+), the sequential deletions can take
+            // 10+ seconds with no UI feedback. The button is disabled during the
+            // operation (enabled = clearAllState is ClearAllState.Idle), preventing
+            // double-clicks. If this becomes a UX issue, consider parallel deletions
+            // or showing a progress count.
             val result = service.clearAllSessions()
             _clearAllState.value = ClearAllState.Done(result)
             delay(2000)
@@ -673,6 +701,9 @@ class ChatViewModel(
         // Capture session ID before the suspend call — service.sessionId could
         // change if a session switch happens during the cancel.
         val sessionId = service.sessionId
+        // Set the multi-model review cancellation flag so the review loop
+        // stops after the current model finishes.
+        multiModelReviewCancelled = true
         service.cancel()
         _streamPhase.value = StreamPhase.IDLE
         sessionId?.let { service.removeStreamingSession(it) }
@@ -823,8 +854,12 @@ class ChatViewModel(
                 queueLock.withLock {
                     val alreadyRequeued = _queuedMessages.value.any { it.id == next.id }
                     if (!alreadyRequeued) {
-                        _queuedMessages.value = listOf(next) + _queuedMessages.value
-                        logger.warn { "[ACP] drainQueue: re-queued failed message at front of queue (attempt $retryCount/$MAX_QUEUE_RETRIES) — ${result.message}" }
+                        // Re-queue at the END of the queue (not the front) to avoid
+                        // starving later messages. The retry delay already gives
+                        // the server time to recover, so the message doesn't need
+                        // priority over others.
+                        _queuedMessages.value = _queuedMessages.value + next
+                        logger.warn { "[ACP] drainQueue: re-queued failed message at end of queue (attempt $retryCount/$MAX_QUEUE_RETRIES) — ${result.message}" }
                     } else {
                         logger.debug { "[ACP] drainQueue: message ${next.id} already re-queued, skipping duplicate add (attempt $retryCount/$MAX_QUEUE_RETRIES)" }
                     }
@@ -954,48 +989,62 @@ class ChatViewModel(
         logger.info { "[ACP] Manual compaction triggered for session $sessionId" }
         _compactionState.value = CompactionState.InProgress
 
-        scope.launch {
-            try {
-                val state = _controlState.value
-                val providerID = state.selectedModel?.providerID ?: ""
-                val modelID = state.selectedModel?.modelID ?: ""
-                if (providerID.isBlank() || modelID.isBlank()) {
-                    _compactionState.value = CompactionState.Error(
-                        CompactionError.ServerError("No model selected")
-                    )
-                    return@launch
-                }
-                val success = kotlinx.coroutines.withTimeout(
-                    com.opencode.acp.chat.model.CompactionConstants.COMPACT_TIMEOUT_MS
-                ) {
-                    client.compactSession(sessionId, providerID, modelID, auto = false)
-                }
-                if (success) {
-                    _compactionState.value = CompactionState.Idle
-                    // SSE session.compacted event handles message refresh + context update
-                    logger.info { "[ACP] Manual compaction succeeded for session $sessionId" }
-                } else {
-                    _compactionState.value = CompactionState.Error(
-                        CompactionError.ServerError("Compaction failed")
-                    )
-                }
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-                _compactionState.value = CompactionState.Error(CompactionError.Timeout)
-            } catch (e: java.net.ConnectException) {
-                _compactionState.value = CompactionState.Error(CompactionError.NotConnected)
-            } catch (e: Exception) {
-                val msg = e.message ?: "Unknown error"
-                // Detect timeout-like exceptions from Ktor
-                if (msg.contains("timeout", ignoreCase = true) || e is java.net.SocketTimeoutException) {
+        // Use a try/finally around the scope.launch to ensure the guard is reset
+        // even if the scope is cancelled before the coroutine starts (e.g., IDE
+        // shutdown, tool window close). Without this, the guard would leak to
+        // true forever, permanently blocking all future compaction attempts.
+        try {
+            scope.launch {
+                try {
+                    val state = _controlState.value
+                    val providerID = state.selectedModel?.providerID ?: ""
+                    val modelID = state.selectedModel?.modelID ?: ""
+                    if (providerID.isBlank() || modelID.isBlank()) {
+                        _compactionState.value = CompactionState.Error(
+                            CompactionError.ServerError("No model selected")
+                        )
+                        return@launch
+                    }
+                    val success = kotlinx.coroutines.withTimeout(
+                        com.opencode.acp.chat.model.CompactionConstants.COMPACT_TIMEOUT_MS
+                    ) {
+                        client.compactSession(sessionId, providerID, modelID, auto = false)
+                    }
+                    if (success) {
+                        _compactionState.value = CompactionState.Idle
+                        // SSE session.compacted event handles message refresh + context update
+                        logger.info { "[ACP] Manual compaction succeeded for session $sessionId" }
+                    } else {
+                        _compactionState.value = CompactionState.Error(
+                            CompactionError.ServerError("Compaction failed")
+                        )
+                    }
+                } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
                     _compactionState.value = CompactionState.Error(CompactionError.Timeout)
-                } else {
-                    _compactionState.value = CompactionState.Error(CompactionError.ServerError(msg))
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: java.net.ConnectException) {
+                    _compactionState.value = CompactionState.Error(CompactionError.NotConnected)
+                } catch (e: Exception) {
+                    val msg = e.message ?: "Unknown error"
+                    // Detect timeout-like exceptions from Ktor
+                    if (msg.contains("timeout", ignoreCase = true) || e is java.net.SocketTimeoutException) {
+                        _compactionState.value = CompactionState.Error(CompactionError.Timeout)
+                    } else {
+                        _compactionState.value = CompactionState.Error(CompactionError.ServerError(msg))
+                    }
+                } finally {
+                    compactionInProgress.set(false)
                 }
-            } finally {
-                compactionInProgress.set(false)
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Scope was cancelled before or during the coroutine launch.
+            // Reset the guard so future compaction attempts aren't blocked.
+            compactionInProgress.set(false)
+            throw e
+        } catch (_: Exception) {
+            // Unexpected exception during launch — reset the guard.
+            compactionInProgress.set(false)
         }
     }
 
@@ -1075,11 +1124,20 @@ class ChatViewModel(
         }
     }
 
+    /** Cancellation flag for multi-model review loops. Set by [cancel] to
+     *  stop the loop after the current model finishes. */
+    @Volatile private var multiModelReviewCancelled = false
+
     /** Shared logic for both review-perform variants: resolve model args and
      *  send the prompt once per model (or once with the control-bar model if
      *  no args). Sequential — each [sendMessage] blocks until that model's
-     *  response completes (via the service's sendMutex + responseDeferred). */
+     *  response completes (via the service's sendMutex + responseDeferred).
+     *
+     *  The user can cancel the loop mid-way by clicking the Cancel button,
+     *  which sets [multiModelReviewCancelled]. The loop checks this flag
+     *  between iterations and stops if set. */
     private suspend fun executeMultiModelReview(args: String, prompt: String) {
+        multiModelReviewCancelled = false
         if (args.isBlank()) {
             // No model args — use the currently-selected control-bar model.
             // Route through the ViewModel's sendMessage() so _streamPhase and
@@ -1117,6 +1175,11 @@ class ChatViewModel(
         val currentVariant = _controlState.value.thinkingEffort.variant
         for (model in resolution.models) {
             currentCoroutineContext().ensureActive()
+            // Check if the user cancelled the review loop (via Cancel button).
+            if (multiModelReviewCancelled) {
+                service.injectLocalMessage("⏹ Review cancelled by user. Remaining models skipped.")
+                break
+            }
             // If the model has variants and the current thinking effort isn't
             // null, use it. Otherwise pick the first variant if available, or
             // null (server default) if the model has no variants.
@@ -1153,7 +1216,9 @@ class ChatViewModel(
     fun executeReviewResolveCommand() {
         scope.launch {
             val index = ReviewCommentManager.getInstance(project).getIndex()
-            service.sendMessage(text = ReviewSkill.buildResolvePrompt(index))
+            // Route through the ViewModel's sendMessage() so _streamPhase,
+            // streamingSessionIds, and recordCommand() stay consistent with the UI.
+            sendMessage(text = ReviewSkill.buildResolvePrompt(index))
         }
     }
 
@@ -1231,24 +1296,32 @@ class ChatViewModel(
     private fun recordCommand(text: String, files: List<AttachedFile>) {
         if (text.isBlank() && files.isEmpty()) return
         val entry = CommandHistoryEntry(text = text, files = files)
-        val maxSize = OpenCodeSettingsState.getInstance().commandHistorySize.coerceIn(1, 100)
-        val current = _commandHistory.value.toMutableList()
-        current.removeAll { existing ->
-            existing.text == text &&
-                existing.attachedFileNames == files.map { it.name } &&
-                existing.attachedFilePaths == files.map { it.path } &&
-                existing.attachedFileMimes == files.map { it.mime }
-        }
-        current.add(0, entry)
-        val trimmed = if (current.size > maxSize) current.take(maxSize) else current
-        _commandHistory.value = trimmed
         val settings = OpenCodeSettingsState.getInstance()
-        settings.commandHistory = java.util.ArrayList(trimmed)
+        val maxSize = settings.commandHistorySize.coerceIn(1, 100)
+        // Synchronize on settings to prevent lost-update race with clearCommandHistory
+        // (which also writes settings.commandHistory from EDT). Without this, a
+        // concurrent recordCommand on a background coroutine can overwrite a clear.
+        synchronized(settings) {
+            val current = _commandHistory.value.toMutableList()
+            current.removeAll { existing ->
+                existing.text == text &&
+                    existing.attachedFileNames == files.map { it.name } &&
+                    existing.attachedFilePaths == files.map { it.path } &&
+                    existing.attachedFileMimes == files.map { it.mime }
+            }
+            current.add(0, entry)
+            val trimmed = if (current.size > maxSize) current.take(maxSize) else current
+            _commandHistory.value = trimmed
+            settings.commandHistory = java.util.ArrayList(trimmed)
+        }
     }
 
     fun clearCommandHistory() {
-        _commandHistory.value = emptyList()
-        OpenCodeSettingsState.getInstance().commandHistory = java.util.ArrayList()
+        val settings = OpenCodeSettingsState.getInstance()
+        synchronized(settings) {
+            _commandHistory.value = emptyList()
+            settings.commandHistory = java.util.ArrayList()
+        }
     }
 
     // --- Retry ---

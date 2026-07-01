@@ -58,6 +58,11 @@ class SessionManager(
     private val sessions = LinkedHashMap<String, SessionState>()
     private val sessionsLock = ReentrantLock()
 
+    /** Volatile snapshot of sessions map values, updated on every put/remove.
+     *  Used by close() when the lock is held — allows cleanup without blocking EDT. */
+    @Volatile
+    private var sessionsSnapshot: List<SessionState> = emptyList()
+
     /** Mutex to serialize session switches. */
     private val switchMutex = Mutex()
 
@@ -77,10 +82,15 @@ class SessionManager(
     /** Messages for the active session. UI observes this.
      *  Uses flatMapLatest on _activeSessionId so that when the active session
      *  changes, the upstream automatically switches to the new session's messages.
-     *  CRITICAL: Uses SharingStarted.Eagerly — the ViewModel reads .value synchronously. */
+     *  CRITICAL: Uses SharingStarted.Eagerly — the ViewModel reads .value synchronously.
+     *
+     *  Closed sessions (evicted from cache) are filtered out so the UI doesn't
+     *  display stale data after eviction. The SessionState's messages StateFlow
+     *  retains its last value after close(), but the data is no longer live. */
     val activeMessages: StateFlow<Map<String, ChatMessage>> = _activeSessionId
         .flatMapLatest { id ->
-            sessionsLock.withLock { sessions[id] }?.messages ?: flowOf(emptyMap())
+            val state = sessionsLock.withLock { sessions[id] }
+            if (state != null && !state.isClosed) state.messages else flowOf(emptyMap())
         }
         .stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
@@ -89,7 +99,7 @@ class SessionManager(
      *  CRITICAL: Uses SharingStarted.Eagerly for the same reason. */
     val activeSignals: SharedFlow<UiSignal> = _activeSessionId
         .flatMapLatest { id ->
-            sessionsLock.withLock { sessions[id] }?.signals ?: emptyFlow()
+            sessionsLock.withLock { sessions[id] }?.takeIf { !it.isClosed }?.signals ?: emptyFlow()
         }
         .shareIn(scope, SharingStarted.Eagerly, replay = 0)
 
@@ -198,8 +208,44 @@ class SessionManager(
     private val _pendingCreationSessionIds = MutableStateFlow<Set<String>>(emptySet())
     val pendingCreationSessionIds: StateFlow<Set<String>> = _pendingCreationSessionIds.asStateFlow()
 
+    // ── Child Session Ephemeral State ──────────────────────────────────
+
+    /** Completed child session IDs to hide from the sidebar.
+     *  Populated by [markChildSessionComplete] on StreamingCompleted/SessionIdle.
+     *  Pruned by [loadSessions] to remove IDs for sessions the server has deleted. */
+    private val _hiddenChildSessionIds = MutableStateFlow<Set<String>>(emptySet())
+    val hiddenChildSessionIds: StateFlow<Set<String>> = _hiddenChildSessionIds.asStateFlow()
+
+    /** All known child session IDs, populated independently of [_childSessionMap].
+     *  Fixes the fast-completion race: a child created, streamed, and completed
+     *  before loadSessions() refreshes _childSessionMap is still recognized via
+     *  this set (populated on session creation and in loadSessions()). */
+    private val _knownChildSessionIds = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Mark a completed child session for hiding from the sidebar.
+     *  Skips the active/selected session — it stays visible until the user switches away. */
+    fun markChildSessionComplete(sessionId: String) {
+        if (sessionId == _activeSessionId.value) return
+        _hiddenChildSessionIds.update { it + sessionId }
+        logger.debug { "[ACP] Child session $sessionId completed — marking for sidebar removal" }
+    }
+
+    /** Un-hide a child session (e.g., when switching to it via ToolPill "open child"). */
+    fun unhideChildSession(sessionId: String) {
+        _hiddenChildSessionIds.update { it - sessionId }
+    }
+
     internal fun emitSessionSignal(sessionId: String, signal: UiSignal) {
         _allSessionSignals.tryEmit(sessionId to signal)
+    }
+
+    /** Emit a global error signal to surface critical errors to the UI.
+     *  Used by OpenCodeService's CoroutineExceptionHandler to prevent
+     *  fail-silent behavior when background coroutines crash. */
+    internal fun emitGlobalError(errorMessage: String) {
+        // Use a synthetic session ID so the ViewModel's SessionError handler
+        // can process it without matching a specific session.
+        _globalSignals.tryEmit(UiSignal.SessionError("__internal__", errorMessage))
     }
 
     /** Imperatively add a session ID to the streaming set.
@@ -219,17 +265,50 @@ class SessionManager(
     }
 
     init {
-        // Track streaming session IDs from all session signals
+        // Track streaming session IDs from all session signals,
+        // and auto-hide completed child sessions.
         scope.launch {
             allSessionSignals.collect { (sessionId, signal) ->
-                when (signal) {
-                    is UiSignal.StreamingStarted -> {
-                        _streamingSessionIds.update { it + sessionId }
+                try {
+                    when (signal) {
+                        is UiSignal.StreamingStarted -> {
+                            _streamingSessionIds.update { it + sessionId }
+                            // If this session isn't in the session list yet (e.g., a new
+                            // subtask/child session that just started streaming), refresh
+                            // the list so the sidebar can discover and auto-expand the parent.
+                            val currentList = _sessionListState.value
+                            if (currentList is SessionListState.Loaded) {
+                                val isInList = currentList.sessions.any { it.id == sessionId }
+                                if (!isInList) {
+                                    scope.launch { loadSessions() }
+                                }
+                            }
+                        }
+                        is UiSignal.StreamingCompleted -> {
+                            _streamingSessionIds.update { it - sessionId }
+                            // Auto-hide completed child sessions.
+                            // Use _knownChildSessionIds (populated on session creation and in loadSessions())
+                            // rather than _childSessionMap, which is only refreshed in loadSessions(). This
+                            // avoids a race where a fast-completing child finishes before loadSessions() runs
+                            // and _childSessionMap does not yet contain it (isChild would return false).
+                            if (sessionId in _knownChildSessionIds.value) {
+                                markChildSessionComplete(sessionId)
+                            }
+                        }
+                        is UiSignal.SessionIdle -> {
+                            // Fallback trigger — SessionIdle also indicates completion
+                            // (the new_message path doesn't always emit StreamingCompleted).
+                            // Set add is idempotent, so redundant calls are harmless.
+                            if (sessionId in _knownChildSessionIds.value) {
+                                markChildSessionComplete(sessionId)
+                            }
+                        }
+                        else -> {}
                     }
-                    is UiSignal.StreamingCompleted -> {
-                        _streamingSessionIds.update { it - sessionId }
-                    }
-                    else -> {}
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] SessionManager: error processing signal for session $sessionId" }
                 }
             }
         }
@@ -252,9 +331,6 @@ class SessionManager(
                 _activeSessionId.value = targetSessionId
                 resetDisplayLimit()
                 updateSessionSelection(targetSessionId)
-                resetSmartContextState()
-                computeSessionContext()
-                fetchTodos()
                 logger.info { "[ACP] Switched to session $targetSessionId" }
             } catch (e: CancellationException) {
                 throw e
@@ -262,6 +338,19 @@ class SessionManager(
                 logger.error(e) { "[ACP] Failed to switch session $targetSessionId" }
                 _activeSessionId.value = previousSessionId
                 updateSessionSelection(previousSessionId)
+                return
+            }
+
+            // Post-switch operations — failures here don't roll back the switch.
+            // The session is active; context/todos will refresh on the next signal.
+            try {
+                resetSmartContextState()
+                computeSessionContext()
+                fetchTodos()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] Failed to refresh context/todos after switching to $targetSessionId" }
             }
         }
     }
@@ -351,11 +440,22 @@ class SessionManager(
                     // to avoid leaking other projects' sessions on a shared server.
                     val currentProjectBase = projectBasePath
                     sessionList = if (currentProjectBase != null) {
+                        val canonicalBase = try {
+                            java.io.File(currentProjectBase).canonicalPath
+                        } catch (_: Exception) { currentProjectBase }
                         val filtered = unfilteredList.filter { session ->
                             session.directory?.let { dir ->
-                                dir == currentProjectBase ||
-                                    dir.startsWith(currentProjectBase + java.io.File.separator) ||
-                                    dir.startsWith(currentProjectBase + "/")
+                                // Canonicalize the server-provided directory before
+                                // prefix comparison to prevent path traversal bypass
+                                // (e.g., "C:\Projects\MyApp\..\OtherProject" would
+                                // pass a naive startsWith check but resolve to a
+                                // different project).
+                                val canonicalDir = try {
+                                    java.io.File(dir).canonicalPath
+                                } catch (_: Exception) { return@let false }
+                                canonicalDir == canonicalBase ||
+                                    canonicalDir.startsWith(canonicalBase + java.io.File.separator) ||
+                                    canonicalDir.startsWith(canonicalBase + "/")
                             } == true
                         }
                         if (filtered.isNotEmpty()) {
@@ -394,6 +494,21 @@ class SessionManager(
             val children = items.filter { it.parentID != null }
                 .groupBy { it.parentID!! }
             _childSessionMap.value = children
+
+            // Populate _knownChildSessionIds independently of _childSessionMap
+            // (fixes fast-completion race — see _knownChildSessionIds doc)
+            _knownChildSessionIds.update { known ->
+                known + items.filter { it.parentID != null }.map { it.id }.toSet()
+            }
+
+            // Prune _hiddenChildSessionIds: remove IDs for sessions the server has deleted,
+            // preserve hidden state for sessions the server still knows about.
+            val currentSessionIds = items.map { it.id }.toSet()
+            _hiddenChildSessionIds.update { ids -> ids.filter { it in currentSessionIds }.toSet() }
+
+            // Prune _knownChildSessionIds: remove IDs for sessions the server has deleted.
+            // Without this, the set grows unbounded across the plugin's lifetime.
+            _knownChildSessionIds.update { ids -> ids.filter { it in currentSessionIds }.toSet() }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -420,7 +535,9 @@ class SessionManager(
 
         // Remove from cache — close() outside lock (not O(1): cancels coroutines, closes channels)
         val evictedState = sessionsLock.withLock {
-            sessions.remove(targetSessionId)
+            val removed = sessions.remove(targetSessionId)
+            sessionsSnapshot = sessions.values.toList()
+            removed
         }
         evictedState?.close()
 
@@ -473,7 +590,11 @@ class SessionManager(
                 val ok = c.deleteSession(sessionItem.id)
                 if (ok) {
                     // Remove from session cache
-                    val evictedState = sessionsLock.withLock { sessions.remove(sessionItem.id) }
+                    val evictedState = sessionsLock.withLock {
+                        val removed = sessions.remove(sessionItem.id)
+                        sessionsSnapshot = sessions.values.toList()
+                        removed
+                    }
                     evictedState?.close()
                     deleted++
                 } else {
@@ -579,17 +700,26 @@ class SessionManager(
                     //    skip if projectBasePath is set (project-scoped) and the session ID
                     //    doesn't match the active session or its known children. This prevents
                     //    loading other projects' messages into the local cache via untrusted SSE.
-                    val cacheHasRoom = sessionsLock.withLock { sessions.size < MAX_CACHED_SESSIONS }
                     val activeId = _activeSessionId.value
-                    val mayBelongToProject = projectBasePath == null ||
-                        sessionId == activeId ||
-                        _childSessionMap.value[activeId]?.any { it.id == sessionId } == true
-                    if (cacheHasRoom && mayBelongToProject) {
+                    // Only auto-cache sessions verifiably related to the active session (child or
+                    // known child), regardless of projectBasePath. Auto-caching from untrusted SSE
+                    // is a higher trust level than user-initiated REST listing — even when
+                    // projectBasePath is null (cross-project mode), don't auto-load arbitrary
+                    // session message histories from SSE.
+                    val mayBelongToProject = sessionId == activeId ||
+                        _childSessionMap.value[activeId]?.any { it.id == sessionId } == true ||
+                        sessionId in _knownChildSessionIds.value
+                    // Don't auto-cache if the cache is at capacity — prevent evicting useful
+                    // sessions to make room for an untrusted SSE-driven auto-cache.
+                    val cacheHasRoom = sessionsLock.withLock { sessions.size < MAX_CACHED_SESSIONS }
+                    if (mayBelongToProject && cacheHasRoom) {
                         logger.info { "[ACP] Auto-caching session $sessionId from SSE event" }
                         ensureSessionCached(sessionId)
                         state = sessionsLock.withLock { sessions[sessionId] }
+                    } else if (!cacheHasRoom) {
+                        logger.debug { "[ACP] Skipping auto-cache for session $sessionId — cache at capacity" }
                     } else {
-                        logger.debug { "[ACP] Cache full — skipping auto-cache for session $sessionId" }
+                        logger.debug { "[ACP] Skipping auto-cache for session $sessionId — not in project scope" }
                     }
                 }
                 if (state == null) {
@@ -700,22 +830,21 @@ class SessionManager(
             try {
                 statesToClose = sessions.values.toList()
                 sessions.clear()
+                sessionsSnapshot = emptyList()
             } finally {
                 sessionsLock.unlock()
             }
         } else {
             // Lock held by a coroutine doing ensureSessionCached (blocking on HTTP).
             // DO NOT call sessionsLock.withLock here — it's a blocking call that would
-            // freeze the EDT until the HTTP request completes. The lock holder will
-            // release soon; scope.cancel() (called by the caller after this method)
-            // will clean up any remaining state.
-            //
-            // Clear the map eagerly to release SessionState references (Channel buffers,
-            // coroutine scopes) without waiting for GC. We don't call close() on each
-            // state (that requires the lock), but scope.cancel() will cancel all their
-            // coroutines anyway.
-            sessions.clear()
-            logger.warn { "[ACP] SessionManager.close: lock held — cleared session map (caller MUST call scope.cancel() after this)" }
+            // freeze the EDT until the HTTP request completes. Use the volatile snapshot
+            // (updated on every put/remove) to close sessions without acquiring the lock.
+            // scope.cancel() (called by the caller after this) will cancel all SessionState
+            // coroutines; close() here handles the critical cleanup (closed flag, responseDeferred,
+            // event channel, prompts) that scope.cancel() alone does NOT perform.
+            logger.warn { "[ACP] SessionManager.close: lock held — using volatile snapshot for cleanup" }
+            val snapshot = sessionsSnapshot
+            snapshot.forEach { it.close() }
             return
         }
         statesToClose.forEach { it.close() }
@@ -765,7 +894,14 @@ class SessionManager(
                 state.close()
             } else {
                 _sessionCachedFlow.tryEmit(sessionId)
+                // Track child sessions for fast-completion detection.
+                // parentID is not available here (SSE context), so check if
+                // the session is already known as a child via _childSessionMap.
+                if (_childSessionMap.value.values.flatten().any { it.id == sessionId }) {
+                    _knownChildSessionIds.update { it + sessionId }
+                }
             }
+            sessionsSnapshot = sessions.values.toList()
         }
     }
 
@@ -810,6 +946,7 @@ class SessionManager(
                 toEvict.add(lru.key to lru.value)
                 sessions.remove(lru.key)
             }
+            sessionsSnapshot = sessions.values.toList()
         }
         toEvict.forEach { (id, state) ->
             state.close()
@@ -840,6 +977,8 @@ class SessionManager(
         // In-flight guard: skip if another full computation is already running.
         // Uses a dedicated guard so local refreshes are not blocked.
         if (!fullComputeInFlight.compareAndSet(false, true)) {
+            // Another full computation is in progress — return the current state as-is.
+            // If it's Loading, the in-progress computation will replace it soon.
             return _sessionContextState.value
         }
         try {
@@ -867,6 +1006,7 @@ class SessionManager(
         // blocked on REST getSession(). Local refreshes are cheap (no REST) and should
         // update the indicator promptly during streaming.
         if (!localComputeInFlight.compareAndSet(false, true)) {
+            // Another local computation is in progress — return the current state as-is.
             return _sessionContextState.value
         }
         try {
