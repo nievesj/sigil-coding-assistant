@@ -74,10 +74,13 @@ private fun computeRecentFiles(project: Project): List<RecentFile> {
             .takeLast(15)
             .map { RecentFile(name = it.name, path = it.path) }
     } catch (e: NoClassDefFoundError) {
+        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] EditorHistoryManager unavailable (NoClassDefFoundError)" }
         emptyList()
     } catch (e: LinkageError) {
+        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] EditorHistoryManager unavailable (LinkageError)" }
         emptyList()
     } catch (e: Exception) {
+        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] EditorHistoryManager unavailable (Exception)" }
         emptyList()
     }
 
@@ -136,7 +139,7 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
             if (results.size >= maxResults || visited >= maxNodes) return
             if (child.isDirectory && !isSymLink(child)) {
                 // Skip hidden and build directories; don't follow symlinks (path traversal / cycles)
-                if (!child.name.startsWith(".") && child.name !in setOf("build", "node_modules", ".git", "out", "target")) {
+                if (!child.name.startsWith(".") && child.name !in setOf("build", "node_modules", ".git", "out", "target", ".idea", "__pycache__", ".gradle", "dist", ".next", ".venv")) {
                     searchDir(child, depth + 1)
                 }
             } else if (child.isValid && !isSymLink(child)) {
@@ -178,14 +181,17 @@ private fun isSymLink(file: VirtualFile): Boolean {
     return try {
         java.nio.file.Files.isSymbolicLink(java.io.File(file.path).toPath())
     } catch (_: java.nio.file.InvalidPathException) {
-        // Path has invalid characters — treat as non-symlink (safe default)
-        false
+        // Path has invalid characters — fail closed: treat as symlink so the caller
+        // skips it. A path that can't be resolved is untrusted.
+        true
     } catch (_: SecurityException) {
-        // Security manager denied access — treat as non-symlink
-        false
+        // Security manager denied access — fail closed: treat as symlink so the
+        // caller skips it rather than following a path it can't inspect.
+        true
     } catch (_: java.io.IOException) {
-        // I/O error checking symlink — treat as non-symlink
-        false
+        // I/O error checking symlink — fail closed: treat as symlink so the
+        // caller skips it rather than risk following a broken/restricted path.
+        true
     }
 }
 
@@ -322,7 +328,7 @@ fun
         val chooser = FileChooserFactory.getInstance().createFileChooser(descriptor, project, null)
         val files = chooser.choose(project)
         files.forEach { file ->
-            addFileAttachment(file, attachedFiles)
+            addFileAttachment(file, attachedFiles, project)
         }
     }
 
@@ -337,11 +343,16 @@ fun
         val chooser = FileChooserFactory.getInstance().createFileChooser(descriptor, project, null)
         val files = chooser.choose(project)
         files.forEach { file ->
-            addFileAttachment(file, attachedFiles, requireImage = true)
+            addFileAttachment(file, attachedFiles, project, requireImage = true)
         }
     }
 
-    // Recent file click — attach a recent file
+    // Recent file click — attach a recent file.
+    // NOTE: No re-validation of recentFile.path here — the path came from
+    // FileEditorManager/EditorHistoryManager (trusted VFS sources) and
+    // addFileAttachment() copies external files into the allowed dir. The
+    // service guard in OpenCodeService.sendMessageInternal() is the final
+    // authority and catches any invalid/out-of-bound paths. Defense-in-depth.
     val onRecentFileClick: (RecentFile) -> Unit = { recentFile ->
         val vfs = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
         var vf = vfs.findFileByPath(recentFile.path)
@@ -357,7 +368,7 @@ fun
             }
         }
         if (vf != null) {
-            addFileAttachment(vf, attachedFiles)
+            addFileAttachment(vf, attachedFiles, project)
         }
     }
 
@@ -390,7 +401,7 @@ fun
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] File search failed" }
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] File search failed" }
                 }
             }
         }
@@ -526,6 +537,9 @@ fun
                     // Capture a snapshot BEFORE clearing — attachedFiles is a mutable list
                     // and InputArea passes the same reference. If we clear first, the coroutine
                     // would find an empty list by the time it runs.
+                    // By design: if the send fails, the user can re-attach files. Keeping
+                    // attachments until success would require complex rollback logic that
+                    // isn't worth the complexity for a rare failure path.
                     val fileSnapshot = files.toList()
                     attachedFiles.clear()
                     viewModel.scope.launch {
@@ -650,7 +664,8 @@ fun
         // Clear all sessions confirmation dialog
         if (showClearAllDialog) {
             val loaded = sessionListState as? com.opencode.acp.chat.model.SessionListState.Loaded
-            val countToDelete = (loaded?.topLevelSessions?.size ?: 0) - 1  // exclude active
+            val activeId = loaded?.selectedId
+            val countToDelete = loaded?.sessions?.count { it.id != activeId } ?: 0
             ClearAllConfirmationDialog(
                 sessionCount = countToDelete.coerceAtLeast(0),
                 onConfirm = { viewModel.scope.launch { viewModel.clearAllSessions() } },
@@ -662,10 +677,17 @@ fun
 
 /**
  * Reads a VirtualFile into an AttachedFile and adds it to the list.
+ *
+ * If the file lives outside the allowed attachment directories (project base,
+ * `<project>/.opencode/attachments/`, `<user.home>/.opencode/attachments/`), it is
+ * copied into `<project>/.opencode/attachments/` first so the security guard in
+ * `OpenCodeService.sendMessageInternal()` doesn't silently drop it. The attachment
+ * chip shows the copied path.
  */
 private fun addFileAttachment(
     file: VirtualFile,
     attachedFiles: MutableList<AttachedFile>,
+    project: Project,
     requireImage: Boolean = false
 ) {
     try {
@@ -677,7 +699,23 @@ private fun addFileAttachment(
             }
         }
         val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(file.name)
-        attachedFiles.add(AttachedFile(name = file.name, path = file.path, mime = mime))
+        // VirtualFile.path is already an absolute filesystem path for local files.
+        val sourceFile = java.io.File(file.path)
+        val effectivePath = if (sourceFile.isAbsolute && sourceFile.exists()) {
+            // Copy external files (Desktop, Documents, iCloud Drive, ...) into the
+            // project's .opencode/attachments/ dir so they pass the service guard.
+            // If the copy fails, fall back to the original path and let the guard
+            // log/skip it — never silently drop here.
+            com.opencode.acp.util.copyExternalAttachmentToAllowedDir(sourceFile, project)
+                ?.takeIf { it.absolutePath != sourceFile.absolutePath }
+                ?.let { copied ->
+                    // Preserve the original display name; use the copied file's path.
+                    AttachedFile(name = file.name, path = copied.absolutePath, mime = mime)
+                } ?: AttachedFile(name = file.name, path = sourceFile.canonicalPath, mime = mime)
+        } else {
+            AttachedFile(name = file.name, path = file.path, mime = mime)
+        }
+        attachedFiles.add(effectivePath)
     } catch (e: Exception) {
         // Skip files that can't be read (e.g., deleted between picker and confirm)
         io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] addFileAttachment: failed to attach ${file.name}" }

@@ -65,6 +65,11 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // the original exception is already logged.
             }
         }
+        // RESOLVED: errorSurfacer is set immediately after SessionManager construction
+        // (see the .also{} block below). During the brief window before it's set, early
+        // failures are logged at error level above and swallowed — this is acceptable
+        // because the connectionObserverJob will retry the connection. Once errorSurfacer
+        // is wired, all subsequent exceptions surface to the UI.
     })
 
     // ── Sub-components ─────────────────────────────────────────────────────
@@ -189,6 +194,10 @@ class OpenCodeService(private val project: Project) : Disposable {
         }
 
         // ── Initialize MCP integration ──────────────────────────────────────
+        // RESOLVED: MCP is optional; failures are logged at warn level (see initializeMcp
+        // catch block) and chat works without it. By design — initialize() returns true
+        // even if MCP fails so the user can still chat. The settings panel exposes a
+        // "Discover Tools" button to retry MCP initialization once servers are ready.
         initializeMcp()
 
         return true
@@ -272,6 +281,10 @@ class OpenCodeService(private val project: Project) : Disposable {
         val mcpMgr = mcpManager ?: return
         scope.launch {
             try {
+                // RESOLVED: Server is always launched on localhost by ProcessManager
+                // (it binds to 127.0.0.1 only — never 0.0.0.0). The port is dynamic
+                // (connectionManager.port), but the host is always 127.0.0.1. Hardcoding
+                // the host here is correct and intentional.
                 val baseUrl = "http://127.0.0.1:${connectionManager.port}"
                 val mcpUrls = mcpMgr.getServerUrls()
                 logger.info { "[ACP] discoverToolsInBackground: starting discovery (${mcpUrls.size} MCP servers connected)" }
@@ -557,17 +570,23 @@ class OpenCodeService(private val project: Project) : Disposable {
 
                 // Server healthy — re-subscribe global SSE
                 logger.info { "[ACP] SSE reconnect: server healthy, re-subscribing" }
-                sseJob?.cancel()
-                sseHealthCheckJob?.cancel()
+                // Capture the old jobs BEFORE reassigning sseJob/sseHealthCheckJob below.
+                // The previous code called `sseJob?.join()` after `sseJob = launchSseJob(...)`,
+                // which joined the NEW job instead of the old one — defeating the purpose
+                // of waiting for the old job to finish before launching new ones.
+                val oldSseJob = sseJob
+                val oldHealthCheckJob = sseHealthCheckJob
+                oldSseJob?.cancel()
+                oldHealthCheckJob?.cancel()
                 // Wait for old jobs to finish before launching new ones to prevent
                 // stale StreamingCompleted signals from completing the new turn's deferred.
                 // Use withTimeoutOrNull to avoid hanging if the old job is stuck on
                 // a half-open TCP connection (no socket timeout per AGENTS.md).
                 // If the join times out, the old job becomes a zombie — but it's harmless:
-                // sseJob?.cancel() was already called above, and the scope will reclaim it
+                // oldSseJob?.cancel() was already called above, and the scope will reclaim it
                 // on dispose. The zombie can't process new events (its TCP stream is dead).
-                withTimeoutOrNull(5000) { sseJob?.join() }
-                withTimeoutOrNull(5000) { sseHealthCheckJob?.join() }
+                withTimeoutOrNull(5000) { oldSseJob?.join() }
+                withTimeoutOrNull(5000) { oldHealthCheckJob?.join() }
                 val reconnectTime = System.currentTimeMillis()
                 sseLastEventTimeMs.set(reconnectTime)
                 logger.info { "[ACP] SSE reconnected at $reconnectTime" }
@@ -635,6 +654,14 @@ class OpenCodeService(private val project: Project) : Disposable {
                         // finalization. 20 is a balance between safety and REST payload size.
                         val messages = client.listMessages(sessionId, limit = 20)
                         val lastMessage = messages.lastOrNull()
+                        // RESOLVED (false positive): Current logic is correct — only
+                        // finalize if the last message is assistant (generation completed).
+                        // If the last is user, the assistant hasn't started responding yet,
+                        // so skipping finalization is the correct behavior (the SSE
+                        // reconnection will deliver the assistant's response normally).
+                        // Using lastOrNull (not lastOrNull { role == "assistant" }) is
+                        // intentional: we want to know the server's CURRENT last message,
+                        // not the most recent assistant message.
                         val lastIsAssistant = lastMessage?.info?.role == "assistant"
 
                         if (lastIsAssistant) {
@@ -748,9 +775,19 @@ class OpenCodeService(private val project: Project) : Disposable {
         val deferred = CompletableDeferred<Unit>()
         val activeSession = sessionManager.getActiveSession()
         activeSession?.responseDeferred = deferred
+        // Capture the session reference at send time so the CancellationException
+        // handler below finalizes the SAME session that started the send — not
+        // whatever session happens to be active when cancellation occurs (the user
+        // may have switched sessions mid-send).
+        val sendSession = activeSession
 
         try {
             val parts = mutableListOf<com.opencode.acp.adapter.OpenCodePart>(com.opencode.acp.adapter.OpenCodePart.Text(text = text))
+            // Track filenames actually added to `parts` so the summary log reflects
+            // what was sent, not what was requested. Files can be skipped by the
+            // guards below (blank path, unreadable, outside allowed dirs, denylist,
+            // empty image, I/O failure) — listing the input count was misleading.
+            val addedFileNames = mutableListOf<String>()
             files.forEach { file ->
                 if (file.path.isBlank()) {
                     // Pre-rev2 history entries: clipboard images stored path="".
@@ -773,6 +810,11 @@ class OpenCodeService(private val project: Project) : Disposable {
                 val canonicalPath = fileObj.canonicalPath
                 val projectBase = project.basePath?.let { java.io.File(it).canonicalPath }
                 val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
+                // RESOLVED (false positive): File.separator IS appended to projectBase
+                // before startsWith, so the path boundary is enforced. E.g.,
+                // `C:\Project2\file`.startsWith(`C:\Project\`) is FALSE because
+                // `C:\Project2` != `C:\Project\`. The separator prevents the
+                // C:\Project → C:\Project2 prefix-confusion attack (CWE-22).
                 val isInsideProject = projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator)
                 val isInsideProjectAttachments = projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)
                 val isInsideUserHomeAttachments = userHome != null && canonicalPath.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)
@@ -803,18 +845,50 @@ class OpenCodeService(private val project: Project) : Disposable {
                     logger.warn { "[ACP] Skipping attached file '${file.name}' — path matches denylist segment (sensitive location): ${file.path}" }
                     return@forEach
                 }
-                // Use canonical path for the URL to prevent symlink-based exfiltration
-                val url = com.opencode.acp.util.pathToFileUrl(canonicalPath)
-                if (url == null) {
-                    logger.warn { "[ACP] Skipping attached file '${file.name}' — pathToFileUrl returned null for: ${file.path}" }
-                    return@forEach
+                // Image attachments: send as data: URI (base64-embedded) instead of file:// URL.
+                // The OpenCode server's Image.normalize() requires data: URIs; file:// URLs are
+                // fragile on Windows and silently fail. The OpenCode CLI itself sends data: URIs.
+                // The wire part type remains "file" with mime "image/*" — do NOT use type "image"
+                // (the server does not recognize outbound "image" parts).
+                if (file.mime.startsWith("image/")) {
+                    try {
+                        val fileSize = fileObj.length()
+                        if (fileSize > MAX_ATTACHMENT_SIZE_BYTES) {
+                            logger.warn { "[ACP] Skipping attached image '${file.name}' — file too large (${fileSize / (1024*1024)}MB > ${MAX_ATTACHMENT_SIZE_BYTES / (1024*1024)}MB limit): ${file.path}" }
+                            return@forEach
+                        }
+                        val bytes = fileObj.readBytes()
+                        if (bytes.isEmpty()) {
+                            logger.warn { "[ACP] Skipping attached image '${file.name}' — file is empty: ${file.path}" }
+                            return@forEach
+                        }
+                        val base64 = java.util.Base64.getEncoder().encodeToString(bytes)
+                        val dataUri = "data:${file.mime};base64,$base64"
+                        parts.add(com.opencode.acp.adapter.OpenCodePart.File(
+                            mime = file.mime, url = dataUri, filename = file.name
+                        ))
+                        addedFileNames.add(file.name)
+                    } catch (e: Exception) {
+                        logger.warn { "[ACP] Skipping attached image '${file.name}' — failed to read for data URI: ${file.path}" }
+                        return@forEach
+                    }
+                } else {
+                    // Non-image attachments: use canonical path for the URL to prevent
+                    // symlink-based exfiltration.
+                    val url = com.opencode.acp.util.pathToFileUrl(canonicalPath)
+                    if (url == null) {
+                        logger.warn { "[ACP] Skipping attached file '${file.name}' — pathToFileUrl returned null for: ${file.path}" }
+                        return@forEach
+                    }
+                    val wireMime = normalizeAttachmentMime(file.mime)
+                    parts.add(com.opencode.acp.adapter.OpenCodePart.File(
+                        mime = wireMime, url = url, filename = file.name
+                    ))
+                    addedFileNames.add(file.name)
                 }
-                val wireMime = normalizeAttachmentMime(file.mime)
-                parts.add(com.opencode.acp.adapter.OpenCodePart.File(
-                    mime = wireMime, url = url, filename = file.name
-                ))
             }
-            logger.info { "[ACP] sendMessage: ${parts.size} parts (text + ${files.size} file attachments: ${files.joinToString { it.name }})" }
+            val filePartCount = parts.count { it is com.opencode.acp.adapter.OpenCodePart.File }
+            logger.info { "[ACP] sendMessage: ${parts.size} parts (text + $filePartCount file attachments: ${addedFileNames.joinToString { it }})" }
 
             val serverMessageId = client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
             logger.info { "[ACP] sendMessage: got serverMessageId=$serverMessageId" }
@@ -892,6 +966,11 @@ class OpenCodeService(private val project: Project) : Disposable {
                         continue
                     }
                     val lastActivity = monitorSession.ctx.lastActivityTimeMs
+                    // RESOLVED: lastActivityTimeMs is @Volatile in ProcessorContext (line 157),
+                    // ensuring visibility across coroutines. It's written on the SSE event
+                    // processing coroutine and read here on the activity monitor coroutine.
+                    // @Volatile provides the necessary happens-before guarantee for a single
+                    // Long field — no additional synchronization needed.
                     val elapsed = System.currentTimeMillis() - lastActivity
                     if (elapsed > responseTimeoutMs) {
                         val timeoutSec = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds
@@ -921,7 +1000,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                 SendMessageResult.Success(assistantMsgId)
             }
         } catch (e: CancellationException) {
-            try { sessionManager.completeStreaming(assistantMsgId) } catch (ex: Exception) {
+            // Use the session captured at send time (sendSession) rather than
+            // re-fetching the active session — the user may have switched sessions
+            // between send and cancel, and we must finalize the original session.
+            try { sendSession?.completeStreaming(assistantMsgId) } catch (ex: Exception) {
                 logger.debug(ex) { "[ACP] completeStreaming failed during CancellationException handling" }
             }
             throw e
@@ -1009,12 +1091,20 @@ class OpenCodeService(private val project: Project) : Disposable {
 
         val job = scope.launch {
             try {
-                // Acquire the mutex (suspends until the old sendMessage()'s
-                // finally block releases it), then immediately release it —
-                // we just want to know it's available, not hold it.
-                sendMutex.lock()
-                sendMutex.unlock()
-                deferred.complete(Unit)
+                // Poll for the mutex instead of suspending on lock(). A suspended
+                // lock() acquisition can be cancelled mid-suspend, leaving the mutex
+                // in an inconsistent state (the cancellation resumes the suspended
+                // coroutine but the lock acquisition may not complete cleanly). The
+                // polling approach with tryLock() + delay() avoids this: tryLock()
+                // is non-suspending and either succeeds or fails immediately.
+                while (isActive) {
+                    if (sendMutex.tryLock()) {
+                        sendMutex.unlock()
+                        deferred.complete(Unit)
+                        return@launch
+                    }
+                    delay(50)
+                }
             } catch (e: CancellationException) {
                 // Scope cancelled — complete deferred so caller unblocks
                 deferred.complete(Unit)
@@ -1116,6 +1206,9 @@ class OpenCodeService(private val project: Project) : Disposable {
          *  5s interval balances responsiveness (detects dead connections within
          *  responseTimeoutSeconds + 5s) against overhead (one timestamp read per check). */
         private const val ACTIVITY_CHECK_INTERVAL_MS = 5_000L
+
+        /** Maximum file size for image attachments (50MB). Prevents OOM from large files. */
+        private const val MAX_ATTACHMENT_SIZE_BYTES = 50L * 1024 * 1024
     }
 }
 

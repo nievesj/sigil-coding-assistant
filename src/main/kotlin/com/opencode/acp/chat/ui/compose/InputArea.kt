@@ -137,6 +137,9 @@ suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? 
                     val bufferedImage = clipResult.toBufferedImage()
                     val savedPath = saveClipboardImageToDisk(bufferedImage, project)
                     if (savedPath != null) {
+                        // No path validation needed here: saveClipboardImageToDisk
+                        // always writes inside .opencode/attachments/ by construction,
+                        // so the path is guaranteed to be within the allowed dir.
                         val filename = java.io.File(savedPath).name
                         ClipboardResult.FileResult(AttachedFile(name = filename, path = savedPath, mime = "image/png"))
                     } else {
@@ -144,10 +147,10 @@ suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? 
                         null
                     }
                 }
-                is List<*> -> {
+                    is List<*> -> {
                     val files = clipResult.filterIsInstance<java.io.File>()
                     if (files.isEmpty()) return@withContext null
-                    ClipboardResult.FileResult(files.first().toAttachedFile())
+                    ClipboardResult.FileResult(files.first().toAttachedFile(project))
                 }
                 is String -> {
                     if (clipResult.isNotBlank()) {
@@ -205,8 +208,10 @@ private fun readClipboardOnEdt(): Any? {
         }
 
         // 2. Try javaFileListFlavor (files from OS file manager) — only return
-        //    actual image files here; non-image files are ignored (the user
-        //    should use the "Attach" button for those).
+        //    actual image files here; non-image files are intentionally ignored.
+        //    Non-image files should be attached via the "Attach" button (which
+        //    runs the full copy-into-allowed-dir + MIME detection path). The
+        //    clipboard path is for images and text only.
         if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
             @Suppress("UNCHECKED_CAST")
             val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
@@ -341,7 +346,9 @@ fun InputArea(
     var showSlashPalette by remember { mutableStateOf(false) }
     var selectedIndex by remember { mutableStateOf(0) }
     val currentText = textState.text.toString()
-    val slashQuery = if (currentText.startsWith("/")) currentText.substring(1) else ""
+    // Only treat a single leading "/" as a slash command query; "//" is the
+    // escape mechanism to send literal text starting with "/".
+    val slashQuery = if (currentText.startsWith("/") && !currentText.startsWith("//")) currentText.substring(1) else ""
 
     val filtered = remember(slashQuery, commands) {
         if (slashQuery.isBlank()) commands
@@ -400,9 +407,16 @@ fun InputArea(
                         val uris = dragData.readFiles()
                         uris.map { uri ->
                             try {
-                                java.io.File(java.net.URI(uri)).toAttachedFile()
+                                // Reject non-file URI schemes (e.g. http://, ftp://) to
+                                // prevent attaching arbitrary remote resources. Only
+                                // local file:// URIs are allowed for drag-and-drop.
+                                if (!uri.startsWith("file:")) {
+                                    logger.warn { "[ACP] Drag-and-drop: rejecting non-file URI scheme: ${uri.take(50)}" }
+                                    null
+                                } else {
+                                    java.io.File(java.net.URI(uri)).toAttachedFile(project)
+                                }
                             } catch (e: Exception) {
-
                                 null
                             }
                         }.filterNotNull().forEach { file ->
@@ -456,7 +470,7 @@ fun InputArea(
                         val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
                         files?.forEach { file ->
                             try {
-                                onAttachFile(file.toAttachedFile())
+                                onAttachFile(file.toAttachedFile(project))
                             } catch (e: Exception) {
 
                             }
@@ -476,7 +490,9 @@ fun InputArea(
         focusRequester.requestFocus()
     }
 
-    // Collect text paste signals and insert into text field
+    // Collect text paste signals and insert into text field.
+    // The cursor position is read inside the collector, which runs on the
+    // Compose thread — so there is no stale read of the selection state.
     if (pasteTextSignal != null) {
         LaunchedEffect(pasteTextSignal) {
             pasteTextSignal.collect { text ->
@@ -497,7 +513,9 @@ fun InputArea(
     LaunchedEffect(Unit) {
         androidx.compose.runtime.snapshotFlow { textState.text.toString() }
             .collect { text ->
-                showSlashPalette = text.startsWith("/") && !text.contains("\n")
+                // Show palette only for a single leading "/" — "//" is the escape
+                // mechanism to send literal text starting with "/".
+                showSlashPalette = text.startsWith("/") && !text.startsWith("//") && !text.contains("\n")
             }
     }
 
@@ -816,7 +834,10 @@ fun InputArea(
                                                 selectedIndex = (selectedIndex + 1).coerceAtMost(filtered.lastIndex)
                                                 true
                                             }
-                                            // Up arrow — navigate command history (older)
+                                            // Up arrow — navigate command history (older).
+                                            // By design: matches documented shell-history behavior —
+                                            // Up recalls older entries, Down recalls newer, Escape
+                                            // restores the draft. See AGENTS.md "Input Command History".
                                             event.key == Key.DirectionUp && !event.isShiftPressed && !showSlashPalette && commandHistory.isNotEmpty() -> {
                                                 saveDraftIfNeeded(attachedFiles)
                                                 val newIndex = if (historyIndex < 0) 0 else (historyIndex + 1).coerceAtMost(commandHistory.size - 1)
@@ -852,37 +873,52 @@ fun InputArea(
                                             }
                                             event.key == Key.Enter && !event.isShiftPressed -> {
                                                 val text = textState.text.toString().trim()
-                                                // Slash command interception: even if the palette isn't
-                                                // visible (e.g. text was pasted, or exceeded the old
-                                                // length cap), check if the text starts with "/" and the
-                                                // first word matches a known command. If so, execute it
-                                                // with trailing args instead of sending to the server.
-                                                val slashCmd = if (text.startsWith("/")) {
-                                                    val firstWord = text.substring(1).substringBefore(" ")
-                                                    commands.filter { it.name.equals(firstWord, ignoreCase = true) }
-                                                        .firstOrNull()?.let { cmd ->
-                                                            val args = if (text.length > firstWord.length + 1) {
-                                                                text.substring(firstWord.length + 1).trim()
-                                                            } else ""
-                                                            cmd.copy(args = args)
-                                                        }
-                                                } else null
-                                                if (slashCmd != null) {
-                                                    showSlashPalette = false
-                                                    inHistoryMode = false
-                                                    historyIndex = -1
-                                                    textState.edit { replace(0, length, "") }
-                                                    onSlashCommand(slashCmd)
-                                                    true
-                                                } else {
-                                                    if (text.isNotEmpty()) {
-                                                        onSend(text, attachedFiles)
+                                                // Escape mechanism: "//" prefix strips one "/" and sends
+                                                // the rest as literal text (lets the user send text that
+                                                // starts with "/" without triggering a slash command).
+                                                if (text.startsWith("//")) {
+                                                    val sendText = text.substring(1)
+                                                    if (sendText.isNotEmpty()) {
+                                                        onSend(sendText, attachedFiles)
                                                         textState.edit { replace(0, length, "") }
                                                     }
                                                     showSlashPalette = false
                                                     inHistoryMode = false
                                                     historyIndex = -1
                                                     true
+                                                } else {
+                                                    // Slash command interception: even if the palette isn't
+                                                    // visible (e.g. text was pasted, or exceeded the old
+                                                    // length cap), check if the text starts with "/" and the
+                                                    // first word matches a known command. If so, execute it
+                                                    // with trailing args instead of sending to the server.
+                                                    val slashCmd = if (text.startsWith("/")) {
+                                                        val firstWord = text.substring(1).substringBefore(" ")
+                                                        commands.filter { it.name.equals(firstWord, ignoreCase = true) }
+                                                            .firstOrNull()?.let { cmd ->
+                                                                val args = if (text.length > firstWord.length + 1) {
+                                                                    text.substring(firstWord.length + 1).trim()
+                                                                } else ""
+                                                                cmd.copy(args = args)
+                                                            }
+                                                    } else null
+                                                    if (slashCmd != null) {
+                                                        showSlashPalette = false
+                                                        inHistoryMode = false
+                                                        historyIndex = -1
+                                                        textState.edit { replace(0, length, "") }
+                                                        onSlashCommand(slashCmd)
+                                                        true
+                                                    } else {
+                                                        if (text.isNotEmpty()) {
+                                                            onSend(text, attachedFiles)
+                                                            textState.edit { replace(0, length, "") }
+                                                        }
+                                                        showSlashPalette = false
+                                                        inHistoryMode = false
+                                                        historyIndex = -1
+                                                        true
+                                                    }
                                                 }
                                             }
                                             event.key == Key.Enter && event.isShiftPressed -> {
@@ -901,7 +937,10 @@ fun InputArea(
                                                     showAttachMenu = false
                                                     true
                                                 } else if (inHistoryMode) {
-                                                    // Cancel history navigation and restore draft
+                                                    // Cancel history navigation and restore draft.
+                                                    // Draft files are snapshotted once on entering
+                                                    // history mode (saveDraftIfNeeded), so restoring
+                                                    // here returns the original pre-navigation input.
                                                     textState.edit { replace(0, length, draftText) }
                                                     onLoadHistoryEntry(CommandHistoryEntry(draftText, draftFiles))
                                                     inHistoryMode = false
@@ -1257,8 +1296,19 @@ private fun FollowAgentCheckbox(enabled: Boolean, onToggle: () -> Unit) {
 /**
  * Converts a java.io.File into an AttachedFile by reading its MIME type from the filename.
  * No bytes are read — the file content is referenced by path on the wire.
+ *
+ * If [sourceFile] lives outside the allowed attachment directories (project base,
+ * `<project>/.opencode/attachments/`, `<user.home>/.opencode/attachments/`), it is
+ * copied into `<project>/.opencode/attachments/` first so the security guard in
+ * `OpenCodeService.sendMessageInternal()` doesn't silently drop it. The attachment
+ * chip shows the copied path. If the copy fails, the original path is used and the
+ * service guard will log/skip it.
  */
-private fun java.io.File.toAttachedFile(): AttachedFile {
+private fun java.io.File.toAttachedFile(project: com.intellij.openapi.project.Project? = null): AttachedFile {
     val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(name)
-    return AttachedFile(name = name, path = absolutePath, mime = mime)
+    val copied = if (project != null) {
+        com.opencode.acp.util.copyExternalAttachmentToAllowedDir(this, project)
+    } else null
+    val effectivePath = copied?.absolutePath ?: absolutePath
+    return AttachedFile(name = name, path = effectivePath, mime = mime)
 }

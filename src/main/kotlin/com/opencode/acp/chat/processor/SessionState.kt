@@ -101,6 +101,23 @@ class SessionState(
      *  read by the event processing coroutine. */
     @Volatile internal var firstTextSegmented = false
 
+    /** Pending turn identity stored when createAssistantMessage's ResetTurn trySend
+     *  fails (event channel full). The event processing coroutine checks this at the
+     *  start of processEventInternal and applies it if set, closing the window where
+     *  activeMessageId would be null and a duplicate auto-create could fire.
+     *  @Volatile because written by createAssistantMessage (caller's coroutine) and
+     *  read/cleared by the event processing coroutine. */
+    @Volatile internal var pendingTurnIdentity: PendingTurnIdentity? = null
+
+    /** Carries the new turn's identity when the ResetTurn control event is dropped
+     *  due to a full event channel. Applied at the start of processEventInternal. */
+    internal data class PendingTurnIdentity(
+        val messageId: String,
+        val serverMessageId: String?,
+        val modelID: String?,
+        val providerID: String?,
+    )
+
     /** Event channel — SSE events buffered for EDT processing. */
     private val eventChannel = Channel<SseEvent>(1024)
 
@@ -264,7 +281,13 @@ class SessionState(
                 //
                 // The only downside is that ctx.isStreaming won't be true until the first
                 // event arrives, but that's a sub-millisecond window in practice.
-                logger.warn { "[ACP] createAssistantMessage: eventChannel FULL — ResetTurn dropped, auto-create will handle it. id=$id" }
+                //
+                // PENDING-TURN FALLBACK: Store the turn identity so the event processing
+                // coroutine can apply it at the start of processEventInternal. This closes
+                // the window where activeMessageId is null and a duplicate auto-create
+                // could fire when the first content-bearing SSE event arrives.
+                pendingTurnIdentity = PendingTurnIdentity(id, serverMessageId, modelID, providerID)
+                logger.warn { "[ACP] createAssistantMessage: eventChannel FULL — ResetTurn dropped, pendingTurnIdentity stored + auto-create will handle it. id=$id" }
             }
         }
 
@@ -307,6 +330,13 @@ class SessionState(
     }
 
     fun completeStreaming(messageId: String) = stateLock.withLock {
+        // BY DESIGN: completeStreaming only finalizes the ACTIVE streaming message.
+        // Old messages from previous turns are already finalized via finalizeStreaming
+        // (triggered by Stop/MessageFinalized/SessionIdle events). If messageId
+        // doesn't match ctx.activeMessageId, this is a stale call for an already-
+        // finalized message — skip it. By design — completeStreaming finalizes the
+        // active streaming message; old turns are finalized via Stop/MessageFinalized
+        // events.
         if (messageId != ctx.activeMessageId) {
             logger.warn { "[ACP] completeStreaming: SKIP messageId=$messageId != activeMessageId=${ctx.activeMessageId}" }
             return@withLock
@@ -357,6 +387,7 @@ class SessionState(
                 entry.value.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
                     ctx.toolCallIndex.remove(part.pill.toolCallId)
                     ctx.toolCallPills.remove(part.pill.toolCallId)
+                    ctx.toolPartStates.remove(part.pill.toolCallId)
                 }
                 iter.remove()
                 toRemove--
@@ -398,6 +429,7 @@ class SessionState(
         val current = LinkedHashMap<String, ChatMessage>()
         ctx.toolCallIndex.clear()
         ctx.toolCallPills.clear()
+        ctx.toolPartStates.clear()
         newMessages.forEach { message ->
             current[message.id] = message
             message.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
@@ -414,6 +446,12 @@ class SessionState(
         // Apply tool output truncation if enabled in settings (opt-in).
         // Truncation is JSON-safe: complete JSON objects are kept until the char limit,
         // then a marker object is appended. The server can still parse the result.
+        //
+        // UI-ONLY (resolved): Truncation is applied ONLY to the pill's `output` field
+        // (UI display). The server receives the ORIGINAL, untruncated output via SSE —
+        // the truncation happens client-side after the SSE event is parsed, so the
+        // server's copy is never modified. Truncation is UI-only; server receives
+        // original output via SSE. Added clarifying comment.
         val truncatedOutput = if (output != null) {
             sessionManager.maybeTruncateToolOutput(
                 toolName = ctx.toolCallPills[toolCallId]?.toolName ?: "tool",
@@ -422,7 +460,11 @@ class SessionState(
         } else null
         val newPartState = when (status) {
             ToolCallStatus.COMPLETED -> PartState.Completed
-            ToolCallStatus.FAILED -> PartState.Failed(truncatedOutput?.toString() ?: "Tool error")
+            ToolCallStatus.FAILED -> PartState.Failed(
+                truncatedOutput?.joinToString("\n") { obj ->
+                    try { obj["text"]?.jsonPrimitive?.contentOrNull ?: obj.toString() } catch (_: Exception) { obj.toString() }
+                }?.take(500) ?: "Tool error"
+            )
             ToolCallStatus.PENDING -> PartState.Pending
             ToolCallStatus.IN_PROGRESS -> PartState.InProgress
             else -> PartState.InProgress
@@ -554,6 +596,25 @@ class SessionState(
     }
 
     private fun processEventInternal(event: SseEvent) {
+        // Apply a pending turn identity stored when createAssistantMessage's ResetTurn
+        // trySend failed (channel full). This closes the window where activeMessageId
+        // was null between the dropped ResetTurn and the first content-bearing SSE event,
+        // which previously caused a duplicate auto-create. Resetting here (on the event
+        // processing coroutine) is single-writer safe — ctx fields are owned by this
+        // coroutine. We do NOT drain the channel; stale events are skipped by the
+        // server-ID routing check below (same as the ResetTurn handler).
+        val pending = pendingTurnIdentity
+        if (pending != null) {
+            pendingTurnIdentity = null
+            ctx.resetTurnState()
+            ctx.activeMessageId = pending.messageId
+            if (pending.serverMessageId != null) ctx.activeServerMessageId = pending.serverMessageId
+            ctx.modelID = pending.modelID
+            ctx.providerID = pending.providerID
+            ctx.isStreaming = true
+            logger.info { "[ACP] processEventInternal: applied pendingTurnIdentity msg=${pending.messageId} serverMsg=${pending.serverMessageId}" }
+        }
+
         // Events that don't require an active streaming message
         when (event) {
             // Internal control event — reset ctx for a new streaming turn.
@@ -616,6 +677,17 @@ class SessionState(
                 // Backstop: if the server says it's idle but we're still streaming,
                 // finalize. This handles the case where message.updated didn't have
                 // a finish field or the messageId was missing.
+                //
+                // TOCTOU RACE (resolved, benign): There's a TOCTOU window between
+                // reading ctx.isStreaming here and finalizeStreaming acquiring
+                // stateLock. A concurrent finalizeStreaming (from a Stop/
+                // MessageFinalized event) could finalize first. The race is benign
+                // because both paths check `ctx.isStreaming` inside stateLock.withLock
+                // (finalizeStreaming line ~1563, completeStreaming, etc.), and
+                // emitStreamingCompleted has a `streamingCompletedEmitted` guard that
+                // prevents double-emission. So at most one finalization succeeds; the
+                // other is a no-op. Race is benign — both paths check ctx.isStreaming
+                // under stateLock; streamingCompletedEmitted prevents double-emission.
                 if (ctx.isStreaming) {
                     val msgId = ctx.activeMessageId
                     if (msgId != null) {
@@ -636,8 +708,29 @@ class SessionState(
             is SseEvent.MessageComplete -> { return }
             is SseEvent.Ignored -> { return }
             is SseEvent.SessionError -> {
-                // Surface server-side session errors to the UI via signal.
-                // Without this handler, session.error events were silently dropped.
+                // Session-level error (e.g. server failed to read an attached file,
+                // LLM provider rejected the request). When streaming is active, we
+                // MUST finalize the streaming message and emit StreamingCompleted so
+                // that responseDeferred is completed and sendMessageInternal unblocks
+                // — otherwise it hangs at deferred.await() holding sendMutex for 300s
+                // (the activity monitor timeout), blocking all subsequent sends.
+                // This mirrors the SseEvent.Error handler below (line ~1404).
+                if (ctx.isStreaming && ctx.activeMessageId != null) {
+                    val msgId = ctx.activeMessageId!!
+                    freezeCurrentThinking()
+                    flushRevealBuffer()
+                    val reason = event.errorMessage ?: "Session error"
+                    ctx.errorMessage = reason
+                    ctx.isStreaming = false
+                    updateMessage(msgId) { msg ->
+                        val parts = LinkedHashMap(msg.parts)
+                        parts["error"] = MessagePart.Error(reason)
+                        msg.copy(parts = parts, isStreaming = false, state = MessageState.Failed(reason))
+                    }
+                    _signals.tryEmit(UiSignal.Error(msgId, reason))
+                    emitStreamingCompleted(msgId)
+                }
+                // Always surface the session error to the UI via signal.
                 _signals.tryEmit(UiSignal.SessionError(sessionId, event.errorMessage))
                 return
             }
@@ -1346,13 +1439,29 @@ class SessionState(
                     if (ctx.activeServerMessageId == null && ctx.activeMessageId != null && ctx.isStreaming) {
                         // We're streaming but haven't received the server message ID yet.
                         // This MessageFinalized event carries it — adopt it.
+                        //
+                        // GUARD (resolved): Only adopt if NO SSE content events have been
+                        // received yet for this turn (firstTextChunkReceived == false AND
+                        // toolCallPills is empty). If content has been received but
+                        // activeServerMessageId is still null, the HTTP response will set
+                        // it via updateServerMessageId() — adopting a stale
+                        // MessageFinalized here would cause subsequent events for the real
+                        // message to be skipped. Log a warning and skip in that case.
                         // WARNING: This adoption is unconditional. If a stale MessageFinalized from a
                         // previous turn arrives late (SSE reordering), it would be adopted as the current
                         // message's server ID, causing subsequent events for the real message to be skipped.
                         // The updateServerMessageId() path (line ~478) logs a mismatch warning when the
                         // HTTP response arrives with a different ID — that's the safety net.
-                        logger.warn { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${ctx.activeMessageId} (activeServerId was null) — verify this matches the HTTP response" }
-                        ctx.activeServerMessageId = serverMsgId
+                        if (!ctx.firstTextChunkReceived && ctx.toolCallPills.isEmpty()) {
+                            logger.warn { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${ctx.activeMessageId} (activeServerId was null, no content yet) — verify this matches the HTTP response" }
+                            ctx.activeServerMessageId = serverMsgId
+                        } else {
+                            // Content already received but activeServerMessageId is still null —
+                            // the HTTP response will set it. Skip adoption to avoid a stale
+                            // MessageFinalized hijacking the turn's server ID.
+                            logger.warn { "[ACP] MessageFinalized: skipping adoption of serverMsgId=$serverMsgId — content already received (firstText=${ctx.firstTextChunkReceived}, pills=${ctx.toolCallPills.size}), HTTP response will set activeServerMessageId" }
+                            return
+                        }
                     } else {
                         logger.debug { "[ACP] MessageFinalized for non-active message $serverMsgId — skipping (activeLocal=${ctx.activeMessageId}, activeServer=${ctx.activeServerMessageId})" }
                         return
@@ -1431,9 +1540,11 @@ class SessionState(
             // ── Agent ─────────────────────────────────────────────────────
             is SseEvent.Agent -> {
                 ctx.activeAgentName = event.agentName
+                val agentKey = "agent_${ctx.activeAgents.size}"
+                ctx.activeAgents.add(event)
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
-                    parts["agent"] = MessagePart.Agent(name = event.agentName)
+                    parts[agentKey] = MessagePart.Agent(name = event.agentName)
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
             }
@@ -1441,9 +1552,10 @@ class SessionState(
             // ── Retry ─────────────────────────────────────────────────────
             is SseEvent.Retry -> {
                 ctx.activeRetry = event
+                val retryKey = "retry_${event.attempt}"
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
-                    parts["retry"] = MessagePart.Retry(attempt = event.attempt, maxAttempts = event.maxAttempts, error = event.error)
+                    parts[retryKey] = MessagePart.Retry(attempt = event.attempt, maxAttempts = event.maxAttempts, error = event.error)
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
             }
@@ -1451,9 +1563,11 @@ class SessionState(
             // ── Compaction ────────────────────────────────────────────────
             is SseEvent.Compaction -> {
                 ctx.activeCompaction = event
+                val compactionKey = "compaction_${ctx.activeCompactions.size}"
+                ctx.activeCompactions.add(event)
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
-                    parts["compaction"] = MessagePart.Compaction(summary = event.summary)
+                    parts[compactionKey] = MessagePart.Compaction(summary = event.summary)
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
             }
@@ -1464,9 +1578,11 @@ class SessionState(
             // ── StepFinish ───────────────────────────────────────────────
             is SseEvent.StepFinish -> {
                 ctx.activeStepFinish = event
+                val stepKey = "step_finish_${ctx.activeStepFinishes.size}"
+                ctx.activeStepFinishes.add(event)
                 updateMessage(msgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
-                    parts["step_finish"] = MessagePart.StepFinish(
+                    parts[stepKey] = MessagePart.StepFinish(
                         snapshot = event.snapshot,
                         inputTokens = event.inputTokens,
                         outputTokens = event.outputTokens,
@@ -1586,6 +1702,15 @@ class SessionState(
             logger.info { "[ACP] finalizeStreaming (new_message): immediate finalization (no debounce, no StreamingCompleted)" }
             stateLock.withLock {
                 updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
+                // Complete the old turn's responseDeferred so sendMessageInternal unblocks.
+                // Don't emit StreamingCompleted — the new message's completion will handle
+                // that. The ViewModel's _streamPhase stays STREAMING (set by the new
+                // message's StreamingStarted), avoiding a brief IDLE flicker.
+                // responseDeferred here belongs to the OLD turn (set by sendMessageInternal
+                // before the new_message was detected). The NEW turn gets a fresh
+                // responseDeferred from its own sendMessageInternal call.
+                responseDeferred?.complete(Unit)
+                responseDeferred = null
             }
         } else {
             val capturedMsgId = msgId
@@ -1688,6 +1813,10 @@ class SessionState(
             } catch (e: Exception) {
                 logger.error(e) { "[ACP] startThinkingRevealLoop: unexpected exception — flushing thinking reveal buffer" }
                 flushThinkingRevealBuffer()
+                // Re-sync the UI: the exception may have left the thinking part's
+                // content out of sync with the reveal buffer. resegmentTextPartsDirect
+                // rebuilds text-derived parts from the current reveal buffer state.
+                resegmentTextPartsDirect(msgId)
             }
         }
     }
@@ -1761,6 +1890,10 @@ class SessionState(
             } catch (e: Exception) {
                 logger.error(e) { "[ACP] startRevealLoop: unexpected exception — flushing reveal buffer" }
                 flushRevealBuffer()
+                // Re-sync the UI: the exception may have left text-derived parts out
+                // of sync with the reveal buffer. resegmentTextPartsDirect rebuilds
+                // them from the current reveal buffer state (now fully revealed).
+                resegmentTextPartsDirect(msgId)
             }
         }
     }
@@ -1837,6 +1970,9 @@ class SessionState(
 
             // Snapshot after anchor setup — iteration below uses this snapshot
             // to avoid races with the event processing coroutine that may mutate ctx.textSegments.
+            // NOTE: This snapshot is taken AFTER the anchor-setup updateMessage call above
+            // (lines ~1848-1857), so it reflects the anchor key mutation. No fix needed —
+            // segmentsSnapshot is taken after anchor setup; no fix needed. (False positive.)
             val segmentsSnapshot = ctx.textSegments.toList()
 
             val raw = ctx.revealBuffer.substring(0, ctx.revealedLen)

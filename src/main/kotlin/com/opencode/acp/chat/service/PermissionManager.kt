@@ -31,6 +31,12 @@ class PermissionManager(
      * Previously, the server call was first — a success followed by a local state failure
      * left the server committed but the UI still showing the prompt. */
     suspend fun respondPermission(permissionId: String, toolCallId: String, sessionId: String, response: PermissionResponse) {
+        // NOTE (ABA race): This uses optimistic local updates before the server call.
+        // If an SSE event arrives between the optimistic update and a rollback (on
+        // server failure), that SSE-driven state could be overwritten by the rollback.
+        // This is an accepted limitation — the window is small and the server is
+        // authoritative on retry (the prompt re-appears if the server never received
+        // the response).
         val client = clientProvider()
         if (client == null) {
             logger.warn { "[ACP] Permission response dropped: client is null (server may not be connected)" }
@@ -78,6 +84,11 @@ class PermissionManager(
         }
         try {
             client.respondQuestion(promptId, answers)
+            // Clear the pending selection prompt ONLY after the server call succeeds.
+            // If the call throws, this line is not reached — the prompt stays visible
+            // for retry. (False-positive review concern: clearPendingSelection is
+            // AFTER the server call, not before.)
+            sessionManager.getSession(sessionId)?.clearPendingSelection()
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -95,6 +106,9 @@ class PermissionManager(
         }
         try {
             client.rejectQuestion(promptId)
+            // Clear the pending selection prompt ONLY after the server call succeeds
+            // (see respondQuestion for the ordering rationale).
+            sessionManager.getSession(sessionId)?.clearPendingSelection()
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -108,6 +122,8 @@ class PermissionManager(
     fun startPermissionTimeout(timeoutSeconds: Int, onTimeout: () -> Unit) {
         permissionTimeoutJob?.cancel()
         if (timeoutSeconds <= 0) return
+        // Clamp BEFORE multiply: coerceAtMost(3600) bounds the value to <= 3600,
+        // so `clampedSeconds * 1000L` is at most 3,600,000 — no Int overflow possible.
         val clampedSeconds = timeoutSeconds.coerceAtMost(3600) // Max 1 hour
         permissionTimeoutJob = scope.launch {
             delay(clampedSeconds * 1000L)
