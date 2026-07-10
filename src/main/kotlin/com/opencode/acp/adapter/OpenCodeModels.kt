@@ -175,6 +175,13 @@ sealed interface OpenCodePart {
     @SerialName("reasoning")
     data class Reasoning(val text: String) : OpenCodePart
 
+    /**
+     * **Inbound-only.** Used to parse assistant-generated image parts from SSE events
+     * (see `ContentMapper.kt`). Must NEVER be used for outbound messages — the OpenCode
+     * server does not recognize `type: "image"` parts on the request wire. Outbound
+     * images must use [OpenCodePart.File] with a `data:` URI (e.g.
+     * `data:image/png;base64,...`) and `mime` set to the image MIME type.
+     */
     @Serializable
     @SerialName("image")
     data class Image(
@@ -286,6 +293,7 @@ object OpenCodePartSerializer : KSerializer<OpenCodePart> {
                 // ToolUse, ToolResult, StepStart, StepFinish, Thinking, Reasoning,
                 // Patch, Agent, Retry, Compaction, Snapshot, Subtask, Unknown
                 // These aren't sent outbound — encode as empty object
+                logger.warn { "[ACP] OpenCodePartSerializer.serialize(): encoding ${value::class.simpleName} as empty JSON object — this type is not expected outbound" }
                 kotlinx.serialization.json.buildJsonObject {}
             }
         }
@@ -385,14 +393,16 @@ fun OpenCodeMessage.toChatMessage(): ChatMessage {
     return try {
         toChatMessageInternal()
     } catch (e: Exception) {
-            logger.error(e) { "[ACP] toChatMessage FAILED for msg=${info.id}: ${e.message}" }
+        // Error is logged at error level AND surfaced to the user via the
+        // synthetic Error part below — not silently swallowed.
+        logger.error(e) { "[ACP] toChatMessage FAILED for msg=${info.id}: ${e.message}" }
         val timestamp = info.createdAt?.let { raw ->
             try { java.time.Instant.parse(raw).toEpochMilli() } catch (_: Exception) { raw.toLongOrNull() ?: 0L }
         } ?: 0L
         ChatMessage(
             id = info.id,
             role = if (info.role == "user") MessageRole.USER else MessageRole.ASSISTANT,
-            parts = linkedMapOf(MessagePart.generatePartId() to MessagePart.Error("Failed to load message: ${e.message ?: e::class.simpleName}")),
+            parts = linkedMapOf(MessagePart.generatePartId() to MessagePart.Error("Failed to load message (see idea.log for details)")),
             timestamp = timestamp,
             isStreaming = false,
             modelID = info.modelID,
@@ -438,7 +448,7 @@ private fun OpenCodeMessage.toChatMessageInternal(): ChatMessage {
         val hasResult = results != null && results.isNotEmpty()
         val anyError = results?.any { it.isError } == true
         val status = when {
-            !hasResult -> ToolCallStatus.COMPLETED
+            !hasResult -> ToolCallStatus.IN_PROGRESS
             anyError -> ToolCallStatus.FAILED
             else -> ToolCallStatus.COMPLETED
         }
@@ -447,7 +457,10 @@ private fun OpenCodeMessage.toChatMessageInternal(): ChatMessage {
             result.content.mapNotNull { part ->
                 when (part) {
                     is OpenCodePart.Text -> buildJsonObject { put("text", JsonPrimitive(part.text)) }
-                    else -> null
+                    else -> {
+                        logger.debug { "[ACP] toChatMessage: dropping non-text part in tool result: ${part::class.simpleName}" }
+                        null
+                    }
                 }
             }
         }?.ifEmpty { null }
@@ -519,11 +532,13 @@ private fun OpenCodeMessage.toChatMessageInternal(): ChatMessage {
                         else -> com.agentclientprotocol.model.ToolCallStatus.IN_PROGRESS
                     }
                     val agentId = segment.taskAttrs?.get("id") ?: ""
+                    // Use the agentId directly (truncated) instead of hashCode to avoid collisions.
+                    val taskToolCallId = if (agentId.isBlank()) "task_${MessagePart.generatePartId()}" else "task_${agentId.take(64)}"
                     val output = listOf(kotlinx.serialization.json.JsonObject(
                         mapOf("text" to kotlinx.serialization.json.JsonPrimitive(segment.content))
                     ))
                     val pill = ToolCallPill(
-                        toolCallId = "task_${agentId.hashCode().toString(16).takeLast(8)}",
+                        toolCallId = taskToolCallId,
                         toolName = "task",
                         title = "task",
                         kind = com.agentclientprotocol.model.ToolKind.OTHER,
@@ -562,11 +577,6 @@ private fun OpenCodeMessage.toChatMessageInternal(): ChatMessage {
     agentParts.forEach { agent ->
         parts[MessagePart.generatePartId()] = MessagePart.Agent(name = agent.name)
     }
-
-    // StepFinish parts — show token usage
-    val stepFinishParts = this.parts.filterIsInstance<OpenCodePart.StepFinish>()
-    // StepFinish with snapshot is informational; only render if it has meaningful data
-    // (token counts are at message level, not part level in current server)
 
     // Retry parts
     val retryParts = this.parts.filterIsInstance<OpenCodePart.Retry>()

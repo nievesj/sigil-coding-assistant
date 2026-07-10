@@ -328,6 +328,11 @@ private data class TreeItem(
  * Cycle safety: The `processed` set (line ~327) prevents infinite recursion
  * if the session tree has a cycle (e.g., A→B→A parent links from a server data bug).
  * Each session is visited at most once.
+ *
+ * The global `processed` set also prevents duplicate rendering: a session that
+ * appears under two parents is a data inconsistency — rendering it once (under
+ * the first parent encountered) is the correct behavior. The duplicate is logged
+ * via sidebarLogger.warn so the inconsistency is visible without crashing.
  */
 private fun buildSessionTree(
     sessions: List<SessionItem>,
@@ -453,7 +458,12 @@ private fun SessionList(
     // avoid mass-expanding all parents that happen to have children.
     val previousChildMap = remember { mutableStateOf<Map<String, List<SessionItem>>>(emptyMap()) }
     val childSessionMap = remember(sessions) {
-        sessions.filter { it.parentID != null }.groupBy { it.parentID!! }
+        // Only group children under parents that are actually present in the
+        // sessions list. A parentID pointing to a hidden/deleted/missing session
+        // would otherwise create a group key that never renders, leaving those
+        // children orphaned in the map (and skipped by the auto-expand logic).
+        val sessionIds = sessions.map { it.id }.toSet()
+        sessions.filter { it.parentID != null && it.parentID in sessionIds }.groupBy { it.parentID!! }
     }
     var initialized = remember { mutableStateOf(false) }
     LaunchedEffect(childSessionMap, streamingSessionIds) {
@@ -493,7 +503,10 @@ private fun SessionList(
 
     // Compute the capped set of child session IDs allowed to show a spinner.
     // Child sessions beyond the cap show a static icon (SessionIndicator.NONE-equivalent).
-    // This avoids GDI nativeBlit hang risk from too many concurrent animations (AGENTS.md).
+    // The global cap (MAX_VISIBLE_CHILD_SPINNERS) prevents the GDI nativeBlit hang
+    // (JDK-8301926) caused by too many concurrent animations generating continuous
+    // frame pressure through Skiko SOFTWARE render → GDI BitBlt → DWM composition.
+    // See AGENTS.md "GDI nativeBlit Hang" for the full investigation.
     val streamingChildIds = remember(streamingSessionIds, sessions, hiddenChildIds) {
         val childIds = sessions.filter { it.parentID != null && it.id !in hiddenChildIds }.map { it.id }.toSet()
         val streamingChildren = streamingSessionIds.filter { it in childIds }
@@ -508,12 +521,12 @@ private fun SessionList(
     // chains (depth 10+) would degrade — if that becomes common, precompute a
     // parent-index map for O(1) ancestor lookup.
     //
-    // Use expandedIds.entries.toSet() as the remember key instead of
-    // expandedIds.toMap() — toMap() creates a new Map instance on every call,
-    // which would cause remember to recompute on every recomposition. The
-    // entries.toSet() approach creates a stable Set that only changes when
-    // the actual entries change.
-    val expandedKey = expandedIds.entries.toSet()
+    // Use expandedIds.toMap() as the remember key. Map equality is structural
+    // (compares entries, not identity), so remember recomputes only when the
+    // actual expanded-state content changes. The previous entries.toSet()
+    // approach created new Entry wrapper objects on every call, which could
+    // defeat equality checks; toMap() returns a stable structural snapshot.
+    val expandedKey = expandedIds.toMap()
     val visibleItems = remember(fullTree, expandedKey) {
         // Precompute parent index: for each item at index i, parentIdx[i] = index of nearest
         // preceding item with strictly smaller depth (the ancestor), or -1 if none.
@@ -547,6 +560,12 @@ private fun SessionList(
                 .weight(1f)
                 .padding(horizontal = 4.dp),
         ) {
+            // Stable keys (session.id) are safe here because SessionRow reads the
+            // SnapshotStateMap (expandedIds/userCollapsed) internally via
+            // retrieveColorOrUnspecified and the isExpanded/isHovered state reads.
+            // These reads create per-item snapshot subscriptions that trigger
+            // recomposition when the underlying state changes, bypassing the
+            // LazyColumn key-diffing stale-data issue documented in AGENTS.md.
             items(
                 count = visibleItems.size,
                 key = { visibleItems[it].session.id },
@@ -616,7 +635,9 @@ private fun SessionRow(
     val isHovered by interactionSource.collectIsHoveredAsState()
 
     val selectedBg = retrieveColorOrUnspecified("List.selectionBackground")
-    val hoverBg = retrieveColorOrUnspecified("MenuItem.selectionBackground").copy(alpha = 0.5f)
+        .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.accent.blue.copy(alpha = 0.15f)
+    val hoverBg = (retrieveColorOrUnspecified("MenuItem.selectionBackground")
+        .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.accent.blue.copy(alpha = 0.10f)).copy(alpha = 0.5f)
     val bgColor = when {
         isSelected -> selectedBg
         isHovered -> hoverBg
@@ -625,26 +646,36 @@ private fun SessionRow(
 
     val indentDp = (depth * 16).dp
 
-    // Text colors: use IntelliJ theme keys for proper dark-theme contrast
+    // Text colors: use IntelliJ theme keys for proper dark-theme contrast.
+    // Fall back to ChatTheme tokens when the IntelliJ key resolves to Unspecified
+    // (happens on some LaFs / themes that don't define the key).
     val titleColor = if (isSelected) {
         retrieveColorOrUnspecified("List.selectionForeground")
+            .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.text.inverse
     } else {
         retrieveColorOrUnspecified("Panel.foreground")
+            .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.component.inputText
     }
     val metaColor = if (isSelected) {
-        retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.75f)
+        (retrieveColorOrUnspecified("List.selectionForeground")
+            .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.text.inverse).copy(alpha = 0.75f)
     } else {
-        retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.6f)
+        (retrieveColorOrUnspecified("Panel.foreground")
+            .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.component.inputText).copy(alpha = 0.6f)
     }
     val sepColor = if (isSelected) {
-        retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.45f)
+        (retrieveColorOrUnspecified("List.selectionForeground")
+            .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.text.inverse).copy(alpha = 0.45f)
     } else {
-        retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.4f)
+        (retrieveColorOrUnspecified("Panel.foreground")
+            .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.component.inputText).copy(alpha = 0.4f)
     }
     val iconTint = if (isSelected) {
-        retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.8f)
+        (retrieveColorOrUnspecified("List.selectionForeground")
+            .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.text.inverse).copy(alpha = 0.8f)
     } else {
-        retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.55f)
+        (retrieveColorOrUnspecified("Panel.foreground")
+            .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.component.inputText).copy(alpha = 0.55f)
     }
 
     val creatingDim = indicator == SessionIndicator.CREATING
@@ -745,28 +776,26 @@ private fun SessionRow(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
-                    // Archive button — only for top-level sessions (child sessions are auto-removed)
-                    if (session.parentID == null) {
-                        val archiveHoverBg = retrieveColorOrUnspecified("Component.errorFocusColor").copy(alpha = 0.12f)
-                        Box(
-                            modifier = Modifier
-                                .size(24.dp)
-                                .clip(RoundedCornerShape(4.dp))
-                                .background(if (isHovered) archiveHoverBg else Color.Transparent)
-                                .clickable(onClick = onArchive),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                key = AllIconsKeys.Actions.Close,
-                                contentDescription = "Archive",
-                                modifier = Modifier.size(18.dp),
-                                tint = if (isHovered) {
-                                    retrieveColorOrUnspecified("Component.errorFocusColor")
-                                } else {
-                                    retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.45f)
-                                },
-                            )
-                        }
+                    // Archive button — shown for all sessions (including children and orphans)
+                    val archiveHoverBg = retrieveColorOrUnspecified("Component.errorFocusColor").copy(alpha = 0.12f)
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(if (isHovered) archiveHoverBg else Color.Transparent)
+                            .clickable(onClick = onArchive),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            key = AllIconsKeys.Actions.Close,
+                            contentDescription = "Archive",
+                            modifier = Modifier.size(18.dp),
+                            tint = if (isHovered) {
+                                retrieveColorOrUnspecified("Component.errorFocusColor")
+                            } else {
+                                retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.45f)
+                            },
+                        )
                     }
                 }
 

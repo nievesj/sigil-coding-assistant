@@ -163,6 +163,9 @@ class ProcessorContext {
     // ConcurrentHashMap provide safe concurrent reads without external synchronization,
     // matching the pattern used for toolCallPills/toolCallIndex/toolPartStates.
     val activePatches: java.util.concurrent.CopyOnWriteArrayList<SseEvent.Patch> = java.util.concurrent.CopyOnWriteArrayList()
+    val activeAgents = mutableListOf<SseEvent.Agent>()
+    val activeCompactions = mutableListOf<SseEvent.Compaction>()
+    val activeStepFinishes = mutableListOf<SseEvent.StepFinish>()
     var activeAgentName: String? = null
     var activeRetry: SseEvent.Retry? = null
     var activeCompaction: SseEvent.Compaction? = null
@@ -211,6 +214,9 @@ class ProcessorContext {
         pendingStopJob = null
         lastActivityTimeMs = System.currentTimeMillis()
         activePatches.clear()
+        activeAgents.clear()
+        activeCompactions.clear()
+        activeStepFinishes.clear()
         activeAgentName = null
         activeRetry = null
         activeCompaction = null
