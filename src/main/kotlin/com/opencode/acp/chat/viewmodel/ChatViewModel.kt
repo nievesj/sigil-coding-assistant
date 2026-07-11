@@ -4,6 +4,7 @@ import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.chat.model.*
+import com.opencode.acp.chat.model.ChildPermissionPrompt
 import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.chat.service.SendMessageResult
@@ -69,6 +70,11 @@ class ChatViewModel(
 
     private val _permissionPrompt = MutableStateFlow<PermissionPrompt?>(null)
     val permissionPrompt: StateFlow<PermissionPrompt?> = _permissionPrompt.asStateFlow()
+
+    /** Child session permission prompts — non-blocking, keyed by child session ID.
+     *  Supports multiple simultaneous pending permissions per child (FIFO list). */
+    private val _childPermissionPrompts = MutableStateFlow<Map<String, List<ChildPermissionPrompt>>>(emptyMap())
+    val childPermissionPrompts: StateFlow<Map<String, List<ChildPermissionPrompt>>> = _childPermissionPrompts.asStateFlow()
 
     private val _selectionPrompt = MutableStateFlow<SelectionPrompt?>(null)
     val selectionPrompt: StateFlow<SelectionPrompt?> = _selectionPrompt.asStateFlow()
@@ -151,6 +157,14 @@ class ChatViewModel(
     private val initMutex = Mutex()
     private var initJob: Job? = null
     private var connectionObserverJob: Job? = null
+
+    /** Timeout jobs for child permission prompts, keyed by child session ID. */
+    private val childPermissionTimeoutJobs = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    /** Session IDs where the last permission POST failed (rolled back to pending).
+     *  Used by the PermissionReplied handler to detect that the server DID process
+     *  the response despite a local network error, and surface a notification. */
+    private val failedPermissionPostSessions = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /** Cached GitService instance — reuses lineDeltaCache across calls. */
     private val gitService = GitService(project)
@@ -245,6 +259,9 @@ class ChatViewModel(
                     is UiSignal.PermissionRequested -> {
                         _permissionPrompt.value = signal.prompt
                         OpenCodeNotifications.notifyPermissionNeeded(project)
+                        // NOTE: timeoutSeconds is read at call time from settings. If the user
+                        // changes the setting while a prompt is pending, the current timeout
+                        // is NOT restarted — the new value applies to the next prompt.
                         startPermissionTimeout()
                     }
                     is UiSignal.SelectionRequested -> {
@@ -275,6 +292,9 @@ class ChatViewModel(
                     is UiSignal.SessionIdle -> Unit
                     is UiSignal.SessionError -> Unit
                     is UiSignal.SessionCompacted -> Unit
+                    is UiSignal.ChildPermissionRequested -> Unit
+                    is UiSignal.PermissionReplied -> Unit
+                    is UiSignal.PermissionTimedOut -> Unit
                 }
             }
         }
@@ -314,6 +334,94 @@ class ChatViewModel(
                         scope.launch {
                             service.refreshActiveSessionMessages()
                             computeSessionContext()
+                        }
+                    }
+                    is UiSignal.ChildPermissionRequested -> {
+                        val childId = signal.prompt.childSessionId
+                        _childPermissionPrompts.update { prompts ->
+                            val existing = prompts[childId] ?: emptyList()
+                            prompts + (childId to (existing + signal.prompt))
+                        }
+                        OpenCodeNotifications.notifyPermissionNeeded(project)
+                        startChildPermissionTimeout(childId, signal.prompt.toolName)
+                        // NOTE: Do NOT change _streamPhase or inputState — child permissions are non-blocking
+                    }
+                    is UiSignal.PermissionReplied -> {
+                        // Confirm server processed our reply
+                        if (_permissionPrompt.value?.permissionId == signal.permissionId) {
+                            // Active-session permission: clear it
+                            _permissionPrompt.value = null
+                            service.permissionManager.cancelPermissionTimeout()
+                        }
+                        // Handle child prompts based on reply type
+                        if (_childPermissionPrompts.value.containsKey(signal.sessionId)) {
+                            // If the last POST for this session failed (rolled back to pending),
+                            // the server still processed it. Surface a notification instead of
+                            // silently clearing (TDD §4.2.4 error handling).
+                            if (signal.sessionId in failedPermissionPostSessions) {
+                                OpenCodeNotifications.notifyPermissionProcessedDespiteError(project, signal.sessionId)
+                                failedPermissionPostSessions.remove(signal.sessionId)
+                            }
+                            if (signal.reply == "reject") {
+                                // Cascade: server rejects all pending permissions in the session
+                                _childPermissionPrompts.update { it - signal.sessionId }
+                                cancelChildPermissionTimeout(signal.sessionId)
+                            } else {
+                                // Non-reject reply: remove only the FIRST prompt (FIFO)
+                                _childPermissionPrompts.update { prompts ->
+                                    val remaining = (prompts[signal.sessionId] ?: emptyList()).drop(1)
+                                    if (remaining.isEmpty()) prompts - signal.sessionId
+                                    else prompts + (signal.sessionId to remaining)
+                                }
+                                if (!_childPermissionPrompts.value.containsKey(signal.sessionId)) {
+                                    // No more prompts — cancel the timeout
+                                    cancelChildPermissionTimeout(signal.sessionId)
+                                } else {
+                                    // Remaining prompts — restart the timeout for the new first prompt
+                                    val newFirst = _childPermissionPrompts.value[signal.sessionId]?.firstOrNull()
+                                    if (newFirst != null) {
+                                        startChildPermissionTimeout(signal.sessionId, newFirst.toolName)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    is UiSignal.PermissionTimedOut -> {
+                        OpenCodeNotifications.notifyPermissionTimedOut(project, signal.toolName)
+                        // Only clear active prompt if the timeout is for the active session's
+                        // permission (non-empty permissionId matching the current prompt).
+                        // Child permission timeouts use permissionId="" — they must NOT
+                        // clear the active session's permission prompt.
+                        if (signal.permissionId.isNotEmpty() && _permissionPrompt.value?.permissionId == signal.permissionId) {
+                            _permissionPrompt.value = null
+                        }
+                        // Clear child prompts for the timed-out child session.
+                        // POST reject to the server for each remaining pending prompt before
+                        // clearing locally — the server is still waiting on Deferred promises
+                        // and would block indefinitely without a reply.
+                        if (signal.sessionId.isNotEmpty()) {
+                            val pending = _childPermissionPrompts.value[signal.sessionId] ?: emptyList()
+                            if (pending.isNotEmpty()) {
+                                // Use service.scope (not ViewModel scope) so reject POSTs survive
+                                // tool window disposal — the server's Deferred promises must be
+                                // resolved even if the user closes the tool window.
+                                service.scope.launch {
+                                    pending.forEach { p ->
+                                        try {
+                                            service.permissionManager.respondPermission(
+                                                p.permissionId, p.toolCallId, signal.sessionId,
+                                                PermissionResponse.REJECT_ONCE,
+                                            )
+                                        } catch (e: kotlinx.coroutines.CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            logger.warn(e) { "[ACP] Timeout reject failed for permission ${p.permissionId}" }
+                                        }
+                                    }
+                                }
+                            }
+                            _childPermissionPrompts.update { it - signal.sessionId }
+                            cancelChildPermissionTimeout(signal.sessionId)
                         }
                     }
                     else -> { /* other global signals */ }
@@ -926,25 +1034,126 @@ class ChatViewModel(
     suspend fun respondPermission(response: PermissionResponse) {
         val prompt = _permissionPrompt.value ?: return
         try {
-            service.respondPermission(prompt.permissionId, prompt.toolCallId, prompt.sessionId, response)
+            service.respondPermission(
+                prompt.permissionId, prompt.toolCallId, prompt.sessionId, response,
+                toolName = prompt.toolName,
+                patterns = prompt.patterns,
+                agentName = _controlState.value.selectedAgent?.id ?: "orchestrator",
+            )
+            // POST succeeded — clear any prior failed-post tracking
+            failedPermissionPostSessions.remove(prompt.sessionId)
             _permissionPrompt.value = null
             service.permissionManager.cancelPermissionTimeout()
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             // Permission response failed (network error, server down). Keep the
-            // prompt open so the user can retry. Don't dismiss it — dismissing
-            // would leave the server waiting for a response it never received.
+            // prompt open so the user can retry. Track the failure so the
+            // PermissionReplied handler can surface a notification if the server
+            // still processed it despite the network error (TDD §4.2.4).
+            failedPermissionPostSessions.add(prompt.sessionId)
             logger.warn(e) { "[ACP] Permission response failed — keeping prompt open for retry" }
         }
     }
 
-    private fun startPermissionTimeout() {
-        service.permissionManager.startPermissionTimeout(
-            timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds
-        ) {
-            _permissionPrompt.value = null
+    suspend fun respondChildPermission(childSessionId: String, response: PermissionResponse) {
+        val prompts = _childPermissionPrompts.value[childSessionId] ?: return
+        val prompt = prompts.first()  // FIFO — respond to oldest first
+        try {
+            service.permissionManager.respondPermission(
+                prompt.permissionId,
+                prompt.toolCallId,
+                childSessionId,  // reply goes to the CHILD session
+                response,
+                prompt.toolName,
+                prompt.patterns,
+                // Only pass the real agent name for config sync when the label was
+                // verified from a Subtask SSE event. If the label is the fallback
+                // "sub-agent" (Subtask event missed), pass empty string so
+                // writeAlwaysAllowRule is skipped (toolName.isNotEmpty() guard
+                // in PermissionManager + isValidConfigKey in McpConfigWriter).
+                if (prompt.agentLabelVerified) prompt.subAgentLabel else "",
+            )
+            // POST succeeded — clear any prior failed-post tracking
+            failedPermissionPostSessions.remove(childSessionId)
+            if (response == PermissionResponse.REJECT_ONCE) {
+                // CASCADE: clear ALL prompts for this child session
+                // (server rejects all pending permissions in the session)
+                _childPermissionPrompts.update { it - childSessionId }
+                cancelChildPermissionTimeout(childSessionId)
+                logger.info { "[ACP] Cascade rejection: clearing all prompts for childSessionId=$childSessionId" }
+            } else {
+                // Remove just this prompt; keep others if any
+                // Verified: success path correctly restarts timeout for the next prompt
+                // if more prompts remain (line ~1093). failedPermissionPostSessions
+                // is cleared before prompt-clearing — safe per StateFlow update semantics.
+                _childPermissionPrompts.update { prompts ->
+                    val remaining = (prompts[childSessionId] ?: emptyList()).drop(1)
+                    if (remaining.isEmpty()) prompts - childSessionId
+                    else prompts + (childSessionId to remaining)
+                }
+                if (!_childPermissionPrompts.value.containsKey(childSessionId)) {
+                    // No more prompts — cancel the timeout
+                    cancelChildPermissionTimeout(childSessionId)
+                } else {
+                    // Remaining prompts — restart the timeout for the new first prompt
+                    val newFirst = _childPermissionPrompts.value[childSessionId]?.firstOrNull()
+                    if (newFirst != null) {
+                        startChildPermissionTimeout(childSessionId, newFirst.toolName)
+                    }
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // POST failed — track this session so the PermissionReplied handler
+            // can surface a notification if the server still processed it.
+            failedPermissionPostSessions.add(childSessionId)
+            logger.warn(e) { "[ACP] Child permission response failed — keeping prompt open" }
         }
+    }
+
+    private fun startPermissionTimeout() {
+        val toolName = _permissionPrompt.value?.toolName ?: ""
+        service.permissionManager.startPermissionTimeout(
+            timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds,
+            toolName = toolName,
+        ) {
+            // Emit a PermissionTimedOut signal instead of silently clearing
+            val permId = _permissionPrompt.value?.permissionId ?: ""
+            val sid = _permissionPrompt.value?.sessionId ?: ""
+            _permissionPrompt.value = null
+            OpenCodeNotifications.notifyPermissionTimedOut(project, toolName)
+            logger.info { "[ACP] Permission timed out: permissionId=$permId, tool=$toolName" }
+        }
+    }
+
+    private fun startChildPermissionTimeout(childSessionId: String, toolName: String) {
+        val timeoutSeconds = ChatConstants.CHILD_PERMISSION_TIMEOUT_SECONDS
+        childPermissionTimeoutJobs[childSessionId]?.cancel()
+        // Use the service scope (survives tool window recreation) so the timeout
+        // fires even if the tool window is closed and reopened. The timeout job
+        // emits a PermissionTimedOut signal via the service's globalSignals so
+        // whichever ViewModel is active will handle the cleanup.
+        childPermissionTimeoutJobs[childSessionId] = service.scope.launch {
+            delay(timeoutSeconds * 1000L)
+            // Clear the prompt and notify — emit via globalSignals so the
+            // active ViewModel (which may be a different instance if the tool
+            // window was recreated) handles cleanup.
+            service.sessionManager.emitGlobalSignal(
+                UiSignal.PermissionTimedOut(
+                    permissionId = "",
+                    sessionId = childSessionId,
+                    toolName = toolName,
+                )
+            )
+            childPermissionTimeoutJobs.remove(childSessionId)
+            logger.info { "[ACP] Child permission timed out: childSessionId=$childSessionId, tool=$toolName" }
+        }
+    }
+
+    private fun cancelChildPermissionTimeout(childSessionId: String) {
+        childPermissionTimeoutJobs.remove(childSessionId)?.cancel()
     }
 
     fun respondSelection(response: SelectionResponse) {
@@ -1431,6 +1640,13 @@ class ChatViewModel(
         connectionObserverJob?.cancel()
         initJob?.cancel()
         service.permissionManager.cancelPermissionTimeout()
+        // Cancel child permission timeout jobs — they run on service.scope which
+        // survives tool window recreation, but the prompts they guard are ViewModel-
+        // scoped and lost on disposal. Without cancellation, the jobs fire after
+        // disposal and emit PermissionTimedOut to globalSignals, but no ViewModel is
+        // collecting (replay=0 SharedFlow drops the signal).
+        childPermissionTimeoutJobs.values.forEach { it.cancel() }
+        childPermissionTimeoutJobs.clear()
     }
 
     // --- Helpers ---

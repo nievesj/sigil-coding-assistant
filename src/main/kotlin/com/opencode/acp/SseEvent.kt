@@ -86,6 +86,15 @@ sealed interface SseEvent {
         override val partId: String? = null
     ) : SseEvent
 
+    /** Permission reply processed by the server (permission.replied SSE event). */
+    data class PermissionReplied(
+        override val sessionId: String,
+        val permissionId: String,
+        val reply: String,
+        override val messageId: String? = null,
+        override val partId: String? = null
+    ) : SseEvent
+
     /** Error event from OpenCode. */
     data class Error(
         override val sessionId: String,

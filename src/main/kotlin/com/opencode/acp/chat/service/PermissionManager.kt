@@ -5,6 +5,7 @@ import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.chat.model.PartState
 import com.opencode.acp.chat.model.PermissionResponse
 import com.opencode.acp.chat.processor.SessionManager
+import com.opencode.acp.mcp.McpConfigWriter
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 
@@ -16,6 +17,7 @@ class PermissionManager(
     private val scope: CoroutineScope,
     private val clientProvider: () -> OpenCodeClient?,
     private val sessionManager: SessionManager,
+    private val mcpConfigWriterProvider: () -> McpConfigWriter? = { null },
 ) {
 
     private val logger = KotlinLogging.logger {}
@@ -30,7 +32,15 @@ class PermissionManager(
      * the local state is rolled back so the permission prompt stays visible for retry.
      * Previously, the server call was first — a success followed by a local state failure
      * left the server committed but the UI still showing the prompt. */
-    suspend fun respondPermission(permissionId: String, toolCallId: String, sessionId: String, response: PermissionResponse) {
+    suspend fun respondPermission(
+        permissionId: String,
+        toolCallId: String,
+        sessionId: String,
+        response: PermissionResponse,
+        toolName: String = "",
+        patterns: List<String> = emptyList(),
+        agentName: String = "orchestrator",
+    ) {
         // NOTE (ABA race): This uses optimistic local updates before the server call.
         // If an SSE event arrives between the optimistic update and a rollback (on
         // server failure), that SSE-driven state could be overwritten by the rollback.
@@ -52,6 +62,17 @@ class PermissionManager(
         }
         try {
             client.respondPermission(permissionId = permissionId, response = response.optionId)
+            // Config sync AFTER POST succeeds (not in parallel) — if the server rejects,
+            // the config file should NOT say "allow".
+            if (response == PermissionResponse.ALLOW_ALWAYS && toolName.isNotEmpty()) {
+                try {
+                    mcpConfigWriterProvider()?.writeAlwaysAllowRule(agentName, toolName, patterns)
+                    logger.info { "[ACP] Always Allow synced to config: agent=$agentName, tool=$toolName, patterns=$patterns" }
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] Failed to sync 'Always Allow' to config for $toolName" }
+                    // Non-fatal — server already persists "always" internally
+                }
+            }
             // Clear the pending permission flag so the session becomes eligible for
             // cache eviction again. Without this, permission-resolved sessions accumulate
             // in the cache (evictIfNeeded excludes hasPendingPermission sessions).
@@ -60,17 +81,13 @@ class PermissionManager(
             // Coroutine cancellation — must re-throw, do NOT swallow
             throw e
         } catch (e: Exception) {
-            // Server call failed — roll back local state so the prompt stays visible
-            // for retry. Without rollback, the server never received the response
-            // but the UI cleared the prompt, leaving the server waiting.
             logger.warn(e) { "[ACP] Failed to respond to permission $permissionId: ${e.message}" }
-            when (response) {
-                PermissionResponse.REJECT_ONCE ->
-                    sessionManager.setToolPartStateForSession(sessionId, toolCallId, PartState.InProgress)
-                PermissionResponse.ALLOW_ONCE,
-                PermissionResponse.ALLOW_ALWAYS ->
-                    sessionManager.updateToolCallStatusForSession(sessionId, toolCallId, ToolCallStatus.PENDING, null)
-            }
+            // Do NOT roll back tool state on POST failure. The server may have processed
+            // the response despite the network error (TDD §4.2.4). Rolling back to PENDING
+            // would overwrite SSE-driven state that already moved the tool to IN_PROGRESS,
+            // making the tool appear stuck. The PermissionReplied handler (or timeout) is
+            // the sole authority on clearing tool state. The prompt stays visible for retry
+            // because the caller (ChatViewModel) catches the exception and keeps the prompt.
             throw e
         }
     }
@@ -119,7 +136,21 @@ class PermissionManager(
 
     // ── Timeout ────────────────────────────────────────────────────────────
 
-    fun startPermissionTimeout(timeoutSeconds: Int, onTimeout: () -> Unit) {
+    /**
+     * Start a permission timeout coroutine.
+     *
+     * Threading: The [onTimeout] callback is invoked on [scope] (Dispatchers.Default).
+     * StateFlow updates from the callback are thread-safe. [OpenCodeNotifications]
+     * methods internally use `invokeLater` for EDT-safe notification posting.
+     *
+     * The [timeoutSeconds] value is clamped to [0, 3600] before multiplication to
+     * prevent absurd delays. The caller's value is untrusted (from settings).
+     */
+    fun startPermissionTimeout(
+        timeoutSeconds: Int,
+        toolName: String = "",
+        onTimeout: () -> Unit,
+    ) {
         permissionTimeoutJob?.cancel()
         if (timeoutSeconds <= 0) return
         // Clamp BEFORE multiply: coerceAtMost(3600) bounds the value to <= 3600,

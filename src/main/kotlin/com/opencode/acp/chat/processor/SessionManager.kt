@@ -241,6 +241,23 @@ class SessionManager(
      *  this set (populated on session creation and in loadSessions()). */
     private val _knownChildSessionIds = MutableStateFlow<Set<String>>(emptySet())
 
+    /** Reverse index: child session ID → parent session ID. O(1) child→parent lookup.
+     *  Populated from [loadSessions] (snapshot). Real-time population from Subtask
+     *  SSE events is handled inline in [processEvent] (agent label only — parent
+     *  is unknown from the Subtask event payload). */
+    private val _childToParent = MutableStateFlow<Map<String, String>>(emptyMap())
+    val childToParent: StateFlow<Map<String, String>> = _childToParent.asStateFlow()
+
+    /** Child session agent labels: child session ID → agent name (e.g., "fixer", "explorer").
+     *  Populated inline in [processEvent] from Subtask SSE events. Used by
+     *  ChildPermissionRelay for sub-agent labels. */
+    private val _childAgentLabels = MutableStateFlow<Map<String, String>>(emptyMap())
+    val childAgentLabels: StateFlow<Map<String, String>> = _childAgentLabels.asStateFlow()
+
+    /** Child sessions with pending permissions — prevents cache eviction. */
+    private val _childPendingPermissions = MutableStateFlow<Set<String>>(emptySet())
+    val childPendingPermissions: StateFlow<Set<String>> = _childPendingPermissions.asStateFlow()
+
     /** Mark a completed child session for hiding from the sidebar.
      *  Skips the active/selected session — it stays visible until the user switches away. */
     fun markChildSessionComplete(sessionId: String) {
@@ -254,6 +271,30 @@ class SessionManager(
         _hiddenChildSessionIds.update { it - sessionId }
     }
 
+    /** Find the parent session ID for a given child session ID.
+     *  O(1) lookup via _childToParent reverse index.
+     *  Falls back to scanning _childSessionMap if reverse index is stale. */
+    fun getParentSession(childSessionId: String): String? {
+        return _childToParent.value[childSessionId]
+            ?: _childSessionMap.value.entries.firstOrNull { (_, children) ->
+                children.any { it.id == childSessionId }
+            }?.key
+    }
+
+    /** Get the agent label for a child session (e.g., "fixer", "explorer"). */
+    fun getChildAgentLabel(childSessionId: String): String? =
+        _childAgentLabels.value[childSessionId]
+
+    /** Mark a child session as having a pending permission. Prevents cache eviction. */
+    fun markChildPendingPermission(childSessionId: String) {
+        _childPendingPermissions.update { it + childSessionId }
+    }
+
+    /** Clear a child session's pending permission flag. */
+    fun clearChildPendingPermission(childSessionId: String) {
+        _childPendingPermissions.update { it - childSessionId }
+    }
+
     internal fun emitSessionSignal(sessionId: String, signal: UiSignal) {
         _allSessionSignals.tryEmit(sessionId to signal)
     }
@@ -265,6 +306,11 @@ class SessionManager(
         // Use a synthetic session ID so the ViewModel's SessionError handler
         // can process it without matching a specific session.
         _globalSignals.tryEmit(UiSignal.SessionError("__internal__", errorMessage))
+    }
+
+    /** Emit a global signal (e.g., ChildPermissionRequested) to be collected by the ViewModel. */
+    internal fun emitGlobalSignal(signal: UiSignal) {
+        _globalSignals.tryEmit(signal)
     }
 
     /** Imperatively add a session ID to the streaming set.
@@ -463,15 +509,18 @@ class SessionManager(
                             java.io.File(currentProjectBase).canonicalPath
                         } catch (_: Exception) { currentProjectBase }
                         val filtered = unfilteredList.filter { session ->
-                            session.directory?.let { dir ->
-                                // Canonicalize the server-provided directory before
-                                // prefix comparison to prevent path traversal bypass
-                                // (e.g., "C:\Projects\MyApp\..\OtherProject" would
-                                // pass a naive startsWith check but resolve to a
-                                // different project).
+                            // Canonicalize the server-provided directory before
+                            // prefix comparison to prevent path traversal bypass
+                            // (e.g., "C:\Projects\MyApp\..\OtherProject" would
+                            // pass a naive startsWith check but resolve to a
+                            // different project).
+                            val dir = session.directory
+                            if (dir.isBlank()) {
+                                false
+                            } else {
                                 val canonicalDir = try {
                                     java.io.File(dir).canonicalPath
-                                } catch (_: Exception) { return@let false }
+                                } catch (_: Exception) { return@filter false }
                                 canonicalDir == canonicalBase ||
                                     // Dual-separator check: the server may return paths with
                                     // either the platform separator (File.separator, e.g. "\" on
@@ -479,7 +528,7 @@ class SessionManager(
                                     // negatives on cross-platform server/client setups.
                                     canonicalDir.startsWith(canonicalBase + java.io.File.separator) ||
                                     canonicalDir.startsWith(canonicalBase + "/")
-                            } == true
+                            }
                         }
                         if (filtered.isNotEmpty()) {
                             logger.info { "[ACP] SessionManager.loadSessions: filtered ${unfilteredList.size} → ${filtered.size} sessions matching project" }
@@ -522,6 +571,17 @@ class SessionManager(
             // (fixes fast-completion race — see _knownChildSessionIds doc)
             _knownChildSessionIds.update { known ->
                 known + items.filter { it.parentID != null }.map { it.id }.toSet()
+            }
+
+            // Populate _childToParent reverse index from session parentID fields
+            _childToParent.update { existing ->
+                val updated = existing.toMutableMap()
+                for (item in items) {
+                    item.parentID?.let { parentId ->
+                        updated[item.id] = parentId
+                    }
+                }
+                updated
             }
 
             // Prune _hiddenChildSessionIds: remove IDs for sessions the server has deleted,
@@ -763,8 +823,33 @@ class SessionManager(
                 return
             }
             is SseEvent.Subtask -> {
-                // Server doesn't send subtask events via V1 bus — subtasks are regular ToolPart with tool="task"
-                // This handler is a no-op; task tool rendering is handled in ToolPill
+                // The Subtask event's `sessionId` field is the CHILD's session ID.
+                // The `processEvent` routing context (`sessionId` variable) is also
+                // `event.sessionId` (the child's ID), NOT the parent's ID — the SSE
+                // parser sets `SseEvent.Subtask.sessionId` to the child's session ID.
+                // The parent's session ID is NOT available in the Subtask event payload.
+                //
+                // We CANNOT populate the _childToParent reverse index from Subtask
+                // events because we don't know the parent's session ID. Mapping
+                // childId as both child and parent would create a
+                // self-referential mapping (childId → childId), which would cause
+                // getParentSession to return the child's own ID as its parent.
+                //
+                // The reverse index is populated solely from loadSessions(), which
+                // has `parentID` on each SessionItem. The agent label is still
+                // captured from the Subtask event for display purposes.
+                val childSessionId = event.sessionId
+                val agent = event.agent
+                // Only capture the agent label — don't populate the reverse index
+                if (agent != null) {
+                    _childAgentLabels.update { it + (childSessionId to agent) }
+                }
+                _knownChildSessionIds.update { it + childSessionId }
+                logger.info { "[ACP] Subtask event: childSessionId=$childSessionId, agent=$agent — agent label captured, reverse index NOT populated (parent unknown from Subtask event)" }
+                // Still route to SessionState for existing ToolPill rendering behavior
+                sessionsLock.withLock { sessions[sessionId] }?.let { state ->
+                    state.processEvent(event)
+                }
                 return
             }
             is SseEvent.TodoUpdated -> {
@@ -1041,7 +1126,8 @@ class SessionManager(
                     .filter { it.key != _activeSessionId.value
                             && it.key != excludeSessionId
                             && !it.value.isStreaming
-                            && !it.value.hasPendingPermission }
+                            && !it.value.hasPendingPermission
+                            && it.key !in _childPendingPermissions.value }
                     .minByOrNull { it.value.lastAccessTime }
                     ?: break
                 toEvict.add(lru.key to lru.value)

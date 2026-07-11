@@ -1,6 +1,7 @@
 package com.opencode.acp.chat.processor
 
 import com.opencode.acp.chat.model.ChatFileChange
+import com.opencode.acp.chat.model.ChildPermissionPrompt
 import com.opencode.acp.chat.model.PermissionPrompt
 import com.opencode.acp.chat.model.SelectionPrompt
 import com.opencode.acp.chat.model.TodoItem
@@ -21,6 +22,15 @@ sealed interface UiSignal {
 
     /** Permission prompt received from the server. */
     data class PermissionRequested(val prompt: PermissionPrompt) : UiSignal
+
+    /** Child session (sub-agent) permission request relayed to the parent session. Non-blocking. */
+    data class ChildPermissionRequested(val prompt: ChildPermissionPrompt) : UiSignal
+
+    /** Server confirmed a permission response was processed (permission.replied SSE event). */
+    data class PermissionReplied(val permissionId: String, val reply: String, val sessionId: String) : UiSignal
+
+    /** Permission prompt timed out — surface visual feedback instead of silent dismissal. */
+    data class PermissionTimedOut(val permissionId: String, val sessionId: String, val toolName: String) : UiSignal
 
     /** Selection/question prompt received from the server. */
     data class SelectionRequested(val prompt: SelectionPrompt) : UiSignal

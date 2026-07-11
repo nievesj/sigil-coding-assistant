@@ -85,11 +85,19 @@ class OpenCodeService(private val project: Project) : Disposable {
         clientProvider = { connectionManager.client },
         sessionIdProvider = { sessionManager.activeSessionId.value }
     )
+    private val mcpConfigWriter by lazy {
+        val path = project.basePath?.let { java.nio.file.Path.of(it) }
+            ?: java.nio.file.Path.of(".")
+        McpConfigWriter(path, OpenCodeSettingsState.getInstance())
+    }
+
     val permissionManager = PermissionManager(
         scope = scope,
         clientProvider = { connectionManager.client },
-        sessionManager = sessionManager
+        sessionManager = sessionManager,
+        mcpConfigWriterProvider = { mcpConfigWriter }
     )
+    val childPermissionRelay = ChildPermissionRelay(sessionManager)
 
     /** ToolRegistry singleton, created during initializeMcp(). Settings panel reads this. */
     var toolRegistry: com.opencode.acp.mcp.ToolRegistry? = null
@@ -135,6 +143,29 @@ class OpenCodeService(private val project: Project) : Disposable {
                         val session = sessionManager.getSession(sessionId)
                         session?.responseDeferred?.complete(Unit)
                         session?.responseDeferred = null
+                    }
+                    is UiSignal.PermissionRequested -> {
+                        // Relay child permissions to parent (non-active sessions only)
+                        if (sessionId != sessionManager.activeSessionId.value) {
+                            val relayed = childPermissionRelay.relayChildPermission(sessionId, signal.prompt)
+                            if (relayed != null) {
+                                sessionManager.emitGlobalSignal(relayed)
+                                sessionManager.markChildPendingPermission(sessionId)
+                            }
+                        }
+                        // If sessionId == activeSessionId, it's already handled via activeSignals
+                    }
+                    is UiSignal.PermissionReplied -> {
+                        // Confirm server processed the reply — clear child pending permission flag
+                        // and forward to ViewModel via globalSignals. The ViewModel's activeSignals
+                        // collector has a no-op `Unit` branch for PermissionReplied (it's handled
+                        // here via globalSignals to avoid double-handling when the child IS the
+                        // active session). Do NOT remove that no-op or add handling there.
+                        sessionManager.clearChildPendingPermission(sessionId)
+                        // Forward to ViewModel via globalSignals so the PermissionReplied handler
+                        // (which clears prompts, checks failedPermissionPostSessions, and handles
+                        // cascade rejection) actually executes. Without this, that handler is dead code.
+                        sessionManager.emitGlobalSignal(signal)
                     }
                     else -> { /* other signals handled by ViewModel via activeSignals */ }
                 }
@@ -994,7 +1025,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             // if the session was evicted/switched during the long-running send.
             val currentSession = sessionManager.getActiveSession()
             val wasAborted = currentSession != null && !currentSession.ctx.isStreaming && currentSession.ctx.errorMessage != null
-            return if (wasAborted && currentSession != null) {
+            return if (wasAborted) {
                 SendMessageResult.Error(currentSession.ctx.errorMessage ?: "Response timed out")
             } else {
                 SendMessageResult.Success(assistantMsgId)
@@ -1119,8 +1150,13 @@ class OpenCodeService(private val project: Project) : Disposable {
         return deferred
     }
 
-    suspend fun respondPermission(permissionId: String, toolCallId: String, sessionId: String, response: PermissionResponse) =
-        permissionManager.respondPermission(permissionId, toolCallId, sessionId, response)
+    suspend fun respondPermission(
+        permissionId: String, toolCallId: String, sessionId: String,
+        response: PermissionResponse,
+        toolName: String = "",
+        patterns: List<String> = emptyList(),
+        agentName: String = "orchestrator",
+    ) = permissionManager.respondPermission(permissionId, toolCallId, sessionId, response, toolName, patterns, agentName)
 
     suspend fun respondQuestion(promptId: String, answers: List<List<String>>, sessionId: String) =
         permissionManager.respondQuestion(promptId, answers, sessionId)

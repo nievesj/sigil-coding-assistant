@@ -39,6 +39,7 @@ import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.ChatInputState
 import com.opencode.acp.chat.model.ConnectionErrorReason
 import com.opencode.acp.chat.model.ConnectionState
+import com.opencode.acp.chat.model.PermissionResponse
 import com.opencode.acp.chat.model.ReadyState
 import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.model.SidebarTab
@@ -210,6 +211,7 @@ fun
     val isStreaming = inputState is ChatInputState.Sending || inputState is ChatInputState.Streaming
     val permissionPrompt = (inputState as? ChatInputState.AwaitingPermission)?.prompt
     val selectionPrompt = (inputState as? ChatInputState.AwaitingSelection)?.prompt
+    val childPermissionPrompts by viewModel.childPermissionPrompts.collectAsState()
     val sessionListState by viewModel.sessionListState.collectAsState()
     val isSidebarVisible by viewModel.isSidebarVisible.collectAsState()
     val sessionContextState by viewModel.sessionContextState.collectAsState()
@@ -507,6 +509,19 @@ fun
                 }
 
                 // Bottom section spans full width (including sidebar)
+                // Child permission banner — non-blocking overlay above the input area.
+                // NOTE: If the ViewModel is disposed (tool window closed) during an in-flight
+                // POST, the CancellationException is re-thrown before failedPermissionPostSessions
+                // is updated. This is acceptable — the tool window is closed so the user won't see
+                // the notification anyway. The failedPermissionPostSessions set is per-ViewModel
+                // instance and is lost on disposal regardless.
+                ChildPermissionBanner(
+                    prompts = childPermissionPrompts,
+                    onRespond = { childId, response ->
+                        viewModel.scope.launch { viewModel.respondChildPermission(childId, response) }
+                    },
+                )
+
                 // Permission prompt (shows/hides based on state)
                 permissionPrompt?.let { prompt ->
                     PermissionPrompt(

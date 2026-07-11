@@ -1398,16 +1398,45 @@ class SessionState(
                     }
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
+                val realToolName = ctx.toolCallPills[event.toolCallId]?.toolName ?: event.action
                 val prompt = PermissionPrompt(
                     sessionId = sessionId,
                     permissionId = event.permissionId,
                     toolCallId = event.toolCallId,
-                    toolName = event.action,
+                    toolName = realToolName,
                     description = event.description,
                     patterns = event.patterns
                 )
                 setPendingPermissionPrompt(prompt)
                 _signals.tryEmit(UiSignal.PermissionRequested(prompt))
+            }
+
+            is SseEvent.PermissionReplied -> {
+                // Only clear hasPendingPermission when the reply matches the current
+                // pending permission. A stale permission.replied for a PREVIOUS
+                // permission must NOT clear the flag for a DIFFERENT, still-pending
+                // permission — that would make the session eligible for cache eviction
+                // while a prompt is still active, and clear the _pendingPermission
+                // StateFlow so the UI loses the prompt on session switch/restore.
+                val currentPermId = _pendingPermission.value?.permissionId
+                if (currentPermId == null || currentPermId == event.permissionId) {
+                    setPendingPermission(false)
+                }
+                if (currentPermId == event.permissionId) {
+                    // Reply matches the current pending permission — emit signal so the
+                    // ViewModel clears the prompt and surfaces any error notification.
+                    _signals.tryEmit(UiSignal.PermissionReplied(
+                        permissionId = event.permissionId,
+                        reply = event.reply,
+                        sessionId = sessionId,
+                    ))
+                } else if (currentPermId == null) {
+                    // Reply for an already-resolved permission (timeout or user response).
+                    // setPendingPermission(false) above is idempotent. Do NOT emit the
+                    // signal — a stale reply must not trigger spurious ViewModel notifications.
+                    logger.debug { "[ACP] permission.replied for already-resolved permission: permissionId=${event.permissionId}, reply=${event.reply} — signal suppressed" }
+                }
+                logger.info { "[ACP] permission.replied received: permissionId=${event.permissionId}, reply=${event.reply}, currentPermId=$currentPermId, cleared=${currentPermId == null || currentPermId == event.permissionId}" }
             }
 
             // ── Stop ─────────────────────────────────────────────────────
