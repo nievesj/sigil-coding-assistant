@@ -34,6 +34,19 @@ object OpenCodeNotifications {
     private val lastResponseNotifyTimeMs = AtomicLong(0L)
 
     /**
+     * Escape untrusted strings for safe display in IntelliJ Notification content.
+     * IntelliJ's Notification API may render content as HTML depending on the
+     * notification group's display type. Escape angle brackets and ampersands
+     * to prevent HTML injection (CWE-79) from untrusted server-provided strings.
+     */
+    private fun htmlEscape(text: String): String =
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#39;")
+
+    /**
      * Notify the user that the LLM response is complete.
      * Only fires when the IDE window is not focused — if the user is in the IDE,
      * they can already see the chat updating.
@@ -116,6 +129,45 @@ object OpenCodeNotifications {
             ).addAction(
                 NotificationAction.createSimpleExpiring("Open") {
                     focusToolWindow(project)
+                }
+            ).notify(project)
+        }
+    }
+
+    /**
+     * Notify the user that a permission prompt timed out.
+     * Provides visual feedback instead of silently dismissing the prompt.
+     */
+    fun notifyPermissionTimedOut(project: Project, toolName: String) {
+        val displayToolName = htmlEscape(toolName.take(100))
+        ApplicationManager.getApplication().invokeLater {
+            Notification(
+                GROUP_ID,
+                "Sigil",
+                "Permission timed out for: $displayToolName",
+                NotificationType.WARNING
+            ).addAction(
+                NotificationAction.createSimpleExpiring("Open") {
+                    focusToolWindow(project)
+                }
+            ).notify(project)
+        }
+    }
+
+    /**
+     * Notify the user that a permission was processed by the server despite a network error.
+     * This happens when the POST fails locally but the server still received and processed the response.
+     */
+    fun notifyPermissionProcessedDespiteError(project: Project, sessionId: String) {
+        ApplicationManager.getApplication().invokeLater {
+            Notification(
+                GROUP_ID,
+                "Sigil",
+                "Permission was processed by the server despite a network error (session: ${htmlEscape(sessionId.take(12))}…).",
+                NotificationType.INFORMATION
+            ).addAction(
+                NotificationAction.createSimpleExpiring("Dismiss") {
+                    // No-op — notification auto-expires
                 }
             ).notify(project)
         }

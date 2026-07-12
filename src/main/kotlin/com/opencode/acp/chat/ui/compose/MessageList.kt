@@ -105,6 +105,9 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 
 private val logger = KotlinLogging.logger {}
 
+/** Font scale for queued message bubbles — slightly larger than body text for emphasis. */
+private const val QUEUED_MESSAGE_FONT_SCALE = 1.5f
+
 @Composable
 fun MessageList(
     messagesState: State<Map<String, ChatMessage>>,
@@ -114,6 +117,7 @@ fun MessageList(
     getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
     queuedMessages: List<com.opencode.acp.chat.model.QueuedMessage> = emptyList(),
     onCancelQueuedMessage: ((String) -> Unit)? = null,
+    onOpenSubtask: ((String) -> Unit)? = null,
 ) {
     // Derive the indexed list from State for count/key computation.
     // The item content lambda reads messagesState.value directly (below) to
@@ -124,9 +128,13 @@ fun MessageList(
     // items that trigger mass recycling of visible items (the "jump" flicker). The
     // message gets parts within milliseconds; the ThinkingIndicator overlay still
     // shows activity during the gap.
-    val messages = messagesState.value.values.filter { msg ->
-        !(msg.role == MessageRole.ASSISTANT && msg.parts.isEmpty() && msg.isStreaming)
-    }.toList()
+    val messages by remember {
+        derivedStateOf {
+            messagesState.value.values.filter { msg ->
+                !(msg.role == MessageRole.ASSISTANT && msg.parts.isEmpty() && msg.isStreaming)
+            }.toList()
+        }
+    }
     val listState = rememberLazyListState()
 
     // Auto-scroll state: starts ON, stays ON until user manually scrolls up.
@@ -286,9 +294,10 @@ fun MessageList(
         val totalItems = messages.size + queuedMessages.size + if (queuedMessages.isNotEmpty() && messages.isNotEmpty()) 1 else 0
         if (totalItems <= 0) return@LaunchedEffect
         // Determine scroll mode by comparing message count delta.
-        val messageDelta = messages.size - prevMessageCount
+        val oldCount = prevMessageCount
+        val messageDelta = messages.size - oldCount
         prevMessageCount = messages.size
-        val isBulkLoad = messageDelta > 1 || (prevMessageCount == messages.size && messages.size > 1 && scrollRequest == 1)
+        val isBulkLoad = messageDelta > 1 || (oldCount == 0 && messages.size > 1 && scrollRequest == 1)
         // isBulkLoad: session switch loaded N messages at once (delta > 1),
         // or first render with existing messages (prevCount=0, now >1).
 
@@ -338,7 +347,7 @@ fun MessageList(
                     }
                 } catch (e2: Exception) {
                     if (e2 is kotlinx.coroutines.CancellationException) throw e2
-                    logger.debug(e2) { "[ACP] scroll fallback also failed — giving up" }
+                    logger.warn(e2) { "[ACP] scroll fallback also failed — giving up (double scroll failure indicates a real problem)" }
                 }
             }
             // Wait for the scroll to fully settle before releasing the mutex.
@@ -398,7 +407,7 @@ fun MessageList(
                     // — bypassing LazyColumn's key-diffing. This eliminates both the
                     // flicker (no dispose+recreate) and the stale-data bug (fresh read).
                     val currentMessage = messagesState.value[messages[index].id] ?: messages[index]
-                    MessageItem(currentMessage, project, onImagePreview, getStreamingText = getStreamingText)
+                    MessageItem(currentMessage, project, onImagePreview, getStreamingText = getStreamingText, onOpenSubtask = onOpenSubtask)
                     if (index < messages.size - 1) {
                         Spacer(modifier = Modifier.height(12.dp))
                     }
@@ -489,11 +498,12 @@ fun MessageItem(
     project: Project? = null,
     onImagePreview: ((String) -> Unit)? = null,
     getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
+    onOpenSubtask: ((String) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     when (message.role) {
         MessageRole.USER -> UserMessage(message, onImagePreview, modifier)
-        MessageRole.ASSISTANT -> AssistantMessage(message, project, getStreamingText = getStreamingText, modifier = modifier)
+        MessageRole.ASSISTANT -> AssistantMessage(message, project, getStreamingText = getStreamingText, onOpenSubtask = onOpenSubtask, modifier = modifier)
     }
 }
 
@@ -565,7 +575,7 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
 }
 
 @Composable
-fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null, modifier: Modifier = Modifier) {
+fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null, onOpenSubtask: ((String) -> Unit)? = null, modifier: Modifier = Modifier) {
      val streamingAlpha = if (message.isStreaming) 0.85f else 1f
 
      if (message.parts.isEmpty()) {
@@ -660,7 +670,7 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                          is MessagePart.ToolCall -> {
                              hasToolCall = true
                              key(key) {
-                                 ToolPill(part.pill, getStreamingText = getStreamingText)
+                                  ToolPill(part.pill, getStreamingText = getStreamingText, onOpenSubtask = onOpenSubtask)
                              }
                          }
                       is MessagePart.Text -> {
@@ -950,14 +960,19 @@ private fun FileChangeCard(
             // could emit filePath = "../../etc/passwd". Validate that the resolved
             // canonical path stays within the project basePath before resolving via
             // LocalFileSystem — prevents opening arbitrary system files in the editor.
-            val absPath = "$basePath/${change.filePath}".replace('/', java.io.File.separatorChar)
-            val canonicalBase = java.io.File(basePath).canonicalPath
-            val canonicalTarget = java.io.File(absPath).canonicalPath
-            if (canonicalTarget.startsWith(canonicalBase + java.io.File.separator) ||
-                canonicalTarget == canonicalBase) {
-                LocalFileSystem.getInstance().findFileByPath(canonicalTarget)
-            } else {
-                logger.warn { "[ACP] FileChangeCard: refusing to open path outside project: ${change.filePath}" }
+            try {
+                val absPath = "$basePath/${change.filePath}".replace('/', java.io.File.separatorChar)
+                val canonicalBase = java.io.File(basePath).canonicalPath
+                val canonicalTarget = java.io.File(absPath).canonicalPath
+                if (canonicalTarget.startsWith(canonicalBase + java.io.File.separator) ||
+                    canonicalTarget == canonicalBase) {
+                    LocalFileSystem.getInstance().findFileByPath(canonicalTarget)
+                } else {
+                    logger.warn { "[ACP] FileChangeCard: refusing to open path outside project: ${change.filePath}" }
+                    null
+                }
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] FileChangeCard: canonicalization failed for path: ${change.filePath}" }
                 null
             }
         }
@@ -1132,7 +1147,27 @@ private fun clampListItem(item: MarkdownBlock.ListItem): MarkdownBlock.ListItem 
 private fun openUrlSafely(url: String) {
     val trimmed = url.trim()
     if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
-        BrowserUtil.open(trimmed)
+        try {
+            val parsed = java.net.URI(trimmed)
+            val host = parsed.host
+            // Block link-local (169.254.x.x) and loopback addresses to prevent
+            // browser-level SSRF (e.g., cloud metadata endpoints, internal services)
+            // unless the host matches the configured OpenCode server.
+            val isLoopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
+            val isLinkLocal = host.startsWith("169.254.")
+            if (isLoopback || isLinkLocal) {
+                // Allow only if it matches the configured OpenCode server port
+                val serverPort = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().port
+                val serverUrl = "http://127.0.0.1:$serverPort"
+                if (!trimmed.startsWith(serverUrl)) {
+                    logger.warn { "[ACP] Blocked internal URL from markdown: ${trimmed.take(100)}" }
+                    return
+                }
+            }
+            BrowserUtil.open(trimmed)
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] Failed to parse URL from markdown: ${trimmed.take(100)}" }
+        }
     } else {
         logger.warn { "[ACP] Blocked non-http URL from markdown: ${trimmed.take(100)}" }
     }
@@ -1209,7 +1244,7 @@ private fun QueuedMessageBubble(
         ) {
             Text(
                 text = message.text,
-                style = TextStyle(fontSize = ChatTheme.fonts.messageBody * 1.5f),
+                style = TextStyle(fontSize = ChatTheme.fonts.messageBody * QUEUED_MESSAGE_FONT_SCALE),
                 color = ChatTheme.colors.text.primary.copy(alpha = 0.7f),
             )
         }

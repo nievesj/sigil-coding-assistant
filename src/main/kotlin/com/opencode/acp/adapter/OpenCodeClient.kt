@@ -614,6 +614,17 @@ class OpenCodeClient(
     // -------------------------------------------------------------------------
 
     /**
+     * Validates that an ID is safe to interpolate into a URL path segment.
+     * Throws [IllegalArgumentException] if the ID contains characters outside
+     * the strict allow-list `^[A-Za-z0-9_-]{1,128}$`.
+     */
+    private fun validatePathId(id: String, fieldName: String) {
+        require(id.matches(Regex("^[A-Za-z0-9_-]{1,128}$"))) {
+            "Invalid $fieldName: '$id' — must match ^[A-Za-z0-9_-]{1,128}$"
+        }
+    }
+
+    /**
      * Responds to a permission request.
      * POST /permission/{requestID}/reply
      */
@@ -621,10 +632,16 @@ class OpenCodeClient(
         permissionId: String,
         response: String
     ) {
-        httpClient.post("$baseUrl/permission/$permissionId/reply") {
+        validatePathId(permissionId, "permissionId")
+        val response = httpClient.post("$baseUrl/permission/$permissionId/reply") {
             applyAuth()
             contentType(ContentType.Application.Json)
             setBody(json.encodeToString(PermissionRequest(response = response)))
+        }
+        if (!response.status.isSuccess()) {
+            val body = response.bodyAsText()
+            logger.error { "POST /permission/$permissionId/reply returned ${response.status}: ${body.take(500)}" }
+            error("POST /permission/$permissionId/reply failed with ${response.status}: ${body.take(200)}")
         }
     }
 
@@ -637,10 +654,16 @@ class OpenCodeClient(
         requestId: String,
         answers: List<List<String>>
     ) {
-        httpClient.post("$baseUrl/question/$requestId/reply") {
+        validatePathId(requestId, "requestId")
+        val response = httpClient.post("$baseUrl/question/$requestId/reply") {
             applyAuth()
             contentType(ContentType.Application.Json)
             setBody(json.encodeToString(QuestionReplyRequest(answers = answers)))
+        }
+        if (!response.status.isSuccess()) {
+            val body = response.bodyAsText()
+            logger.error { "POST /question/$requestId/reply returned ${response.status}: ${body.take(500)}" }
+            error("POST /question/$requestId/reply failed with ${response.status}: ${body.take(200)}")
         }
     }
 
@@ -649,10 +672,16 @@ class OpenCodeClient(
      * POST /question/{requestID}/reject
      */
     suspend fun rejectQuestion(requestId: String) {
-        httpClient.post("$baseUrl/question/$requestId/reject") {
+        validatePathId(requestId, "requestId")
+        val response = httpClient.post("$baseUrl/question/$requestId/reject") {
             applyAuth()
             contentType(ContentType.Application.Json)
             setBody("{}")
+        }
+        if (!response.status.isSuccess()) {
+            val body = response.bodyAsText()
+            logger.error { "POST /question/$requestId/reject returned ${response.status}: ${body.take(500)}" }
+            error("POST /question/$requestId/reject failed with ${response.status}: ${body.take(200)}")
         }
     }
 
@@ -937,6 +966,20 @@ class OpenCodeClient(
                         action = permission,
                         description = description,
                         patterns = patterns ?: emptyList()
+                    )
+                }
+
+                "session.next.permission.replied" -> {
+                    val sid = props["sessionID"]?.jsonPrimitive?.contentOrNull ?: sessionId
+                    val requestId = props["requestID"]?.jsonPrimitive?.contentOrNull
+                        ?: props["id"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing requestID")
+                    val reply = props["reply"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing reply")
+                    SseEvent.PermissionReplied(
+                        sessionId = sid,
+                        permissionId = requestId,
+                        reply = reply
                     )
                 }
 
@@ -1361,6 +1404,20 @@ class OpenCodeClient(
                         action = permission,
                         description = description,
                         messageId = messageId
+                    )
+                }
+
+                "permission.replied" -> {
+                    val sid = props["sessionID"]?.jsonPrimitive?.contentOrNull ?: sessionId
+                    val requestId = props["requestID"]?.jsonPrimitive?.contentOrNull
+                        ?: props["id"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing requestID")
+                    val reply = props["reply"]?.jsonPrimitive?.contentOrNull
+                        ?: return SseEvent.Ignored(sessionId, eventType, "parse error: missing reply")
+                    SseEvent.PermissionReplied(
+                        sessionId = sid,
+                        permissionId = requestId,
+                        reply = reply
                     )
                 }
 

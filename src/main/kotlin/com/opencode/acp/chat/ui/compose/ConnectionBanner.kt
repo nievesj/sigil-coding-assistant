@@ -38,6 +38,7 @@ fun ConnectionBanner(
             is ConnectionErrorReason.ProcessExited -> "OpenCode process stopped (exit ${errorReason.exitCode})"
             is ConnectionErrorReason.HealthCheckTimeout -> "OpenCode server did not respond in time"
             is ConnectionErrorReason.ReconnectionFailed -> "Reconnection failed"
+            is ConnectionErrorReason.ServerUnreachable -> "Server unreachable — reconnection attempts exhausted"
             is ConnectionErrorReason.Other -> errorReason.detail ?: "Connection failed"
             null -> "Connection failed"
         }

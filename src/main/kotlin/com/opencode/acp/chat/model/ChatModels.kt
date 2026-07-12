@@ -146,6 +146,24 @@ data class PermissionPrompt(
     val patterns: List<String> = emptyList()
 )
 
+/** A child session (sub-agent) permission prompt relayed to the parent session UI.
+ *  Non-blocking — renders as a banner, not in ChatInputState. */
+data class ChildPermissionPrompt(
+    val childSessionId: String,
+    val permissionId: String,
+    val toolCallId: String,
+    val toolName: String,
+    val description: String?,
+    val patterns: List<String>,
+    val subAgentLabel: String,
+    /** Whether [subAgentLabel] was derived from a Subtask SSE event (true) or
+     *  is the fallback "sub-agent" string (false). When false, the label should
+     *  NOT be used for config sync (writeAlwaysAllowRule) because "sub-agent"
+     *  is not a real agent name — it would create a config entry for a
+     *  non-existent agent. */
+    val agentLabelVerified: Boolean,
+)
+
 /** A single option in a selection prompt. */
 data class SelectionOption(
     val title: String,
@@ -253,6 +271,13 @@ sealed interface ConnectionErrorReason {
     data object HealthCheckTimeout : ConnectionErrorReason
     /** Connection lost after successful init (reconnection failure). */
     data class ReconnectionFailed(val detail: String?) : ConnectionErrorReason
+    /**
+     * The server became permanently unreachable after repeated SSE reconnection
+     * attempts (circuit breaker tripped). The server may be down, the port may
+     * be blocked, or the process may have been killed externally.
+     */
+    data object ServerUnreachable : ConnectionErrorReason
+
     /**
      * Any other connection failure not covered above.
      *

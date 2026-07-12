@@ -292,6 +292,8 @@ private fun resolveStatusMessages(
                 "The binary started but did not become healthy within 60 seconds. It may be busy, misconfigured, or the wrong executable."
             is ConnectionErrorReason.ReconnectionFailed -> "Reconnection failed" to
                 (errorReason.detail ?: "The connection was lost and could not be re-established.")
+            is ConnectionErrorReason.ServerUnreachable -> "Server unreachable" to
+                "The OpenCode server did not respond after repeated reconnection attempts. It may be down or the port may be blocked. Check the server process and retry."
             is ConnectionErrorReason.Other -> "Connection failed" to
                 (errorReason.detail ?: "An unexpected connection error occurred.")
             null -> "Connection failed" to ""

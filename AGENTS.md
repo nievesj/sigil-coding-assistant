@@ -8,6 +8,38 @@ that are intentionally left for future implementation.
 
 ## Developer Notes
 
+### Reading the Plugin Log File (idea.log)
+
+The plugin log is at `C:\Users\<username>\AppData\Local\JetBrains\IntelliJIdea<version>\log\idea.log`
+(installed plugin — see "Installed Plugin Log Location" below for the developer-specific example) or `.intellijPlatform/sandbox/sigil/IU-2026.1/log/idea.log` (runIde).
+
+**The intellij MCP file tools (`intellij_read_file`, `intellij_search_in_files_by_text`, etc.)
+are sandboxed to the project directory and CANNOT read files outside
+`D:\Projects\intellij-opencode-plugin`.** The log file is under
+`C:\Users\josen\AppData\Local\...` which is outside the project root.
+
+**The correct way to read the log is `intellij_execute_terminal_command` with PowerShell:**
+
+```
+Get-Content "C:\Users\josen\AppData\Local\JetBrains\IntelliJIdea2026.1\log\idea.log" -Tail 300 | Select-String "[ACP]"
+```
+
+For targeted searches:
+```
+Select-String -Path "C:\Users\josen\AppData\Local\JetBrains\IntelliJIdea2026.1\log\idea.log" -Pattern "subtask|StreamingCompleted|SessionIdle|streamPhase|error" | Select-Object -Last 80
+```
+
+**Do NOT:**
+- Use `webfetch` with `file:///` protocol — it only reads the first 100K chars and truncates
+- Spawn subagents to read the log — they hit `external_directory` permission prompts and get cancelled
+- Use `intellij_read_file` or `intellij_search_in_files_by_text` on the log path — they reject paths outside the project
+- Waste time trying alternative approaches — use `intellij_execute_terminal_command` directly
+
+**Do:**
+- Use `intellij_execute_terminal_command` with `executeInShell=true` and PowerShell commands
+- Set `maxLinesCount=200` and `truncateMode=START` to get the tail without truncation issues
+- Use `Select-String` with `Select-Object -Last N` to limit output
+
 ### Auto-Compaction is Server-Side
 
 OpenCode handles context compaction automatically on the server. After each
@@ -267,6 +299,8 @@ OpenCode server sends two different SSE wire formats depending on event version:
 3. V2 puts `sessionID` inside `data` (not at root or in `properties`)
 
 **Actual server behavior (as of June 2026, pinned OpenCode binary version):** The OpenCode server sends V1 BusEvents exclusively, NOT V2 SyncEvents. All events use `"properties"` wrapper. Tool parts use `"type": "tool"` (not `"tool_use"`) with `"callID"` (not `"id"`), `"state"` (running/completed/failed), and `"tool"` (not `"name"`). The V2 parsing code is retained for future compatibility but the server currently uses V1 only. **Re-verify after any OpenCode binary version bump** (the binary is pinned by `ProcessManager`).
+
+**CRITICAL:** If you bump the OpenCode binary version in `ProcessManager`, you MUST re-verify the V1/V2 wire format. A version bump without re-verification will silently drop ALL SSE events. Add a TODO comment in `ProcessManager.kt` at the version constant referencing this section.
 
 **Detection logic:** Check for `jsonObj["data"]` (V2) vs `jsonObj["properties"]` (V1). For V2, strip the `.N` version suffix from the type and extract all fields from the `data` object.
 
@@ -812,6 +846,8 @@ it on context computation causes the session to compact immediately on load when
 exceeds the checkpoint threshold (default 60%). There is no server API to pre-compute a
 summary without side effects. Manual compaction (`/compact` command, "Compact Now" button)
 is the correct path — it is user-initiated and expected.
+
+**Action item:** Mark `BackgroundCompactor.kt` with `@Deprecated("Auto-trigger disabled — server /summarize performs actual compaction. Do NOT re-enable auto-trigger. See AGENTS.md 'Smart Compaction & Context Management'.")` to prevent accidental re-enabling.
 
 ### `message.removed` SSE Event "” Message Deletion
 

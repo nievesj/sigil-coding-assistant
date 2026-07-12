@@ -17,6 +17,7 @@ import kotlinx.serialization.json.put
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import kotlin.concurrent.withLock
 
 private val logger = KotlinLogging.logger {}
 
@@ -39,6 +40,9 @@ class McpConfigWriter(
     private val settings: OpenCodeSettingsState
 ) {
 
+    /** Serializes all writeConfig calls to prevent concurrent read-modify-write races. */
+    private val writeLock = java.util.concurrent.locks.ReentrantLock()
+
     /**
      * Read-modify-write the opencode.json config file atomically.
      *
@@ -50,61 +54,68 @@ class McpConfigWriter(
      * @return true if written successfully, false on error.
      */
     private fun writeConfig(transform: (JsonObject) -> JsonObject): Boolean {
-        return try {
-            val opencodeDir = projectBasePath.resolve(".opencode")
-            Files.createDirectories(opencodeDir)
+        return writeLock.withLock {
+            try {
+                val opencodeDir = projectBasePath.resolve(".opencode")
+                Files.createDirectories(opencodeDir)
 
-            val configFile = opencodeDir.resolve("opencode.json")
+                val configFile = opencodeDir.resolve("opencode.json")
 
-            // Read existing config or start with empty object
-            val existingConfig = if (Files.exists(configFile)) {
-                try {
-                    val content = Files.readString(configFile)
-                    if (content.isNotBlank()) {
-                        Json.parseToJsonElement(content).jsonObject
-                    } else {
+                // Read existing config or start with empty object
+                val existingConfig = if (Files.exists(configFile)) {
+                    try {
+                        val content = Files.readString(configFile)
+                        if (content.isNotBlank()) {
+                            Json.parseToJsonElement(content).jsonObject
+                        } else {
+                            null
+                        }
+                    } catch (e: Exception) {
+                        logger.warn(e) { "[ACP] McpConfigWriter: failed to parse existing config, starting fresh" }
                         null
                     }
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] McpConfigWriter: failed to parse existing config, starting fresh" }
+                } else {
                     null
                 }
-            } else {
-                null
-            }
 
-            val config = existingConfig ?: buildJsonObject {}
+                val config = existingConfig ?: buildJsonObject {}
 
-            // Apply the caller's transform to produce the new config
-            val newConfig = transform(config)
+                // Apply the caller's transform to produce the new config
+                val newConfig = transform(config)
 
-            // Add $schema if not present
-            val finalConfig = if (!newConfig.containsKey("\$schema")) {
-                buildJsonObject {
-                    for ((key, value) in newConfig) {
-                        put(key, value)
+                // Add $schema if not present
+                val finalConfig = if (!newConfig.containsKey("\$schema")) {
+                    buildJsonObject {
+                        for ((key, value) in newConfig) {
+                            put(key, value)
+                        }
+                        put("\$schema", "https://opencode.ai/config.json")
                     }
-                    put("\$schema", "https://opencode.ai/config.json")
+                } else {
+                    newConfig
                 }
-            } else {
-                newConfig
-            }
 
-            // Write atomically via temp file
-            val tempFile = Files.createTempFile(opencodeDir, "opencode.json.", ".tmp")
-            try {
-                val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
-                Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), finalConfig))
-                Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-                true
+                // Write atomically via temp file
+                val tempFile = Files.createTempFile(opencodeDir, "opencode.json.", ".tmp")
+                try {
+                    val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
+                    Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), finalConfig))
+                    try {
+                        Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                    } catch (e: java.nio.file.AtomicMoveNotSupportedException) {
+                        logger.warn { "[ACP] McpConfigWriter: atomic move not supported, falling back to non-atomic replace" }
+                        Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING)
+                    }
+                    true
+                } catch (e: Exception) {
+                    // Clean up temp file on failure
+                    try { Files.deleteIfExists(tempFile) } catch (_: Exception) {}
+                    throw e
+                }
             } catch (e: Exception) {
-                // Clean up temp file on failure
-                try { Files.deleteIfExists(tempFile) } catch (_: Exception) {}
-                throw e
+                logger.error(e) { "[ACP] McpConfigWriter: failed to write config" }
+                false
             }
-        } catch (e: Exception) {
-            logger.error(e) { "[ACP] McpConfigWriter: failed to write config" }
-            false
         }
     }
 
@@ -279,6 +290,108 @@ class McpConfigWriter(
     }
 
     /**
+     * Write a single "always allow" permission rule to the config file.
+     * Called after the user clicks "Always Allow" in the runtime permission prompt
+     * AND the server has confirmed the response (POST succeeded).
+     *
+     * Updates `agent.{agentName}.permission.{toolName}` to `"allow"`.
+     * For pattern-based tools (e.g., bash), patterns are stored but the tool-level
+     * permission is set to "allow" — the server handles pattern-level evaluation.
+     *
+     * @param agentName The agent to apply the permission to (e.g., "orchestrator", "fixer")
+     * @param toolName The tool name to allow (e.g., "bash", "read", "edit")
+     * @param patterns Optional patterns for pattern-based tools (currently informational —
+     *   the tool-level permission is set to "allow")
+     * @return true if the config was written successfully, false otherwise
+     */
+    fun writeAlwaysAllowRule(agentName: String, toolName: String, patterns: List<String>): Boolean {
+        // Validate inputs — agentName and toolName become JSON object keys in the
+        // config file. Reject values that are blank or contain path separators /
+        // control characters to prevent writing config entries for non-existent
+        // agents or tools (e.g., the fallback label "sub-agent" from a missed
+        // Subtask SSE event, or a malicious server-provided string).
+        if (!isValidConfigKey(agentName) || !isValidConfigKey(toolName)) {
+            logger.warn { "[ACP] McpConfigWriter.writeAlwaysAllowRule: rejected invalid key — agentName='$agentName', toolName='$toolName'" }
+            return false
+        }
+
+        val success = writeConfig { config ->
+            // Get existing agent section or start with empty object
+            val existingAgents = config["agent"]?.jsonObject ?: buildJsonObject {}
+
+            // Get existing agent config or start with empty object
+            val existingAgentConfig = existingAgents[agentName]?.jsonObject ?: buildJsonObject {}
+
+            // Get existing permission section or start with empty object
+            val existingPermissions = existingAgentConfig["permission"]?.jsonObject ?: buildJsonObject {}
+
+            // Build updated permissions: copy existing + add/override the tool.
+            // If the existing value is a JsonObject (pattern-specific rules), merge
+            // a wildcard "allow" key instead of replacing the entire object — this
+            // preserves pattern-specific deny rules (e.g., "rm -rf /": "deny").
+            val existingToolPermission = existingPermissions[toolName]
+            val updatedPermissions = buildJsonObject {
+                for ((key, value) in existingPermissions) {
+                    put(key, value)
+                }
+                if (existingToolPermission is JsonObject) {
+                    // Guard: do NOT silently flip an existing wildcard "deny" to "allow".
+                    // A user who previously denied all commands for this tool should not
+                    // have their deny rule overwritten by a single "Always Allow" click.
+                    val existingWildcard = existingToolPermission["*"]
+                    if (existingWildcard is JsonPrimitive && existingWildcard.content == "deny") {
+                        logger.warn { "[ACP] McpConfigWriter: refusing to overwrite existing wildcard 'deny' rule for tool '$toolName' — keeping deny. User must manually update config if they want to allow." }
+                        // Keep the existing permission object unchanged — do NOT add "*": "allow"
+                        put(toolName, existingToolPermission)
+                    } else {
+                        // Merge: add wildcard "allow" without destroying pattern rules
+                        put(toolName, buildJsonObject {
+                            for ((k, v) in existingToolPermission) put(k, v)
+                            put("*", JsonPrimitive("allow"))
+                        })
+                    }
+                } else {
+                    put(toolName, JsonPrimitive("allow"))
+                }
+            }
+
+            // Build updated agent config
+            val updatedAgentConfig = buildJsonObject {
+                for ((key, value) in existingAgentConfig) {
+                    if (key != "permission") {
+                        put(key, value)
+                    }
+                }
+                put("permission", updatedPermissions)
+            }
+
+            // Build updated agents section
+            val updatedAgents = buildJsonObject {
+                for ((key, value) in existingAgents) {
+                    if (key != agentName) {
+                        put(key, value)
+                    }
+                }
+                put(agentName, updatedAgentConfig)
+            }
+
+            // Merge: start with existing config, replace agent section
+            buildJsonObject {
+                for ((key, value) in config) {
+                    if (key != "agent" && key != "\$schema") {
+                        put(key, value)
+                    }
+                }
+                put("agent", updatedAgents)
+            }
+        }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: wrote always-allow rule for agent=$agentName, tool=$toolName" }
+        }
+        return success
+    }
+
+    /**
      * Build permission entries from a map of tool permissions.
      *
      * Merges new permissions with existing ones. New permissions override existing
@@ -357,5 +470,22 @@ class McpConfigWriter(
             logger.info { "[ACP] McpConfigWriter: cleared plugin MCP entries" }
         }
         return success
+    }
+
+    /**
+     * Validate that a string is safe to use as a JSON object key in the config file.
+     * Rejects blank strings, strings with path separators, and strings with
+     * control characters. This prevents writing config entries for non-existent
+     * agents or tools from untrusted SSE-provided data.
+     */
+    private fun isValidConfigKey(key: String): Boolean {
+        if (key.isBlank()) return false
+        // Reject excessively long keys from untrusted SSE data
+        if (key.length > 128) return false
+        // Reject path separators and traversal sequences
+        if (key.contains('/') || key.contains('\\') || key.contains("..")) return false
+        // Reject control characters
+        if (key.any { it.code < 0x20 }) return false
+        return true
     }
 }

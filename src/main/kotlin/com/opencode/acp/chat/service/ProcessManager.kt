@@ -33,6 +33,14 @@ class ProcessManager(private val scope: CoroutineScope) {
     private val _connectionErrorReason = MutableStateFlow<ConnectionErrorReason?>(null)
     val connectionErrorReason: StateFlow<ConnectionErrorReason?> = _connectionErrorReason.asStateFlow()
 
+    /** Public setter for transitioning to an error state from outside ProcessManager.
+     *  Used by the SSE circuit breaker in OpenCodeService to signal that the server
+     *  is permanently unreachable after exhausting reconnection attempts. */
+    fun setConnectionError(reason: ConnectionErrorReason) {
+        _connectionErrorReason.value = reason
+        _connectionState.value = ConnectionState.ERROR
+    }
+
     @Volatile private var openCodeClient: OpenCodeClient? = null
     @Volatile private var openCodeProcess: Process? = null
     private var processWatcherJob: Job? = null
@@ -252,6 +260,11 @@ class ProcessManager(private val scope: CoroutineScope) {
     }
 
     // --- Binary management ---
+
+    // TODO: The OpenCode binary version is pinned by the configured binaryPath (see OpenCodeSettingsState.binaryPath).
+    //   If you bump the binary version, you MUST re-verify the V1/V2 SSE wire format in OpenCodeClient.subscribeGlobalEvents.
+    //   A version bump without re-verification will silently drop ALL SSE events.
+    //   See AGENTS.md "SSE V2 SyncEvent Wire Format — Critical Parsing Fix".
 
     private fun launchOpenCodeBinary(binaryPath: String): Boolean {
         // Kill any previously launched process before starting a new one

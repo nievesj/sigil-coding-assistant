@@ -167,9 +167,19 @@ class OpenCodeAgentSession(
                     }
 
                     is SseEvent.Permission -> {
-                        // Permission handling is routed by the SDK.
-                        // This event is informational — the SDK handles session/request_permission.
-                        logger.debug { "Permission event for tool ${sseEvent.toolCallId}: ${sseEvent.action}" }
+                        // ACP mode does not implement permission handling (TDD §3 Non-Goals).
+                        // Emit a CANCELLED response so the ACP consumer sees the turn end
+                        // instead of hanging indefinitely on the server's Deferred promise.
+                        logger.warn { "[ACP] ACP path: permission event for tool ${sseEvent.toolCallId} (action=${sseEvent.action}) — emitting CANCELLED (permission handling not implemented in ACP mode)" }
+                        emit(Event.PromptResponseEvent(
+                            response = PromptResponse(stopReason = StopReason.CANCELLED)
+                        ))
+                        return@collect
+                    }
+
+                    is SseEvent.PermissionReplied -> {
+                        // Informational — server confirmed a permission response was processed.
+                        logger.warn { "[ACP] ACP path: permission replied ${sseEvent.permissionId} → ${sseEvent.reply} — permission handling not implemented in ACP mode" }
                     }
 
                     is SseEvent.Error -> {
@@ -301,7 +311,13 @@ class OpenCodeAgentSession(
             logger.warn(e) { "[ACP] Failed to abort session $openCodeSessionId" }
         }
         try {
-            promptJob.getCompleted().cancel()
+            // Guard: getCompleted() throws IllegalStateException if prompt() was never
+            // called (promptJob not yet completed). Only cancel if the job exists.
+            if (promptJob.isCompleted) {
+                promptJob.getCompleted().cancel()
+            } else {
+                logger.debug { "[ACP] cancel(): promptJob not yet completed (prompt() never called) — nothing to cancel" }
+            }
         } catch (e: Exception) {
             logger.debug(e) { "[ACP] Failed to cancel prompt job for session $openCodeSessionId" }
         }

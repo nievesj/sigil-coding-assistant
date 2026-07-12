@@ -50,6 +50,7 @@ data class BackgroundCompactorSettings(
  * @param settings background compaction settings
  * @param scope CoroutineScope tied to the active session lifecycle
  */
+@Deprecated("Auto-trigger disabled — server /summarize performs actual compaction. Do NOT re-enable auto-trigger. See AGENTS.md 'Smart Compaction & Context Management'.")
 class BackgroundCompactor(
     private val client: OpenCodeClient,
     private val settings: BackgroundCompactorSettings,

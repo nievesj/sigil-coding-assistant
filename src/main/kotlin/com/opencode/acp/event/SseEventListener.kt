@@ -68,50 +68,57 @@ class SseEventListener(
             // Strip V2 version suffix (e.g. "session.next.text.delta.1" → "session.next.text.delta")
             val normalizedType = type.replace(Regex("\\.\\d+$"), "")
 
-            // V1 bus events nest data under "properties"; V2 events are flat.
-            // Extract properties wrapper for V1 events so field access works correctly.
-            val props = obj["properties"]?.jsonObject ?: obj
+            // V2 SyncEvents nest payload under "data"; V1 BusEvents nest under "properties".
+            // Extract the payload container for field access. For V2 events, fields like
+            // "sessionID", "delta", "callID" are inside "data". For V1, they're inside
+            // "properties". If neither wrapper exists, use the root object (legacy flat format).
+            val v2Data = obj["data"]?.jsonObject
+            val props: JsonObject = when {
+                v2Data != null -> v2Data
+                obj["properties"] != null -> obj["properties"]?.jsonObject ?: obj
+                else -> obj
+            }
 
             return when (normalizedType) {
                 // V2 Text events
                 "session.next.text.started" -> SseEvent.Ignored(sessionId, "session.next.text.started", "intentional no-op")
                 "session.next.text.delta" -> SseEvent.TextChunk(
                     sessionId = sessionId,
-                    text = obj["delta"]?.jsonPrimitive?.contentOrNull ?: ""
+                    text = props["delta"]?.jsonPrimitive?.contentOrNull ?: ""
                 )
                 "session.next.text.ended" -> SseEvent.TextReplace(
                     sessionId = sessionId,
-                    text = obj["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                    text = props["text"]?.jsonPrimitive?.contentOrNull ?: ""
                 )
 
                 // V2 Reasoning events
                 "session.next.reasoning.started" -> SseEvent.Ignored(sessionId, "session.next.reasoning.started", "intentional no-op")
                 "session.next.reasoning.delta" -> SseEvent.ThinkingChunk(
                     sessionId = sessionId,
-                    text = obj["delta"]?.jsonPrimitive?.contentOrNull ?: ""
+                    text = props["delta"]?.jsonPrimitive?.contentOrNull ?: ""
                 )
                 "session.next.reasoning.ended" -> SseEvent.ThinkingReplace(
                     sessionId = sessionId,
-                    text = obj["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                    text = props["text"]?.jsonPrimitive?.contentOrNull ?: ""
                 )
 
                 // V2 Tool events
-                "session.next.tool.input.started" -> null
+                "session.next.tool.input.started" -> SseEvent.Ignored(sessionId, "session.next.tool.input.started", "intentional no-op — dedup: only tool.called creates a pill")
                 "session.next.tool.called" -> SseEvent.ToolUse(
                     sessionId = sessionId,
-                    toolCallId = obj["callID"]?.jsonPrimitive?.contentOrNull ?: "",
-                    toolName = obj["tool"]?.jsonPrimitive?.contentOrNull ?: "tool",
-                    title = obj["tool"]?.jsonPrimitive?.contentOrNull ?: "tool",
-                    input = obj["input"]?.jsonObject
+                    toolCallId = props["callID"]?.jsonPrimitive?.contentOrNull ?: "",
+                    toolName = props["tool"]?.jsonPrimitive?.contentOrNull ?: "tool",
+                    title = props["tool"]?.jsonPrimitive?.contentOrNull ?: "tool",
+                    input = props["input"]?.jsonObject
                 )
                 "session.next.tool.success" -> SseEvent.ToolResult(
                     sessionId = sessionId,
-                    toolCallId = obj["callID"]?.jsonPrimitive?.contentOrNull ?: "",
+                    toolCallId = props["callID"]?.jsonPrimitive?.contentOrNull ?: "",
                     isError = false
                 )
                 "session.next.tool.failed" -> SseEvent.ToolResult(
                     sessionId = sessionId,
-                    toolCallId = obj["callID"]?.jsonPrimitive?.contentOrNull ?: "",
+                    toolCallId = props["callID"]?.jsonPrimitive?.contentOrNull ?: "",
                     isError = true
                 )
 
@@ -122,7 +129,7 @@ class SseEventListener(
 
                 // V2 Prompted event
                 "session.next.prompted" -> {
-                    val prompt = obj["prompt"]?.jsonObject
+                    val prompt = props["prompt"]?.jsonObject
                     if (prompt != null) {
                         SseEvent.UserMessage(
                             sessionId = sessionId,
@@ -135,17 +142,27 @@ class SseEventListener(
                 // V2 Permission event
                 "session.next.permission" -> SseEvent.Permission(
                     sessionId = sessionId,
-                    permissionId = obj["id"]?.jsonPrimitive?.contentOrNull ?: "",
-                    toolCallId = obj["tool"]?.jsonObject?.get("callID")?.jsonPrimitive?.contentOrNull ?: "",
-                    action = obj["permission"]?.jsonPrimitive?.contentOrNull ?: "",
-                    description = obj["description"]?.jsonPrimitive?.contentOrNull,
-                    patterns = obj["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+                    permissionId = props["id"]?.jsonPrimitive?.contentOrNull ?: "",
+                    toolCallId = props["tool"]?.jsonObject?.get("callID")?.jsonPrimitive?.contentOrNull ?: "",
+                    action = props["permission"]?.jsonPrimitive?.contentOrNull ?: "",
+                    description = props["description"]?.jsonPrimitive?.contentOrNull,
+                    patterns = props["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
                 )
+
+                "session.next.permission.replied" -> {
+                    val sid = props["sessionID"]?.jsonPrimitive?.contentOrNull ?: sessionId
+                    SseEvent.PermissionReplied(
+                        sessionId = sid,
+                        permissionId = props["requestID"]?.jsonPrimitive?.contentOrNull
+                            ?: props["id"]?.jsonPrimitive?.contentOrNull ?: "",
+                        reply = props["reply"]?.jsonPrimitive?.contentOrNull ?: ""
+                    )
+                }
 
                 // V2 Question event
                 "session.next.question" -> {
-                    val requestId = obj["id"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val questionsArray = obj["questions"]?.jsonArray ?: return null
+                    val requestId = props["id"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val questionsArray = props["questions"]?.jsonArray ?: return null
                     val questions = questionsArray.mapNotNull { element ->
                         val qObj = element.jsonObject
                         val question = qObj["question"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
@@ -175,7 +192,7 @@ class SseEventListener(
 
                 // V2 Todo event
                 "session.next.todo.updated" -> {
-                    val todosArray = obj["todos"]?.jsonArray
+                    val todosArray = props["todos"]?.jsonArray
                     if (todosArray != null) {
                         val todos = todosArray.mapNotNull { element ->
                             val todoObj = element.jsonObject
@@ -191,7 +208,7 @@ class SseEventListener(
                 // V2 Stop event
                 "session.next.stopped" -> SseEvent.Stop(
                     sessionId = sessionId,
-                    stopReason = obj["stopReason"]?.jsonPrimitive?.contentOrNull ?: "stop"
+                    stopReason = props["stopReason"]?.jsonPrimitive?.contentOrNull ?: "stop"
                 )
 
                 // V2 Session created
@@ -218,56 +235,56 @@ class SseEventListener(
 
                 // V2 new part type events
                 "session.next.patch" -> {
-                    val hash = obj["hash"]?.jsonPrimitive?.contentOrNull ?: return null
-                    val files = obj["files"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+                    val hash = props["hash"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val files = props["files"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
                     SseEvent.Patch(sessionId = sessionId, hash = hash, files = files)
                 }
                 "session.next.agent" -> {
-                    val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: return null
+                    val name = props["name"]?.jsonPrimitive?.contentOrNull ?: return null
                     SseEvent.Agent(sessionId = sessionId, agentName = name)
                 }
                 "session.next.retry" -> {
-                    val attempt = obj["attempt"]?.jsonPrimitive?.intOrNull ?: 1
-                    val maxAttempts = obj["maxAttempts"]?.jsonPrimitive?.intOrNull ?: 3
-                    val error = obj["error"]?.jsonPrimitive?.contentOrNull
+                    val attempt = props["attempt"]?.jsonPrimitive?.intOrNull ?: 1
+                    val maxAttempts = props["maxAttempts"]?.jsonPrimitive?.intOrNull ?: 3
+                    val error = props["error"]?.jsonPrimitive?.contentOrNull
                     SseEvent.Retry(sessionId = sessionId, attempt = attempt, maxAttempts = maxAttempts, error = error)
                 }
                 "session.next.compaction" -> {
-                    val summary = obj["summary"]?.jsonPrimitive?.contentOrNull
+                    val summary = props["summary"]?.jsonPrimitive?.contentOrNull
                     SseEvent.Compaction(sessionId = sessionId, summary = summary)
                 }
                 "session.next.subtask" -> {
-                    val prompt = obj["prompt"]?.jsonPrimitive?.contentOrNull
-                    val description = obj["description"]?.jsonPrimitive?.contentOrNull
-                    val agent = obj["agent"]?.jsonPrimitive?.contentOrNull
-                    val model = obj["model"]?.jsonPrimitive?.contentOrNull
+                    val prompt = props["prompt"]?.jsonPrimitive?.contentOrNull
+                    val description = props["description"]?.jsonPrimitive?.contentOrNull
+                    val agent = props["agent"]?.jsonPrimitive?.contentOrNull
+                    val model = props["model"]?.jsonPrimitive?.contentOrNull
                     SseEvent.Subtask(sessionId = sessionId, prompt = prompt, description = description, agent = agent, model = model)
                 }
 
                 // Legacy events
                 "text_chunk" -> SseEvent.TextChunk(
                     sessionId = sessionId,
-                    text = obj["text"]?.jsonPrimitive?.content ?: ""
+                    text = props["text"]?.jsonPrimitive?.content ?: ""
                 )
                 "tool_use" -> SseEvent.ToolUse(
                     sessionId = sessionId,
-                    toolCallId = obj["toolCallId"]?.jsonPrimitive?.content ?: "",
-                    toolName = obj["toolName"]?.jsonPrimitive?.content ?: "",
-                    title = obj["title"]?.jsonPrimitive?.content,
-                    input = obj["input"]?.jsonObject
+                    toolCallId = props["toolCallId"]?.jsonPrimitive?.content ?: "",
+                    toolName = props["toolName"]?.jsonPrimitive?.content ?: "",
+                    title = props["title"]?.jsonPrimitive?.content,
+                    input = props["input"]?.jsonObject
                 )
                 "tool_result" -> SseEvent.ToolResult(
                     sessionId = sessionId,
-                    toolCallId = obj["toolCallId"]?.jsonPrimitive?.content ?: "",
-                    isError = obj["isError"]?.jsonPrimitive?.let {
+                    toolCallId = props["toolCallId"]?.jsonPrimitive?.content ?: "",
+                    isError = props["isError"]?.jsonPrimitive?.let {
                         if (it.isString) it.content.lowercase() == "true" else it.toString().lowercase() == "true"
                     } ?: false,
-                    content = (obj["content"] as? kotlinx.serialization.json.JsonArray)
+                    content = (props["content"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject) }
                 )
                 "plan" -> SseEvent.Plan(
                     sessionId = sessionId,
-                    entries = (obj["entries"] as? kotlinx.serialization.json.JsonArray)
+                    entries = (props["entries"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { entry ->
                             val entryObj = (entry as? JsonObject) ?: return@mapNotNull null
                             PlanEntry(
@@ -279,25 +296,34 @@ class SseEventListener(
                 )
                 "stop" -> SseEvent.Stop(
                     sessionId = sessionId,
-                    stopReason = obj["stopReason"]?.jsonPrimitive?.content ?: "end_turn"
+                    stopReason = props["stopReason"]?.jsonPrimitive?.content ?: "end_turn"
                 )
                 "permission" -> SseEvent.Permission(
                     sessionId = sessionId,
-                    permissionId = obj["permissionId"]?.jsonPrimitive?.content ?: "",
-                    toolCallId = obj["toolCallId"]?.jsonPrimitive?.content ?: "",
-                    action = obj["action"]?.jsonPrimitive?.content ?: "",
-                    description = obj["description"]?.jsonPrimitive?.content,
-                    patterns = obj["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+                    permissionId = props["permissionId"]?.jsonPrimitive?.content ?: "",
+                    toolCallId = props["toolCallId"]?.jsonPrimitive?.content ?: "",
+                    action = props["action"]?.jsonPrimitive?.content ?: "",
+                    description = props["description"]?.jsonPrimitive?.content,
+                    patterns = props["patterns"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
                 )
+                "permission.replied" -> {
+                    val sid = props["sessionID"]?.jsonPrimitive?.contentOrNull ?: sessionId
+                    SseEvent.PermissionReplied(
+                        sessionId = sid,
+                        permissionId = props["requestID"]?.jsonPrimitive?.contentOrNull
+                            ?: props["id"]?.jsonPrimitive?.contentOrNull ?: "",
+                        reply = props["reply"]?.jsonPrimitive?.contentOrNull ?: ""
+                    )
+                }
                 "error" -> SseEvent.Error(
                     sessionId = sessionId,
-                    message = obj["message"]?.jsonPrimitive?.content ?: "Unknown error",
-                    code = obj["code"]?.jsonPrimitive?.intOrNull
+                    message = props["message"]?.jsonPrimitive?.content ?: "Unknown error",
+                    code = props["code"]?.jsonPrimitive?.intOrNull
                 )
                 "session_created" -> SseEvent.SessionCreated(sessionId = sessionId)
                 "message_complete" -> SseEvent.MessageComplete(
                     sessionId = sessionId,
-                    messageId = obj["messageId"]?.jsonPrimitive?.content ?: ""
+                    messageId = props["messageId"]?.jsonPrimitive?.content ?: ""
                 )
                 else -> {
                     logger.debug { "Unknown SSE event type: $type" }

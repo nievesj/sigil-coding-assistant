@@ -320,13 +320,25 @@ class SessionState(
      * Does NOT create a new message — the message already exists in the map from REST fetch.
      */
     fun adoptStreamingContext(messageId: String, modelID: String?, providerID: String?) = stateLock.withLock {
-        ctx.activeMessageId = messageId
-        ctx.modelID = modelID
-        ctx.providerID = providerID
-        ctx.isStreaming = true
+        // Send through the event channel to maintain single-writer invariant.
+        // The event processing coroutine owns ctx field mutations — writing
+        // directly here would race with it (the reader doesn't hold stateLock).
+        val resetEvent = SseEvent.ResetTurn(
+            sessionId = sessionId,
+            newTurnMessageId = messageId,
+            newTurnServerMessageId = null,
+            newTurnModelID = modelID,
+            newTurnProviderID = providerID,
+        )
+        val sendResult = eventChannel.trySend(resetEvent)
+        if (sendResult.isFailure) {
+            // Channel full — store as pending turn identity (same fallback as createAssistantMessage)
+            pendingTurnIdentity = PendingTurnIdentity(messageId, null, modelID, providerID)
+            logger.warn { "[ACP] adoptStreamingContext: eventChannel FULL — ResetTurn dropped, pendingTurnIdentity stored" }
+        }
         firstTextSegmented = false
         lastAccessTime = System.currentTimeMillis()
-        logger.info { "[ACP] adoptStreamingContext: id=$messageId, modelID=$modelID, providerID=$providerID" }
+        logger.info { "[ACP] adoptStreamingContext: id=$messageId, modelID=$modelID, providerID=$providerID (sent via ResetTurn)" }
     }
 
     fun completeStreaming(messageId: String) = stateLock.withLock {
@@ -372,6 +384,10 @@ class SessionState(
     }
 
     fun addMessage(message: ChatMessage) = stateLock.withLock {
+        if (closed) {
+            logger.debug { "[ACP] addMessage: session is closed, dropping message id=${message.id}" }
+            return@withLock
+        }
         val current = LinkedHashMap(_messages.value)
         current[message.id] = message
         message.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
@@ -392,6 +408,9 @@ class SessionState(
                 iter.remove()
                 toRemove--
             }
+            // Reset thinking phase index when evicting to prevent unbounded growth.
+            // The index is only meaningful within the current message context.
+            ctx.thinkingPhaseIndex = 0
         }
         _messages.value = current
         logger.info { "[ACP] addMessage: id=${message.id}, role=${message.role}, mapSize=${current.size}" }
@@ -463,7 +482,7 @@ class SessionState(
             ToolCallStatus.FAILED -> PartState.Failed(
                 truncatedOutput?.joinToString("\n") { obj ->
                     try { obj["text"]?.jsonPrimitive?.contentOrNull ?: obj.toString() } catch (_: Exception) { obj.toString() }
-                }?.take(500) ?: "Tool error"
+                }?.let { text -> if (text.length > 500) text.take(500) + "…[truncated]" else text } ?: "Tool error"
             )
             ToolCallStatus.PENDING -> PartState.Pending
             ToolCallStatus.IN_PROGRESS -> PartState.InProgress
@@ -471,27 +490,32 @@ class SessionState(
         }
         ctx.toolPartStates[toolCallId] = newPartState
 
-        val targetMsgId = ctx.toolCallIndex[toolCallId] ?: ctx.activeMessageId
-        if (targetMsgId != null) {
-            updateMessage(targetMsgId) { msg ->
-                val parts = LinkedHashMap(msg.parts)
-                val existing = parts[toolCallId]
-                if (existing is MessagePart.ToolCall) {
-                    parts[toolCallId] = existing.copy(
-                        pill = existing.pill.copy(status = status, output = truncatedOutput ?: existing.pill.output),
-                        state = newPartState
-                    )
-                } else {
-                    // Fallback: try to use pill from ctx.toolCallPills (has proper kind/title)
-                    val existingPill = ctx.toolCallPills[toolCallId]
-                    parts[toolCallId] = MessagePart.ToolCall(
-                        pill = existingPill?.copy(status = status, output = truncatedOutput ?: existingPill.output)
-                            ?: ToolCallPill(toolCallId = toolCallId, toolName = "tool", title = "tool", kind = ToolKind.OTHER, status = status, output = truncatedOutput),
-                        state = newPartState
-                    )
-                }
-                msg.copy(parts = parts)
+        val targetMsgId = ctx.toolCallIndex[toolCallId]
+        // If the tool call was evicted (message exceeded MAX_MESSAGE_HISTORY),
+        // don't fall back to activeMessageId — that would misroute the result
+        // to the wrong message. Log and skip instead.
+        if (targetMsgId == null) {
+            logger.warn { "[ACP] updateToolCallStatus: toolCallId=$toolCallId not in index (evicted?) — skipping to avoid misrouting to activeMessageId" }
+            return@withLock
+        }
+        updateMessage(targetMsgId) { msg ->
+            val parts = LinkedHashMap(msg.parts)
+            val existing = parts[toolCallId]
+            if (existing is MessagePart.ToolCall) {
+                parts[toolCallId] = existing.copy(
+                    pill = existing.pill.copy(status = status, output = truncatedOutput ?: existing.pill.output),
+                    state = newPartState
+                )
+            } else {
+                // Fallback: try to use pill from ctx.toolCallPills (has proper kind/title)
+                val existingPill = ctx.toolCallPills[toolCallId]
+                parts[toolCallId] = MessagePart.ToolCall(
+                    pill = existingPill?.copy(status = status, output = truncatedOutput ?: existingPill.output)
+                        ?: ToolCallPill(toolCallId = toolCallId, toolName = "tool", title = "tool", kind = ToolKind.OTHER, status = status, output = truncatedOutput),
+                    state = newPartState
+                )
             }
+            msg.copy(parts = parts)
         }
         val pill = ctx.toolCallPills[toolCallId]
         if (pill != null) {
@@ -558,8 +582,10 @@ class SessionState(
         // Cancel jobs (cooperative — they stop at next suspension point).
         // Close channel (non-blocking — prevents new events from being enqueued).
         // Complete responseDeferred unconditionally (prevents sendMutex leak).
-        if (closed) return
-        closed = true
+        stateLock.withLock {
+            if (closed) return@withLock
+            closed = true
+        }
         eventProcessingJob?.cancel()
         eventProcessingJob = null
         resegmentJob?.cancel()
@@ -1398,16 +1424,45 @@ class SessionState(
                     }
                     msg.copy(parts = parts, isStreaming = ctx.isStreaming)
                 }
+                val realToolName = ctx.toolCallPills[event.toolCallId]?.toolName ?: event.action
                 val prompt = PermissionPrompt(
                     sessionId = sessionId,
                     permissionId = event.permissionId,
                     toolCallId = event.toolCallId,
-                    toolName = event.action,
+                    toolName = realToolName,
                     description = event.description,
                     patterns = event.patterns
                 )
                 setPendingPermissionPrompt(prompt)
                 _signals.tryEmit(UiSignal.PermissionRequested(prompt))
+            }
+
+            is SseEvent.PermissionReplied -> {
+                // Only clear hasPendingPermission when the reply matches the current
+                // pending permission. A stale permission.replied for a PREVIOUS
+                // permission must NOT clear the flag for a DIFFERENT, still-pending
+                // permission — that would make the session eligible for cache eviction
+                // while a prompt is still active, and clear the _pendingPermission
+                // StateFlow so the UI loses the prompt on session switch/restore.
+                val currentPermId = _pendingPermission.value?.permissionId
+                if (currentPermId == null || currentPermId == event.permissionId) {
+                    setPendingPermission(false)
+                }
+                if (currentPermId == event.permissionId) {
+                    // Reply matches the current pending permission — emit signal so the
+                    // ViewModel clears the prompt and surfaces any error notification.
+                    _signals.tryEmit(UiSignal.PermissionReplied(
+                        permissionId = event.permissionId,
+                        reply = event.reply,
+                        sessionId = sessionId,
+                    ))
+                } else if (currentPermId == null) {
+                    // Reply for an already-resolved permission (timeout or user response).
+                    // setPendingPermission(false) above is idempotent. Do NOT emit the
+                    // signal — a stale reply must not trigger spurious ViewModel notifications.
+                    logger.debug { "[ACP] permission.replied for already-resolved permission: permissionId=${event.permissionId}, reply=${event.reply} — signal suppressed" }
+                }
+                logger.info { "[ACP] permission.replied received: permissionId=${event.permissionId}, reply=${event.reply}, currentPermId=$currentPermId, cleared=${currentPermId == null || currentPermId == event.permissionId}" }
             }
 
             // ── Stop ─────────────────────────────────────────────────────
@@ -1440,28 +1495,24 @@ class SessionState(
                         // We're streaming but haven't received the server message ID yet.
                         // This MessageFinalized event carries it — adopt it.
                         //
-                        // GUARD (resolved): Only adopt if NO SSE content events have been
-                        // received yet for this turn (firstTextChunkReceived == false AND
-                        // toolCallPills is empty). If content has been received but
-                        // activeServerMessageId is still null, the HTTP response will set
-                        // it via updateServerMessageId() — adopting a stale
-                        // MessageFinalized here would cause subsequent events for the real
-                        // message to be skipped. Log a warning and skip in that case.
-                        // WARNING: This adoption is unconditional. If a stale MessageFinalized from a
-                        // previous turn arrives late (SSE reordering), it would be adopted as the current
-                        // message's server ID, causing subsequent events for the real message to be skipped.
-                        // The updateServerMessageId() path (line ~478) logs a mismatch warning when the
-                        // HTTP response arrives with a different ID — that's the safety net.
-                        if (!ctx.firstTextChunkReceived && ctx.toolCallPills.isEmpty()) {
-                            logger.warn { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${ctx.activeMessageId} (activeServerId was null, no content yet) — verify this matches the HTTP response" }
-                            ctx.activeServerMessageId = serverMsgId
-                        } else {
-                            // Content already received but activeServerMessageId is still null —
-                            // the HTTP response will set it. Skip adoption to avoid a stale
-                            // MessageFinalized hijacking the turn's server ID.
-                            logger.warn { "[ACP] MessageFinalized: skipping adoption of serverMsgId=$serverMsgId — content already received (firstText=${ctx.firstTextChunkReceived}, pills=${ctx.toolCallPills.size}), HTTP response will set activeServerMessageId" }
-                            return
-                        }
+                        // The previous guard (only adopt if NO content received yet) caused
+                        // a stuck-streaming bug: when TextChunks arrived before the HTTP
+                        // response set activeServerMessageId, MessageFinalized was dropped
+                        // and finalizeStreaming() never fired — the UI stayed streaming
+                        // forever. The HTTP response may arrive late or not at all (e.g.
+                        // when the server aborts the session after a child task error).
+                        //
+                        // SAFE ADOPTION: If content events (TextChunks) have already been
+                        // processed with eventServerId == serverMsgId, this is definitively
+                        // the active message — adopt unconditionally. The stale-event
+                        // concern (a late MessageFinalized from a previous turn) is
+                        // mitigated by the fact that TextChunks for the CURRENT turn carry
+                        // the same eventServerId — if they're being processed into this
+                        // message, the MessageFinalized with the same ID belongs here.
+                        // The updateServerMessageId() path (line ~478) logs a mismatch
+                        // warning when the HTTP response arrives with a different ID.
+                        logger.warn { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${ctx.activeMessageId} (activeServerId was null, firstText=${ctx.firstTextChunkReceived}, pills=${ctx.toolCallPills.size}) — content events prove this is the active message" }
+                        ctx.activeServerMessageId = serverMsgId
                     } else {
                         logger.debug { "[ACP] MessageFinalized for non-active message $serverMsgId — skipping (activeLocal=${ctx.activeMessageId}, activeServer=${ctx.activeServerMessageId})" }
                         return
@@ -1701,6 +1752,7 @@ class SessionState(
             // set _streamPhase=IDLE while the new message is actively streaming.
             logger.info { "[ACP] finalizeStreaming (new_message): immediate finalization (no debounce, no StreamingCompleted)" }
             stateLock.withLock {
+                ctx.isStreaming = false
                 updateMessage(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
                 // Complete the old turn's responseDeferred so sendMessageInternal unblocks.
                 // Don't emit StreamingCompleted — the new message's completion will handle
