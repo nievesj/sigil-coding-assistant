@@ -408,9 +408,6 @@ class SessionState(
                 iter.remove()
                 toRemove--
             }
-            // Reset thinking phase index when evicting to prevent unbounded growth.
-            // The index is only meaningful within the current message context.
-            ctx.thinkingPhaseIndex = 0
         }
         _messages.value = current
         logger.info { "[ACP] addMessage: id=${message.id}, role=${message.role}, mapSize=${current.size}" }
@@ -429,6 +426,7 @@ class SessionState(
             entry.value.parts.values.filterIsInstance<MessagePart.ToolCall>().forEach { part ->
                 ctx.toolCallIndex.remove(part.pill.toolCallId)
                 ctx.toolCallPills.remove(part.pill.toolCallId)
+                ctx.toolPartStates.remove(part.pill.toolCallId)
             }
             current.remove(entry.key)
             _messages.value = current
@@ -536,16 +534,21 @@ class SessionState(
         if (pill != null) {
             ctx.toolCallPills[toolCallId] = pill.copy(status = pillStatus)
         }
-        val targetMsgId = ctx.toolCallIndex[toolCallId] ?: ctx.activeMessageId
-        if (targetMsgId != null) {
-            updateMessage(targetMsgId) { msg ->
-                val parts = LinkedHashMap(msg.parts)
-                val existing = parts[toolCallId]
-                if (existing is MessagePart.ToolCall) {
-                    parts[toolCallId] = existing.copy(state = state)
-                }
-                msg.copy(parts = parts)
+        val targetMsgId = ctx.toolCallIndex[toolCallId]
+        // If the tool call was evicted (message exceeded MAX_MESSAGE_HISTORY),
+        // don't fall back to activeMessageId — that would misroute the result
+        // to the wrong message. Log and skip instead, matching updateToolCallStatus.
+        if (targetMsgId == null) {
+            logger.warn { "[ACP] setToolPartState: toolCallId=$toolCallId not in index (evicted?) — skipping to avoid misrouting to activeMessageId" }
+            return@withLock
+        }
+        updateMessage(targetMsgId) { msg ->
+            val parts = LinkedHashMap(msg.parts)
+            val existing = parts[toolCallId]
+            if (existing is MessagePart.ToolCall) {
+                parts[toolCallId] = existing.copy(state = state)
             }
+            msg.copy(parts = parts)
         }
     }
 
@@ -808,6 +811,11 @@ class SessionState(
             || event is SseEvent.Snapshot || event is SseEvent.AssistantFile
             || event is SseEvent.AssistantImage
         val needsNewMessage = when {
+            // ToolResult for a known tool call (in toolCallIndex) belongs to a previous
+            // turn's message — don't auto-create a new message. The ToolResult handler
+            // routes via toolCallIndex. This prevents a spurious third message when a
+            // child task completes after the user steered/sent a follow-up.
+            event is SseEvent.ToolResult && ctx.toolCallIndex.containsKey(event.toolCallId) -> false
             ctx.activeMessageId == null && isContentEvent -> true // No streaming context at all
             eventServerId != null && eventServerId != ctx.activeMessageId && eventServerId != ctx.activeServerMessageId -> {
                 // If activeServerMessageId is null, we're still waiting for the HTTP
@@ -1386,8 +1394,15 @@ class SessionState(
                         metadata = event.metadata,
                     )
                     ctx.toolCallPills[event.toolCallId] = newPill
-                    ctx.toolCallIndex[event.toolCallId] = msgId
-                    updateMessage(msgId) { msg ->
+                    // Route to the original message if toolCallIndex has it (late result
+                    // after a turn reset cleared toolCallPills but preserved toolCallIndex).
+                    // Fall back to msgId only if the tool call was never registered.
+                    val existing = ctx.toolCallIndex[event.toolCallId]
+                    val targetMsgId = existing ?: msgId
+                    if (existing == null) {
+                        ctx.toolCallIndex[event.toolCallId] = msgId
+                    }
+                    updateMessage(targetMsgId) { msg ->
                         val parts = LinkedHashMap(msg.parts)
                         parts[event.toolCallId] = MessagePart.ToolCall(pill = newPill, state = if (event.isError) PartState.Failed(event.content?.toString() ?: "Tool error") else PartState.Completed)
                         msg.copy(parts = parts, isStreaming = ctx.isStreaming)
@@ -1412,7 +1427,11 @@ class SessionState(
                 if (existingPill != null) {
                     ctx.toolCallPills[event.toolCallId] = existingPill.copy(status = ToolCallStatus.PENDING)
                 }
-                val targetMsgId = ctx.toolCallIndex[event.toolCallId] ?: msgId
+                val targetMsgId = ctx.toolCallIndex[event.toolCallId]
+                if (targetMsgId == null) {
+                    logger.warn { "[ACP] Permission: toolCallId=${event.toolCallId} not in index (evicted?) — skipping to avoid misrouting to activeMessageId" }
+                    return
+                }
                 updateMessage(targetMsgId) { msg ->
                     val parts = LinkedHashMap(msg.parts)
                     val existing = parts[event.toolCallId]
@@ -1711,6 +1730,12 @@ class SessionState(
             return
         }
 
+        // NOTE: This function must ONLY be called from the event processing coroutine
+        // (the single writer for ctx fields). The initial isStreaming check and the
+        // freezeCurrentThinking/flushRevealBuffer calls run WITHOUT stateLock because
+        // they mutate ctx fields that are owned by this coroutine. The lock is acquired
+        // later inside resegmentTextPartsDirect and in the debounced/idle/new_message
+        // branches. Adding a concurrent writer would break this invariant.
         freezeCurrentThinking()
         flushRevealBuffer()
         val partsBefore = _messages.value[msgId]?.parts?.keys?.filter { it.startsWith("text_") || it.startsWith("code_") || it.startsWith("table_") || it.startsWith("task_") }?.toSet()
@@ -2015,7 +2040,12 @@ class SessionState(
                         !entry.key.startsWith("text_") && !entry.key.startsWith("code_") &&
                             !entry.key.startsWith("table_") && !entry.key.startsWith("task_")
                     }
-                    ctx.textSegments[0].anchorKey = lastNonTextEntry?.key
+                    val anchorKey = lastNonTextEntry?.key
+                    if (anchorKey != null) {
+                        // Replace the element instead of mutating it in place —
+                        // anchorKey is now a val, so we create a new TextSegment.
+                        ctx.textSegments[0] = TextSegment(ctx.textSegments[0].startOffset, anchorKey)
+                    }
                     msg
                 }
             }
@@ -2023,7 +2053,7 @@ class SessionState(
             // Snapshot after anchor setup — iteration below uses this snapshot
             // to avoid races with the event processing coroutine that may mutate ctx.textSegments.
             // NOTE: This snapshot is taken AFTER the anchor-setup updateMessage call above
-            // (lines ~1848-1857), so it reflects the anchor key mutation. No fix needed —
+            // (lines ~2023-2032), so it reflects the anchor key replacement. No fix needed —
             // segmentsSnapshot is taken after anchor setup; no fix needed. (False positive.)
             val segmentsSnapshot = ctx.textSegments.toList()
 

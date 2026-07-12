@@ -1167,16 +1167,21 @@ class ChatViewModel(
 
     private fun startPermissionTimeout() {
         val toolName = _permissionPrompt.value?.toolName ?: ""
+        // Capture permissionId at START time, not at fire time.
+        // If a new permission prompt arrives before this timeout fires, the
+        // callback must NOT clear the new prompt — only the one it was started for.
+        val capturedPermId = _permissionPrompt.value?.permissionId ?: ""
         service.permissionManager.startPermissionTimeout(
             timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds,
             toolName = toolName,
         ) {
-            // Emit a PermissionTimedOut signal instead of silently clearing
-            val permId = _permissionPrompt.value?.permissionId ?: ""
-            val sid = _permissionPrompt.value?.sessionId ?: ""
-            _permissionPrompt.value = null
+            // Only clear the prompt if it's still the one we were started for.
+            // A newer prompt may have replaced this one before the timeout fired.
+            if (_permissionPrompt.value?.permissionId == capturedPermId) {
+                _permissionPrompt.value = null
+            }
             OpenCodeNotifications.notifyPermissionTimedOut(project, toolName)
-            logger.info { "[ACP] Permission timed out: permissionId=$permId, tool=$toolName" }
+            logger.info { "[ACP] Permission timed out: permissionId=$capturedPermId, tool=$toolName" }
         }
     }
 
@@ -1574,30 +1579,30 @@ class ChatViewModel(
         }
     }
 
-    /** Trigger a VFS refresh AND a direct disk re-read so the [ReviewCommentManager]
+    /** Trigger a direct disk re-read so the [ReviewCommentManager]
      *  picks up any new `.review/` JSON files written by the LLM agent.
      *
-     *  Two paths:
-     *  1. `asyncRefresh(null)` — triggers VFS discovery → AsyncFileListener re-reads
-     *     changed files incrementally. Fire-and-forget; may miss newly-created
-     *     `.review/` subdirectories.
-     *  2. `loadAll()` — reads ALL `.review/` files from disk via
-     *     `java.nio.file.Files.walk()`, bypassing VFS. Reliable but O(all-files).
-     *     Runs on ReviewCommentManager's internal scope (non-blocking).
+     *  `loadAll()` reads ALL `.review/` files from disk via
+     *  `java.nio.file.Files.walk()`, bypassing VFS entirely. This is reliable
+     *  even if VFS hasn't discovered a newly-created `.review/` subdirectory.
+     *  Runs on ReviewCommentManager's internal scope (non-blocking).
      *
-     *  Without this, gutter icons and highlights don't appear after `/review-perform`
-     *  until the user manually refreshes (Ctrl+Alt+Y) or restarts the IDE. */
+     *  NOTE: The previous secondary path (`VirtualFileManager.asyncRefresh(null)`)
+     *  was removed because it triggers a VFS refresh on a platform background
+     *  coroutine, which acquires a write intent via the suspend
+     *  `runWriteActionWithCheckInWriteIntent` API. On IntelliJ 2026.2, the
+     *  platform's `beforeWriteActionStart` callback fires on that background
+     *  thread, where `TrafficLightRenderer.getErrorCounts` →
+     *  `CodeInsightContextManagerImpl.getPreferredContext` tries to read editor
+     *  context without wrapping in a read action — causing a
+     *  `RuntimeExceptionWithAttachments: Read access is allowed from inside
+     *  read-action only`. This is a platform bug, but `asyncRefresh` was the
+     *  only background write-action trigger from our plugin, so removing it
+     *  eliminates the crash. The AsyncFileListener still fires for VFS events
+     *  from other sources (user edits, git operations, manual refresh). */
     private fun refreshReviewFiles(): kotlinx.coroutines.Job {
-        // 1. Direct disk re-read — reads ALL .review/ files via java.nio.file.Files.walk(),
-        // bypassing VFS entirely. This is the reliable primary path: even if VFS hasn't
-        // discovered a newly-created .review/ subdirectory, loadAll() still picks it up.
-        // Runs on ReviewCommentManager's internal scope (Dispatchers.Default) — non-blocking.
         val manager = com.opencode.acp.review.ReviewCommentManager.getInstance(project)
-        val job = manager.scope.launch { manager.loadAll() }
-        // 2. Trigger VFS refresh so the ReviewCommentFileWatcher's AsyncFileListener
-        // can do incremental re-reads for any later changes (secondary path).
-        com.intellij.openapi.vfs.VirtualFileManager.getInstance().asyncRefresh(null)
-        return job
+        return manager.scope.launch { manager.loadAll() }
     }
 
     /** Get messages StateFlow for a child session (used by ToolPill for task pills). */
@@ -1619,6 +1624,14 @@ class ChatViewModel(
         // (which also writes settings.commandHistory from EDT). Using `settings` as the
         // monitor could block the EDT if a background coroutine holds it; the dedicated
         // lock avoids coupling EDT blocking to settings object monitor contention.
+        //
+        // Threading note: settings.commandHistory is a PersistentStateComponent field
+        // written here from a background coroutine and read from EDT (settings panel).
+        // This is safe because ArrayList reference assignment is atomic on the JVM
+        // (reference writes are atomic per JLS §17.7). The EDT reader may see a stale
+        // value but never a partially-written list. Using invokeLater for the write would
+        // add EDT round-trip latency to every send — the reference-atomicity tradeoff is
+        // intentional. Do NOT change to invokeLater without measuring the latency impact.
         synchronized(commandHistoryLock) {
             val current = _commandHistory.value.toMutableList()
             // Compute the new file lists once outside removeAll to avoid creating
@@ -1718,8 +1731,9 @@ class ChatViewModel(
         // collecting (replay=0 SharedFlow drops the signal).
         childPermissionTimeoutJobs.values.forEach { it.cancel() }
         childPermissionTimeoutJobs.clear()
-        // Clear child permission prompts to prevent stale StateFlow values lingering
+        // Clear permission prompts to prevent stale StateFlow values lingering
         // in the old ViewModel after tool window recreation/disposal.
+        _permissionPrompt.value = null
         _childPermissionPrompts.value = emptyMap()
     }
 
