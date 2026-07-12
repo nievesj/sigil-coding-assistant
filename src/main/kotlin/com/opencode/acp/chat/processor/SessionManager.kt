@@ -173,6 +173,7 @@ class SessionManager(
     internal val pressureMonitor = ContextPressureMonitor()
 
     /** Pre-computes compaction summaries in the background for instant swap. */
+    @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     internal var backgroundCompactor: BackgroundCompactor? = null
         private set
 
@@ -192,6 +193,7 @@ class SessionManager(
         OpenCodeSettingsState.getInstance().enableBackgroundCompaction
 
     /** Creates or recreates the BackgroundCompactor with current settings. */
+    @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     private fun createBackgroundCompactor(): BackgroundCompactor {
         val settings = OpenCodeSettingsState.getInstance()
         return BackgroundCompactor(
@@ -240,6 +242,7 @@ class SessionManager(
      *  before loadSessions() refreshes _childSessionMap is still recognized via
      *  this set (populated on session creation and in loadSessions()). */
     private val _knownChildSessionIds = MutableStateFlow<Set<String>>(emptySet())
+    val knownChildSessionIds: StateFlow<Set<String>> = _knownChildSessionIds.asStateFlow()
 
     /** Reverse index: child session ID → parent session ID. O(1) child→parent lookup.
      *  Populated from [loadSessions] (snapshot). Real-time population from Subtask
@@ -363,6 +366,9 @@ class SessionManager(
                         is UiSignal.SessionIdle -> {
                             // Fallback trigger — SessionIdle also indicates completion
                             // (the new_message path doesn't always emit StreamingCompleted).
+                            // Remove from streaming set (same as StreamingCompleted — SessionIdle
+                            // is a completion signal and the new_message path may not emit StreamingCompleted).
+                            _streamingSessionIds.update { it - sessionId }
                             // Set add is idempotent, so redundant calls are harmless.
                             if (sessionId in _knownChildSessionIds.value) {
                                 markChildSessionComplete(sessionId)
@@ -522,12 +528,7 @@ class SessionManager(
                                     java.io.File(dir).canonicalPath
                                 } catch (_: Exception) { return@filter false }
                                 canonicalDir == canonicalBase ||
-                                    // Dual-separator check: the server may return paths with
-                                    // either the platform separator (File.separator, e.g. "\" on
-                                    // Windows) or "/" (POSIX). Both are checked to avoid false
-                                    // negatives on cross-platform server/client setups.
-                                    canonicalDir.startsWith(canonicalBase + java.io.File.separator) ||
-                                    canonicalDir.startsWith(canonicalBase + "/")
+                                    canonicalDir.startsWith(canonicalBase + java.io.File.separator)
                             }
                         }
                         if (filtered.isNotEmpty()) {
@@ -623,8 +624,15 @@ class SessionManager(
         // Wrapped in try/catch so archive can proceed even if the session list
         // refresh fails — the descendants collection will be empty, but direct
         // deletion of the target still works.
-        try { loadSessions() } catch (e: CancellationException) { throw e } catch (e: Exception) {
-            logger.warn(e) { "[ACP] archiveSession: loadSessions failed, proceeding with direct deletion" }
+        var sessionsLoaded = false
+        try { loadSessions(); sessionsLoaded = true } catch (e: CancellationException) { throw e } catch (e: Exception) {
+            logger.error(e) { "[ACP] archiveSession: loadSessions failed — child sessions may be orphaned if not already in _childSessionMap" }
+        }
+        if (!sessionsLoaded) {
+            // Retry once — stale _childSessionMap can cause orphaned children
+            try { loadSessions() } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                logger.warn(e) { "[ACP] archiveSession: loadSessions retry also failed — proceeding with stale data" }
+            }
         }
 
         val descendants = collectDescendants(targetSessionId)
@@ -665,7 +673,12 @@ class SessionManager(
         try {
             if (_activeSessionId.value in allIdsToDelete) {
                 val next = sessionsLock.withLock {
-                    sessions.keys.firstOrNull { it !in allIdsToDelete }
+                    // Select the most recently used surviving session (by lastAccessTime)
+                    // instead of arbitrary LinkedHashMap iteration order
+                    sessions.entries
+                        .filter { it.key !in allIdsToDelete }
+                        .maxByOrNull { it.value.lastAccessTime }
+                        ?.key
                 }
                 if (next != null && sessionsLock.withLock { sessions.containsKey(next) }) {
                     switchSession(next)
@@ -708,17 +721,46 @@ class SessionManager(
     suspend fun clearAllSessions(): ClearAllResult {
         val c = client ?: return ClearAllResult.Failed("Client not initialized")
         val currentId = _activeSessionId.value
+
+        // Refresh the session list before collecting descendants. _childSessionMap
+        // is only updated by loadSessions(), so children created via SSE auto-cache
+        // since the last loadSessions() would be missed by collectDescendants().
+        // This one extra HTTP call ensures the parent→child map is current.
+        // Wrapped in try/catch so clear-all can proceed even if the session list
+        // refresh fails — the descendants collection will be empty, but direct
+        // deletion of top-level sessions still works.
+        try { loadSessions() } catch (e: CancellationException) { throw e } catch (e: Exception) {
+            logger.error(e) { "[ACP] clearAllSessions: loadSessions failed — child sessions may be orphaned" }
+        }
+
+        // Re-read the loaded state AFTER loadSessions() so we use fresh data
+        // (the state may have changed from the refresh above).
         val loaded = _sessionListState.value as? SessionListState.Loaded
             ?: return ClearAllResult.Failed("Sessions not loaded")
 
-        val toDelete = loaded.sessions.filter { it.id != currentId }
-        if (toDelete.isEmpty()) return ClearAllResult.Success(0)
+        val directDelete = loaded.sessions.filter { it.id != currentId }
+        // Collect descendants for each session to prevent orphaning children
+        // (the server does NOT cascade-delete children)
+        val toDelete = mutableListOf<SessionItem>()
+        // Build a map for O(1) lookup instead of O(n) find per descendant
+        val sessionMap = loaded.sessions.associateBy { it.id }
+        for (session in directDelete) {
+            toDelete.add(session)
+            val descendants = collectDescendants(session.id)
+            for (descId in descendants) {
+                sessionMap[descId]?.let { toDelete.add(it) }
+            }
+        }
+        // Deduplicate in case a child appears both directly and as a descendant
+        val seen = mutableSetOf<String>()
+        val uniqueToDelete = toDelete.filter { seen.add(it.id) }
+        if (uniqueToDelete.isEmpty()) return ClearAllResult.Success(0)
 
         var deleted = 0
         var failed = 0
-        _clearAllProgress.value = ClearAllState.InProgress(0, toDelete.size)
+        _clearAllProgress.value = ClearAllState.InProgress(0, uniqueToDelete.size)
         try {
-            for (sessionItem in toDelete) {
+            for (sessionItem in uniqueToDelete) {
                 try {
                     val ok = c.deleteSession(sessionItem.id)
                     if (ok) {
@@ -730,7 +772,7 @@ class SessionManager(
                         }
                         evictedState?.close()
                         deleted++
-                        _clearAllProgress.value = ClearAllState.InProgress(deleted, toDelete.size)
+                        _clearAllProgress.value = ClearAllState.InProgress(deleted, uniqueToDelete.size)
                     } else {
                         failed++
                         logger.warn { "DELETE /session/${sessionItem.id} returned false during clear-all" }
@@ -765,6 +807,12 @@ class SessionManager(
                 if (event.sessionId == _activeSessionId.value) {
                     _globalSignals.tryEmit(UiSignal.SessionIdle(event.sessionId))
                 }
+                // Also emit to _allSessionSignals so the collector's SessionIdle
+                // branch fires as a fallback — removes the session from
+                // _streamingSessionIds even if StreamingCompleted was lost (e.g.
+                // signalForwardJob cancelled, streamingCompletedEmitted guard blocked,
+                // or ctx.isStreaming was already false when the backstop checked).
+                _allSessionSignals.tryEmit(event.sessionId to UiSignal.SessionIdle(event.sessionId))
                 // NOTE: The child-session backstop that previously finalized the
                 // parent when a child went idle has been REMOVED. It caused premature
                 // "Response Complete" notifications because a child session going idle
@@ -896,7 +944,13 @@ class SessionManager(
                     if (mayBelongToProject && cacheHasRoom) {
                         logger.info { "[ACP] Auto-caching session $sessionId from SSE event" }
                         ensureSessionCached(sessionId)
+                        // Re-check: ensureSessionCached may have evicted a useful session.
+                        // If the cache was at capacity and this session isn't the active or
+                        // known child, skip caching to avoid evicting useful sessions.
                         state = sessionsLock.withLock { sessions[sessionId] }
+                        if (state == null) {
+                            logger.debug { "[ACP] Auto-cache for session $sessionId failed — cache at capacity after race" }
+                        }
                     } else if (!cacheHasRoom) {
                         logger.debug { "[ACP] Skipping auto-cache for session $sessionId — cache at capacity" }
                     } else {
@@ -1074,11 +1128,30 @@ class SessionManager(
             logger.info { "[ACP] ensureSessionCached: adopted message ${lastAssistant.info.id} for session $sessionId" }
         }
 
+        val evictedAfterInsert = mutableListOf<SessionState>()
         sessionsLock.withLock {
             val existing = sessions.putIfAbsent(sessionId, state)
             if (existing != null) {
                 state.close()
             } else {
+                // Re-check capacity under lock to prevent race with concurrent auto-cache:
+                // the pre-fetch `cacheHasRoom` check in processEvent acquires the lock
+                // separately, so the cache could fill between that check and this put.
+                // Evict here (under the lock) to keep the cache bounded. We collect
+                // evicted states and close them outside the lock to avoid blocking
+                // other lock waiters on state.close() (which cancels coroutines).
+                while (sessions.size > MAX_CACHED_SESSIONS) {
+                    val lru = sessions.entries
+                        .filter { it.key != _activeSessionId.value
+                                && it.key != sessionId
+                                && !it.value.isStreaming
+                                && !it.value.hasPendingPermission
+                                && it.key !in _childPendingPermissions.value }
+                        .minByOrNull { it.value.lastAccessTime }
+                        ?: break
+                    evictedAfterInsert.add(lru.value)
+                    sessions.remove(lru.key)
+                }
                 _sessionCachedFlow.tryEmit(sessionId)
                 // Track child sessions for fast-completion detection.
                 // parentID is not available here (SSE context), so check if
@@ -1088,6 +1161,11 @@ class SessionManager(
                 }
             }
             sessionsSnapshot = sessions.values.toList()
+        }
+        // Close evicted states outside the lock (cancels coroutines, closes channels).
+        evictedAfterInsert.forEach {
+            it.close()
+            logger.debug { "[ACP] Evicted session from cache (capacity re-check in ensureSessionCached)" }
         }
     }
 
@@ -1514,6 +1592,7 @@ class SessionManager(
      * Reset smart-context state on session switch.
      * Called from [switchSession] and [createAndSwitchSession].
      */
+    @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     suspend fun resetSmartContextState() {
         BreakdownComputer.resetCalibration()
         pressureMonitor.reset()
@@ -1525,6 +1604,7 @@ class SessionManager(
      * Handle server-side compaction: reset pressure monitor and clear background checkpoint.
      * Called when the `session.compacted` SSE event fires.
      */
+    @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     suspend fun onSessionCompacted() {
         pressureMonitor.onCompaction()
         backgroundCompactor?.clearCheckpoint()
@@ -1540,6 +1620,7 @@ class SessionManager(
     }
 
     /** Whether the background compactor has a valid checkpoint for the active session. */
+    @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     fun isCheckpointReady(): Boolean {
         val sessionId = _activeSessionId.value ?: return false
         val context = _sessionContextState.value

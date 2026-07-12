@@ -272,6 +272,13 @@ sealed interface ConnectionErrorReason {
     /** Connection lost after successful init (reconnection failure). */
     data class ReconnectionFailed(val detail: String?) : ConnectionErrorReason
     /**
+     * The server became permanently unreachable after repeated SSE reconnection
+     * attempts (circuit breaker tripped). The server may be down, the port may
+     * be blocked, or the process may have been killed externally.
+     */
+    data object ServerUnreachable : ConnectionErrorReason
+
+    /**
      * Any other connection failure not covered above.
      *
      * Currently unused (no call site constructs this), but retained for future

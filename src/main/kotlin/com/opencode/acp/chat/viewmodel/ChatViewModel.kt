@@ -59,6 +59,8 @@ class ChatViewModel(
     val streamingSessionIds: StateFlow<Set<String>> = service.streamingSessionIds
     val pendingCreationSessionIds: StateFlow<Set<String>> = service.pendingCreationSessionIds
     val hiddenChildSessionIds: StateFlow<Set<String>> = service.hiddenChildSessionIds
+    val knownChildSessionIds: StateFlow<Set<String>> = service.knownChildSessionIds
+    val childToParent: StateFlow<Map<String, String>> = service.childToParent
     val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = service.sessionCachedFlow
 
     // --- UI-specific state ---
@@ -139,6 +141,11 @@ class ChatViewModel(
      *  the ConcurrentHashMap provides a safety net against data races. */
     private val queueRetryCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
+    /** Next-allowed-retry timestamp (ms) per queued message id. Enforces RETRY_DELAY_MS
+     *  before the next send attempt, not after the re-queue, so consecutive failures
+     *  cannot bypass the retry delay. */
+    private val nextRetryTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
     private val _readyState = MutableStateFlow(ReadyState.NOT_STARTED)
     val readyState: StateFlow<ReadyState> = _readyState.asStateFlow()
 
@@ -206,6 +213,24 @@ class ChatViewModel(
         }
         state
     }.stateIn(scope, SharingStarted.WhileSubscribed(5_000), ChatInputState.Disabled)
+
+    /** True when the active session is a sub-task/child session (parentID != null).
+     *  Used to disable the input area — sub sessions are agent-only. */
+    val isActiveSessionChild: StateFlow<Boolean> = combine(
+        service.activeSessionId,
+        knownChildSessionIds,
+    ) { activeId, knownChildren ->
+        activeId != null && activeId in knownChildren
+    }.stateIn(scope, SharingStarted.WhileSubscribed(5_000), false)
+
+    /** Parent session ID of the active session, or null if the active session is not a child.
+     *  Used for the "Back to parent" button in the sub-session banner. */
+    val activeSessionParentId: StateFlow<String?> = combine(
+        service.activeSessionId,
+        childToParent,
+    ) { activeId, childToParentMap ->
+        activeId?.let { childToParentMap[it] }
+    }.stateIn(scope, SharingStarted.WhileSubscribed(5_000), null)
 
     private val _fileChangeSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val fileChangeSignal: SharedFlow<Unit> = _fileChangeSignal.asSharedFlow()
@@ -319,11 +344,11 @@ class ChatViewModel(
                         // for the edge case where StreamingCompleted was already emitted
                         // (streamingCompletedEmitted guard) and the phase is stuck.
                         //
-                        // Only reset phase for errors on the ACTIVE session — errors on
-                        // child/subagent sessions should not affect the input area state.
-                        if (signal.sessionId == service.sessionId) {
-                            _streamPhase.value = StreamPhase.IDLE
-                        }
+                        // Reset phase for any session error — the signal carries the
+                        // sessionId that errored. Using service.sessionId (mutable) here
+                        // could miss the reset if the user switched sessions between
+                        // signal emission and this handler. Resetting is idempotent.
+                        _streamPhase.value = StreamPhase.IDLE
                         // Always remove the specific session from shimmer (not just active)
                         service.removeStreamingSession(signal.sessionId)
                         logger.warn { "[ACP] ViewModel received session error: session=${signal.sessionId}, error=${signal.errorMessage}" }
@@ -360,7 +385,8 @@ class ChatViewModel(
                             // silently clearing (TDD §4.2.4 error handling).
                             if (signal.sessionId in failedPermissionPostSessions) {
                                 OpenCodeNotifications.notifyPermissionProcessedDespiteError(project, signal.sessionId)
-                                failedPermissionPostSessions.remove(signal.sessionId)
+                                // Remove AFTER the reject check below — the reject cascade
+                                // needs to know about the failed POST for notification.
                             }
                             if (signal.reply == "reject") {
                                 // Cascade: server rejects all pending permissions in the session
@@ -384,6 +410,8 @@ class ChatViewModel(
                                     }
                                 }
                             }
+                            // Now safe to remove — notification has been shown and reject cascade is done
+                            failedPermissionPostSessions.remove(signal.sessionId)
                         }
                     }
                     is UiSignal.PermissionTimedOut -> {
@@ -406,16 +434,18 @@ class ChatViewModel(
                                 // tool window disposal — the server's Deferred promises must be
                                 // resolved even if the user closes the tool window.
                                 service.scope.launch {
-                                    pending.forEach { p ->
-                                        try {
-                                            service.permissionManager.respondPermission(
-                                                p.permissionId, p.toolCallId, signal.sessionId,
-                                                PermissionResponse.REJECT_ONCE,
-                                            )
-                                        } catch (e: kotlinx.coroutines.CancellationException) {
-                                            throw e
-                                        } catch (e: Exception) {
-                                            logger.warn(e) { "[ACP] Timeout reject failed for permission ${p.permissionId}" }
+                                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                                        pending.forEach { p ->
+                                            try {
+                                                service.permissionManager.respondPermission(
+                                                    p.permissionId, p.toolCallId, signal.sessionId,
+                                                    PermissionResponse.REJECT_ONCE,
+                                                )
+                                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                                throw e
+                                            } catch (e: Exception) {
+                                                logger.warn(e) { "[ACP] Timeout reject failed for permission ${p.permissionId}" }
+                                            }
                                         }
                                     }
                                 }
@@ -490,6 +520,10 @@ class ChatViewModel(
         // initialize() call acquires it.
         if (!initMutex.tryLock()) {
             logger.warn { "[ACP] initialize() already in progress — user click acknowledged but deduplicated (current readyState=${_readyState.value})" }
+            // NOTE: The user gets no UI feedback that their click was deduplicated.
+            // The Connect button should be disabled while init is in progress.
+            // This is a known UX limitation — the connectionObserverJob will re-trigger
+            // on the next CONNECTED event if the first attempt fails.
             return
         }
 
@@ -966,6 +1000,7 @@ class ChatViewModel(
             if (count > 0) {
                 _queuedMessages.value = emptyList()
                 queueRetryCounts.clear()
+                nextRetryTime.clear()
                 logger.info { "[ACP] clearQueue: cleared $count queued messages" }
             }
         }
@@ -992,6 +1027,17 @@ class ChatViewModel(
             _queuedMessages.value = queue.drop(1)
         }
         if (next == null) return@withLock
+        // Enforce retry delay BEFORE sending, not after re-queue. Without this,
+        // a re-queued message would be re-sent immediately on the next drainQueue
+        // call (triggered by the next StreamingCompleted), bypassing RETRY_DELAY_MS.
+        val retryAt = nextRetryTime[next.id]
+        if (retryAt != null && System.currentTimeMillis() < retryAt) {
+            // Not yet time to retry — re-queue at end and return without sending.
+            queueLock.withLock {
+                _queuedMessages.value = _queuedMessages.value + next
+            }
+            return@withLock
+        }
         logger.info { "[ACP] drainQueue: sending '${next.text.take(50)}' (${_queuedMessages.value.size} remaining)" }
 
         val result = try {
@@ -1003,11 +1049,15 @@ class ChatViewModel(
             SendMessageResult.Error(e.message ?: "Send failed")
         }
         if (result is SendMessageResult.Error) {
-            val retryCount = queueRetryCounts.getOrDefault(next.id, 0) + 1
-            if (retryCount <= MAX_QUEUE_RETRIES) {
-                queueRetryCounts[next.id] = retryCount
-                delay(RETRY_DELAY_MS)
-                queueLock.withLock {
+            queueLock.withLock {
+                // Check retry count inside queueLock to prevent race with clearQueue
+                // (which clears queueRetryCounts under queueLock as well)
+                val retryCount = queueRetryCounts.getOrDefault(next.id, 0) + 1
+                if (retryCount <= MAX_QUEUE_RETRIES) {
+                    queueRetryCounts[next.id] = retryCount
+                    // Record next-allowed-retry timestamp so the delay is enforced
+                    // before the next send attempt (checked at the top of drainQueue).
+                    nextRetryTime[next.id] = System.currentTimeMillis() + RETRY_DELAY_MS
                     val alreadyRequeued = _queuedMessages.value.any { it.id == next.id }
                     if (!alreadyRequeued) {
                         // Re-queue at the END of the queue (not the front) to avoid
@@ -1019,13 +1069,15 @@ class ChatViewModel(
                     } else {
                         logger.debug { "[ACP] drainQueue: message ${next.id} already re-queued, skipping duplicate add (attempt $retryCount/$MAX_QUEUE_RETRIES)" }
                     }
+                } else {
+                    queueRetryCounts.remove(next.id)
+                    nextRetryTime.remove(next.id)
+                    logger.error { "[ACP] drainQueue: dropping message after $MAX_QUEUE_RETRIES failed attempts — ${result.message}" }
                 }
-            } else {
-                queueRetryCounts.remove(next.id)
-                logger.error { "[ACP] drainQueue: dropping message after $MAX_QUEUE_RETRIES failed attempts — ${result.message}" }
             }
         } else {
             queueRetryCounts.remove(next.id)
+            nextRetryTime.remove(next.id)
         }
     }
 
@@ -1161,7 +1213,10 @@ class ChatViewModel(
         scope.launch {
             try {
                 val selectedLabels = response.selectedIndices.mapNotNull { idx ->
-                    prompt.options.getOrNull(idx)?.label
+                    prompt.options.getOrNull(idx)?.label ?: run {
+                        logger.warn { "[ACP] respondSelection: index $idx out of bounds (options size=${prompt.options.size}) — selection may be stale" }
+                        null
+                    }
                 }
                 // The server expects one inner array per question. Merge custom input
                 // into the SAME inner list as selected labels (not a separate array),
@@ -1436,6 +1491,12 @@ class ChatViewModel(
                 else -> model.variants.firstOrNull()
             }
             val header = "### Review by ${model.displayName}\n\n"
+            // Re-check cancellation flag immediately before send to close TOCTOU window
+            // (cancel() may have set the flag between the loop-top check and this point).
+            if (multiModelReviewCancelled) {
+                service.injectLocalMessage("⏹ Review cancelled by user. Remaining models skipped.")
+                break
+            }
             // Route through the ViewModel's sendMessageWithModel() so _streamPhase and
             // streamingSessionIds stay consistent with the UI (stop button, shimmer).
             val result = sendMessageWithModel(
@@ -1546,21 +1607,31 @@ class ChatViewModel(
 
     // --- Command history ---
 
+    /** Lock for command history mutations — prevents EDT blocking from synchronized(settings). */
+    private val commandHistoryLock = Any()
+
     private fun recordCommand(text: String, files: List<AttachedFile>) {
         if (text.isBlank() && files.isEmpty()) return
         val entry = CommandHistoryEntry(text = text, files = files)
         val settings = OpenCodeSettingsState.getInstance()
         val maxSize = settings.commandHistorySize.coerceIn(1, 100)
-        // Synchronize on settings to prevent lost-update race with clearCommandHistory
-        // (which also writes settings.commandHistory from EDT). Without this, a
-        // concurrent recordCommand on a background coroutine can overwrite a clear.
-        synchronized(settings) {
+        // Synchronize on a dedicated lock to prevent lost-update race with clearCommandHistory
+        // (which also writes settings.commandHistory from EDT). Using `settings` as the
+        // monitor could block the EDT if a background coroutine holds it; the dedicated
+        // lock avoids coupling EDT blocking to settings object monitor contention.
+        synchronized(commandHistoryLock) {
             val current = _commandHistory.value.toMutableList()
+            // Compute the new file lists once outside removeAll to avoid creating
+            // 3 intermediate lists per existing-entry comparison (O(history×files)
+            // → O(history+files) allocations).
+            val names = files.map { it.name }
+            val paths = files.map { it.path }
+            val mimes = files.map { it.mime }
             current.removeAll { existing ->
                 existing.text == text &&
-                    existing.attachedFileNames == files.map { it.name } &&
-                    existing.attachedFilePaths == files.map { it.path } &&
-                    existing.attachedFileMimes == files.map { it.mime }
+                    existing.attachedFileNames == names &&
+                    existing.attachedFilePaths == paths &&
+                    existing.attachedFileMimes == mimes
             }
             current.add(0, entry)
             val trimmed = if (current.size > maxSize) current.take(maxSize) else current
@@ -1571,7 +1642,7 @@ class ChatViewModel(
 
     fun clearCommandHistory() {
         val settings = OpenCodeSettingsState.getInstance()
-        synchronized(settings) {
+        synchronized(commandHistoryLock) {
             _commandHistory.value = emptyList()
             settings.commandHistory = java.util.ArrayList()
         }
@@ -1647,6 +1718,9 @@ class ChatViewModel(
         // collecting (replay=0 SharedFlow drops the signal).
         childPermissionTimeoutJobs.values.forEach { it.cancel() }
         childPermissionTimeoutJobs.clear()
+        // Clear child permission prompts to prevent stale StateFlow values lingering
+        // in the old ViewModel after tool window recreation/disposal.
+        _childPermissionPrompts.value = emptyMap()
     }
 
     // --- Helpers ---

@@ -2,13 +2,18 @@ package com.opencode.acp.chat.ui.compose
 
 import androidx.compose.foundation.Image as ComposeImage
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.animation.core.animateDpAsState
@@ -49,6 +54,9 @@ import com.opencode.acp.chat.model.QueuedMessage
 import com.opencode.acp.chat.viewmodel.ChatViewModel
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.config.settings.OpenCodeSettingsState
+import org.jetbrains.jewel.ui.component.Icon
+import org.jetbrains.jewel.ui.component.Link
+import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -138,9 +146,15 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
         val children = dir.children ?: return
         for (child in children) {
             if (results.size >= maxResults || visited >= maxNodes) return
+            // Check for cancellation periodically within large directories
+            if (visited % 500 == 0) {
+                com.intellij.openapi.progress.ProgressManager.checkCanceled()
+            }
             if (child.isDirectory && !isSymLink(child)) {
                 // Skip hidden and build directories; don't follow symlinks (path traversal / cycles)
                 if (!child.name.startsWith(".") && child.name !in setOf("build", "node_modules", ".git", "out", "target", ".idea", "__pycache__", ".gradle", "dist", ".next", ".venv")) {
+                    // NOTE: This skip set is hardcoded. Non-standard build directories (bin, obj,
+                    // .build) won't be skipped. Consider making configurable or using .gitignore.
                     searchDir(child, depth + 1)
                 }
             } else if (child.isValid && !isSymLink(child)) {
@@ -152,9 +166,14 @@ fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): L
                     // canonicalized is untrusted (broken symlink, restricted path, or a
                     // symlink that resolves outside the project). Falling back to the raw
                     // path would bypass the boundary check via symlinks.
+                    // Canonicalization is a filesystem stat call — deferred to only matched files
+                    // to minimize I/O. For 5000 nodes with 100 matches, this is 100 stat calls.
                     val canonicalChild = try { java.io.File(child.path).canonicalPath } catch (_: Exception) { continue }
                     val canonicalBase = try { java.io.File(basePath).canonicalPath } catch (_: Exception) { basePath }
-                    if (canonicalChild.startsWith(canonicalBase + java.io.File.separator) || canonicalChild == canonicalBase) {
+                    // On Windows, paths are case-insensitive — normalize for comparison
+                    val compareChild = if (System.getProperty("os.name").lowercase().contains("win")) canonicalChild.lowercase() else canonicalChild
+                    val compareBase = if (System.getProperty("os.name").lowercase().contains("win")) canonicalBase.lowercase() else canonicalBase
+                    if (compareChild.startsWith(compareBase + java.io.File.separator) || compareChild == compareBase) {
                         seen.add(child.path)
                         results.add(RecentFile(name = child.name, path = child.path))
                     }
@@ -219,6 +238,8 @@ fun
     val streamingSessionIds by viewModel.streamingSessionIds.collectAsState()
     val pendingCreationSessionIds by viewModel.pendingCreationSessionIds.collectAsState()
     val hiddenChildSessionIds by viewModel.hiddenChildSessionIds.collectAsState()
+    val isActiveSessionChild by viewModel.isActiveSessionChild.collectAsState()
+    val activeSessionParentId by viewModel.activeSessionParentId.collectAsState()
     val availableCommands by viewModel.availableCommands.collectAsState()
     val commandHistory by viewModel.commandHistory.collectAsState()
     val queuedMessages by viewModel.queuedMessages.collectAsState()
@@ -362,8 +383,12 @@ fun
             // Fallback for non-local paths. If the path is already a VFS URL
             // (e.g. jar://, http://), resolve it directly; otherwise treat it
             // as a local filesystem path.
-            vf = if (recentFile.path.contains("://")) {
+            vf = if (recentFile.path.startsWith("file://")) {
                 com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(recentFile.path)
+            } else if (recentFile.path.contains("://") && !recentFile.path.startsWith("file://")) {
+                // Reject non-file URL schemes (jar://, http://, etc.) — only file:// is valid for attachments
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] onRecentFileClick: rejecting non-file URL scheme: ${recentFile.path.take(50)}" }
+                null
             } else {
                 com.intellij.openapi.vfs.LocalFileSystem.getInstance()
                     .findFileByIoFile(java.io.File(recentFile.path))
@@ -495,6 +520,45 @@ fun
                             onRetry = { viewModel.scope.launch { viewModel.retryConnection(project.basePath) } }
                         )
 
+                        // Sub-session banner — shown when the active session is a child/sub-task session.
+                        // Sub sessions are agent-only; the user can view messages but cannot send new ones.
+                        if (isActiveSessionChild) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(
+                                        color = ChatTheme.colors.accent.bannerInfoBg,
+                                        shape = ChatTheme.shapes.bannerCornerRadius
+                                    )
+                                    .border(
+                                        width = ChatTheme.dims.bannerBorderWidth,
+                                        color = ChatTheme.colors.accent.bannerInfoBorder,
+                                        shape = ChatTheme.shapes.bannerCornerRadius
+                                    )
+                                    .padding(horizontal = ChatTheme.dims.bannerPaddingH, vertical = ChatTheme.dims.bannerPaddingV),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    key = AllIconsKeys.General.BalloonInformation,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(ChatTheme.dims.bannerIconSize)
+                                )
+                                Text(
+                                    text = "This is a sub-task session. It's managed by the agent — you can view its messages but cannot send new ones here.",
+                                    fontWeight = ChatTheme.fontWeights.bannerText,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                val parentId = activeSessionParentId
+                                if (parentId != null) {
+                                    Link(
+                                        "Back to parent",
+                                        onClick = { viewModel.scope.launch { viewModel.switchSession(parentId) } }
+                                    )
+                                }
+                            }
+                        }
+
                         // Message list (fills remaining space)
                         MessageList(
                             messagesState = messagesState,
@@ -504,6 +568,7 @@ fun
                             getStreamingText = { sessionId -> viewModel.getStreamingText(sessionId) },
                             queuedMessages = queuedMessages,
                             onCancelQueuedMessage = { msgId -> viewModel.removeQueuedMessage(msgId) },
+                            onOpenSubtask = { childSessionId -> viewModel.scope.launch { viewModel.switchSession(childSessionId) } },
                         )
                     }
                 }
@@ -542,7 +607,7 @@ fun
                 }
 
                 // Input area (always visible at bottom, disabled when disconnected or prompt active)
-                val inputEnabled = inputState !is ChatInputState.Disabled
+                val inputEnabled = inputState !is ChatInputState.Disabled && !isActiveSessionChild
                 InputArea(
                     enabled = inputEnabled,
                 isStreaming = isStreaming,
@@ -637,6 +702,7 @@ fun
                     }
                 },
                 onToggleFollow = { viewModel.toggleFollowAgent() },
+                placeholderText = if (isActiveSessionChild) "Sub-task sessions cannot be prompted" else "Type a message...",
             )
             }
         }
@@ -725,8 +791,25 @@ private fun addFileAttachment(
                 ?.takeIf { it.absolutePath != sourceFile.absolutePath }
                 ?.let { copied ->
                     // Preserve the original display name; use the copied file's path.
+                    // NOTE: Display name uses the original file.name, but the path points to the
+                    // copied file. If a collision occurred, the actual filename on disk may differ
+                    // (e.g., "file (1).txt"). This is a known minor UX issue — the display name
+                    // is more useful to the user than the collision-resolved name.
                     AttachedFile(name = file.name, path = copied.absolutePath, mime = mime)
-                } ?: AttachedFile(name = file.name, path = sourceFile.canonicalPath, mime = mime)
+                } ?: run {
+                    // Copy failed — check if source is outside allowed dirs
+                    val canonicalSource = sourceFile.canonicalPath
+                    val projectBase = project.basePath?.let { java.io.File(it).canonicalPath }
+                    val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
+                    val isInsideProject = projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator)
+                    val isInsideAttachments = (projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
+                        (userHome != null && canonicalSource.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))
+                    if (!isInsideProject && !isInsideAttachments) {
+                        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] addFileAttachment: rejecting file outside allowed dirs: ${file.name} (${sourceFile.path})" }
+                        return
+                    }
+                    AttachedFile(name = file.name, path = canonicalSource, mime = mime)
+                }
         } else {
             AttachedFile(name = file.name, path = file.path, mime = mime)
         }

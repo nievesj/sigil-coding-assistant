@@ -39,12 +39,15 @@ import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
+private val logger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+
 @Composable
 fun ToolPill(
     pill: ToolCallPill,
     modifier: Modifier = Modifier,
     getStreamingText: ((String) -> kotlinx.coroutines.flow.StateFlow<String>?)? = null,
     project: com.intellij.openapi.project.Project? = null,
+    onOpenSubtask: ((childSessionId: String) -> Unit)? = null,
 ) {
     // Default expanded from settings — task pills use dedicated setting, others use ToolKind setting
     val settings = OpenCodeSettingsState.getInstance()
@@ -54,7 +57,8 @@ fun ToolPill(
 
     val isTask = pill.toolName == "task"
     val childSessionId = if (isTask) {
-        try { pill.metadata?.get("sessionId")?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+        try { pill.metadata?.get("sessionId")?.jsonPrimitive?.contentOrNull }
+        catch (e: Exception) { logger.warn(e) { "[ACP] ToolPill: failed to parse sessionId metadata" }; null }
     } else null
     val taskAgentName = if (isTask) {
         pill.input?.getString("subagent_type") ?: pill.input?.getString("description") ?: "subagent"
@@ -98,7 +102,13 @@ fun ToolPill(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { if (hasDetails) expanded = !expanded },
+                .clickable {
+                    if (isTask && childSessionId != null && onOpenSubtask != null) {
+                        onOpenSubtask.invoke(childSessionId)
+                    } else if (hasDetails) {
+                        expanded = !expanded
+                    }
+                },
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // Colored accent strip
@@ -163,20 +173,34 @@ fun ToolPill(
                         .size(20.dp)
                         .padding(2.dp)
                         .clickable(enabled = followEnabled) {
-                            val proj = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-                            if (proj != null) {
-                                val line = try {
-                                    pill.input?.get("offset")?.jsonPrimitive?.intOrNull
-                                        ?: pill.input?.get("start_line")?.jsonPrimitive?.intOrNull
-                                        ?: 0
-                                } catch (_: Exception) { 0 }
-                                EditorFollowManager.getInstance(proj).openFileAtLine(
-                                    project = proj,
-                                    filePath = openInEditorPath,
-                                    line = line,
-                                    focus = true,
-                                )
+                            val proj = project
+                            if (proj == null) {
+                                logger.warn { "[ACP] ToolPill: no project available — refusing to open file without correct project context" }
+                                return@clickable
                             }
+                            val line = try {
+                                (pill.input?.get("offset")?.jsonPrimitive?.intOrNull
+                                    ?: pill.input?.get("start_line")?.jsonPrimitive?.intOrNull
+                                    ?: 0)
+                            } catch (_: Exception) { 0 }.coerceAtLeast(0)
+                            val canonicalFilePath = try { java.io.File(openInEditorPath).canonicalPath } catch (_: Exception) { return@clickable }
+                            val basePath = proj.basePath
+                            if (basePath.isNullOrBlank()) { return@clickable }
+                            val canonicalBase = try { java.io.File(basePath).canonicalPath } catch (_: Exception) { return@clickable }
+                            // On Windows, paths are case-insensitive — normalize for comparison
+                            val isWin = System.getProperty("os.name").lowercase().contains("win")
+                            val cmpFile = if (isWin) canonicalFilePath.lowercase() else canonicalFilePath
+                            val cmpBase = if (isWin) canonicalBase.lowercase() else canonicalBase
+                            if (!cmpFile.startsWith(cmpBase + java.io.File.separator) && cmpFile != cmpBase) {
+                                logger.warn { "[ACP] ToolPill: refusing to open path outside project: $openInEditorPath" }
+                                return@clickable
+                            }
+                            EditorFollowManager.getInstance(proj).openFileAtLine(
+                                project = proj,
+                                filePath = canonicalFilePath,
+                                line = line,
+                                focus = true,
+                            )
                         },
                     tint = if (followEnabled) ChatTheme.colors.component.taskRunning
                            else ChatTheme.colors.component.taskPending,
@@ -194,11 +218,13 @@ fun ToolPill(
                         .size(20.dp)
                         .padding(2.dp)
                         .clickable(enabled = followEnabled) {
-                            val proj = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-                            if (proj != null) {
-                                CommandFollowManager.getInstance(proj)
-                                    .activateConsole(proj, pill.toolCallId)
+                            val proj = project
+                            if (proj == null) {
+                                logger.warn { "[ACP] ToolPill: no project available — refusing to open console without correct project context" }
+                                return@clickable
                             }
+                            CommandFollowManager.getInstance(proj)
+                                .activateConsole(proj, pill.toolCallId)
                         },
                     tint = if (followEnabled) ChatTheme.colors.component.taskRunning
                            else ChatTheme.colors.component.taskPending,
@@ -223,18 +249,41 @@ fun ToolPill(
                             .size(20.dp)
                             .padding(2.dp)
                             .clickable(enabled = followEnabled) {
-                                val proj = project ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-                                if (proj != null) {
-                                    val sPath = try {
-                                        pill.input?.get("path")?.jsonPrimitive?.contentOrNull
-                                    } catch (_: Exception) { null }
-                                    val sGlob = try {
-                                        pill.input?.get("include")?.jsonPrimitive?.contentOrNull
-                                            ?: pill.input?.get("glob")?.jsonPrimitive?.contentOrNull
-                                    } catch (_: Exception) { null }
-                                    SearchFollowManager.getInstance(proj)
-                                        .reopenSearch(proj, searchPattern, sPath, sGlob, isRegex = false)
+                                val proj = project
+                                if (proj == null) {
+                                    logger.warn { "[ACP] ToolPill: no project available — refusing to search without correct project context" }
+                                    return@clickable
                                 }
+                                val sPath = try {
+                                    pill.input?.get("path")?.jsonPrimitive?.contentOrNull
+                                } catch (_: Exception) { null }
+                                val sGlob = try {
+                                    pill.input?.get("include")?.jsonPrimitive?.contentOrNull
+                                        ?: pill.input?.get("glob")?.jsonPrimitive?.contentOrNull
+                                } catch (_: Exception) { null }
+                                val validatedPath = sPath?.let { p ->
+                                    try {
+                                        val basePath = proj.basePath
+                                        if (basePath.isNullOrBlank()) {
+                                            logger.warn { "[ACP] ToolPill: refusing search — project basePath is null/blank" }
+                                            return@clickable
+                                        }
+                                        val canonical = java.io.File(p).canonicalPath
+                                        val canonicalBase = java.io.File(basePath).canonicalPath
+                                        // On Windows, paths are case-insensitive — normalize for comparison
+                                        val isWin = System.getProperty("os.name").lowercase().contains("win")
+                                        val cmpFile = if (isWin) canonical.lowercase() else canonical
+                                        val cmpBase = if (isWin) canonicalBase.lowercase() else canonicalBase
+                                        if (cmpFile.startsWith(cmpBase + java.io.File.separator) || cmpFile == cmpBase) {
+                                            canonical
+                                        } else {
+                                            logger.warn { "[ACP] ToolPill: refusing search outside project: $p" }
+                                            null
+                                        }
+                                    } catch (_: Exception) { null }
+                                }
+                                SearchFollowManager.getInstance(proj)
+                                    .reopenSearch(proj, searchPattern, validatedPath, sGlob, isRegex = false)
                             },
                         tint = if (followEnabled) ChatTheme.colors.component.taskRunning
                                else ChatTheme.colors.component.taskPending,
@@ -264,13 +313,16 @@ fun ToolPill(
                 }
             }
 
-            // Chevron
+            // Chevron — independently clickable for expand/collapse
+            // (header click navigates to child session for task pills; chevron toggles expansion)
             if (hasDetails) {
                 Spacer(Modifier.width(4.dp))
                 Icon(
                     key = if (expanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
                     contentDescription = if (expanded) "Collapse" else "Expand",
-                    modifier = Modifier.size(14.dp),
+                    modifier = Modifier
+                        .size(14.dp)
+                        .clickable { expanded = !expanded },
                     tint = ChatTheme.colors.component.taskRunning,
                 )
                 Spacer(Modifier.width(4.dp))
@@ -465,8 +517,20 @@ private fun computeLineDelta(pill: ToolCallPill): Pair<Int, Int>? {
             val oldString = input.getString("oldString") ?: input.getString("old_string") ?: input.getString("old")
             val newString = input.getString("newString") ?: input.getString("new_string") ?: input.getString("new")
             if (oldString != null && newString != null) {
-                val additions = newString.lines().size
-                val deletions = oldString.lines().size
+                // Simple line-by-line diff: count lines that differ
+                val oldLines = oldString.lines()
+                val newLines = newString.lines()
+                val maxLines = maxOf(oldLines.size, newLines.size)
+                var additions = 0
+                var deletions = 0
+                for (i in 0 until maxLines) {
+                    val oldLine = oldLines.getOrNull(i)
+                    val newLine = newLines.getOrNull(i)
+                    if (oldLine != newLine) {
+                        if (newLine != null) additions++
+                        if (oldLine != null) deletions++
+                    }
+                }
                 Pair(additions, deletions)
             } else {
                 // content field = full new file; no old content to diff against
@@ -530,16 +594,15 @@ private fun formatTaskOutput(output: List<kotlinx.serialization.json.JsonObject>
     var text = sb.toString().trim()
     if (text.isBlank()) return null
     // Strip <task ...> and <task_result>...</task_result></task> wrappers
-    val taskMatch = Regex("<task[^>]*>\\s*<task_result>\\s*([\\s\\S]*?)\\s*</task_result>\\s*</task>", RegexOption.MULTILINE)
-        .find(text)
-    if (taskMatch != null) {
-        text = taskMatch.groupValues[1].trim()
-    } else {
-        // Try removing just <task_result>...</task_result>
-        val resultMatch = Regex("<task_result>\\s*([\\s\\S]*?)\\s*</task_result>", RegexOption.MULTILINE)
-            .find(text)
-        if (resultMatch != null) {
-            text = resultMatch.groupValues[1].trim()
+    val taskResultStart = text.indexOf("<task_result>")
+    val taskResultEnd = text.indexOf("</task_result>", taskResultStart)
+    if (taskResultStart >= 0 && taskResultEnd >= 0) {
+        val innerStart = taskResultStart + "<task_result>".length
+        text = text.substring(innerStart, taskResultEnd).trim()
+        // Also strip surrounding <task ...> and </task> if present
+        val taskEnd = text.lastIndexOf("</task>")
+        if (taskEnd >= 0) {
+            text = text.substring(0, taskEnd).trim()
         }
     }
     return text.ifBlank { null }

@@ -123,8 +123,15 @@ suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? 
                 com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
                     deferred.complete(readClipboardOnEdt())
                 }
-                kotlinx.coroutines.withTimeoutOrNull(5000) { deferred.await() }
+                kotlinx.coroutines.withTimeoutOrNull(5000) { deferred.await() } ?: run {
+                    logger.warn { "[ACP] readClipboardContent: EDT timed out after 5s — clipboard read failed" }
+                    null
+                }
+            } catch (e: SecurityException) {
+                logger.warn(e) { "[ACP] readClipboardContent: clipboard access denied (SecurityException)" }
+                null
             } catch (e: Exception) {
+                logger.debug(e) { "[ACP] readClipboardContent: clipboard read failed" }
                 null
             }
         }
@@ -194,6 +201,8 @@ private fun readClipboardOnEdt(): Any? {
                             return text
                         }
                     }
+                } catch (e: SecurityException) {
+                    logger.warn(e) { "[ACP] readClipboardOnEdt: clipboard access denied (SecurityException)" }
                 } catch (_: Exception) { }
             }
         }
@@ -204,6 +213,8 @@ private fun readClipboardOnEdt(): Any? {
                 if (text != null && text.isNotBlank()) {
                     return text
                 }
+            } catch (e: SecurityException) {
+                logger.warn(e) { "[ACP] readClipboardOnEdt: stringFlavor access denied (SecurityException)" }
             } catch (_: Exception) { }
         }
 
@@ -235,6 +246,8 @@ private fun readClipboardOnEdt(): Any? {
             }
         }
 
+    } catch (e: SecurityException) {
+        logger.warn(e) { "[ACP] readClipboardOnEdt: clipboard access denied (SecurityException)" }
     } catch (e: Exception) {
         logger.debug(e) { "[ACP] readClipboardOnEdt: clipboard access failed" }
     }
@@ -335,6 +348,7 @@ fun InputArea(
     isFollowEnabled: Boolean = false,                // NEW
     onDisconnect: () -> Unit = {},                   // NEW
     onToggleFollow: () -> Unit = {},                 // NEW
+    placeholderText: String = "Type a message...",
     ) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
@@ -414,15 +428,31 @@ fun InputArea(
                                     logger.warn { "[ACP] Drag-and-drop: rejecting non-file URI scheme: ${uri.take(50)}" }
                                     null
                                 } else {
-                                    java.io.File(java.net.URI(uri)).toAttachedFile(project)
+                                    val file = java.io.File(java.net.URI(uri))
+                                    // Validate path is within project or allowed attachment dirs
+                                    val canonicalPath = file.canonicalPath
+                                    val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }
+                                    val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
+                                    val isInsideProject = projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator)
+                                    val isInsideAttachments = (projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
+                                        (userHome != null && canonicalPath.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))
+                                    if (!isInsideProject && !isInsideAttachments) {
+                                        // toAttachedFile will copy it into the allowed dir; if copy fails,
+                                        // the service guard will catch it. Log for visibility.
+                                        logger.debug { "[ACP] Drag-and-drop: file outside allowed dirs, will attempt copy: ${file.name}" }
+                                    }
+                                    file.toAttachedFile(project)
                                 }
                             } catch (e: Exception) {
+                                logger.warn(e) { "[ACP] Drag-and-drop: failed to process file URI: ${uri.take(50)}" }
                                 null
                             }
-                        }.filterNotNull().forEach { file ->
-                            onAttachFile(file)
+                        }.filterNotNull().let { attached ->
+                            attached.forEach { file ->
+                                onAttachFile(file)
+                            }
+                            return attached.isNotEmpty()
                         }
-                        return uris.isNotEmpty()
                     }
                     is DragData.Image -> {
                         try {
@@ -460,7 +490,7 @@ fun InputArea(
                                 }
                             }
                         } catch (e: Exception) {
-
+                            logger.warn(e) { "[ACP] Drag-and-drop AWT fallback: image read failed" }
                         }
                     }
 
@@ -468,17 +498,19 @@ fun InputArea(
                     if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
                         @Suppress("UNCHECKED_CAST")
                         val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
+                        var anyAttached = false
                         files?.forEach { file ->
                             try {
                                 onAttachFile(file.toAttachedFile(project))
+                                anyAttached = true
                             } catch (e: Exception) {
-
+                                logger.warn(e) { "[ACP] Drag-and-drop AWT fallback: file attach failed" }
                             }
                         }
-                        return !files.isNullOrEmpty()
+                        return anyAttached
                     }
                 } catch (e: Exception) {
-
+                    logger.warn(e) { "[ACP] Drag-and-drop AWT fallback failed" }
                 }
 
                 return false
@@ -903,6 +935,7 @@ fun InputArea(
                                                             }
                                                     } else null
                                                     if (slashCmd != null) {
+                                                        logger.debug { "[ACP] Slash command intercepted: /${slashCmd.name} args='${slashCmd.args}'" }
                                                         showSlashPalette = false
                                                         inHistoryMode = false
                                                         historyIndex = -1
@@ -970,7 +1003,7 @@ fun InputArea(
                                 ) {
                                     if (textState.text.isEmpty()) {
                                         Text(
-                                            text = "Type a message...",
+                                            text = placeholderText,
                                             color = ChatTheme.colors.component.inputPlaceholder,
                                             fontSize = ChatTheme.fonts.inputPlaceholder,
                                         )
@@ -1309,6 +1342,20 @@ private fun java.io.File.toAttachedFile(project: com.intellij.openapi.project.Pr
     val copied = if (project != null) {
         com.opencode.acp.util.copyExternalAttachmentToAllowedDir(this, project)
     } else null
-    val effectivePath = copied?.absolutePath ?: absolutePath
+    val effectivePath = if (copied != null) {
+        copied.absolutePath
+    } else {
+        // Copy failed — check if source is within allowed dirs
+        val canonicalSource = canonicalPath
+        val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }
+        val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
+        val isInsideProject = projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator)
+        val isInsideAttachments = (projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
+            (userHome != null && canonicalSource.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))
+        if (!isInsideProject && !isInsideAttachments) {
+            logger.warn { "[ACP] toAttachedFile: file outside allowed dirs and copy failed: $name ($absolutePath)" }
+        }
+        canonicalSource
+    }
     return AttachedFile(name = name, path = effectivePath, mime = mime)
 }

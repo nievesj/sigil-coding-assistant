@@ -60,9 +60,10 @@ class OpenCodeService(private val project: Project) : Disposable {
         if (throwable !is CancellationException) {
             try {
                 errorSurfacer?.invoke(throwable.message ?: throwable.javaClass.simpleName)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 // Don't let the error-surfacing mechanism itself throw —
-                // the original exception is already logged.
+                // the original exception is already logged above.
+                logger.warn(e) { "[ACP] Error surfacing mechanism failed — original exception was logged at error level above" }
             }
         }
         // RESOLVED: errorSurfacer is set immediately after SessionManager construction
@@ -117,6 +118,9 @@ class OpenCodeService(private val project: Project) : Disposable {
     val streamingSessionIds: StateFlow<Set<String>> = sessionManager.streamingSessionIds
     val pendingCreationSessionIds: StateFlow<Set<String>> = sessionManager.pendingCreationSessionIds
     val hiddenChildSessionIds: StateFlow<Set<String>> = sessionManager.hiddenChildSessionIds
+    val knownChildSessionIds: StateFlow<Set<String>> = sessionManager.knownChildSessionIds
+    val childToParent: StateFlow<Map<String, String>> = sessionManager.childToParent
+    val activeSessionId: StateFlow<String?> = sessionManager.activeSessionId
     val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = sessionManager.sessionCachedFlow
 
     // ── Internal state ─────────────────────────────────────────────────────
@@ -574,9 +578,17 @@ class OpenCodeService(private val project: Project) : Disposable {
             while (isActive) {
                 val base = ChatConstants.RECONNECT_DELAY_MS
                 val max = ChatConstants.RECONNECT_MAX_DELAY_MS
-                val exponential = (base * (1L shl sseReconnectAttempt.coerceIn(0, 10))).coerceAtMost(max)
+                val exponential = minOf(base * (1L shl sseReconnectAttempt.coerceIn(0, MAX_BACKOFF_SHIFT)), max)
                 val jitter = (exponential * kotlin.random.Random.nextDouble(0.0, 0.2)).toLong()
                 val delayMs = (exponential + jitter).coerceAtMost(max)
+
+                // Circuit breaker: after MAX_RECONNECT_ATTEMPTS, transition to ERROR state
+                // to stop infinite reconnection loops on permanently-down servers.
+                if (sseReconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+                    logger.error { "[ACP] SSE reconnect: giving up after $MAX_RECONNECT_ATTEMPTS attempts — server appears permanently down" }
+                    connectionManager.setConnectionError(ConnectionErrorReason.ServerUnreachable)
+                    return@launch
+                }
 
                 if (sseReconnectAttempt > 0) {
                     logger.info { "[ACP] SSE reconnect attempt ${sseReconnectAttempt + 1}, waiting ${delayMs}ms" }
@@ -700,13 +712,12 @@ class OpenCodeService(private val project: Project) : Disposable {
                             // not just the last one. The server returns messages in chronological order
                             // in practice, but scanning all fetched messages is safer and bounded (limit=20).
                             // O(n) instead of O(n²): build a Set of completed tool IDs first,
-                            // then check ToolUse membership.
-                            val completedToolIds = messages.flatMap { it.parts }
-                                .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
+                            // then check ToolUse membership. Single flatMap reused for both checks.
+                            val allParts = messages.flatMap { it.parts }
+                            val completedToolIds = allParts.filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
                                 .map { it.toolUseId }
                                 .toSet()
-                            val hasInProgressTools = messages.flatMap { it.parts }
-                                .filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
+                            val hasInProgressTools = allParts.filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
                                 .any { it.id !in completedToolIds }
 
                             if (hasInProgressTools) {
@@ -864,15 +875,19 @@ class OpenCodeService(private val project: Project) : Disposable {
                     ".git", ".hg", ".svn",
                     ".idea",
                     "node_modules",
-                    "build", "target", "out",
                 )
+                val rootOnlyDenylist = setOf("build", "target", "out")
                 val pathSegments = canonicalPath.lowercase()
                     .split(java.io.File.separatorChar, '/')
                     .filter { it.isNotEmpty() }
-                val isDenylisted = pathSegments.any { it in denylistSegments }
-                // Only apply denylist to the broad isInsideProject path —
-                // .opencode/attachments/ is explicitly user-managed and safe.
-                if (isDenylisted && isInsideProject && !isInsideProjectAttachments) {
+                // Root-level segments are at index 1 (index 0 is the drive letter or root on Windows)
+                val isDenylisted = pathSegments.any { it in denylistSegments } ||
+                    (pathSegments.size >= 2 && pathSegments[1] in rootOnlyDenylist)
+                // Apply denylist to ALL paths regardless of location.
+                // A symlink in .opencode/attachments/ pointing to .env would otherwise
+                // bypass the denylist. The denylist must apply universally to prevent
+                // exfiltration of secrets via symlink tricks.
+                if (isDenylisted) {
                     logger.warn { "[ACP] Skipping attached file '${file.name}' — path matches denylist segment (sensitive location): ${file.path}" }
                     return@forEach
                 }
@@ -889,6 +904,16 @@ class OpenCodeService(private val project: Project) : Disposable {
                             return@forEach
                         }
                         val bytes = fileObj.readBytes()
+                        // Re-verify canonical path after read to detect TOCTOU symlink swap
+                        val postReadCanonical = fileObj.canonicalPath
+                        if (postReadCanonical != canonicalPath) {
+                            logger.warn { "[ACP] Skipping attached image '${file.name}' — path changed during read (possible symlink swap): ${file.path}" }
+                            return@forEach
+                        }
+                        // NOTE: This detects swaps that persist after the read, but NOT
+                        // mid-read swaps that are reverted before this check. For high-security
+                        // contexts, use Files.readAllBytes(Path) with a pre-opened FileChannel.
+                        // Low-probability attack — documented as residual risk.
                         if (bytes.isEmpty()) {
                             logger.warn { "[ACP] Skipping attached image '${file.name}' — file is empty: ${file.path}" }
                             return@forEach
@@ -940,6 +965,8 @@ class OpenCodeService(private val project: Project) : Disposable {
                 while (isActive) {
                     delay(ACTIVITY_CHECK_INTERVAL_MS)
                     val responseTimeoutMs = OpenCodeSettingsState.getInstance().state.responseTimeoutSeconds.coerceIn(10, 3600) * 1000L
+                    // NOTE: Timeout is re-read each iteration — changes take effect mid-response.
+                    // This is intentional but may cause unexpected aborts if the user lowers the timeout.
                     // Re-fetch the active session on each iteration instead of using the
                     // captured reference. The session could be evicted from the cache
                     // during the long-running send (e.g., user switches sessions and the
@@ -1034,7 +1061,9 @@ class OpenCodeService(private val project: Project) : Disposable {
             // Use the session captured at send time (sendSession) rather than
             // re-fetching the active session — the user may have switched sessions
             // between send and cancel, and we must finalize the original session.
-            try { sendSession?.completeStreaming(assistantMsgId) } catch (ex: Exception) {
+            try { sendSession?.completeStreaming(assistantMsgId) } catch (ex: kotlinx.coroutines.CancellationException) {
+                throw ex
+            } catch (ex: Exception) {
                 logger.debug(ex) { "[ACP] completeStreaming failed during CancellationException handling" }
             }
             throw e
@@ -1128,6 +1157,9 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // coroutine but the lock acquisition may not complete cleanly). The
                 // polling approach with tryLock() + delay() avoids this: tryLock()
                 // is non-suspending and either succeeds or fails immediately.
+                // Polling with 50ms interval — up to 50ms latency before detecting a released
+                // mutex. Acceptable for steer use case (user is waiting for UI feedback).
+                // A Channel-based signal would provide instant notification but adds complexity.
                 while (isActive) {
                     if (sendMutex.tryLock()) {
                         sendMutex.unlock()
@@ -1243,8 +1275,15 @@ class OpenCodeService(private val project: Project) : Disposable {
          *  responseTimeoutSeconds + 5s) against overhead (one timestamp read per check). */
         private const val ACTIVITY_CHECK_INTERVAL_MS = 5_000L
 
-        /** Maximum file size for image attachments (50MB). Prevents OOM from large files. */
-        private const val MAX_ATTACHMENT_SIZE_BYTES = 50L * 1024 * 1024
+        /** Maximum file size for image attachments (10MB). Prevents OOM from large files
+         *  (base64 encoding inflates size ~33%, plus the data URI string — 10MB → ~37MB heap). */
+        private const val MAX_ATTACHMENT_SIZE_BYTES = 10L * 1024 * 1024
+
+        /** Maximum bit shift for exponential backoff (prevents Long overflow). */
+        private const val MAX_BACKOFF_SHIFT = 10
+
+        /** Maximum SSE reconnection attempts before transitioning to ERROR state. */
+        private const val MAX_RECONNECT_ATTEMPTS = 50
     }
 }
 
