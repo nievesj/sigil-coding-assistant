@@ -18,7 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
  */
 class TextSegment(
     val startOffset: Int,
-    @Volatile var anchorKey: String?
+    val anchorKey: String?
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -45,10 +45,13 @@ class TextSegment(
  * The SSE coroutine never touches ProcessorContext directly — it sends
  * events to eventChannel, which is consumed on a single coroutine.
  *
- * Exception: [resetTurnState] is called by [SessionState.createAssistantMessage]
- * on the caller's coroutine (under stateLock), NOT on the event processing
- * coroutine. Fields read cross-coroutine ([isStreaming], [activeTextPartId],
- * [lastActivityTimeMs]) are marked @Volatile for thread-safe visibility.
+ * [resetTurnState] is called ONLY from the event processing coroutine —
+ * either directly (when [SessionState.createAssistantMessage] is called with
+ * fromEventProcessing=true) or via the [SseEvent.ResetTurn] control event
+ * handler (when fromEventProcessing=false). External callers never call
+ * resetTurnState() directly. Fields read cross-coroutine ([isStreaming],
+ * [activeTextPartId], [lastActivityTimeMs]) are marked @Volatile for
+ * thread-safe visibility.
  */
 class ProcessorContext {
     // ── Text buffer ────────────────────────────────────────────────────────
@@ -174,9 +177,14 @@ class ProcessorContext {
     val activeAssistantImages: java.util.concurrent.ConcurrentHashMap<String, SseEvent.AssistantImage> = java.util.concurrent.ConcurrentHashMap()
 
     /** Reset turn-specific state for a new streaming turn.
-     *  NOTE: Does NOT clear toolCallIndex — it spans turns so late tool results
-     *  from previous turns can still be routed. Stale entries for evicted messages
-     *  are harmlessly routed to ctx.activeMessageId via the fallback. */
+     *  NOTE: Does NOT clear toolCallIndex or toolCallPills — they span turns so
+     *  late tool results from previous turns can still be routed and update the
+     *  existing pill's status. Stale entries for evicted messages are cleared by
+     *  addMessage eviction / removeMessageByServerId / replaceAllMessages (which
+     *  clear all three together). toolPartStates IS cleared here because it is a
+     *  lifecycle-state cache (InProgress/Pending) that must not persist across
+     *  turns — stale entries would make the activity monitor skip the activity
+     *  timeout and trigger false stuck-tool aborts for tools from previous turns. */
     fun resetTurnState() {
         textBuffer.clear()
         streamingText.value = ""
@@ -195,7 +203,6 @@ class ProcessorContext {
         activeThinkingKey = null
         activeThinkingCompleted = false
         thinkingPhaseIndex = 0
-        toolCallPills.clear()
         toolPartStates.clear()
         pendingFileChanges.clear()
         firstTextChunkReceived = false
@@ -223,12 +230,5 @@ class ProcessorContext {
         activeStepFinish = null
         activeAssistantFiles.clear()
         activeAssistantImages.clear()
-    }
-
-    /** Reset ALL state including toolCallIndex and lastUserText. */
-    fun reset() {
-        resetTurnState()
-        toolCallIndex.clear()
-        lastUserText = null
     }
 }

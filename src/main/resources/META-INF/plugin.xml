@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<idea-plugin require-restart="true" version="1.0.0">
+<idea-plugin require-restart="true">
     <id>com.sigil.plugin</id>
     <idea-version since-build="261"/>
     <name>Sigil - Coding Assistant</name>
@@ -56,6 +56,7 @@
 
     <dependencies>
         <plugin id="com.intellij.modules.platform"/>
+        <plugin id="com.intellij.modules.lang"/>
         <module name="intellij.platform.jewel.foundation"/>
         <module name="intellij.platform.jewel.ui"/>
         <module name="intellij.platform.jewel.ideLafBridge"/>
@@ -69,10 +70,6 @@
         <module name="intellij.libraries.compose.runtime.desktop"/>
         <module name="intellij.libraries.skiko"/>
     </dependencies>
-
-    <depends>com.intellij.modules.lang</depends>
-
-    <depends optional="true" config-file="git4idea.xml">Git4Idea</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <applicationConfigurable
@@ -114,12 +111,11 @@
                                  order="first"/>
 
         <!-- Review Comments -->
-        <projectService serviceImplementation="com.opencode.acp.review.ReviewCommentManager"/>
-
         <postStartupActivity
             implementation="com.opencode.acp.review.ReviewCommentStartupActivity"/>
 
         <codeInsight.lineMarkerProvider
+            language=""
             implementationClass="com.opencode.acp.review.ReviewCommentLineMarkerProvider"/>
 
         <!-- Phase 2: Diff-viewer annotation — applies review-comment
