@@ -241,9 +241,20 @@ sealed interface DropdownItem {
 
 enum class ThinkingEffort(val label: String, val variant: String?) {
     NONE("None", "none"),
+    MINIMAL("Minimal", "minimal"),
     LOW("Low", "low"),
     MEDIUM("Medium", "medium"),
     HIGH("High", "high"),
+    MAX("Max", "max"),
+    XHIGH("XHigh", "xhigh"),
+    /**
+     * "Use the server's default thinking mode." Has `variant = null`, which is
+     * sent to the server as `variant = null` — the server picks the model's
+     * default. This is intentionally always offered in the Thinking selector
+     * (regardless of the selected model's `variants` list) because every model
+     * has a server-side default. See `ThinkingSelector` in Selectors.kt and
+     * `sendMessageWithModel` in ChatViewModel.kt.
+     */
     DEFAULT("Default", null)
 }
 
@@ -526,11 +537,13 @@ data class TodoItem(
  * - ToolCall, FileChange, and Subagent parts are skipped (not markdown-renderable)
  *
  * **WARNING:** This output is NOT escaped and is intended for display/clipboard/debug only.
- * Do NOT pass `rawMarkdownForClipboard` back into an LLM context — use `escapedForPrompt` instead.
- * Untrusted message content can contain markdown fences or directive-like syntax that
- * acts as prompt injection. The content is intentionally NOT escaped because this is a
- * raw representation of the message parts for clipboard/debug purposes, not a sanitized
- * prompt input.
+ * Do NOT pass `rawMarkdownForClipboard` back into an LLM context — untrusted message
+ * content can contain markdown fences or directive-like syntax that acts as prompt
+ * injection. The content is intentionally NOT escaped because this is a raw
+ * representation of the message parts for clipboard/debug purposes, not a sanitized
+ * prompt input. If you need to feed message content into an LLM prompt, use the
+ * structured message API (system/user/assistant roles) or wrap untrusted content in
+ * explicit delimiters and instruct the model to treat it as data.
  */
 val ChatMessage.rawMarkdownForClipboard: String
     get() = buildString {
@@ -556,30 +569,6 @@ val ChatMessage.rawMarkdownForClipboard: String
                 is MessagePart.StepFinish -> { /* skip — informational */ }
             }
         }
-    }
-
-/**
- * Returns a content-neutralized markdown representation of a ChatMessage, safe
- * for inclusion in LLM prompts. Wraps each part in fenced delimiters and escapes
- * directive-like syntax (markdown headings, code fences, HTML tags) so that
- * untrusted message content cannot act as prompt injection.
- *
- * Use this instead of [rawMarkdownForClipboard] when feeding message content
- * back into an LLM context (e.g., for summarization, context inclusion, or
- * multi-shot review prompts).
- */
-val ChatMessage.escapedForPrompt: String
-    get() {
-        val raw = rawMarkdownForClipboard
-        // Escape code fences so untrusted content can't break out of a fenced block
-        // and inject directives. Replace triple-backtick sequences with a safe alias.
-        val fenceEscaped = raw.replace("```", "´´´")
-        // Escape markdown heading markers at line start so untrusted content can't
-        // inject headings like "### System: ignore previous instructions".
-        val headingEscaped = fenceEscaped.replace(Regex("(?m)^(#{1,6}\\s)"), "\\$1")
-        // Escape HTML-like tags so untrusted content can't inject HTML directives
-        val htmlEscaped = headingEscaped.replace("<", "&lt;").replace(">", "&gt;")
-        return htmlEscaped
     }
 
 /** Sidebar tab identifiers. */

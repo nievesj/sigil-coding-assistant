@@ -85,6 +85,8 @@ import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
+import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
+import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 // ── Review Panel (sidebar tab content) ───────────────────────────────────────
@@ -609,7 +611,42 @@ internal fun getFileTypeIcon(fileName: String): org.jetbrains.jewel.ui.icon.Icon
         "gitignore" -> AllIconsKeys.FileTypes.Text
         "svg" -> AllIconsKeys.FileTypes.Image
         "png", "jpg", "jpeg", "gif", "bmp", "webp" -> AllIconsKeys.FileTypes.Image
-        else -> AllIconsKeys.FileTypes.Text
+        else -> resolveFileTypeIconFromPlatform(fileName)
+    }
+}
+
+/**
+ * Fallback for file types not covered by the static [AllIconsKeys] map above.
+ *
+ * The platform's [AllIcons]/[AllIconsKeys] only ship icons for a handful of
+ * languages (Kotlin, Java, Python, …). Rider-specific languages — C#, C++,
+ * F#, VB, Razor, .csproj/.sln, etc. — and CLion's C/C++ have **no** constant
+ * in `AllIcons.FileTypes`/`AllIcons.Language`. Their icons are contributed by
+ * the host IDE's file-type registry instead.
+ *
+ * This asks [FileTypeManager] for the registered [FileType] for the file name
+ * and wraps its icon as a Jewel [IconKey] via
+ * [IntelliJIconKey.fromPlatformIcon]. On Rider this resolves the real C#/C++/
+ * F#/VB/Razor/csproj/sln icons; on IntelliJ IDEA (no .NET plugin) it falls
+ * back to the plain-text file-type icon, which is the same as the previous
+ * hard-coded `AllIconsKeys.FileTypes.Text` fallback. The lookup is cheap and
+ * read-safe ([FileTypeManager.getFileTypeByFileName] does not require a read
+ * action), so it is safe to call from composition.
+ *
+ * Guarded with a try/catch so a misbehaving FileType extension can never break
+ * the review tab — it degrades to the generic text icon.
+ */
+private fun resolveFileTypeIconFromPlatform(fileName: String): org.jetbrains.jewel.ui.icon.IconKey {
+    return try {
+        val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
+        val icon = fileType.icon
+        if (icon != null) {
+            IntelliJIconKey.fromPlatformIcon(icon)
+        } else {
+            AllIconsKeys.FileTypes.Text
+        }
+    } catch (t: Throwable) {
+        AllIconsKeys.FileTypes.Text
     }
 }
 
