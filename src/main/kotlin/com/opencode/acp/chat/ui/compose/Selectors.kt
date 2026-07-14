@@ -74,7 +74,8 @@ fun AgentSelector(
                     title = "AGENT",
                     items = agents.map { agent ->
                         PickerItem(
-                            label = agent.name.replaceFirstChar { it.uppercase() },
+                            key = agent.id,
+                            label = agent.name.ifBlank { agent.id }.replaceFirstChar { it.uppercase() },
                             isSelected = agent == selected,
                             onClick = {
                                 onAgentChanged(agent)
@@ -104,7 +105,7 @@ fun ThinkingSelector(
     val availableEfforts = remember(variants) {
         val matched = variants.mapNotNull { variantName ->
             ThinkingEffort.entries.find { it.variant == variantName }
-        }
+        }.sortedBy { it.ordinal }
         listOf(ThinkingEffort.DEFAULT) + matched
     }
 
@@ -129,6 +130,7 @@ fun ThinkingSelector(
                     title = "THINKING",
                     items = availableEfforts.map { effort ->
                         PickerItem(
+                            key = effort.name,
                             label = effort.label,
                             isSelected = effort == controlState.thinkingEffort,
                             onClick = {
@@ -209,6 +211,8 @@ internal fun SelectorChip(
 // ── Simple Picker Panel (used by Agent + Thinking) ──────────────────────────
 
 private data class PickerItem(
+    /** Unique stable key for LazyColumn — must not collide across items. */
+    val key: String,
     val label: String,
     val isSelected: Boolean,
     val onClick: () -> Unit,
@@ -247,7 +251,7 @@ private fun SimplePickerPanel(
         ) {
             items(
                 count = items.size,
-                key = { items[it].label },
+                key = { items[it].key },
             ) { index ->
                 val item = items[index]
                 PickerItemRow(
