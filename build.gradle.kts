@@ -52,6 +52,7 @@ dependencies {
     testImplementation(libs.kotest.assertions)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.wiremock)
+    testImplementation(libs.mockk)
 
     intellijPlatform {
         intellijIdea(providers.gradleProperty("platformVersion"))

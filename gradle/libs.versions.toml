@@ -12,6 +12,7 @@ micrometer = "1.14.6"
 junit = "5.12.2"
 kotest = "6.0.0.M3"
 wiremock = "3.12.1"
+mockk = "1.13.12"
 
 [libraries]
 # ACP SDK
@@ -48,6 +49,7 @@ junit-engine = { group = "org.junit.jupiter", name = "junit-jupiter-engine", ver
 kotest-runner = { group = "io.kotest", name = "kotest-runner-junit5", version.ref = "kotest" }
 kotest-assertions = { group = "io.kotest", name = "kotest-assertions-core", version.ref = "kotest" }
 wiremock = { group = "org.wiremock", name = "wiremock-standalone", version.ref = "wiremock" }
+mockk = { group = "io.mockk", name = "mockk", version.ref = "mockk" }
 
 [bundles]
 acp = ["acp-sdk"]

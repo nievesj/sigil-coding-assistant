@@ -725,7 +725,7 @@ class OpenCodeService(private val project: Project) : Disposable {
                                 return@async
                             }
 
-                            val activeMsgId = session.ctx.activeMessageId
+                            val activeMsgId = session.activeMessageId
                             if (activeMsgId != null) {
                                 session.completeStreaming(activeMsgId)
                             } else {
@@ -880,9 +880,12 @@ class OpenCodeService(private val project: Project) : Disposable {
                 val pathSegments = canonicalPath.lowercase()
                     .split(java.io.File.separatorChar, '/')
                     .filter { it.isNotEmpty() }
-                // Root-level segments are at index 1 (index 0 is the drive letter or root on Windows)
+                // Root-level segments: on Windows, index 0 is the drive letter (e.g., "c:"),
+                // so the first directory is at index 1. On Unix, index 0 is the first
+                // directory. Check both to handle cross-platform paths correctly.
+                val rootSegmentIndex = if (pathSegments.isNotEmpty() && pathSegments[0].endsWith(":")) 1 else 0
                 val isDenylisted = pathSegments.any { it in denylistSegments } ||
-                    (pathSegments.size >= 2 && pathSegments[1] in rootOnlyDenylist)
+                    (pathSegments.size > rootSegmentIndex && pathSegments[rootSegmentIndex] in rootOnlyDenylist)
                 // Apply denylist to ALL paths regardless of location.
                 // A symlink in .opencode/attachments/ pointing to .env would otherwise
                 // bypass the denylist. The denylist must apply universally to prevent
@@ -1023,8 +1026,8 @@ class OpenCodeService(private val project: Project) : Disposable {
                         logger.debug { "[ACP] sendMessage: tools still running, skipping activity check" }
                         continue
                     }
-                    val lastActivity = monitorSession.ctx.lastActivityTimeMs
-                    // RESOLVED: lastActivityTimeMs is @Volatile in ProcessorContext (line 157),
+                    val lastActivity = monitorSession.lastActivityTimeMs
+                    // RESOLVED: lastActivityTimeMs is @Volatile in TurnLifecycleState,
                     // ensuring visibility across coroutines. It's written on the SSE event
                     // processing coroutine and read here on the activity monitor coroutine.
                     // @Volatile provides the necessary happens-before guarantee for a single
@@ -1051,9 +1054,9 @@ class OpenCodeService(private val project: Project) : Disposable {
             // Re-fetch the active session — the reference captured at L680 may be stale
             // if the session was evicted/switched during the long-running send.
             val currentSession = sessionManager.getActiveSession()
-            val wasAborted = currentSession != null && !currentSession.ctx.isStreaming && currentSession.ctx.errorMessage != null
+            val wasAborted = currentSession != null && !currentSession.isStreaming && currentSession.errorMessage != null
             return if (wasAborted) {
-                SendMessageResult.Error(currentSession.ctx.errorMessage ?: "Response timed out")
+                SendMessageResult.Error(currentSession.errorMessage ?: "Response timed out")
             } else {
                 SendMessageResult.Success(assistantMsgId)
             }
@@ -1061,7 +1064,12 @@ class OpenCodeService(private val project: Project) : Disposable {
             // Use the session captured at send time (sendSession) rather than
             // re-fetching the active session — the user may have switched sessions
             // between send and cancel, and we must finalize the original session.
-            try { sendSession?.completeStreaming(assistantMsgId) } catch (ex: kotlinx.coroutines.CancellationException) {
+            // Wrap in withTimeoutOrNull to avoid hanging the cancellation path if
+            // the event processing coroutine is holding stateLock (e.g., inside
+            // resegmentDirect's long markdown parse).
+            try {
+                withTimeoutOrNull(5000) { sendSession?.completeStreaming(assistantMsgId) }
+            } catch (ex: kotlinx.coroutines.CancellationException) {
                 throw ex
             } catch (ex: Exception) {
                 logger.debug(ex) { "[ACP] completeStreaming failed during CancellationException handling" }
