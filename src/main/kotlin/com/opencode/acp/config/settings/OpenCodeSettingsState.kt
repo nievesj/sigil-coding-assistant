@@ -92,13 +92,16 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     // ── MCP integration ────────────────────────────────────────────────
     /** Whether to enable IntelliJ MCP server integration. */
+    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().enableIntellijMcp"))
     var enableIntellijMcp: Boolean = false
     /** IntelliJ MCP server SSE URL. Copy from Settings → Tools → MCP Server → "Copy SSE Config". */
+    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().mcpServerUrl"))
     var mcpServerUrl: String = ""
     /**
      * Additional MCP servers as JSON array: [{"name":"github","url":"http://127.0.0.1:8080/sse"}].
      * Stored as JSON string for XStream serialization compatibility.
      */
+    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().additionalMcpServers"))
     var additionalMcpServers: String = ""
 
     // ── Tool Permissions ──────────────────────────────────────────────
@@ -107,6 +110,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Format: {"toolName":{"enabled":true,"permission":"allow"},...}
      * Stored as JSON string for XStream serialization compatibility.
      */
+    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().toolPermissions"))
     var toolPermissions: String = ""
 
     /**
@@ -116,6 +120,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Format: {"toolId":"allow",...} (tool ID → permission action string).
      * Empty when no Disable All has been performed.
      */
+    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().savedToolPermissionsBeforeDisable"))
     var savedToolPermissionsBeforeDisable: String = ""
 
     /**
@@ -123,6 +128,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Format: [{"name":"bash","description":"...","source":"builtin","serverName":"builtin"},...]
      * Allows showing previously discovered tools without re-discovery.
      */
+    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().discoveredToolsJson"))
     var discoveredToolsJson: String = ""
 
     /** Whether to show a confirmation dialog before disconnecting from the server. */
@@ -130,53 +136,72 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     // ── Context & Compaction settings (Tools → Sigil → Context) ─────────────
     /** When on, tool results exceeding the char limit are truncated at insertion time. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().truncateToolOutput"))
     var truncateToolOutput: Boolean = false
     /** Max chars per tool output before truncation. Clamped to 10_000..200_000 on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().toolOutputCharLimit"))
     var toolOutputCharLimit: Int = 50_000
     /** When on, repeated reads of unchanged files emit [unchanged] instead of re-emitting content. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().detectDuplicateReads"))
     var detectDuplicateReads: Boolean = false
     /** When on, pre-computes compaction summaries in the background for instant swap.
      *  OFF by default — the server's /summarize endpoint performs ACTUAL compaction
      *  (not a preview), so auto-triggering it compacts the session immediately.
      *  Retained as a setting in case a preview API is added in the future. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().enableBackgroundCompaction"))
     var enableBackgroundCompaction: Boolean = false
     /** Context usage % at which background checkpointing starts. Clamped to 40f..80f on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().checkpointThresholdPercent"))
     var checkpointThresholdPercent: Float = 60f
     /** Context usage % at which pre-computed summary is ready for instant swap. Clamped to 60f..95f on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().swapThresholdPercent"))
     var swapThresholdPercent: Float = 80f
     /** Show the 5-category proportional bar in Context tab. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().showContextBreakdown"))
     var showContextBreakdown: Boolean = true
     /** When to show pressure warnings on the context indicator. One of NEVER / ELEVATED / HIGH / CRITICAL. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().pressureNotificationThreshold"))
     var pressureNotificationThreshold: String = "HIGH"
     /** Ask for confirmation before triggering manual compaction. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().compactConfirmation"))
     var compactConfirmation: Boolean = true
 
     // ── Context Pruner settings (Tools → Sigil → Context) ─────────────
     /** When on, the sigil-pruner.ts plugin is extracted and loaded by the OpenCode server.
      *  Performs server-side deterministic pruning (dedup, old tool output pruning, errored
      *  tool input pruning) and LLM-driven compression via a compress tool. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().enableContextPruner"))
     var enableContextPruner: Boolean = false
     /** Prune tool outputs older than N messages. Clamped to 5..100 on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerMaxToolOutputMessages"))
     var prunerMaxToolOutputMessages: Int = 20
     /** Prune errored tool inputs after N turns. Clamped to 1..20 on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerErroredToolTurns"))
     var prunerErroredToolTurns: Int = 4
     /** Enable LLM-driven compression (compress tool). */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerCompressEnabled"))
     var prunerCompressEnabled: Boolean = true
     /** Compression mode: "range" or "message". Whitelisted on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerCompressMode"))
     var prunerCompressMode: String = "range"
 
     // ── Context Pruner: Nudge settings ────────────────────────────────
     /** When on, injects a system reminder prompting the model to call the compress
      *  tool when context usage exceeds the threshold. Two levels: gentle (threshold)
      *  and urgent (urgentPercent). Cooldown prevents nagging every turn. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeEnabled"))
     var prunerNudgeEnabled: Boolean = true
     /** Gentle nudge threshold (% of context limit). Clamped to 30..90 on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeThresholdPercent"))
     var prunerNudgeThresholdPercent: Int = 60
     /** Urgent nudge threshold (% of context limit). Clamped to 50..99 on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeUrgentPercent"))
     var prunerNudgeUrgentPercent: Int = 80
     /** Minimum turns between nudges. Clamped to 1..10 on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeCooldownTurns"))
     var prunerNudgeCooldownTurns: Int = 3
     /** Fallback context limit when the model object doesn't expose one. Clamped to 1000..2_000_000 on set. */
+    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerDefaultContextLimit"))
     var prunerDefaultContextLimit: Int = 128000
 
     /** Target FPS for throttled infinite animations (glow, pulse, shimmer).
@@ -199,12 +224,14 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * editor on every read tool call, which can be jarring for users who
      * have not opted in.
      */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followAgentEnabled"))
     var followAgentEnabled: Boolean = false
     /**
      * When Follow Agent is enabled, also show agent-executed commands in a read-only
      * console in the Run tool window. Default true — if the user opted into Follow Agent,
      * they want to see command output too.
      */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followCommandsInConsole"))
     var followCommandsInConsole: Boolean = true
 
     /**
@@ -212,58 +239,48 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * agent performs a search. Default true — gives the user an interactive result set
      * they can navigate, filter, and group.
      */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followSearchesInFindWindow"))
     var followSearchesInFindWindow: Boolean = true
     /** Highlight color for READ tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followReadColor"))
     var followReadColor: String = "#5078C888"
     /** Highlight color for EDIT tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followEditColor"))
     var followEditColor: String = "#50A05088"
     /** Highlight color for SEARCH tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followSearchColor"))
     var followSearchColor: String = "#C8B43C88"
     /** Highlight color for EXECUTE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followExecuteColor"))
     var followExecuteColor: String = "#B4785088"
     /** Highlight color for DELETE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followDeleteColor"))
     var followDeleteColor: String = "#C8505088"
     /** Highlight color for MOVE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followMoveColor"))
     var followMoveColor: String = "#A050C888"
     /** Highlight color for FETCH tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followFetchColor"))
     var followFetchColor: String = "#50A0C888"
     /** Highlight color for OTHER tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followOtherColor"))
     var followOtherColor: String = "#80808088"
 
     /**
      * Returns the persisted hex color for a [com.agentclientprotocol.model.ToolKind].
      * THINK and SWITCH_MODE have no persisted color and fall back to OTHER.
      */
-    fun getFollowColor(kind: com.agentclientprotocol.model.ToolKind): String = when (kind) {
-        com.agentclientprotocol.model.ToolKind.READ -> followReadColor
-        com.agentclientprotocol.model.ToolKind.EDIT -> followEditColor
-        com.agentclientprotocol.model.ToolKind.SEARCH -> followSearchColor
-        com.agentclientprotocol.model.ToolKind.EXECUTE -> followExecuteColor
-        com.agentclientprotocol.model.ToolKind.DELETE -> followDeleteColor
-        com.agentclientprotocol.model.ToolKind.MOVE -> followMoveColor
-        com.agentclientprotocol.model.ToolKind.FETCH -> followFetchColor
-        com.agentclientprotocol.model.ToolKind.THINK,
-        com.agentclientprotocol.model.ToolKind.SWITCH_MODE,
-        com.agentclientprotocol.model.ToolKind.OTHER -> followOtherColor
-    }
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().getFollowColor(kind)"))
+    fun getFollowColor(kind: com.agentclientprotocol.model.ToolKind): String =
+        OpenCodeFollowSettingsState.getInstance().getFollowColor(kind)
 
     /**
      * Persists the hex color for a [com.agentclientprotocol.model.ToolKind].
      * THINK and SWITCH_MODE have no persisted color — no-op.
      */
+    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().setFollowColor(kind, hex)"))
     fun setFollowColor(kind: com.agentclientprotocol.model.ToolKind, hex: String) {
-        when (kind) {
-            com.agentclientprotocol.model.ToolKind.READ -> followReadColor = hex
-            com.agentclientprotocol.model.ToolKind.EDIT -> followEditColor = hex
-            com.agentclientprotocol.model.ToolKind.SEARCH -> followSearchColor = hex
-            com.agentclientprotocol.model.ToolKind.EXECUTE -> followExecuteColor = hex
-            com.agentclientprotocol.model.ToolKind.DELETE -> followDeleteColor = hex
-            com.agentclientprotocol.model.ToolKind.MOVE -> followMoveColor = hex
-            com.agentclientprotocol.model.ToolKind.FETCH -> followFetchColor = hex
-            com.agentclientprotocol.model.ToolKind.OTHER -> followOtherColor = hex
-            com.agentclientprotocol.model.ToolKind.THINK,
-            com.agentclientprotocol.model.ToolKind.SWITCH_MODE -> { /* no-op */ }
-        }
+        OpenCodeFollowSettingsState.getInstance().setFollowColor(kind, hex)
     }
 
     /** Returns true if the given ToolKind should default to expanded. */
@@ -283,6 +300,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         return this
     }
 
+    @Suppress("DEPRECATION") // migrated fields retained for one release cycle
     override fun loadState(state: OpenCodeSettingsState) {
         binaryPath = state.binaryPath
         permissionTimeoutSeconds = state.permissionTimeoutSeconds
@@ -378,6 +396,64 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         prunerDefaultContextLimit = state.prunerDefaultContextLimit.coerceIn(1000, 2_000_000)
         animationThrottleFps = state.animationThrottleFps.coerceIn(15, 60)
         logLevel = AcpLogLevel.fromName(state.logLevel).name
+
+        // ── Forward moved fields to new state classes (Phase A: dual-read) ──
+        // The fields above are also copied into the new dedicated state classes so
+        // readers migrated to the new classes see the same values. Wrapped in
+        // try-catch: if forwarding throws, the old state must still load (the new
+        // classes fall back to their defaults, which is acceptable during migration).
+        try {
+            OpenCodeMcpSettingsState.getInstance().loadState(
+                OpenCodeMcpSettingsState().apply {
+                    enableIntellijMcp = state.enableIntellijMcp
+                    mcpServerUrl = state.mcpServerUrl
+                    additionalMcpServers = state.additionalMcpServers
+                    toolPermissions = state.toolPermissions
+                    savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
+                    discoveredToolsJson = state.discoveredToolsJson
+                }
+            )
+            OpenCodeFollowSettingsState.getInstance().loadState(
+                OpenCodeFollowSettingsState().apply {
+                    followAgentEnabled = state.followAgentEnabled
+                    followCommandsInConsole = state.followCommandsInConsole
+                    followSearchesInFindWindow = state.followSearchesInFindWindow
+                    followReadColor = state.followReadColor
+                    followEditColor = state.followEditColor
+                    followSearchColor = state.followSearchColor
+                    followExecuteColor = state.followExecuteColor
+                    followDeleteColor = state.followDeleteColor
+                    followMoveColor = state.followMoveColor
+                    followFetchColor = state.followFetchColor
+                    followOtherColor = state.followOtherColor
+                }
+            )
+            OpenCodeContextSettingsState.getInstance().loadState(
+                OpenCodeContextSettingsState().apply {
+                    truncateToolOutput = state.truncateToolOutput
+                    toolOutputCharLimit = state.toolOutputCharLimit
+                    detectDuplicateReads = state.detectDuplicateReads
+                    enableBackgroundCompaction = state.enableBackgroundCompaction
+                    checkpointThresholdPercent = state.checkpointThresholdPercent
+                    swapThresholdPercent = state.swapThresholdPercent
+                    showContextBreakdown = state.showContextBreakdown
+                    pressureNotificationThreshold = state.pressureNotificationThreshold
+                    compactConfirmation = state.compactConfirmation
+                    enableContextPruner = state.enableContextPruner
+                    prunerMaxToolOutputMessages = state.prunerMaxToolOutputMessages
+                    prunerErroredToolTurns = state.prunerErroredToolTurns
+                    prunerCompressEnabled = state.prunerCompressEnabled
+                    prunerCompressMode = state.prunerCompressMode
+                    prunerNudgeEnabled = state.prunerNudgeEnabled
+                    prunerNudgeThresholdPercent = state.prunerNudgeThresholdPercent
+                    prunerNudgeUrgentPercent = state.prunerNudgeUrgentPercent
+                    prunerNudgeCooldownTurns = state.prunerNudgeCooldownTurns
+                    prunerDefaultContextLimit = state.prunerDefaultContextLimit
+                }
+            )
+        } catch (e: Exception) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to new state classes" }
+        }
     }
 
     companion object {

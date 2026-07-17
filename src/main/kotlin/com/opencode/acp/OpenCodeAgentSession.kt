@@ -78,13 +78,8 @@ class OpenCodeAgentSession(
 
         try {
             // 1. Convert ContentBlocks → OpenCodeParts
-            val parts = content.mapNotNull { block ->
-                try { contentMapper.toOpenCodePart(block) }
-                catch (e: UnsupportedContentException) {
-                    logger.warn(e) { "Skipping unsupported content type" }
-                    null
-                }
-            }
+            // toOpenCodePart returns null for unsupported types (LSP fix — no longer throws)
+            val parts = content.mapNotNull { block -> contentMapper.toOpenCodePart(block) }
 
             // 2. Send async to OpenCode, get correlation ID for SSE matching
             val correlationId = openCodeClient.sendMessageAsync(openCodeSessionId, parts)

@@ -1,26 +1,7 @@
 ﻿package com.opencode.acp.mcp
 
-import io.github.oshai.kotlinlogging.KotlinLogging
-import io.ktor.client.HttpClient
-import io.ktor.client.request.get
-import io.ktor.client.statement.bodyAsText
-import io.ktor.http.isSuccess
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
-import java.util.concurrent.atomic.AtomicBoolean
-
-private val logger = KotlinLogging.logger {}
+import io.ktor.client.HttpClient
 
 /**
  * Represents a tool available to the LLM, either built-in or from an MCP server.
@@ -85,26 +66,23 @@ enum class ToolSource {
  * Used by the settings UI to display tool toggles and by the config writer to generate
  * permission rules.
  *
- * Thread safety: All writes ([discoverAll], [loadPermissions], [setToolPermission],
- * [setToolEnabled], [enableAll], [disableAll]) produce a new immutable map under
+ * This class is the storage layer only — discovery logic is delegated to [ToolDiscoverer]
+ * and permission management to [ToolPermissionManager] (TDD §4.2.5 SRP split).
+ *
+ * Thread safety: All writes (discoverAll, loadPermissions, setToolPermission,
+ * setToolEnabled, enableAll, disableAll) produce a new immutable map under
  * [toolsMutex], then assign it atomically to [_toolsSnapshot]. Reads via [tools]
  * are lock-free (reads a volatile reference to an immutable map).
  */
 class ToolRegistry(
-    private val httpClient: HttpClient,
-    private val mcpToolDiscovery: McpToolDiscovery,
-    private val json: Json = Json { ignoreUnknownKeys = true }
+    httpClient: HttpClient,
+    mcpToolDiscovery: McpToolDiscovery,
+    private val json: kotlinx.serialization.json.Json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
 ) {
     private val toolsMutex = Mutex()
 
-    /**
-     * Guard against concurrent [discoverAll] invocations. The HTTP discovery calls
-     * happen outside the mutex, so concurrent callers would both execute HTTP requests
-     * and one's results would be silently discarded. This flag enforces single-caller
-     * semantics at the class level, rather than relying solely on the external
-     * `isDiscovering` flag in OpenCodeMcpConfigurable.
-     */
-    private val discovering = AtomicBoolean(false)
+    private val discoverer = ToolDiscoverer(httpClient, mcpToolDiscovery, json)
+    private val permissionManager = ToolPermissionManager(json)
 
     /**
      * Snapshot of current tools. Uses CopyOnWriteArrayList-style approach:
@@ -114,27 +92,15 @@ class ToolRegistry(
     @Volatile
     private var _toolsSnapshot: Map<String, ToolInfo> = emptyMap()
 
-    /**
-     * Permissions saved before [disableAll], so [enableAll] can restore
-     * ASK permissions that were active before the disable. Prevents ASK→ALLOW
-     * promotion on a disable→enable cycle.
-     */
-    private val savedPermissionsBeforeDisable: MutableMap<String, ToolPermission> = mutableMapOf()
-
     /** Lock-free read of the current tool snapshot. */
     val tools: Map<String, ToolInfo>
         get() = _toolsSnapshot
 
+    // --- Discovery (delegated to ToolDiscoverer) ---
+
     /**
      * Discover all available tools from OpenCode and MCP servers.
-     * Uses a two-phase approach: discover into a temporary map, then swap atomically.
-     * This prevents partial data loss if discovery fails partway — the previous
-     * full set is preserved until the new set is complete.
-     *
-     * NOTE: This method is NOT internally synchronized — the mutex only guards the
-     * snapshot swap, not the discovery HTTP calls. Callers MUST serialize invocations
-     * (e.g., via the `isDiscovering` flag in OpenCodeMcpConfigurable). Concurrent
-     * calls may result in wasted HTTP requests and one call's results being discarded.
+     * Delegates to [ToolDiscoverer.discoverAll].
      *
      * @param opencodeBaseUrl The base URL of the OpenCode server (e.g., "http://127.0.0.1:4096")
      * @param mcpServerUrls Map of MCP server name to SSE URL
@@ -143,173 +109,103 @@ class ToolRegistry(
     suspend fun discoverAll(
         opencodeBaseUrl: String,
         mcpServerUrls: Map<String, String>
-    ): List<ToolInfo> {
-        // Guard: reject concurrent discovery calls to prevent wasted HTTP requests
-        // and silent result discarding.
-        if (!discovering.compareAndSet(false, true)) {
-            logger.warn { "[ACP] ToolRegistry: discoverAll() called while already in flight — skipping" }
-            return _toolsSnapshot.values.toList()
-        }
-        try {
-            // Phase 1: Discover into a temporary map (no lock needed)
-            val newTools = mutableMapOf<String, ToolInfo>()
-            discoverBuiltinTools(opencodeBaseUrl, newTools)
-            discoverMcpTools(mcpServerUrls, newTools)
+    ): List<ToolInfo> = discoverer.discoverAll(
+        opencodeBaseUrl = opencodeBaseUrl,
+        mcpServerUrls = mcpServerUrls,
+        toolsMutex = toolsMutex,
+        snapshotRef = { _toolsSnapshot },
+        snapshotSetter = { _toolsSnapshot = it }
+    )
 
-            // Phase 2: Atomic swap — merge persisted permissions from the old
-            // snapshot into the new one, then assign under lock. This prevents
-            // loadPermissions() changes from being silently overwritten when
-            // discoverAll() completes (the race where loadPermissions runs during
-            // the HTTP discovery phase and its changes are lost on swap).
-            toolsMutex.withLock {
-                val oldSnapshot = _toolsSnapshot
-                // Re-apply permissions from the old snapshot to matching tools in the new set.
-                // Match by both compound id and raw name to handle all key formats.
-                for ((oldId, oldTool) in oldSnapshot) {
-                    // Try exact id match first
-                    val newTool = newTools[oldId]
-                        // Then try raw name match (handles tools whose serverName changed)
-                        ?: newTools.values.find { it.name == oldTool.name }
-                    if (newTool != null) {
-                        newTools[newTool.id] = newTool.copy(
-                            enabled = oldTool.enabled,
-                            permission = oldTool.permission
-                        )
-                    }
-                }
-                _toolsSnapshot = newTools.toMap()  // Immutable snapshot
-            }
+    /** Delegate access to the built-in tool description catalog. */
+    fun getBuiltinToolDescription(toolId: String): String =
+        discoverer.getBuiltinToolDescription(toolId)
 
-            logger.info { "[ACP] ToolRegistry: discovered ${newTools.size} total tools" }
-            return newTools.values.toList()
-        } finally {
-            discovering.set(false)
-        }
-    }
-
-    /**
-     * Discover built-in tools from OpenCode's /experimental/tool/ids endpoint.
-     */
-    private suspend fun discoverBuiltinTools(opencodeBaseUrl: String, newTools: MutableMap<String, ToolInfo>) {
-        try {
-            val response = httpClient.get("$opencodeBaseUrl/experimental/tool/ids")
-            if (!response.status.isSuccess()) {
-                logger.warn { "[ACP] ToolRegistry: /experimental/tool/ids returned ${response.status}" }
-                return
-            }
-
-            val body = response.bodyAsText()
-            val toolIds = parseToolIds(body)
-
-            for (toolId in toolIds) {
-                val tool = ToolInfo.create(
-                    name = toolId,
-                    description = getBuiltinToolDescription(toolId),
-                    source = ToolSource.BUILTIN,
-                    enabled = true,
-                    permission = ToolPermission.ALLOW
-                )
-                newTools[tool.id] = tool
-            }
-
-            logger.info { "[ACP] ToolRegistry: discovered ${toolIds.size} built-in tools" }
-        } catch (e: Exception) {
-            logger.warn(e) { "[ACP] ToolRegistry: failed to discover built-in tools" }
-        }
-    }
-
-    /**
-     * Parse the response from /experimental/tool/ids.
-     *
-     * The server returns a bare JSON array: ["bash", "read", ...]
-     * Fallback: wrapped format {"value": [...]}
-     */
-    private fun parseToolIds(body: String): List<String> {
-        return try {
-            val element = json.parseToJsonElement(body)
-            val array = if (element is kotlinx.serialization.json.JsonArray) {
-                element
-            } else {
-                element.jsonObject["value"]?.jsonArray ?: return emptyList()
-            }
-            array.mapNotNull { it.jsonPrimitive.contentOrNull }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.warn(e) { "[ACP] ToolRegistry: failed to parse tool IDs" }
-            emptyList()
-        }
-    }
-
-    /**
-     * Get a human-readable description for a built-in tool.
-     */
-    fun getBuiltinToolDescription(toolId: String): String {
-        return when (toolId) {
-            "bash" -> "Execute shell commands"
-            "read" -> "Read file contents"
-            "glob" -> "Find files by pattern"
-            "grep" -> "Search file contents with regex"
-            "edit" -> "Edit files with string replacement"
-            "write" -> "Write new files"
-            "task" -> "Launch specialized agents"
-            "webfetch" -> "Fetch URLs and extract content"
-            "todowrite" -> "Manage task lists"
-            "websearch" -> "Search the web"
-            "skill" -> "Load specialized workflows"
-            "apply_patch" -> "Apply patches to files"
-            "council_session" -> "Multi-LLM consensus engine"
-            "auto_continue" -> "Toggle auto-continuation"
-            "ast_grep_search" -> "AST-aware code search"
-            "ast_grep_replace" -> "AST-aware code replacement"
-            "subtask" -> "Run child worker sessions"
-            "read_session" -> "Read conversation transcripts"
-            else -> "Built-in tool: $toolId"
-        }
-    }
-
-    /**
-     * Discover tools from MCP servers using the MCP protocol.
-     */
-    private suspend fun discoverMcpTools(mcpServerUrls: Map<String, String>, newTools: MutableMap<String, ToolInfo>) {
-        val mcpTools = mcpToolDiscovery.discoverAllTools(mcpServerUrls)
-
-        for ((serverName, toolDescriptors) in mcpTools) {
-            for (tool in toolDescriptors) {
-                val toolInfo = ToolInfo.create(
-                    name = tool.name,
-                    description = tool.description,
-                    source = ToolSource.MCP,
-                    serverName = serverName,
-                    enabled = true,
-                    permission = ToolPermission.ALLOW
-                )
-                newTools[toolInfo.id] = toolInfo
-            }
-        }
-    }
+    // --- Permission management (delegated to ToolPermissionManager) ---
 
     /**
      * Update the permission for a specific tool by its ID.
      */
-    suspend fun setToolPermission(toolId: String, permission: ToolPermission) = toolsMutex.withLock {
-        val tool = _toolsSnapshot[toolId] ?: return@withLock
-        val newSnapshot = _toolsSnapshot.toMutableMap()
-        newSnapshot[toolId] = tool.copy(permission = permission)
-        _toolsSnapshot = newSnapshot
-    }
+    suspend fun setToolPermission(toolId: String, permission: ToolPermission) =
+        permissionManager.setToolPermission(toolId, permission, toolsMutex, { _toolsSnapshot }, { _toolsSnapshot = it })
 
     /**
      * Update the enabled state for a specific tool by its ID.
      */
-    suspend fun setToolEnabled(toolId: String, enabled: Boolean) = toolsMutex.withLock {
-        val tool = _toolsSnapshot[toolId] ?: return@withLock
-        val newSnapshot = _toolsSnapshot.toMutableMap()
-        // Enabled and permission are orthogonal: disabling a tool doesn't change
-        // its permission — the user might want "ask" preserved for re-enable.
-        newSnapshot[toolId] = tool.copy(enabled = enabled)
-        _toolsSnapshot = newSnapshot
-    }
+    suspend fun setToolEnabled(toolId: String, enabled: Boolean) =
+        permissionManager.setToolEnabled(toolId, enabled, toolsMutex, { _toolsSnapshot }, { _toolsSnapshot = it })
+
+    /**
+     * Enable all tools. Restores permissions from [savedPermissions] if provided
+     * (preserving ASK settings). For tools not in [savedPermissions], only overrides
+     * DENY to ALLOW (preserving existing ASK/ALLOW).
+     *
+     * @param savedPermissions Optional map of tool ID to permission, loaded from
+     *   persistent settings. If null or empty, falls back to in-memory cache
+     *   which does NOT survive IDE restarts.
+     */
+    suspend fun enableAll(savedPermissions: Map<String, ToolPermission>? = null) =
+        permissionManager.enableAll(savedPermissions, toolsMutex, { _toolsSnapshot }, { _toolsSnapshot = it })
+
+    /**
+     * Disable all tools. Saves each tool's current permission so [enableAll]
+     * can restore ASK settings that were active before the disable.
+     *
+     * @return The saved permissions map, which the caller should persist to
+     *   settings to survive IDE restarts.
+     */
+    suspend fun disableAll(): Map<String, ToolPermission> =
+        permissionManager.disableAll(toolsMutex, { _toolsSnapshot }, { _toolsSnapshot = it })
+
+    /**
+     * Batch-set enabled state for a specific set of tools (the panel's visible subset),
+     * preserving the panel's filtered-batch semantics. Acquires [toolsMutex].
+     *
+     * Matches by raw name OR compound id, applying to ALL matches.
+     */
+    suspend fun syncEnabled(toolNames: Set<String>, enabled: Boolean) =
+        permissionManager.syncEnabled(toolNames, enabled, toolsMutex, { _toolsSnapshot }, { _toolsSnapshot = it })
+
+    /**
+     * Load persisted permissions into the registry. Must be called after
+     * [discoverAll] to preserve user customizations.
+     */
+    suspend fun loadPermissions(permissions: Map<String, ToolPermission>) =
+        permissionManager.loadPermissions(permissions, toolsMutex, { _toolsSnapshot }, { _toolsSnapshot = it })
+
+    /**
+     * Load persisted enabled state AND permissions into the registry. Must be
+     * called after [discoverAll] to preserve user customizations.
+     *
+     * This is the preferred method over [loadPermissions] when the caller has
+     * both the enabled flag and the permission level.
+     */
+    suspend fun loadEnabledAndPermissions(state: Map<String, Pair<Boolean, ToolPermission>>) =
+        permissionManager.loadEnabledAndPermissions(state, toolsMutex, { _toolsSnapshot }, { _toolsSnapshot = it })
+
+    // --- Serialization (delegated to ToolPermissionManager) ---
+
+    /**
+     * Export tool permissions as a JSON string for settings persistence.
+     * Format: {"toolId":{"enabled":true,"permission":"allow"}, ...}
+     */
+    fun exportPermissionsJson(): String =
+        permissionManager.exportPermissionsJsonFromSnapshot(_toolsSnapshot)
+
+    /**
+     * Serialize an explicit permissions map to the settings-persistence JSON format.
+     */
+    fun exportPermissionsJson(permissions: Map<String, Pair<Boolean, ToolPermission>>): String =
+        permissionManager.exportPermissionsJson(permissions)
+
+    /**
+     * Export tool permissions as a Map for McpConfigWriter.
+     * Keys are raw tool names (matching McpConfigWriter convention).
+     */
+    fun exportPermissions(): Map<String, ToolPermission> =
+        permissionManager.exportPermissions(_toolsSnapshot)
+
+    // --- Read-only queries (storage layer) ---
 
     /**
      * Get tools grouped by source.
@@ -345,81 +241,6 @@ class ToolRegistry(
     fun getTotalCount(): Int = _toolsSnapshot.size
 
     /**
-     * Enable all tools. Restores permissions from [savedPermissions] if provided
-     * (preserving ASK settings). For tools not in [savedPermissions], only overrides
-     * DENY to ALLOW (preserving existing ASK/ALLOW).
-     *
-     * @param savedPermissions Optional map of tool ID to permission, loaded from
-     *   persistent settings. If null or empty, falls back to in-memory cache
-     *   ([savedPermissionsBeforeDisable]) which does NOT survive IDE restarts.
-     */
-    suspend fun enableAll(savedPermissions: Map<String, ToolPermission>? = null) = toolsMutex.withLock {
-        val newSnapshot = _toolsSnapshot.toMutableMap()
-        val source = savedPermissions?.takeIf { it.isNotEmpty() } ?: savedPermissionsBeforeDisable
-        for ((id, tool) in newSnapshot) {
-            val restoredPermission = source[id]
-                ?: if (tool.permission == ToolPermission.DENY) ToolPermission.ALLOW else tool.permission
-            newSnapshot[id] = tool.copy(enabled = true, permission = restoredPermission)
-        }
-        _toolsSnapshot = newSnapshot
-    }
-
-    /**
-     * Disable all tools. Saves each tool's current permission so [enableAll]
-     * can restore ASK settings that were active before the disable.
-     *
-     * @return The saved permissions map, which the caller should persist to
-     *   settings (e.g., [OpenCodeSettingsState.savedToolPermissionsBeforeDisable])
-     *   to survive IDE restarts.
-     */
-    suspend fun disableAll(): Map<String, ToolPermission> = toolsMutex.withLock {
-        val newSnapshot = _toolsSnapshot.toMutableMap()
-        val saved = mutableMapOf<String, ToolPermission>()
-        for ((id, tool) in newSnapshot) {
-            saved[id] = tool.permission
-            savedPermissionsBeforeDisable[id] = tool.permission
-            newSnapshot[id] = tool.copy(enabled = false, permission = ToolPermission.DENY)
-        }
-        _toolsSnapshot = newSnapshot
-        saved
-    }
-
-    /**
-     * Batch-set enabled state for a specific set of tools (the panel's visible subset),
-     * preserving the panel's filtered-batch semantics. Acquires [toolsMutex].
-     *
-     * Unlike [enableAll]/[disableAll], which operate on all tools, this only affects
-     * the named tools — tools filtered out of the panel view are untouched.
-     *
-     * When enabling, preserves "ask" permission — only overrides "deny" to "allow"
-     * (same semantics as [enableAll]).
-     *
-     * Matches by raw name OR compound id, applying to ALL matches. This handles
-     * the case where two MCP servers expose tools with the same raw name (e.g.,
-     * both server A and server B have "create_file") — both are updated.
-     *
-     * NOTE: The per-tool checkbox in the settings panel uses the compound id
-     * (ToolInfo.id) as the map key, so individual toggles ARE server-specific.
-     * Only this batch operation (Enable All / Disable All) has this limitation.
-     */
-    suspend fun syncEnabled(toolNames: Set<String>, enabled: Boolean) = toolsMutex.withLock {
-        val newSnapshot = _toolsSnapshot.toMutableMap()
-        for (name in toolNames) {
-            // Match by raw name OR compound id — apply to ALL matches (handles duplicate names across servers)
-            val matchingTools = newSnapshot.values.filter { it.name == name || it.id == name }
-            for (tool in matchingTools) {
-                newSnapshot[tool.id] = if (enabled) {
-                    val newPermission = if (tool.permission == ToolPermission.DENY) ToolPermission.ALLOW else tool.permission
-                    tool.copy(enabled = true, permission = newPermission)
-                } else {
-                    tool.copy(enabled = false, permission = ToolPermission.DENY)
-                }
-            }
-        }
-        _toolsSnapshot = newSnapshot
-    }
-
-    /**
      * Filter tools by name or description.
      */
     fun filterTools(query: String): List<ToolInfo> {
@@ -444,123 +265,5 @@ class ToolRegistry(
     fun filterByServer(serverName: String): List<ToolInfo> {
         return _toolsSnapshot.values.filter { it.serverName == serverName }
             .sortedBy { it.name }
-    }
-
-    /**
-     * Load persisted permissions into the registry. Must be called after
-     * [discoverAll] to preserve user customizations. Acquires the mutex
-     * to prevent concurrent modification with [discoverAll].
-     *
-     * The permissions map may be keyed by either:
-     * - Raw tool names (e.g., "bash") — from toolPermissions settings field
-     * - Compound IDs (e.g., "builtin_bash") — from discoveredToolsJson
-     * Both formats are handled. Each key is matched against BOTH ToolInfo.id
-     * AND ToolInfo.name, applying to ALL matching tools. This handles the case
-     * where two MCP servers expose tools with the same raw name.
-     *
-     * Only restores [ToolPermission] — the [ToolInfo.enabled] flag is left at
-     * its discovery default (true). Use [loadEnabledAndPermissions] to restore both.
-     */
-    suspend fun loadPermissions(permissions: Map<String, ToolPermission>) = toolsMutex.withLock {
-        val current = _toolsSnapshot.toMutableMap()
-        for ((key, permission) in permissions) {
-            // Match by compound id first, then by raw name — apply to ALL matches
-            val matchingTools = current.values.filter { it.id == key || it.name == key }
-            for (tool in matchingTools) {
-                current[tool.id] = tool.copy(permission = permission)
-            }
-        }
-        _toolsSnapshot = current.toMap()  // Immutable snapshot
-    }
-
-    /**
-     * Load persisted enabled state AND permissions into the registry. Must be
-     * called after [discoverAll] to preserve user customizations. Acquires the
-     * mutex to prevent concurrent modification with [discoverAll].
-     *
-     * The map keys follow the same matching rules as [loadPermissions] — both
-     * raw names and compound IDs are matched against [ToolInfo.id] and [ToolInfo.name].
-     *
-     * This is the preferred method over [loadPermissions] when the caller has
-     * both the enabled flag and the permission level, because it preserves the
-     * user's enable/disable selections across re-discovery.
-     */
-    suspend fun loadEnabledAndPermissions(state: Map<String, Pair<Boolean, ToolPermission>>) = toolsMutex.withLock {
-        val current = _toolsSnapshot.toMutableMap()
-        for ((key, pair) in state) {
-            val (enabled, permission) = pair
-            val matchingTools = current.values.filter { it.id == key || it.name == key }
-            for (tool in matchingTools) {
-                current[tool.id] = tool.copy(enabled = enabled, permission = permission)
-            }
-        }
-        _toolsSnapshot = current.toMap()  // Immutable snapshot
-    }
-
-    /**
-     * Export tool permissions as a JSON string for settings persistence.
-     * Format: {"toolId":{"enabled":true,"permission":"allow"}, ...}
-     * Uses buildJsonObject to construct the structure manually since
-     * Map<String, Map<String, Any>> has no built-in kotlinx.serialization serializer.
-     */
-    fun exportPermissionsJson(): String {
-        val snapshot = _toolsSnapshot  // Lock-free read
-        val root = buildJsonObject {
-            for (tool in snapshot.values) {
-                put(tool.id, buildJsonObject {
-                    put("enabled", tool.enabled)
-                    put("permission", tool.permission.toActionString())
-                })
-            }
-        }
-        return json.encodeToString(JsonObject.serializer(), root)
-    }
-
-    /**
-     * Serialize an explicit permissions map to the settings-persistence JSON format.
-     * Overload of [exportPermissionsJson] that accepts an explicit map rather than
-     * reading the registry's internal snapshot — lets the panel delegate JSON
-     * generation without first pushing state into the registry.
-     *
-     * Keys are raw tool names (matching the panel's [generateToolPermissionsJson]
-     * convention). Values are pairs of (enabled, permission).
-     *
-     * Format: {"toolName":{"enabled":true,"permission":"allow"}, ...}
-     */
-    fun exportPermissionsJson(permissions: Map<String, Pair<Boolean, ToolPermission>>): String {
-        val root = buildJsonObject {
-            for ((toolName, pair) in permissions) {
-                val (enabled, permission) = pair
-                put(toolName, buildJsonObject {
-                    put("enabled", enabled)
-                    put("permission", permission.toActionString())
-                })
-            }
-        }
-        return json.encodeToString(JsonObject.serializer(), root)
-    }
-
-    /**
-     * Export tool permissions as a Map for McpConfigWriter.
-     * Keys are raw tool names (matching McpConfigWriter convention).
-     * Uses [ToolInfo.name] directly to produce raw names compatible with
-     * McpConfigWriter (e.g., "bash", "intellij_read_file").
-     *
-     * WARNING: When two tools across different servers share the same raw name,
-     * only one entry survives (last-write-wins). This is a known limitation of
-     * the MCP config format, which keys permissions by raw tool name. The compound
-     * [ToolInfo.id] field exists for internal disambiguation but cannot be used in
-     * the config file format.
-     */
-    fun exportPermissions(): Map<String, ToolPermission> {
-        val snapshot = _toolsSnapshot  // Lock-free read
-        val result = mutableMapOf<String, ToolPermission>()
-        for (tool in snapshot.values) {
-            val existing = result.put(tool.name, tool.permission)
-            if (existing != null && existing != tool.permission) {
-                logger.warn { "[ACP] ToolRegistry: duplicate tool name '${tool.name}' from servers '${tool.serverName}' overwrites previous permission ($existing → ${tool.permission})" }
-            }
-        }
-        return result
     }
 }

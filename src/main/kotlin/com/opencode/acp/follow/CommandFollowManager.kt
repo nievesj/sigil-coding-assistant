@@ -16,7 +16,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -101,7 +101,7 @@ class CommandFollowManager(private val project: Project) : Disposable {
         modelName: String?,
     ) {
         // Guard: feature must be enabled
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
         if (!settings.followAgentEnabled) return
         if (!settings.followCommandsInConsole) return
 

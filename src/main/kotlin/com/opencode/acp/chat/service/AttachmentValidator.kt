@@ -112,12 +112,24 @@ internal class AttachmentValidator(
             val pathSegments = canonicalPath.lowercase()
                 .split(java.io.File.separatorChar, '/')
                 .filter { it.isNotEmpty() }
-            // Root-level segments: on Windows, index 0 is the drive letter (e.g., "c:"),
-            // so the first directory is at index 1. On Unix, index 0 is the first
-            // directory. Check both to handle cross-platform paths correctly.
-            val rootSegmentIndex = if (pathSegments.isNotEmpty() && pathSegments[0].endsWith(":")) 1 else 0
+            // Root-level denylist: check the first path segment RELATIVE to the project
+            // base, not the filesystem root. "build" at the project root should be
+            // rejected, but "build" under src/ should not. On Windows, the filesystem
+            // root is the drive letter (e.g., "c:"), so checking pathSegments[1] would
+            // give "users" — not useful. We compute the relative path from the project
+            // base and check its first segment.
+            val projectRelativeFirstSegment = if (projectBasePath != null) {
+                val projectBaseLower = projectBasePath.lowercase()
+                val canonicalLower = canonicalPath.lowercase()
+                if (canonicalLower.startsWith(projectBaseLower + java.io.File.separator)) {
+                    canonicalLower.substring(projectBaseLower.length + 1)
+                        .split(java.io.File.separatorChar, '/')
+                        .filter { it.isNotEmpty() }
+                        .firstOrNull()
+                } else null
+            } else null
             val isDenylisted = pathSegments.any { it in DENYLIST_SEGMENTS } ||
-                (pathSegments.size > rootSegmentIndex && pathSegments[rootSegmentIndex] in ROOT_ONLY_DENYLIST)
+                (projectRelativeFirstSegment != null && projectRelativeFirstSegment in ROOT_ONLY_DENYLIST)
             // Apply denylist to ALL paths regardless of location.
             // A symlink in .opencode/attachments/ pointing to .env would otherwise
             // bypass the denylist. The denylist must apply universally to prevent
@@ -190,13 +202,22 @@ internal class AttachmentValidator(
     companion object {
         const val MAX_ATTACHMENT_SIZE_BYTES = 10L * 1024 * 1024  // 10MB
 
-        // Denylist segments — moved here from inline setOf() in sendMessageInternal
+        // Denylist segments — moved here from inline setOf() in sendMessageInternal.
+        // These segments are checked against ALL path segments globally (see isDenylisted
+        // below). They are sensitive regardless of location in the path tree.
+        // NOTE: "build", "target", "out" are intentionally NOT here — they are legitimate
+        // package/directory names under src/ (e.g., src/main/build/). They are checked
+        // only at the project-root level via ROOT_ONLY_DENYLIST to avoid false positives.
         val DENYLIST_SEGMENTS = setOf(
             ".env", ".env.local", ".env.production",
             ".git", ".hg", ".svn",
             ".idea",
             "node_modules",
         )
+        // Root-only denylist: checked against the first path segment RELATIVE to the
+        // project base (see projectRelativeFirstSegment below). "build"/"target"/"out"
+        // at the project root are build-output directories and rejected, but the same
+        // names nested under src/ are legitimate source directories and allowed.
         val ROOT_ONLY_DENYLIST = setOf("build", "target", "out")
     }
 }

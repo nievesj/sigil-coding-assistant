@@ -29,16 +29,19 @@ import kotlin.concurrent.withLock
  * @param messageMap Message cache manager � used to update message parts when
  *        tool call status/state changes.
  * @param sessionManager Session manager � used for tool output truncation
- *        ([SessionManager.maybeTruncateToolOutput]).
+ *        ([SessionStateContext.maybeTruncateToolOutput]).
  * @param logger Shared logger instance.
  */
 internal class ToolCallStateManager(
     private val toolCallState: ToolCallState,
     private val stateLock: ReentrantLock,
     private val messageMap: MessageMapManager,
-    private val sessionManager: SessionManager,
+    private val sessionManager: SessionStateContext,
     private val logger: KLogger,
 ) {
+    private companion object {
+        const val MAX_ERROR_TEXT_LENGTH = 500
+    }
     /**
      * Update tool call status with optional output truncation.
      * Applies tool output truncation if enabled in settings (opt-in).
@@ -58,7 +61,7 @@ internal class ToolCallStateManager(
             ToolCallStatus.FAILED -> PartState.Failed(
                 truncatedOutput?.joinToString("\n") { obj ->
                     try { obj["text"]?.jsonPrimitive?.contentOrNull ?: obj.toString() } catch (_: Exception) { obj.toString() }
-                }?.let { text -> if (text.length > 500) text.take(500) + "�[truncated]" else text } ?: "Tool error"
+                }?.let { text -> if (text.length > MAX_ERROR_TEXT_LENGTH) text.take(MAX_ERROR_TEXT_LENGTH) + "[truncated]" else text } ?: "Tool error"
             )
             ToolCallStatus.PENDING -> PartState.Pending
             ToolCallStatus.IN_PROGRESS -> PartState.InProgress

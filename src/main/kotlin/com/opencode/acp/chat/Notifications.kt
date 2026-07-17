@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicLong
  * When the IDE is not focused, [requestWindowAttention] plays a system beep
  * to alert the user without forcibly stealing focus.
  */
-object OpenCodeNotifications {
+object OpenCodeNotifications : NotificationService {
 
     private const val GROUP_ID = "Sigil"
 
@@ -54,7 +54,7 @@ object OpenCodeNotifications {
      * Deduped: skips if a response-complete notification was shown within the last
      * [RESPONSE_NOTIFY_MIN_INTERVAL_MS] to avoid balloon stacking from rapid responses.
      */
-    fun notifyResponseComplete(project: Project) {
+    override fun notifyResponseComplete(project: Project) {
         if (isIdeWindowFocused(project)) return
 
         val now = System.currentTimeMillis()
@@ -84,7 +84,7 @@ object OpenCodeNotifications {
      * Notify the user that the LLM is asking a question that requires input.
      * Always fires — this blocks the conversation and needs user action.
      */
-    fun notifyQuestionAsked(project: Project) {
+    override fun notifyQuestionAsked(project: Project) {
         if (!isIdeWindowFocused(project)) {
             requestWindowAttention(project)
         } else {
@@ -112,7 +112,7 @@ object OpenCodeNotifications {
      * Notify the user that the LLM is requesting permission for a tool.
      * Always fires — this blocks the conversation and needs user action.
      */
-    fun notifyPermissionNeeded(project: Project) {
+    override fun notifyPermissionNeeded(project: Project) {
         if (!isIdeWindowFocused(project)) {
             requestWindowAttention(project)
         } else {
@@ -138,7 +138,7 @@ object OpenCodeNotifications {
      * Notify the user that a permission prompt timed out.
      * Provides visual feedback instead of silently dismissing the prompt.
      */
-    fun notifyPermissionTimedOut(project: Project, toolName: String) {
+    override fun notifyPermissionTimedOut(project: Project, toolName: String) {
         val displayToolName = htmlEscape(toolName.take(100))
         ApplicationManager.getApplication().invokeLater {
             Notification(
@@ -158,7 +158,7 @@ object OpenCodeNotifications {
      * Notify the user that a permission was processed by the server despite a network error.
      * This happens when the POST fails locally but the server still received and processed the response.
      */
-    fun notifyPermissionProcessedDespiteError(project: Project, sessionId: String) {
+    override fun notifyPermissionProcessedDespiteError(project: Project, sessionId: String) {
         ApplicationManager.getApplication().invokeLater {
             Notification(
                 GROUP_ID,
@@ -178,7 +178,7 @@ object OpenCodeNotifications {
      * Used when MCP settings change and the OpenCode server is being re-initialized,
      * to inform the user that a restart may be needed for full effect.
      */
-    fun showRestartWarning(message: String) {
+    override fun showRestartWarning(message: String) {
         val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
             ?: run {
                 io.github.oshai.kotlinlogging.KotlinLogging.logger {}

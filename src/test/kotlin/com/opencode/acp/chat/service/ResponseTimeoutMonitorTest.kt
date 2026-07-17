@@ -21,7 +21,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
-import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -45,9 +45,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class ResponseTimeoutMonitorTest {
 
-    private lateinit var scope: TestScope
-    private lateinit var sessionManager: SessionManager
-    private lateinit var monitor: ResponseTimeoutMonitor
+    private val testScope = TestScope()
 
     /** Controls what getActiveSession() returns on each call. */
     private val activeSessionRef = AtomicReference<SessionState?>(null)
@@ -58,13 +56,15 @@ class ResponseTimeoutMonitorTest {
     /** Controls what toolStuckTimeoutSecondsProvider returns. */
     private val toolStuckTimeoutRef = AtomicReference(300)
 
+    private lateinit var sessionManager: SessionManager
+    private lateinit var monitor: ResponseTimeoutMonitor
+
     @BeforeEach
     fun setUp() {
-        scope = TestScope()
         sessionManager = mockk(relaxed = true)
         every { sessionManager.getActiveSession() } answers { activeSessionRef.get() }
         monitor = ResponseTimeoutMonitor(
-            scope = scope,
+            scope = testScope,
             sessionManager = sessionManager,
             responseTimeoutSecondsProvider = { responseTimeoutRef.get() },
             toolStuckTimeoutSecondsProvider = { toolStuckTimeoutRef.get() },
@@ -73,11 +73,11 @@ class ResponseTimeoutMonitorTest {
 
     @AfterEach
     fun tearDown() {
-        scope.cancel()
+        testScope.cancel()
     }
 
     @Test
-    fun `no SSE activity beyond timeout triggers onTimeout`() = runTest {
+    fun `no SSE activity beyond timeout triggers onTimeout`() = testScope.runTest {
         val session = mockk<SessionState>(relaxed = true)
         // lastActivity was 20 seconds ago; timeout is 10s
         every { session.lastActivityTimeMs } returns System.currentTimeMillis() - 20_000
@@ -90,9 +90,11 @@ class ResponseTimeoutMonitorTest {
             onTimeout = { timeoutMsg = it },
             onToolStuck = { },
         )
-        // Advance past the 5s check interval + a bit more
+        // Advance past the 5s check interval + a bit more.
+        // Do NOT use advanceUntilIdle() — the monitor has an infinite while(isActive) loop
+        // that keeps scheduling delay(5000), so advanceUntilIdle() would never return.
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        runCurrent()
         job.cancel()
 
         timeoutMsg shouldNotBe null
@@ -100,7 +102,7 @@ class ResponseTimeoutMonitorTest {
     }
 
     @Test
-    fun `running tool skips activity timeout`() = runTest {
+    fun `running tool skips activity timeout`() = testScope.runTest {
         val session = mockk<SessionState>(relaxed = true)
         // lastActivity was 100 seconds ago (way past 10s timeout)
         every { session.lastActivityTimeMs } returns System.currentTimeMillis() - 100_000
@@ -120,7 +122,8 @@ class ResponseTimeoutMonitorTest {
             onToolStuck = { stuckCalled = true },
         )
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        advanceTimeBy(6_000)
+        runCurrent()
         job.cancel()
 
         timeoutCalled shouldBe false
@@ -128,22 +131,17 @@ class ResponseTimeoutMonitorTest {
     }
 
     @Test
-    fun `tool stuck beyond ceiling triggers onToolStuck`() = runTest {
+    fun `tool stuck beyond ceiling triggers onToolStuck`() = testScope.runTest {
         val session = mockk<SessionState>(relaxed = true)
         every { session.lastActivityTimeMs } returns System.currentTimeMillis()
         // Tool started 200 seconds ago; stuck ceiling is 60s
-        // NOTE: The pill mock uses an empty-string key ("") and the statesSnapshot map
-        // uses the same key. In real code, the pill key is the toolCallId and statesSnapshot
-        // is keyed by toolCallId. The empty-string key is a test simplification that works
-        // because the monitor filters pills by checking statesSnapshot[it.key].
-        val pill = mockk<kotlin.collections.Map.Entry<String, ToolCallPill>>()
         val pillValue = mockk<ToolCallPill>()
-        every { pill.value } returns pillValue
         every { pillValue.startTimeMs } returns System.currentTimeMillis() - 200_000
+        val pill = java.util.AbstractMap.SimpleEntry("tool1", pillValue)
         every { session.snapshotToolState() } returns Triple<List<PartState>, List<Map.Entry<String, ToolCallPill>>, Map<String, PartState>>(
             listOf(PartState.InProgress),
             listOf(pill),
-            mapOf("" to (PartState.InProgress as PartState))
+            mapOf("tool1" to (PartState.InProgress as PartState))
         )
         activeSessionRef.set(session)
         toolStuckTimeoutRef.set(60)
@@ -154,7 +152,8 @@ class ResponseTimeoutMonitorTest {
             onToolStuck = { stuckMsg = it },
         )
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        advanceTimeBy(6_000)
+        runCurrent()
         job.cancel()
 
         stuckMsg shouldNotBe null
@@ -162,7 +161,7 @@ class ResponseTimeoutMonitorTest {
     }
 
     @Test
-    fun `evicted session skips iteration without false-positive timeout`() = runTest {
+    fun `evicted session skips iteration without false-positive timeout`() = testScope.runTest {
         // Session was evicted — getActiveSession returns null
         activeSessionRef.set(null)
         responseTimeoutRef.set(10)
@@ -174,7 +173,8 @@ class ResponseTimeoutMonitorTest {
             onToolStuck = { stuckCalled = true },
         )
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        advanceTimeBy(6_000)
+        runCurrent()
         job.cancel()
 
         timeoutCalled shouldBe false
@@ -182,7 +182,7 @@ class ResponseTimeoutMonitorTest {
     }
 
     @Test
-    fun `responseTimeoutSeconds clamped to minimum 10`() = runTest {
+    fun `responseTimeoutSeconds clamped to minimum 10`() = testScope.runTest {
         val session = mockk<SessionState>(relaxed = true)
         // lastActivity was 15 seconds ago
         every { session.lastActivityTimeMs } returns System.currentTimeMillis() - 15_000
@@ -197,7 +197,8 @@ class ResponseTimeoutMonitorTest {
             onToolStuck = { },
         )
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        advanceTimeBy(6_000)
+        runCurrent()
         job.cancel()
 
         timeoutMsg shouldNotBe null
@@ -206,18 +207,17 @@ class ResponseTimeoutMonitorTest {
     }
 
     @Test
-    fun `toolStuckTimeoutSeconds clamped to minimum 60`() = runTest {
+    fun `toolStuckTimeoutSeconds clamped to minimum 60`() = testScope.runTest {
         val session = mockk<SessionState>(relaxed = true)
         every { session.lastActivityTimeMs } returns System.currentTimeMillis()
         // Tool started 70 seconds ago
-        val pill = mockk<kotlin.collections.Map.Entry<String, ToolCallPill>>()
         val pillValue = mockk<ToolCallPill>()
-        every { pill.value } returns pillValue
         every { pillValue.startTimeMs } returns System.currentTimeMillis() - 70_000
+        val pill = java.util.AbstractMap.SimpleEntry("tool1", pillValue)
         every { session.snapshotToolState() } returns Triple<List<PartState>, List<Map.Entry<String, ToolCallPill>>, Map<String, PartState>>(
             listOf(PartState.InProgress),
             listOf(pill),
-            mapOf("" to (PartState.InProgress as PartState))
+            mapOf("tool1" to (PartState.InProgress as PartState))
         )
         activeSessionRef.set(session)
         // Set to 0 — should be clamped to 60s; 70s > 60s → stuck
@@ -229,7 +229,8 @@ class ResponseTimeoutMonitorTest {
             onToolStuck = { stuckMsg = it },
         )
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        advanceTimeBy(6_000)
+        runCurrent()
         job.cancel()
 
         stuckMsg shouldNotBe null
@@ -237,7 +238,7 @@ class ResponseTimeoutMonitorTest {
     }
 
     @Test
-    fun `settings change mid-response takes effect on next iteration`() = runTest {
+    fun `settings change mid-response takes effect on next iteration`() = testScope.runTest {
         val session = mockk<SessionState>(relaxed = true)
         every { session.snapshotToolState() } returns Triple(emptyList(), emptyList(), emptyMap())
         activeSessionRef.set(session)
@@ -254,7 +255,7 @@ class ResponseTimeoutMonitorTest {
 
         // First check at 5s — no timeout (activity is recent)
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        runCurrent()
         timeoutCalled shouldBe false
 
         // Now lower the timeout to 10s and set lastActivity to 20s ago
@@ -263,14 +264,14 @@ class ResponseTimeoutMonitorTest {
 
         // Second check at 10s — should timeout now
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        runCurrent()
         job.cancel()
 
         timeoutCalled shouldBe true
     }
 
     @Test
-    fun `monitor job can be cancelled cleanly`() = runTest {
+    fun `monitor job can be cancelled cleanly`() = testScope.runTest {
         val session = mockk<SessionState>(relaxed = true)
         every { session.lastActivityTimeMs } returns System.currentTimeMillis()
         every { session.snapshotToolState() } returns Triple(emptyList(), emptyList(), emptyMap())
@@ -281,7 +282,7 @@ class ResponseTimeoutMonitorTest {
             onToolStuck = { },
         )
         advanceTimeBy(6_000)
-        advanceUntilIdle()
+        runCurrent()
         job.cancel()
         // Should not throw
         job.isCancelled shouldBe true

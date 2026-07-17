@@ -3,7 +3,6 @@ package com.opencode.acp.chat.processor
 import com.opencode.acp.chat.model.ChatConstants
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.nio.file.Files
-import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
@@ -19,19 +18,21 @@ private val logger = KotlinLogging.logger {}
  *
  * Mirrors the [com.opencode.acp.mcp.McpConfigWriter] pattern of preparing files
  * before `ProcessManager.initialize()` launches the binary.
+ *
+ * @param projectBasePath The project root directory (where `.opencode/` lives).
+ *        Injected via constructor for testability — see TDD §4.2.4.
  */
-object PrunerResourceExtractor {
+class PrunerResourceExtractor(private val projectBasePath: java.nio.file.Path) {
 
     /**
      * Extracts `sigil-pruner.ts` from JAR resources to `.opencode/plugins/`.
      * Overwrites if the version marker differs from the bundled resource.
      *
-     * @param projectBasePath The project root directory (where `.opencode/` lives).
      * @return true if extraction succeeded (or file was already up to date).
      */
-    fun extractPlugin(projectBasePath: String): Boolean {
+    fun extractPlugin(): Boolean {
         return try {
-            val targetDir = Path.of(projectBasePath, ".opencode", "plugins")
+            val targetDir = projectBasePath.resolve(".opencode").resolve("plugins")
             Files.createDirectories(targetDir)
 
             val target = targetDir.resolve(ChatConstants.PRUNER_PLUGIN_FILENAME)
@@ -41,7 +42,7 @@ object PrunerResourceExtractor {
                     return false
                 }
 
-            val resourceContent = resource.readAllBytes().decodeToString()
+            val resourceContent = resource.readAllBytes().decodeToString().removePrefix("\uFEFF")
             val resourceHash = computeSha256OfString(resourceContent)
 
             // Check if existing file has the same version (header comment)
@@ -66,12 +67,17 @@ object PrunerResourceExtractor {
             // on all filesystems (e.g., Windows NTFS cross-volume). Fall back to
             // non-atomic move if ATOMIC_MOVE fails.
             val temp = target.resolveSibling("${ChatConstants.PRUNER_PLUGIN_FILENAME}.tmp")
-            Files.write(temp, resourceContent.toByteArray())
             try {
-                Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-            } catch (_: java.nio.file.FileSystemException) {
-                // ATOMIC_MOVE not supported — fall back to non-atomic move
-                Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING)
+                Files.write(temp, resourceContent.toByteArray())
+                try {
+                    Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                } catch (_: java.nio.file.FileSystemException) {
+                    // ATOMIC_MOVE not supported — fall back to non-atomic move
+                    Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING)
+                }
+            } catch (e: Exception) {
+                try { Files.deleteIfExists(temp) } catch (_: Exception) {}
+                throw e
             }
             logger.info { "[ACP] PrunerResourceExtractor: extracted sigil-pruner.ts to $target" }
 
@@ -96,12 +102,10 @@ object PrunerResourceExtractor {
     /**
      * Removes the plugin file from `.opencode/plugins/`.
      * Called when the pruner is disabled in settings.
-     *
-     * @param projectBasePath The project root directory.
      */
-    fun removePlugin(projectBasePath: String) {
+    fun removePlugin() {
         try {
-            val target = Path.of(projectBasePath, ".opencode", "plugins", ChatConstants.PRUNER_PLUGIN_FILENAME)
+            val target = projectBasePath.resolve(".opencode").resolve("plugins").resolve(ChatConstants.PRUNER_PLUGIN_FILENAME)
             if (Files.exists(target)) {
                 Files.delete(target)
                 logger.info { "[ACP] PrunerResourceExtractor: removed sigil-pruner.ts" }
@@ -114,17 +118,16 @@ object PrunerResourceExtractor {
     /**
      * Checks if the plugin file exists on disk.
      *
-     * @param projectBasePath The project root directory.
      * @return true if the file exists.
      */
-    fun isPluginPresent(projectBasePath: String): Boolean {
-        return Files.exists(Path.of(projectBasePath, ".opencode", "plugins", ChatConstants.PRUNER_PLUGIN_FILENAME))
+    fun isPluginPresent(): Boolean {
+        return Files.exists(projectBasePath.resolve(".opencode").resolve("plugins").resolve(ChatConstants.PRUNER_PLUGIN_FILENAME))
     }
 
     /**
      * Computes SHA-256 hash of a file's content.
      */
-    private fun computeSha256(path: Path): String {
+    private fun computeSha256(path: java.nio.file.Path): String {
         return try {
             val bytes = Files.readAllBytes(path)
             val digest = MessageDigest.getInstance("SHA-256")

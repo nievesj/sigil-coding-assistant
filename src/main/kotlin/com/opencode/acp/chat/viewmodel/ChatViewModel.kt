@@ -1,15 +1,13 @@
 package com.opencode.acp.chat.viewmodel
 
-import com.opencode.acp.SseEvent
 import com.opencode.acp.adapter.OpenCodeClient
-import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.model.ChildPermissionPrompt
 import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.chat.service.SendMessageResult
 import com.opencode.acp.chat.ui.compose.SlashCommand
-import com.opencode.acp.chat.util.generateId
+import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.OpenCodeNotifications
 import com.opencode.acp.chat.model.ConnectionState
@@ -17,21 +15,13 @@ import com.opencode.acp.follow.EditorFollowManager
 import com.opencode.acp.mcp.ToolPermission
 import com.opencode.acp.review.ReviewCommentManager
 import com.opencode.acp.review.ReviewIndex
-import com.opencode.acp.review.ReviewSkill
 import com.opencode.acp.chat.service.GitService
-import com.opencode.acp.util.ModelArgResolver
-import com.intellij.openapi.application.runReadActionBlocking
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import java.io.Closeable
-import kotlin.concurrent.withLock
 
 /**
  * Thin UI wrapper around [OpenCodeService].
@@ -39,12 +29,16 @@ import kotlin.concurrent.withLock
  * Owns only UI-specific state (control bar, permission prompts, etc.).
  * Delegates all connection, session, and message operations to the service.
  * Created per tool window — safe to dispose/recreate without losing state.
+ *
+ * ISP fix (TDD §4.2.5): Does NOT implement [java.io.Closeable] — the plugin
+ * lifecycle is managed explicitly via [close] called from the tool window's
+ * content disposer ([ChatToolWindowFactory]).
  */
 class ChatViewModel(
     val scope: CoroutineScope,
     private val service: OpenCodeService,
     private val project: Project
-) : Closeable {
+) {
 
     private val logger = KotlinLogging.logger {}
 
@@ -70,16 +64,11 @@ class ChatViewModel(
     private val _streamPhase = MutableStateFlow(StreamPhase.IDLE)
     val streamPhase: StateFlow<StreamPhase> = _streamPhase.asStateFlow()
 
-    private val _permissionPrompt = MutableStateFlow<PermissionPrompt?>(null)
-    val permissionPrompt: StateFlow<PermissionPrompt?> = _permissionPrompt.asStateFlow()
-
-    /** Child session permission prompts — non-blocking, keyed by child session ID.
-     *  Supports multiple simultaneous pending permissions per child (FIFO list). */
-    private val _childPermissionPrompts = MutableStateFlow<Map<String, List<ChildPermissionPrompt>>>(emptyMap())
-    val childPermissionPrompts: StateFlow<Map<String, List<ChildPermissionPrompt>>> = _childPermissionPrompts.asStateFlow()
-
-    private val _selectionPrompt = MutableStateFlow<SelectionPrompt?>(null)
-    val selectionPrompt: StateFlow<SelectionPrompt?> = _selectionPrompt.asStateFlow()
+    // --- Permission/Selection state (delegated to PermissionViewModel) ---
+    private val permissionViewModel = PermissionViewModel(scope, service, project)
+    val permissionPrompt: StateFlow<PermissionPrompt?> = permissionViewModel.permissionPrompt
+    val childPermissionPrompts: StateFlow<Map<String, List<ChildPermissionPrompt>>> = permissionViewModel.childPermissionPrompts
+    val selectionPrompt: StateFlow<SelectionPrompt?> = permissionViewModel.selectionPrompt
 
     private val _pasteImageSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val pasteImageSignal: SharedFlow<Unit> = _pasteImageSignal.asSharedFlow()
@@ -95,8 +84,9 @@ class ChatViewModel(
     private val _selectedSidebarTab = MutableStateFlow(SidebarTab.SESSIONS)
     val selectedSidebarTab: StateFlow<SidebarTab> = _selectedSidebarTab.asStateFlow()
 
-    private val _commandHistory = MutableStateFlow<List<CommandHistoryEntry>>(emptyList())
-    val commandHistory: StateFlow<List<CommandHistoryEntry>> = _commandHistory.asStateFlow()
+    // --- Command history (delegated to CommandHistoryManager) ---
+    private val commandHistoryManager = CommandHistoryManager()
+    val commandHistory: StateFlow<List<CommandHistoryEntry>> = commandHistoryManager.commandHistory
 
     private val _availableCommands = MutableStateFlow<List<SlashCommand>>(emptyList())
     val availableCommands: StateFlow<List<SlashCommand>> = _availableCommands.asStateFlow()
@@ -115,36 +105,11 @@ class ChatViewModel(
         ReviewCommentManager.getInstance(project).commentChanges
     }
 
-    /** Messages waiting to be sent when the current response completes (queue mode). */
-    private val _queuedMessages = MutableStateFlow<List<QueuedMessage>>(emptyList())
-    val queuedMessages: StateFlow<List<QueuedMessage>> = _queuedMessages.asStateFlow()
-
-    /** Serializes drainQueue to prevent concurrent queue-drain races. */
-    private val drainMutex = Mutex()
-
-    /** Lock for non-suspend queue mutations (queueMessage/removeQueuedMessage/
-     *  editQueuedMessage/clearQueue). These are called from EDT callbacks and cannot
-     *  use the suspend `drainMutex.withLock`. A plain ReentrantLock avoids signature
-     *  changes while preventing the read-modify-write race with drainQueue.
-     *
-     *  LOCK ORDERING CONSTRAINT: Always acquire `queueLock` BEFORE `drainMutex` if
-     *  both are needed. Currently, `drainQueue` acquires `drainMutex` first, then
-     *  `queueLock` inside — this is safe because no EDT caller acquires `drainMutex`.
-     *  DO NOT add `drainMutex` acquisition inside a `queueLock`-held block without
-     *  reversing the order, or a deadlock will occur. */
-    private val queueLock = java.util.concurrent.locks.ReentrantLock()
-
-    /** Retry counts for queued messages — prevents infinite retry loops.
-     *  Uses ConcurrentHashMap for thread-safety: clearQueue() may be called from
-     *  EDT coroutines (session switch, cancel) while drainQueue() runs on the
-     *  ViewModel scope. Both are serialized by [drainMutex] for correctness, but
-     *  the ConcurrentHashMap provides a safety net against data races. */
-    private val queueRetryCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
-
-    /** Next-allowed-retry timestamp (ms) per queued message id. Enforces RETRY_DELAY_MS
-     *  before the next send attempt, not after the re-queue, so consecutive failures
-     *  cannot bypass the retry delay. */
-    private val nextRetryTime = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    // --- Message queue (delegated to MessageQueueManager) ---
+    private val messageQueueManager = MessageQueueManager(
+        sendFunction = { msg -> sendMessage(msg.text, msg.files) }
+    )
+    val queuedMessages: StateFlow<List<QueuedMessage>> = messageQueueManager.queuedMessages
 
     private val _readyState = MutableStateFlow(ReadyState.NOT_STARTED)
     val readyState: StateFlow<ReadyState> = _readyState.asStateFlow()
@@ -164,14 +129,6 @@ class ChatViewModel(
     private val initMutex = Mutex()
     private var initJob: Job? = null
     private var connectionObserverJob: Job? = null
-
-    /** Timeout jobs for child permission prompts, keyed by child session ID. */
-    private val childPermissionTimeoutJobs = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
-
-    /** Session IDs where the last permission POST failed (rolled back to pending).
-     *  Used by the PermissionReplied handler to detect that the server DID process
-     *  the response despite a local network error, and surface a notification. */
-    private val failedPermissionPostSessions = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /** Cached GitService instance — reuses lineDeltaCache across calls. */
     private val gitService = GitService(project)
@@ -272,7 +229,7 @@ class ChatViewModel(
                             computeSessionContext()
                             fetchTodos()
                             service.loadSessions()
-                            drainQueue()
+                            messageQueueManager.drainQueue()
                         }
                         // Refresh review comments — the LLM may have written .review/ files
                         // during the response. StreamingCompleted fires once per response
@@ -282,15 +239,15 @@ class ChatViewModel(
                         refreshReviewFiles()
                     }
                     is UiSignal.PermissionRequested -> {
-                        _permissionPrompt.value = signal.prompt
+                        permissionViewModel.setPermissionPrompt(signal.prompt)
                         OpenCodeNotifications.notifyPermissionNeeded(project)
                         // NOTE: timeoutSeconds is read at call time from settings. If the user
                         // changes the setting while a prompt is pending, the current timeout
                         // is NOT restarted — the new value applies to the next prompt.
-                        startPermissionTimeout()
+                        permissionViewModel.startPermissionTimeout()
                     }
                     is UiSignal.SelectionRequested -> {
-                        _selectionPrompt.value = signal.prompt
+                        permissionViewModel.setSelectionPrompt(signal.prompt)
                         OpenCodeNotifications.notifyQuestionAsked(project)
                     }
                     // Informational signals — processor handles state updates directly
@@ -362,56 +319,44 @@ class ChatViewModel(
                         }
                     }
                     is UiSignal.ChildPermissionRequested -> {
-                        val childId = signal.prompt.childSessionId
-                        _childPermissionPrompts.update { prompts ->
-                            val existing = prompts[childId] ?: emptyList()
-                            prompts + (childId to (existing + signal.prompt))
-                        }
+                        permissionViewModel.addChildPermissionPrompt(signal.prompt)
                         OpenCodeNotifications.notifyPermissionNeeded(project)
-                        startChildPermissionTimeout(childId, signal.prompt.toolName)
                         // NOTE: Do NOT change _streamPhase or inputState — child permissions are non-blocking
                     }
                     is UiSignal.PermissionReplied -> {
                         // Confirm server processed our reply
-                        if (_permissionPrompt.value?.permissionId == signal.permissionId) {
+                        if (permissionViewModel.permissionPrompt.value?.permissionId == signal.permissionId) {
                             // Active-session permission: clear it
-                            _permissionPrompt.value = null
+                            permissionViewModel.setPermissionPrompt(null)
                             service.permissionManager.cancelPermissionTimeout()
                         }
                         // Handle child prompts based on reply type
-                        if (_childPermissionPrompts.value.containsKey(signal.sessionId)) {
+                        if (permissionViewModel.childPermissionPrompts.value.containsKey(signal.sessionId)) {
                             // If the last POST for this session failed (rolled back to pending),
                             // the server still processed it. Surface a notification instead of
                             // silently clearing (TDD §4.2.4 error handling).
-                            if (signal.sessionId in failedPermissionPostSessions) {
+                            if (signal.sessionId in permissionViewModel.failedPermissionPostSessions) {
                                 OpenCodeNotifications.notifyPermissionProcessedDespiteError(project, signal.sessionId)
                                 // Remove AFTER the reject check below — the reject cascade
                                 // needs to know about the failed POST for notification.
                             }
                             if (signal.reply == "reject") {
                                 // Cascade: server rejects all pending permissions in the session
-                                _childPermissionPrompts.update { it - signal.sessionId }
-                                cancelChildPermissionTimeout(signal.sessionId)
+                                permissionViewModel.removeChildPrompts(signal.sessionId)
+                                permissionViewModel.cancelChildPermissionTimeout(signal.sessionId)
                             } else {
                                 // Non-reject reply: remove only the FIRST prompt (FIFO)
-                                _childPermissionPrompts.update { prompts ->
-                                    val remaining = (prompts[signal.sessionId] ?: emptyList()).drop(1)
-                                    if (remaining.isEmpty()) prompts - signal.sessionId
-                                    else prompts + (signal.sessionId to remaining)
-                                }
-                                if (!_childPermissionPrompts.value.containsKey(signal.sessionId)) {
+                                val newFirstToolName = permissionViewModel.dropFirstChildPrompt(signal.sessionId)
+                                if (newFirstToolName == null) {
                                     // No more prompts — cancel the timeout
-                                    cancelChildPermissionTimeout(signal.sessionId)
+                                    permissionViewModel.cancelChildPermissionTimeout(signal.sessionId)
                                 } else {
                                     // Remaining prompts — restart the timeout for the new first prompt
-                                    val newFirst = _childPermissionPrompts.value[signal.sessionId]?.firstOrNull()
-                                    if (newFirst != null) {
-                                        startChildPermissionTimeout(signal.sessionId, newFirst.toolName)
-                                    }
+                                    permissionViewModel.startChildPermissionTimeout(signal.sessionId, newFirstToolName)
                                 }
                             }
                             // Now safe to remove — notification has been shown and reject cascade is done
-                            failedPermissionPostSessions.remove(signal.sessionId)
+                            permissionViewModel.failedPermissionPostSessions.remove(signal.sessionId)
                         }
                     }
                     is UiSignal.PermissionTimedOut -> {
@@ -420,15 +365,15 @@ class ChatViewModel(
                         // permission (non-empty permissionId matching the current prompt).
                         // Child permission timeouts use permissionId="" — they must NOT
                         // clear the active session's permission prompt.
-                        if (signal.permissionId.isNotEmpty() && _permissionPrompt.value?.permissionId == signal.permissionId) {
-                            _permissionPrompt.value = null
+                        if (signal.permissionId.isNotEmpty() && permissionViewModel.permissionPrompt.value?.permissionId == signal.permissionId) {
+                            permissionViewModel.setPermissionPrompt(null)
                         }
                         // Clear child prompts for the timed-out child session.
                         // POST reject to the server for each remaining pending prompt before
                         // clearing locally — the server is still waiting on Deferred promises
                         // and would block indefinitely without a reply.
                         if (signal.sessionId.isNotEmpty()) {
-                            val pending = _childPermissionPrompts.value[signal.sessionId] ?: emptyList()
+                            val pending = permissionViewModel.getChildPrompts(signal.sessionId)
                             if (pending.isNotEmpty()) {
                                 // Use service.scope (not ViewModel scope) so reject POSTs survive
                                 // tool window disposal — the server's Deferred promises must be
@@ -450,8 +395,8 @@ class ChatViewModel(
                                     }
                                 }
                             }
-                            _childPermissionPrompts.update { it - signal.sessionId }
-                            cancelChildPermissionTimeout(signal.sessionId)
+                            permissionViewModel.removeChildPrompts(signal.sessionId)
+                            permissionViewModel.cancelChildPermissionTimeout(signal.sessionId)
                         }
                     }
                     else -> { /* other global signals */ }
@@ -460,8 +405,7 @@ class ChatViewModel(
         }
 
         // Load persisted command history
-        val settings = OpenCodeSettingsState.getInstance()
-        _commandHistory.value = ArrayList(settings.commandHistory)
+        commandHistoryManager.loadFromSettings()
 
         // Observe connectionState and reset readyState on disconnect/reconnect/error.
         // On auto-reconnect (CONNECTED after NOT_STARTED), re-run initialize().
@@ -727,7 +671,7 @@ class ChatViewModel(
             isCreating -> StreamPhase.IDLE
             else -> StreamPhase.IDLE
         }
-        clearQueue()
+        messageQueueManager.clearQueue()
 
         // Sync prompt state from the new session's persistent StateFlows.
         // Cosmetic brief window: snapshots are read atomically here, but a
@@ -735,12 +679,12 @@ class ChatViewModel(
         // read and the assignment. The next SSE event will re-sync, so this
         // is not a correctness issue.
         val activeSession = service.sessionManager.getActiveSession()
-        _permissionPrompt.value = activeSession?.pendingPermission?.value
-        _selectionPrompt.value = activeSession?.pendingSelection?.value
+        permissionViewModel.setPermissionPrompt(activeSession?.pendingPermission?.value)
+        permissionViewModel.setSelectionPrompt(activeSession?.pendingSelection?.value)
 
         // If a permission prompt was restored, restart the timeout
-        if (_permissionPrompt.value != null) {
-            startPermissionTimeout()
+        if (permissionViewModel.permissionPrompt.value != null) {
+            permissionViewModel.startPermissionTimeout()
         }
     }
 
@@ -748,10 +692,10 @@ class ChatViewModel(
         service.createAndSwitchSession(title)
         // New session — definitely not streaming yet
         _streamPhase.value = StreamPhase.IDLE
-        clearQueue()
+        messageQueueManager.clearQueue()
         val activeSession = service.sessionManager.getActiveSession()
-        _permissionPrompt.value = activeSession?.pendingPermission?.value
-        _selectionPrompt.value = activeSession?.pendingSelection?.value
+        permissionViewModel.setPermissionPrompt(activeSession?.pendingPermission?.value)
+        permissionViewModel.setSelectionPrompt(activeSession?.pendingSelection?.value)
     }
 
     suspend fun archiveSession(sessionId: String) = service.archiveSession(sessionId)
@@ -836,7 +780,7 @@ class ChatViewModel(
         agent: String? = null,
         model: OpenCodeClient.MessageModel? = null
     ): SendMessageResult {
-        recordCommand(text, files)
+        commandHistoryManager.recordCommand(text, files)
 
         // Activate streaming indicators BEFORE the suspend call.
         // This ensures the glow, stop button, pulse, and shimmer appear
@@ -889,7 +833,7 @@ class ChatViewModel(
         service.cancel()
         _streamPhase.value = StreamPhase.IDLE
         sessionId?.let { service.removeStreamingSession(it) }
-        clearQueue()
+        messageQueueManager.clearQueue()
     }
 
     /**
@@ -951,306 +895,47 @@ class ChatViewModel(
         sendMessage(text, files)
     }
 
-    // --- Message Queue (queue mode) ---
+    // --- Message Queue (queue mode) — delegated to MessageQueueManager ---
 
     /**
      * Add a message to the queue instead of sending it immediately.
      * Used when streaming is active (SENDING or STREAMING phase) and queue mode is enabled.
      * The message will be auto-sent when the current response completes.
      */
-    fun queueMessage(text: String, files: List<AttachedFile> = emptyList()) {
-        queueLock.withLock {
-            val msg = QueuedMessage(
-                id = generateId(),
-                text = text,
-                files = files
-            )
-            _queuedMessages.value = _queuedMessages.value + msg
-            logger.info { "[ACP] queueMessage: queued '${text.take(50)}' (${_queuedMessages.value.size} in queue)" }
-        }
-    }
+    fun queueMessage(text: String, files: List<AttachedFile> = emptyList()) =
+        messageQueueManager.queueMessage(text, files)
 
     /**
      * Remove a queued message by ID (user cancelled it from the queue bar).
      */
-    fun removeQueuedMessage(messageId: String) {
-        queueLock.withLock {
-            _queuedMessages.value = _queuedMessages.value.filter { it.id != messageId }
-            logger.info { "[ACP] removeQueuedMessage: $messageId (${_queuedMessages.value.size} remaining)" }
-        }
-    }
+    fun removeQueuedMessage(messageId: String) =
+        messageQueueManager.removeQueuedMessage(messageId)
 
     /**
      * Edit a queued message's text (user clicked edit in the queue bar).
      */
-    fun editQueuedMessage(messageId: String, newText: String) {
-        queueLock.withLock {
-            _queuedMessages.value = _queuedMessages.value.map {
-                if (it.id == messageId) it.copy(text = newText) else it
-            }
-        }
-    }
+    fun editQueuedMessage(messageId: String, newText: String) =
+        messageQueueManager.editQueuedMessage(messageId, newText)
 
     /**
      * Clear all queued messages. Called on session switch, cancel, etc.
      */
-    fun clearQueue() {
-        queueLock.withLock {
-            val count = _queuedMessages.value.size
-            if (count > 0) {
-                _queuedMessages.value = emptyList()
-                queueRetryCounts.clear()
-                nextRetryTime.clear()
-                logger.info { "[ACP] clearQueue: cleared $count queued messages" }
-            }
-        }
-    }
+    fun clearQueue() = messageQueueManager.clearQueue()
 
-    /**
-     * Drain the queue — send the next queued message if any.
-     * Called automatically when StreamingCompleted fires and queue is non-empty.
-     * Serialized by [drainMutex] to prevent concurrent queue-drain races.
-     *
-     * RETRY LIMIT: Failed messages are re-queued at most [MAX_QUEUE_RETRIES]
-     * times before being dropped. This prevents infinite retry loops when the
-     * server is unavailable.
-     */
-    private suspend fun drainQueue() = drainMutex.withLock {
-        val next: QueuedMessage?
-        queueLock.withLock {
-            val queue = _queuedMessages.value
-            if (queue.isEmpty()) {
-                next = null
-                return@withLock
-            }
-            next = queue.first()
-            _queuedMessages.value = queue.drop(1)
-        }
-        if (next == null) return@withLock
-        // Enforce retry delay BEFORE sending, not after re-queue. Without this,
-        // a re-queued message would be re-sent immediately on the next drainQueue
-        // call (triggered by the next StreamingCompleted), bypassing RETRY_DELAY_MS.
-        val retryAt = nextRetryTime[next.id]
-        if (retryAt != null && System.currentTimeMillis() < retryAt) {
-            // Not yet time to retry — re-queue at end and return without sending.
-            queueLock.withLock {
-                _queuedMessages.value = _queuedMessages.value + next
-            }
-            return@withLock
-        }
-        logger.info { "[ACP] drainQueue: sending '${next.text.take(50)}' (${_queuedMessages.value.size} remaining)" }
-
-        val result = try {
-            sendMessage(next.text, next.files)
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.warn(e) { "[ACP] drainQueue: sendMessage threw exception" }
-            SendMessageResult.Error(e.message ?: "Send failed")
-        }
-        if (result is SendMessageResult.Error) {
-            queueLock.withLock {
-                // Check retry count inside queueLock to prevent race with clearQueue
-                // (which clears queueRetryCounts under queueLock as well)
-                val retryCount = queueRetryCounts.getOrDefault(next.id, 0) + 1
-                if (retryCount <= MAX_QUEUE_RETRIES) {
-                    queueRetryCounts[next.id] = retryCount
-                    // Record next-allowed-retry timestamp so the delay is enforced
-                    // before the next send attempt (checked at the top of drainQueue).
-                    nextRetryTime[next.id] = System.currentTimeMillis() + RETRY_DELAY_MS
-                    val alreadyRequeued = _queuedMessages.value.any { it.id == next.id }
-                    if (!alreadyRequeued) {
-                        // Re-queue at the END of the queue (not the front) to avoid
-                        // starving later messages. The retry delay already gives
-                        // the server time to recover, so the message doesn't need
-                        // priority over others.
-                        _queuedMessages.value = _queuedMessages.value + next
-                        logger.warn { "[ACP] drainQueue: re-queued failed message at end of queue (attempt $retryCount/$MAX_QUEUE_RETRIES) — ${result.message}" }
-                    } else {
-                        logger.debug { "[ACP] drainQueue: message ${next.id} already re-queued, skipping duplicate add (attempt $retryCount/$MAX_QUEUE_RETRIES)" }
-                    }
-                } else {
-                    queueRetryCounts.remove(next.id)
-                    nextRetryTime.remove(next.id)
-                    logger.error { "[ACP] drainQueue: dropping message after $MAX_QUEUE_RETRIES failed attempts — ${result.message}" }
-                }
-            }
-        } else {
-            queueRetryCounts.remove(next.id)
-            nextRetryTime.remove(next.id)
-        }
-    }
-
-    // --- Permission/Selection ---
+    // --- Permission/Selection — delegated to PermissionViewModel ---
 
     suspend fun respondPermission(response: PermissionResponse) {
-        val prompt = _permissionPrompt.value ?: return
-        try {
-            service.respondPermission(
-                prompt.permissionId, prompt.toolCallId, prompt.sessionId, response,
-                toolName = prompt.toolName,
-                patterns = prompt.patterns,
-                agentName = _controlState.value.selectedAgent?.id ?: "orchestrator",
-            )
-            // POST succeeded — clear any prior failed-post tracking
-            failedPermissionPostSessions.remove(prompt.sessionId)
-            _permissionPrompt.value = null
-            service.permissionManager.cancelPermissionTimeout()
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // Permission response failed (network error, server down). Keep the
-            // prompt open so the user can retry. Track the failure so the
-            // PermissionReplied handler can surface a notification if the server
-            // still processed it despite the network error (TDD §4.2.4).
-            failedPermissionPostSessions.add(prompt.sessionId)
-            logger.warn(e) { "[ACP] Permission response failed — keeping prompt open for retry" }
-        }
+        permissionViewModel.respondPermission(
+            response,
+            agentName = _controlState.value.selectedAgent?.id ?: "orchestrator",
+        )
     }
 
-    suspend fun respondChildPermission(childSessionId: String, response: PermissionResponse) {
-        val prompts = _childPermissionPrompts.value[childSessionId] ?: return
-        val prompt = prompts.first()  // FIFO — respond to oldest first
-        try {
-            service.permissionManager.respondPermission(
-                prompt.permissionId,
-                prompt.toolCallId,
-                childSessionId,  // reply goes to the CHILD session
-                response,
-                prompt.toolName,
-                prompt.patterns,
-                // Only pass the real agent name for config sync when the label was
-                // verified from a Subtask SSE event. If the label is the fallback
-                // "sub-agent" (Subtask event missed), pass empty string so
-                // writeAlwaysAllowRule is skipped (toolName.isNotEmpty() guard
-                // in PermissionManager + isValidConfigKey in McpConfigWriter).
-                if (prompt.agentLabelVerified) prompt.subAgentLabel else "",
-            )
-            // POST succeeded — clear any prior failed-post tracking
-            failedPermissionPostSessions.remove(childSessionId)
-            if (response == PermissionResponse.REJECT_ONCE) {
-                // CASCADE: clear ALL prompts for this child session
-                // (server rejects all pending permissions in the session)
-                _childPermissionPrompts.update { it - childSessionId }
-                cancelChildPermissionTimeout(childSessionId)
-                logger.info { "[ACP] Cascade rejection: clearing all prompts for childSessionId=$childSessionId" }
-            } else {
-                // Remove just this prompt; keep others if any
-                // Verified: success path correctly restarts timeout for the next prompt
-                // if more prompts remain (line ~1093). failedPermissionPostSessions
-                // is cleared before prompt-clearing — safe per StateFlow update semantics.
-                _childPermissionPrompts.update { prompts ->
-                    val remaining = (prompts[childSessionId] ?: emptyList()).drop(1)
-                    if (remaining.isEmpty()) prompts - childSessionId
-                    else prompts + (childSessionId to remaining)
-                }
-                if (!_childPermissionPrompts.value.containsKey(childSessionId)) {
-                    // No more prompts — cancel the timeout
-                    cancelChildPermissionTimeout(childSessionId)
-                } else {
-                    // Remaining prompts — restart the timeout for the new first prompt
-                    val newFirst = _childPermissionPrompts.value[childSessionId]?.firstOrNull()
-                    if (newFirst != null) {
-                        startChildPermissionTimeout(childSessionId, newFirst.toolName)
-                    }
-                }
-            }
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // POST failed — track this session so the PermissionReplied handler
-            // can surface a notification if the server still processed it.
-            failedPermissionPostSessions.add(childSessionId)
-            logger.warn(e) { "[ACP] Child permission response failed — keeping prompt open" }
-        }
-    }
+    suspend fun respondChildPermission(childSessionId: String, response: PermissionResponse) =
+        permissionViewModel.respondChildPermission(childSessionId, response)
 
-    private fun startPermissionTimeout() {
-        val toolName = _permissionPrompt.value?.toolName ?: ""
-        // Capture permissionId at START time, not at fire time.
-        // If a new permission prompt arrives before this timeout fires, the
-        // callback must NOT clear the new prompt — only the one it was started for.
-        val capturedPermId = _permissionPrompt.value?.permissionId ?: ""
-        service.permissionManager.startPermissionTimeout(
-            timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds,
-            toolName = toolName,
-        ) {
-            // Only clear the prompt if it's still the one we were started for.
-            // A newer prompt may have replaced this one before the timeout fired.
-            if (_permissionPrompt.value?.permissionId == capturedPermId) {
-                _permissionPrompt.value = null
-            }
-            OpenCodeNotifications.notifyPermissionTimedOut(project, toolName)
-            logger.info { "[ACP] Permission timed out: permissionId=$capturedPermId, tool=$toolName" }
-        }
-    }
-
-    private fun startChildPermissionTimeout(childSessionId: String, toolName: String) {
-        val timeoutSeconds = ChatConstants.CHILD_PERMISSION_TIMEOUT_SECONDS
-        childPermissionTimeoutJobs[childSessionId]?.cancel()
-        // Use the service scope (survives tool window recreation) so the timeout
-        // fires even if the tool window is closed and reopened. The timeout job
-        // emits a PermissionTimedOut signal via the service's globalSignals so
-        // whichever ViewModel is active will handle the cleanup.
-        childPermissionTimeoutJobs[childSessionId] = service.scope.launch {
-            delay(timeoutSeconds * 1000L)
-            // Clear the prompt and notify — emit via globalSignals so the
-            // active ViewModel (which may be a different instance if the tool
-            // window was recreated) handles cleanup.
-            service.sessionManager.emitGlobalSignal(
-                UiSignal.PermissionTimedOut(
-                    permissionId = "",
-                    sessionId = childSessionId,
-                    toolName = toolName,
-                )
-            )
-            childPermissionTimeoutJobs.remove(childSessionId)
-            logger.info { "[ACP] Child permission timed out: childSessionId=$childSessionId, tool=$toolName" }
-        }
-    }
-
-    private fun cancelChildPermissionTimeout(childSessionId: String) {
-        childPermissionTimeoutJobs.remove(childSessionId)?.cancel()
-    }
-
-    fun respondSelection(response: SelectionResponse) {
-        val prompt = _selectionPrompt.value ?: return
-        scope.launch {
-            try {
-                val selectedLabels = response.selectedIndices.mapNotNull { idx ->
-                    prompt.options.getOrNull(idx)?.label ?: run {
-                        logger.warn { "[ACP] respondSelection: index $idx out of bounds (options size=${prompt.options.size}) — selection may be stale" }
-                        null
-                    }
-                }
-                // The server expects one inner array per question. Merge custom input
-                // into the SAME inner list as selected labels (not a separate array),
-                // producing [[label1, label2, customInput]] instead of
-                // [[label1, label2], [customInput]].
-                val answers = mutableListOf<List<String>>()
-                val combined = selectedLabels.toMutableList()
-                response.customInput?.let { custom ->
-                    if (custom.isNotBlank()) combined.add(custom)
-                }
-                if (combined.isNotEmpty()) {
-                    answers.add(combined)
-                }
-                if (answers.isEmpty()) {
-                    service.rejectQuestion(prompt.promptId, prompt.sessionId)
-                } else {
-                    service.respondQuestion(prompt.promptId, answers, prompt.sessionId)
-                }
-                _selectionPrompt.value = null
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.warn(e) { "Failed to respond to question ${prompt.promptId}" }
-                // Clear the prompt so the UI doesn't show a stale prompt that can't
-                // be retried — SessionState already cleared its pendingSelection.
-                _selectionPrompt.value = null
-            }
-        }
-    }
+    fun respondSelection(response: SelectionResponse) =
+        permissionViewModel.respondSelection(response)
 
     // --- Paste signals ---
 
@@ -1378,206 +1063,58 @@ class ChatViewModel(
         }
     }
 
-    /** Execute `/review-perform [model...]` — instructs the LLM to adversarially
-     *  review the VCS-changed files and add review comments to `.review/` JSON files.
-     *
-     *  ## Model selection
-     *
-     *  - **No args** (`/review-perform`): uses the currently-selected control-bar
-     *    model. Backward-compatible with the original behavior.
-     *  - **One or more model args** (`/review-perform glm5.2 claude-sonnet`):
-     *    each arg is fuzzy-matched against the server-fetched model list
-     *    ([ModelArgResolver]) and the review prompt is sent once per matched
-     *    model, **sequentially** (each response completes before the next starts).
-     *    Each response is prefixed with a `### Review by <model>` header so the
-     *    user can compare findings across models in the same chat thread.
-     *  - **`*` wildcard** (`/review-perform *`): runs the review on all available
-     *    models. Use with caution — can be slow and costly.
-     *  - **Unresolved args**: if any arg doesn't match a model, an error message
-     *    is shown in the chat and only the resolved models run (or the control-bar
-     *    model if none resolved). */
-    fun executeReviewPerformCommand(args: String = "") {
-        scope.launch {
-            // GitService.getChangedFiles must run inside a read action.
-            // Uses Dispatchers.IO because runReadActionBlocking may spin-wait
-            // for a write action to complete — IO threads handle blocking.
-            val changedFiles = withContext(Dispatchers.IO) {
-                runReadActionBlocking {
-                    gitService.getChangedFiles()
-                }
-            }
-            val changedPaths = changedFiles.map { it.filePath }
-            val prompt = ReviewSkill.buildPerformPrompt(changedPaths)
-            executeMultiModelReview(args, prompt)
-        }
-    }
-
-    /** Execute `/review-perform-gaming [model...]` — like
-     *  [executeReviewPerformCommand] but injects the game-engine-specific
-     *  adversarial checklist (Unreal C++ GC/threading/lifecycle, Unity C#
-     *  allocations/coroutines/leaks, frame budgets, Blueprint interop,
-     *  replication). Model arg handling is identical to
-     *  [executeReviewPerformCommand]. */
-    fun executeReviewPerformGamingCommand(args: String = "") {
-        scope.launch {
-            val changedFiles = withContext(Dispatchers.IO) {
-                runReadActionBlocking {
-                    gitService.getChangedFiles()
-                }
-            }
-            val changedPaths = changedFiles.map { it.filePath }
-            val prompt = ReviewSkill.buildPerformGamingPrompt(changedPaths)
-            executeMultiModelReview(args, prompt)
-        }
-    }
+    // --- Review commands — delegated to ReviewCommandHandler ---
 
     /** Cancellation flag for multi-model review loops. Set by [cancel] to
      *  stop the loop after the current model finishes. */
     @Volatile private var multiModelReviewCancelled = false
 
-    /** Shared logic for both review-perform variants: resolve model args and
-     *  send the prompt once per model (or once with the control-bar model if
-     *  no args). Sequential — each [sendMessage] blocks until that model's
-     *  response completes (via the service's sendMutex + responseDeferred).
-     *
-     *  The user can cancel the loop mid-way by clicking the Cancel button,
-     *  which sets [multiModelReviewCancelled]. The loop checks this flag
-     *  between iterations and stops if set. */
-    private suspend fun executeMultiModelReview(args: String, prompt: String) {
-        multiModelReviewCancelled = false
-        if (args.isBlank()) {
-            // No model args — use the currently-selected control-bar model.
-            // Route through the ViewModel's sendMessage() so _streamPhase and
-            // streamingSessionIds stay consistent with the UI.
-            sendMessage(text = prompt)
-            return
-        }
-
-        // Use connected-providers models only (controlState.models), NOT
-        // allModels — allModels includes disconnected providers whose models
-        // would 500 when sent to the server.
-        val models = _controlState.value.models
-        val resolution = ModelArgResolver.resolveAll(args, models)
-
-        // Surface unresolved args as a chat message so the user sees the typo.
-        if (resolution.unresolved.isNotEmpty()) {
-            val unresolvedStr = resolution.unresolved.joinToString(", ") { "`$it`" }
-            val availableHints = models.take(5).joinToString(", ") {
-                "`${it.providerID}/${it.modelID}`"
-            }
-            val errorMsg = "[User Notification] ⚠️ Could not resolve model(s): $unresolvedStr. " +
-                "Available models include: $availableHints" +
-                if (models.size > 5) ", …" else "."
-            service.injectLocalMessage(errorMsg)
-        }
-
-        if (resolution.models.isEmpty()) {
-            // Nothing resolved — don't run a review with the wrong model silently.
-            return
-        }
-
-        // Send one review per model, sequentially.
-        // For reasoning models that have variants, pick the first variant
-        // (or the control-bar's current thinking effort if the model supports it).
-        val currentVariant = _controlState.value.thinkingEffort.variant
-        for (model in resolution.models) {
-            currentCoroutineContext().ensureActive()
-            // Check if the user cancelled the review loop (via Cancel button).
-            if (multiModelReviewCancelled) {
-                service.injectLocalMessage("⏹ Review cancelled by user. Remaining models skipped.")
-                break
-            }
-            // If the model has variants and the current thinking effort isn't
-            // null, use it. Otherwise pick the first variant if available, or
-            // null (server default) if the model has no variants.
-            val variant = when {
-                model.variants.isEmpty() -> null
-                currentVariant != null && currentVariant in model.variants -> currentVariant
-                else -> model.variants.firstOrNull()
-            }
-            val header = "### Review by ${model.displayName}\n\n"
-            // Re-check cancellation flag immediately before send to close TOCTOU window
-            // (cancel() may have set the flag between the loop-top check and this point).
-            if (multiModelReviewCancelled) {
-                service.injectLocalMessage("⏹ Review cancelled by user. Remaining models skipped.")
-                break
-            }
-            // Route through the ViewModel's sendMessageWithModel() so _streamPhase and
-            // streamingSessionIds stay consistent with the UI (stop button, shimmer).
-            val result = sendMessageWithModel(
-                text = header + prompt,
-                modelID = model.modelID,
-                providerID = model.providerID,
+    private val reviewCommandHandler = ReviewCommandHandler(
+        scope = scope,
+        project = project,
+        gitService = gitService,
+        controlStateProvider = { _controlState.value },
+        sendFunction = { text -> sendMessage(text) },
+        sendWithModelFunction = { text, modelID, providerID, variant, model ->
+            sendMessageWithModel(
+                text = text,
+                modelID = modelID,
+                providerID = providerID,
                 variant = variant,
-                model = OpenCodeClient.MessageModel(providerID = model.providerID, modelID = model.modelID)
+                model = model,
             )
-            // If a review fails (timeout, error), stop the loop — no point
-            // continuing with the remaining models if the session is in a
-            // bad state.
-            if (result is SendMessageResult.Error) {
-                service.injectLocalMessage(
-                    "⚠️ Review with ${model.displayName} failed: ${result.message}. " +
-                        "Remaining models skipped."
-                )
-                break
-            }
-        }
-        // Reset the cancellation flag after the loop completes (or breaks on
-        // error/cancel) so the next review invocation starts with a clean state.
-        multiModelReviewCancelled = false
-    }
+        },
+        injectLocalMessage = { service.injectLocalMessage(it) },
+        refreshReviewFiles = { refreshReviewFiles() },
+        isCancelledProvider = { multiModelReviewCancelled },
+        resetCancelled = { multiModelReviewCancelled = false },
+    )
+
+    /** Execute `/review-perform [model...]` — instructs the LLM to adversarially
+     *  review the VCS-changed files and add review comments to `.review/` JSON files.
+     *  See [ReviewCommandHandler.executeReviewPerformCommand] for model-selection
+     *  semantics. */
+    fun executeReviewPerformCommand(args: String = "") =
+        reviewCommandHandler.executeReviewPerformCommand(args)
+
+    /** Execute `/review-perform-gaming [model...]` — like
+     *  [executeReviewPerformCommand] but injects the game-engine-specific
+     *  adversarial checklist. Delegated to [ReviewCommandHandler]. */
+    fun executeReviewPerformGamingCommand(args: String = "") =
+        reviewCommandHandler.executeReviewPerformGamingCommand(args)
 
     /** Execute `/review-resolve` — injects the [ReviewSkill.buildResolvePrompt]
-     *  summarizing all open review comments and the resolution workflow. */
-    fun executeReviewResolveCommand() {
-        scope.launch {
-            val index = ReviewCommentManager.getInstance(project).getIndex()
-            // Route through the ViewModel's sendMessage() so _streamPhase,
-            // streamingSessionIds, and recordCommand() stay consistent with the UI.
-            sendMessage(text = ReviewSkill.buildResolvePrompt(index))
-        }
-    }
+     *  summarizing all open review comments and the resolution workflow.
+     *  Delegated to [ReviewCommandHandler]. */
+    fun executeReviewResolveCommand() =
+        reviewCommandHandler.executeReviewResolveCommand()
 
     /** Execute `/review-recheck [model...]` — re-runs the adversarial review with
-     *  existing comments + replies as context. The LLM verifies replies against
-     *  the actual code, re-raises unresolved issues, marks resolved comments, and
-     *  adds new comments. Model arg handling is identical to
-     *  [executeReviewPerformCommand] (via [executeMultiModelReview]).
-     *
-     *  ## Reply preservation safety net
-     *
-     *  After the LLM finishes and [refreshReviewFiles] re-reads the `.review/` files,
-     *  the plugin verifies no pre-existing replies were dropped by the LLM's file
-     *  rewrite and re-merges any that were via [ReviewCommentManager.restoreMissingReplies].
-     *  This is a structural guarantee independent of prompt compliance — see TDD §4. */
-    fun executeReviewRecheckCommand(args: String = "") {
-        scope.launch {
-            val manager = ReviewCommentManager.getInstance(project)
-            val preRecheckIndex = manager.getIndex()
-            val replySnapshot = manager.snapshotReplyIds(preRecheckIndex)
-            val changedFiles = withContext(Dispatchers.IO) {
-                runReadActionBlocking {
-                    gitService.getChangedFiles()
-                }
-            }
-            val changedPaths = changedFiles.map { it.filePath }
-            val prompt = ReviewSkill.buildRecheckPrompt(preRecheckIndex, changedPaths)
-            try {
-                executeMultiModelReview(args, prompt)
-            } finally {
-                // After the LLM writes updated .review/ files, refresh the index
-                // and WAIT for loadAll() to finish before checking for dropped replies.
-                // The restore reads stateHolder.value which must reflect the post-LLM state.
-                refreshReviewFiles().join()
-                // Structural safety net: re-merge any replies the LLM dropped.
-                val restored = manager.restoreMissingReplies(replySnapshot, preRecheckIndex)
-                if (restored > 0) {
-                    logger.warn { "[ACP] /review-recheck restored $restored dropped reply(ies)" }
-                    refreshReviewFiles()
-                }
-            }
-        }
-    }
+     *  existing comments + replies as context. Delegated to [ReviewCommandHandler].
+     *  See [ReviewCommandHandler.executeReviewRecheckCommand] for the reply
+     *  preservation safety net. */
+    fun executeReviewRecheckCommand(args: String = "") =
+        reviewCommandHandler.executeReviewRecheckCommand(args)
 
     /** Trigger a direct disk re-read so the [ReviewCommentManager]
      *  picks up any new `.review/` JSON files written by the LLM agent.
@@ -1610,56 +1147,9 @@ class ChatViewModel(
 
     fun getStreamingText(sessionId: String) = service.getStreamingText(sessionId)
 
-    // --- Command history ---
+    // --- Command history — delegated to CommandHistoryManager ---
 
-    /** Lock for command history mutations — prevents EDT blocking from synchronized(settings). */
-    private val commandHistoryLock = Any()
-
-    private fun recordCommand(text: String, files: List<AttachedFile>) {
-        if (text.isBlank() && files.isEmpty()) return
-        val entry = CommandHistoryEntry(text = text, files = files)
-        val settings = OpenCodeSettingsState.getInstance()
-        val maxSize = settings.commandHistorySize.coerceIn(1, 100)
-        // Synchronize on a dedicated lock to prevent lost-update race with clearCommandHistory
-        // (which also writes settings.commandHistory from EDT). Using `settings` as the
-        // monitor could block the EDT if a background coroutine holds it; the dedicated
-        // lock avoids coupling EDT blocking to settings object monitor contention.
-        //
-        // Threading note: settings.commandHistory is a PersistentStateComponent field
-        // written here from a background coroutine and read from EDT (settings panel).
-        // This is safe because ArrayList reference assignment is atomic on the JVM
-        // (reference writes are atomic per JLS §17.7). The EDT reader may see a stale
-        // value but never a partially-written list. Using invokeLater for the write would
-        // add EDT round-trip latency to every send — the reference-atomicity tradeoff is
-        // intentional. Do NOT change to invokeLater without measuring the latency impact.
-        synchronized(commandHistoryLock) {
-            val current = _commandHistory.value.toMutableList()
-            // Compute the new file lists once outside removeAll to avoid creating
-            // 3 intermediate lists per existing-entry comparison (O(history×files)
-            // → O(history+files) allocations).
-            val names = files.map { it.name }
-            val paths = files.map { it.path }
-            val mimes = files.map { it.mime }
-            current.removeAll { existing ->
-                existing.text == text &&
-                    existing.attachedFileNames == names &&
-                    existing.attachedFilePaths == paths &&
-                    existing.attachedFileMimes == mimes
-            }
-            current.add(0, entry)
-            val trimmed = if (current.size > maxSize) current.take(maxSize) else current
-            _commandHistory.value = trimmed
-            settings.commandHistory = java.util.ArrayList(trimmed)
-        }
-    }
-
-    fun clearCommandHistory() {
-        val settings = OpenCodeSettingsState.getInstance()
-        synchronized(commandHistoryLock) {
-            _commandHistory.value = emptyList()
-            settings.commandHistory = java.util.ArrayList()
-        }
-    }
+    fun clearCommandHistory() = commandHistoryManager.clearCommandHistory()
 
     // --- Retry ---
 
@@ -1702,7 +1192,7 @@ class ChatViewModel(
     // --- Permission persistence ---
 
     private fun loadPersistedPermissions(): Map<String, Pair<Boolean, ToolPermission>> {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         val permsJson = settings.toolPermissions
         if (permsJson.isBlank()) return emptyMap()
         // Delegate to the service's parser to avoid duplicating JSON parsing logic.
@@ -1720,29 +1210,18 @@ class ChatViewModel(
 
     // --- Cleanup ---
 
-    override fun close() {
+    fun close() {
         connectionObserverJob?.cancel()
         initJob?.cancel()
         service.permissionManager.cancelPermissionTimeout()
-        // Cancel child permission timeout jobs — they run on service.scope which
-        // survives tool window recreation, but the prompts they guard are ViewModel-
-        // scoped and lost on disposal. Without cancellation, the jobs fire after
-        // disposal and emit PermissionTimedOut to globalSignals, but no ViewModel is
-        // collecting (replay=0 SharedFlow drops the signal).
-        childPermissionTimeoutJobs.values.forEach { it.cancel() }
-        childPermissionTimeoutJobs.clear()
-        // Clear permission prompts to prevent stale StateFlow values lingering
-        // in the old ViewModel after tool window recreation/disposal.
-        _permissionPrompt.value = null
-        _childPermissionPrompts.value = emptyMap()
+        // Cancel child permission timeout jobs and clear prompt state —
+        // delegated to PermissionViewModel, which owns both.
+        permissionViewModel.close()
     }
 
     // --- Helpers ---
 
     companion object {
         private const val MAX_STEER_WAIT_MS = 10_000L
-        private const val MAX_QUEUE_RETRIES = 3
-        /** Delay before re-queuing a failed message to prevent rapid retry loops. */
-        private const val RETRY_DELAY_MS = 2_000L
     }
 }

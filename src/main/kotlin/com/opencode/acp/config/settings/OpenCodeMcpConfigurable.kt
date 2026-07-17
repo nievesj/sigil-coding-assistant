@@ -45,7 +45,7 @@ class OpenCodeMcpConfigurable : Configurable {
     override fun getDisplayName(): String = "MCP"
 
     override fun createComponent(): JComponent {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         val mcpPanel = OpenCodeMcpPanel()
         mcpPanel.setState(settings)
         panel = mcpPanel
@@ -57,7 +57,7 @@ class OpenCodeMcpConfigurable : Configurable {
 
         // Wire retry button
         mcpPanel.mcpRetryButton.addActionListener {
-            triggerMcpReinitialize(OpenCodeSettingsState.getInstance())
+            triggerMcpReinitialize()
         }
 
         // Wire discover tools button
@@ -69,12 +69,12 @@ class OpenCodeMcpConfigurable : Configurable {
     }
 
     override fun isModified(): Boolean {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         return panel?.isModified(settings) ?: false
     }
 
     override fun apply() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         // Save old permissions before applyTo overwrites them
         val oldPermissionsJson = settings.toolPermissions
         panel?.applyTo(settings)
@@ -109,7 +109,7 @@ class OpenCodeMcpConfigurable : Configurable {
             settings.additionalMcpServers != prevAdditionalMcpServers
 
         if (mcpChanged) {
-            triggerMcpReinitialize(settings)
+            triggerMcpReinitialize()
             // Inform the user that a restart may be needed for full effect
             com.opencode.acp.chat.OpenCodeNotifications.showRestartWarning(
                 "OpenCode MCP settings changed. The OpenCode server is being re-initialized; " +
@@ -122,7 +122,7 @@ class OpenCodeMcpConfigurable : Configurable {
     }
 
     override fun reset() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         panel?.setState(settings)
         prevEnableIntellijMcp = settings.enableIntellijMcp
         prevMcpServerUrl = settings.mcpServerUrl
@@ -132,7 +132,7 @@ class OpenCodeMcpConfigurable : Configurable {
     /**
      * Trigger MCP re-initialization on the active project's OpenCodeService.
      */
-    private fun triggerMcpReinitialize(settings: OpenCodeSettingsState) {
+    private fun triggerMcpReinitialize() {
         val project = getActiveProject()
         if (project == null) {
             logger.warn { "[ACP] MCP settings changed but no open project found" }
@@ -156,7 +156,8 @@ class OpenCodeMcpConfigurable : Configurable {
      * tools can't be discovered because the server is down.
      */
     private fun discoverTools() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
+        val generalSettings = OpenCodeSettingsState.getInstance()
         val p = this.panel ?: return
         if (p.isDiscovering) return
 
@@ -242,7 +243,7 @@ class OpenCodeMcpConfigurable : Configurable {
                     settings.discoveredToolsJson = panelRef.generateDiscoveredToolsJson()
                     if (allTools.isEmpty()) {
                         panelRef.showToolPermissionsStatus(
-                            "No tools found. Ensure the OpenCode server is running on port ${settings.port}.", false)
+                            "No tools found. Ensure the OpenCode server is running on port ${generalSettings.port}.", false)
                     } else if (mcpServerCount == 0 && settings.enableIntellijMcp) {
                         // MCP is enabled but no MCP servers connected — warn the user
                         panelRef.showToolPermissionsStatus(

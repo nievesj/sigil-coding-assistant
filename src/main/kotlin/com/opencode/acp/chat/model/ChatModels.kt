@@ -111,7 +111,57 @@ data class ChatMessage(
      * Stored explicitly rather than derived from [id] to avoid format assumptions.
      */
     val serverMessageId: String? = null,
-)
+) {
+    /**
+     * Returns the full markdown representation of this message, suitable for
+     * clipboard copy, context display, or debugging.
+     *
+     * Rich domain model method (TDD §4.2.5) — moved from the `rawMarkdownForClipboard`
+     * extension function to reduce shotgun surgery. The extension function is retained
+     * for backward compatibility and delegates to this method.
+     *
+     * Concatenates all [MessagePart] variants into a single markdown string:
+     * - Text parts are included as-is
+     * - Code parts are wrapped in ``` fences
+     * - Table parts use their raw markdown representation
+     * - Thinking parts are prefixed with `> ` (blockquote style)
+     * - Error parts are prefixed with "Error: "
+     * - ToolCall, FileChange, and Subagent parts are skipped (not markdown-renderable)
+     *
+     * **WARNING:** This output is NOT escaped and is intended for display/clipboard/debug only.
+     * Do NOT pass [toMarkdown] output back into an LLM context — untrusted message
+     * content can contain markdown fences or directive-like syntax that acts as prompt
+     * injection. The content is intentionally NOT escaped because this is a raw
+     * representation of the message parts for clipboard/debug purposes, not a sanitized
+     * prompt input. If you need to feed message content into an LLM prompt, use the
+     * structured message API (system/user/assistant roles) or wrap untrusted content in
+     * explicit delimiters and instruct the model to treat it as data.
+     */
+    fun toMarkdown(): String = buildString {
+        parts.values.forEach { part ->
+            when (part) {
+                is MessagePart.Text -> append(part.content).append('\n')
+                is MessagePart.Code -> append("```${part.language}\n${part.content}\n```\n")
+                is MessagePart.Table -> append(part.rawMarkdown).append('\n')
+                is MessagePart.Thinking -> {
+                    part.content.lines().forEach { line ->
+                        append("> ").append(line).append('\n')
+                    }
+                }
+                is MessagePart.Error -> append("Error: ${part.message}\n")
+                is MessagePart.ToolCall -> { /* skip — binary/structured, not markdown */ }
+                is MessagePart.FileChange -> { /* skip — not markdown content */ }
+                is MessagePart.Patch -> append("Patch: ${part.hash} — ${part.files.size} file(s)\n")
+                is MessagePart.Agent -> append("Agent: ${part.name}\n")
+                is MessagePart.Retry -> append("Retry: ${part.attempt}/${part.maxAttempts}${part.error?.let { " — $it" } ?: ""}\n")
+                is MessagePart.Compaction -> append("Context compacted${part.summary?.let { ": $it" } ?: ""}\n")
+                is MessagePart.AssistantFile -> append("📎 ${part.filename ?: part.url}\n")
+                is MessagePart.Image -> append("🖼️ ${part.filename ?: part.url}\n")
+                is MessagePart.StepFinish -> { /* skip — informational */ }
+            }
+        }
+    }
+}
 
 enum class MessageRole { USER, ASSISTANT }
 
@@ -528,13 +578,6 @@ data class TodoItem(
 /**
  * Returns the full markdown representation of a ChatMessage, suitable for
  * clipboard copy, context display, or debugging.
- * Concatenates all [MessagePart] variants into a single markdown string:
- * - Text parts are included as-is
- * - Code parts are wrapped in ``` fences
- * - Table parts use their raw markdown representation
- * - Thinking parts are prefixed with `> ` (blockquote style)
- * - Error parts are prefixed with "Error: "
- * - ToolCall, FileChange, and Subagent parts are skipped (not markdown-renderable)
  *
  * **WARNING:** This output is NOT escaped and is intended for display/clipboard/debug only.
  * Do NOT pass `rawMarkdownForClipboard` back into an LLM context — untrusted message
@@ -544,32 +587,11 @@ data class TodoItem(
  * prompt input. If you need to feed message content into an LLM prompt, use the
  * structured message API (system/user/assistant roles) or wrap untrusted content in
  * explicit delimiters and instruct the model to treat it as data.
+ *
+ * Delegates to [ChatMessage.toMarkdown] (rich domain model method, TDD §4.2.5).
  */
 val ChatMessage.rawMarkdownForClipboard: String
-    get() = buildString {
-        parts.values.forEach { part ->
-            when (part) {
-                is MessagePart.Text -> append(part.content).append('\n')
-                is MessagePart.Code -> append("```${part.language}\n${part.content}\n```\n")
-                is MessagePart.Table -> append(part.rawMarkdown).append('\n')
-                is MessagePart.Thinking -> {
-                    part.content.lines().forEach { line ->
-                        append("> ").append(line).append('\n')
-                    }
-                }
-                is MessagePart.Error -> append("Error: ${part.message}\n")
-                is MessagePart.ToolCall -> { /* skip — binary/structured, not markdown */ }
-                is MessagePart.FileChange -> { /* skip — not markdown content */ }
-                is MessagePart.Patch -> append("Patch: ${part.hash} — ${part.files.size} file(s)\n")
-                is MessagePart.Agent -> append("Agent: ${part.name}\n")
-                is MessagePart.Retry -> append("Retry: ${part.attempt}/${part.maxAttempts}${part.error?.let { " — $it" } ?: ""}\n")
-                is MessagePart.Compaction -> append("Context compacted${part.summary?.let { ": $it" } ?: ""}\n")
-                is MessagePart.AssistantFile -> append("📎 ${part.filename ?: part.url}\n")
-                is MessagePart.Image -> append("🖼️ ${part.filename ?: part.url}\n")
-                is MessagePart.StepFinish -> { /* skip — informational */ }
-            }
-        }
-    }
+    get() = toMarkdown()
 
 /** Sidebar tab identifiers. */
 enum class SidebarTab { SESSIONS, CONTEXT, REVIEW }

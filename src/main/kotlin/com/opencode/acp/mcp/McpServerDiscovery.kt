@@ -27,9 +27,7 @@ private val logger = KotlinLogging.logger {}
  * the status code and Content-Type header, then disconnect immediately
  * without reading the body.
  */
-class McpServerDiscovery(
-    @Suppress("UNUSED_PARAMETER") httpClient: io.ktor.client.HttpClient
-) {
+class McpServerDiscovery {
     companion object {
         private const val VERIFY_TIMEOUT_MS = ChatConstants.MCP_VERIFY_TIMEOUT_MS
     }

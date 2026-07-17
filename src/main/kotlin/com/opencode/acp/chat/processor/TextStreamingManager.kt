@@ -5,8 +5,8 @@ import com.opencode.acp.chat.model.MessagePart
 import com.opencode.acp.chat.model.MessageState
 import com.opencode.acp.chat.model.PartState
 import com.opencode.acp.chat.model.ToolCallPill
-import com.opencode.acp.chat.ui.compose.MarkdownSegment
-import com.opencode.acp.chat.ui.compose.MarkdownSegmenter
+import com.opencode.acp.chat.markdown.MarkdownSegment
+import com.opencode.acp.chat.markdown.MarkdownSegmenter
 import io.github.oshai.kotlinlogging.KLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -296,6 +296,9 @@ internal class TextStreamingManager(
             // (acquired above) serializing all resegmentDirect calls. The @Volatile
             // annotations on revealedLen/lastSegmentedLen are for cross-coroutine
             // visibility of the VALUES, not for lock-free concurrency of this guard.
+            // INVARIANT: revealedLen is written ONLY by the reveal coroutine (startRevealLoop)
+            // immediately before calling resegmentDirect. Do not write revealedLen from
+            // any other context without also calling resegmentDirect under stateLock.
             if (textStreamingState.revealedLen == textStreamingState.lastSegmentedLen && textStreamingState.revealedLen > 0) {
                 return@withLock
             }

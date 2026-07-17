@@ -7,30 +7,24 @@ import com.opencode.acp.adapter.OpenCodeSession
 import com.opencode.acp.adapter.toChatMessage
 import com.opencode.acp.adapter.toSessionItem
 import com.opencode.acp.chat.model.*
+import com.opencode.acp.config.settings.OpenCodeContextSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.processor.BackgroundCompactor
 import com.opencode.acp.chat.processor.BackgroundCompactorSettings
-import com.opencode.acp.chat.processor.BreakdownComputer
-import com.opencode.acp.chat.processor.ContextPressureMonitor
 import com.opencode.acp.chat.processor.FileReadCache
 import com.opencode.acp.chat.processor.ToolOutputTruncator
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.supervisorScope
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import java.util.LinkedHashMap
 import java.util.concurrent.locks.ReentrantLock
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.withLock
 
 /**
@@ -46,7 +40,7 @@ import kotlin.concurrent.withLock
 class SessionManager(
     private val scope: CoroutineScope,
     private val project: Project,
-) {
+) : SessionStateContext {
 
     private val logger = KotlinLogging.logger {}
 
@@ -69,18 +63,18 @@ class SessionManager(
     /** Mutex to serialize session switches. */
     private val switchMutex = Mutex()
 
-    /** In-flight guard for full computeSessionContext (REST path). Prevents stacking
-     *  concurrent full computations. Local-only refreshes use [localComputeInFlight] instead
-     *  so they are not blocked by a slow REST call. */
-    private val fullComputeInFlight = AtomicBoolean(false)
-
-    /** In-flight guard for computeSessionContextLocal (no REST). Local refreshes are
-     *  cheap and should not be starved by a full computation blocked on getSession(). */
-    private val localComputeInFlight = AtomicBoolean(false)
-
     /** The currently active session ID. Null if no session is active. */
     private val _activeSessionId = MutableStateFlow<String?>(null)
     val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
+
+    /** Extracted context computation: token accumulation, model resolution, pressure monitoring. */
+    internal val contextComputer = ContextComputer(
+        activeSessionIdProvider = { _activeSessionId.value },
+        messagesProvider = { getActiveSession()?.messages?.value ?: emptyMap() },
+        clientProvider = { client },
+        projectBasePathProvider = { projectBasePath },
+        sessionListStateProvider = { _sessionListState.value },
+    )
 
     /** Messages for the active session. UI observes this.
      *  Uses flatMapLatest on _activeSessionId so that when the active session
@@ -136,8 +130,7 @@ class SessionManager(
     private val _todoItems = MutableStateFlow<List<TodoItem>>(emptyList())
     val todoItems: StateFlow<List<TodoItem>> = _todoItems.asStateFlow()
 
-    private val _sessionContextState = MutableStateFlow<SessionContextState>(SessionContextState.Loading)
-    val sessionContextState: StateFlow<SessionContextState> = _sessionContextState.asStateFlow()
+    val sessionContextState: StateFlow<SessionContextState> = contextComputer.sessionContextState
 
     /** Progress for clear-all operation — updated during clearAllSessions().
      *  Emits [ClearAllState.InProgress] during the deletion loop and resets to
@@ -172,9 +165,6 @@ class SessionManager(
 
     // ── Smart Context Manager components ──
 
-    /** Tracks context pressure via rolling growth rate. Reset on session switch/compaction. */
-    internal val pressureMonitor = ContextPressureMonitor()
-
     /** Pre-computes compaction summaries in the background for instant swap. */
     @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     internal var backgroundCompactor: BackgroundCompactor? = null
@@ -185,20 +175,20 @@ class SessionManager(
 
     /** Whether tool output truncation is enabled (from settings, read per-call). */
     private fun truncateToolOutputEnabled(): Boolean =
-        OpenCodeSettingsState.getInstance().truncateToolOutput
+        OpenCodeContextSettingsState.getInstance().truncateToolOutput
 
     /** Tool output char limit (from settings, read per-call). */
     private fun toolOutputCharLimit(): Int =
-        OpenCodeSettingsState.getInstance().toolOutputCharLimit
+        OpenCodeContextSettingsState.getInstance().toolOutputCharLimit
 
     /** Whether background compaction is enabled (from settings). */
     private fun backgroundCompactionEnabled(): Boolean =
-        OpenCodeSettingsState.getInstance().enableBackgroundCompaction
+        OpenCodeContextSettingsState.getInstance().enableBackgroundCompaction
 
     /** Creates or recreates the BackgroundCompactor with current settings. */
     @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     private fun createBackgroundCompactor(): BackgroundCompactor {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeContextSettingsState.getInstance()
         return BackgroundCompactor(
             client = client ?: throw IllegalStateException("Client not initialized"),
             settings = BackgroundCompactorSettings(
@@ -232,76 +222,47 @@ class SessionManager(
     private val _pendingCreationSessionIds = MutableStateFlow<Set<String>>(emptySet())
     val pendingCreationSessionIds: StateFlow<Set<String>> = _pendingCreationSessionIds.asStateFlow()
 
-    // ── Child Session Ephemeral State ──────────────────────────────────
+    // ── Child Session Ephemeral State (delegated to ChildSessionTracker) ──
 
-    /** Completed child session IDs to hide from the sidebar.
-     *  Populated by [markChildSessionComplete] on StreamingCompleted/SessionIdle.
-     *  Pruned by [loadSessions] to remove IDs for sessions the server has deleted. */
-    private val _hiddenChildSessionIds = MutableStateFlow<Set<String>>(emptySet())
-    val hiddenChildSessionIds: StateFlow<Set<String>> = _hiddenChildSessionIds.asStateFlow()
+    /** Extracted child session tracking: hidden/known/pending sets, reverse index, agent labels. */
+    internal val childSessionTracker = ChildSessionTracker(
+        activeSessionIdProvider = { _activeSessionId.value },
+    )
 
-    /** All known child session IDs, populated independently of [_childSessionMap].
-     *  Fixes the fast-completion race: a child created, streamed, and completed
-     *  before loadSessions() refreshes _childSessionMap is still recognized via
-     *  this set (populated on session creation and in loadSessions()). */
-    private val _knownChildSessionIds = MutableStateFlow<Set<String>>(emptySet())
-    val knownChildSessionIds: StateFlow<Set<String>> = _knownChildSessionIds.asStateFlow()
-
-    /** Reverse index: child session ID → parent session ID. O(1) child→parent lookup.
-     *  Populated from [loadSessions] (snapshot). Real-time population from Subtask
-     *  SSE events is handled inline in [processEvent] (agent label only — parent
-     *  is unknown from the Subtask event payload). */
-    private val _childToParent = MutableStateFlow<Map<String, String>>(emptyMap())
-    val childToParent: StateFlow<Map<String, String>> = _childToParent.asStateFlow()
-
-    /** Child session agent labels: child session ID → agent name (e.g., "fixer", "explorer").
-     *  Populated inline in [processEvent] from Subtask SSE events. Used by
-     *  ChildPermissionRelay for sub-agent labels. */
-    private val _childAgentLabels = MutableStateFlow<Map<String, String>>(emptyMap())
-    val childAgentLabels: StateFlow<Map<String, String>> = _childAgentLabels.asStateFlow()
-
-    /** Child sessions with pending permissions — prevents cache eviction. */
-    private val _childPendingPermissions = MutableStateFlow<Set<String>>(emptySet())
-    val childPendingPermissions: StateFlow<Set<String>> = _childPendingPermissions.asStateFlow()
+    val hiddenChildSessionIds: StateFlow<Set<String>> = childSessionTracker.hiddenChildSessionIds
+    val knownChildSessionIds: StateFlow<Set<String>> = childSessionTracker.knownChildSessionIds
+    val childToParent: StateFlow<Map<String, String>> = childSessionTracker.childToParent
+    val childAgentLabels: StateFlow<Map<String, String>> = childSessionTracker.childAgentLabels
+    val childPendingPermissions: StateFlow<Set<String>> = childSessionTracker.childPendingPermissions
 
     /** Mark a completed child session for hiding from the sidebar.
      *  Skips the active/selected session — it stays visible until the user switches away. */
-    fun markChildSessionComplete(sessionId: String) {
-        if (sessionId == _activeSessionId.value) return
-        _hiddenChildSessionIds.update { it + sessionId }
-        logger.debug { "[ACP] Child session $sessionId completed — marking for sidebar removal" }
-    }
+    fun markChildSessionComplete(sessionId: String) =
+        childSessionTracker.markChildSessionComplete(sessionId)
 
     /** Un-hide a child session (e.g., when switching to it via ToolPill "open child"). */
-    fun unhideChildSession(sessionId: String) {
-        _hiddenChildSessionIds.update { it - sessionId }
-    }
+    fun unhideChildSession(sessionId: String) =
+        childSessionTracker.unhideChildSession(sessionId)
 
     /** Find the parent session ID for a given child session ID.
-     *  O(1) lookup via _childToParent reverse index.
-     *  Falls back to scanning _childSessionMap if reverse index is stale. */
-    fun getParentSession(childSessionId: String): String? {
-        return _childToParent.value[childSessionId]
-            ?: _childSessionMap.value.entries.firstOrNull { (_, children) ->
-                children.any { it.id == childSessionId }
-            }?.key
-    }
+     *  O(1) lookup via childToParent reverse index.
+     *  Falls back to scanning childSessionMap if reverse index is stale. */
+    fun getParentSession(childSessionId: String): String? =
+        childSessionTracker.getParentSession(childSessionId, _childSessionMap.value)
 
     /** Get the agent label for a child session (e.g., "fixer", "explorer"). */
     fun getChildAgentLabel(childSessionId: String): String? =
-        _childAgentLabels.value[childSessionId]
+        childSessionTracker.getChildAgentLabel(childSessionId)
 
     /** Mark a child session as having a pending permission. Prevents cache eviction. */
-    fun markChildPendingPermission(childSessionId: String) {
-        _childPendingPermissions.update { it + childSessionId }
-    }
+    fun markChildPendingPermission(childSessionId: String) =
+        childSessionTracker.markChildPendingPermission(childSessionId)
 
     /** Clear a child session's pending permission flag. */
-    fun clearChildPendingPermission(childSessionId: String) {
-        _childPendingPermissions.update { it - childSessionId }
-    }
+    fun clearChildPendingPermission(childSessionId: String) =
+        childSessionTracker.clearChildPendingPermission(childSessionId)
 
-    internal fun emitSessionSignal(sessionId: String, signal: UiSignal) {
+    override fun emitSessionSignal(sessionId: String, signal: UiSignal) {
         _allSessionSignals.tryEmit(sessionId to signal)
     }
 
@@ -358,11 +319,11 @@ class SessionManager(
                         is UiSignal.StreamingCompleted -> {
                             _streamingSessionIds.update { it - sessionId }
                             // Auto-hide completed child sessions.
-                            // Use _knownChildSessionIds (populated on session creation and in loadSessions())
+                            // Use knownChildSessionIds (populated on session creation and in loadSessions())
                             // rather than _childSessionMap, which is only refreshed in loadSessions(). This
                             // avoids a race where a fast-completing child finishes before loadSessions() runs
                             // and _childSessionMap does not yet contain it (isChild would return false).
-                            if (sessionId in _knownChildSessionIds.value) {
+                            if (childSessionTracker.isKnownChild(sessionId)) {
                                 markChildSessionComplete(sessionId)
                             }
                         }
@@ -373,7 +334,7 @@ class SessionManager(
                             // is a completion signal and the new_message path may not emit StreamingCompleted).
                             _streamingSessionIds.update { it - sessionId }
                             // Set add is idempotent, so redundant calls are harmless.
-                            if (sessionId in _knownChildSessionIds.value) {
+                            if (childSessionTracker.isKnownChild(sessionId)) {
                                 markChildSessionComplete(sessionId)
                             }
                         }
@@ -571,31 +532,19 @@ class SessionManager(
                 .groupBy { it.parentID!! }
             _childSessionMap.value = children
 
-            // Populate _knownChildSessionIds independently of _childSessionMap
-            // (fixes fast-completion race — see _knownChildSessionIds doc)
-            _knownChildSessionIds.update { known ->
-                known + items.filter { it.parentID != null }.map { it.id }.toSet()
-            }
+            // Populate knownChildSessionIds independently of _childSessionMap
+            // (fixes fast-completion race — see knownChildSessionIds doc)
+            childSessionTracker.addKnownChildrenFromItems(items)
 
-            // Populate _childToParent reverse index from session parentID fields
-            _childToParent.update { existing ->
-                val updated = existing.toMutableMap()
-                for (item in items) {
-                    item.parentID?.let { parentId ->
-                        updated[item.id] = parentId
-                    }
-                }
-                updated
-            }
+            // Populate childToParent reverse index from session parentID fields
+            childSessionTracker.updateChildToParent(items)
 
-            // Prune _hiddenChildSessionIds: remove IDs for sessions the server has deleted,
-            // preserve hidden state for sessions the server still knows about.
+            // Prune hiddenChildSessionIds and knownChildSessionIds: remove IDs for
+            // sessions the server has deleted, preserve state for sessions the server
+            // still knows about. Without this, the sets grow unbounded across the
+            // plugin's lifetime.
             val currentSessionIds = items.map { it.id }.toSet()
-            _hiddenChildSessionIds.update { ids -> ids.filter { it in currentSessionIds }.toSet() }
-
-            // Prune _knownChildSessionIds: remove IDs for sessions the server has deleted.
-            // Without this, the set grows unbounded across the plugin's lifetime.
-            _knownChildSessionIds.update { ids -> ids.filter { it in currentSessionIds }.toSet() }
+            childSessionTracker.pruneDeleted(currentSessionIds)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -880,7 +829,7 @@ class SessionManager(
                 // parser sets `SseEvent.Subtask.sessionId` to the child's session ID.
                 // The parent's session ID is NOT available in the Subtask event payload.
                 //
-                // We CANNOT populate the _childToParent reverse index from Subtask
+                // We CANNOT populate the childToParent reverse index from Subtask
                 // events because we don't know the parent's session ID. Mapping
                 // childId as both child and parent would create a
                 // self-referential mapping (childId → childId), which would cause
@@ -893,9 +842,9 @@ class SessionManager(
                 val agent = event.agent
                 // Only capture the agent label — don't populate the reverse index
                 if (agent != null) {
-                    _childAgentLabels.update { it + (childSessionId to agent) }
+                    childSessionTracker.setChildAgentLabel(childSessionId, agent)
                 }
-                _knownChildSessionIds.update { it + childSessionId }
+                childSessionTracker.addKnownChild(childSessionId)
                 logger.info { "[ACP] Subtask event: childSessionId=$childSessionId, agent=$agent — agent label captured, reverse index NOT populated (parent unknown from Subtask event)" }
                 // Still route to SessionState for existing ToolPill rendering behavior
                 sessionsLock.withLock { sessions[sessionId] }?.let { state ->
@@ -918,30 +867,28 @@ class SessionManager(
                     // Auto-cache unknown sessions when SSE events arrive (e.g. subtask streaming).
                     // Guards:
                     // 1. Only auto-cache if the cache has room to avoid evicting useful sessions.
-                    // 2. Only auto-cache sessions that could belong to the current project:
-                    //    skip if projectBasePath is set (project-scoped) and the session ID
-                    //    doesn't match the active session or its known children. This prevents
-                    //    loading other projects' messages into the local cache via untrusted SSE.
+                    // 2. Only auto-cache sessions verifiably related to the active session
+                    //    (the active session itself, a known child of the active session, or a
+                    //    known child in childSessionTracker). This check is UNCONDITIONAL — it
+                    //    always applies regardless of whether projectBasePath is set. Even in
+                    //    cross-project mode (projectBasePath == null), we never auto-load
+                    //    arbitrary session message histories from untrusted SSE. Auto-caching
+                    //    from SSE is a higher trust level than user-initiated REST listing.
                     val activeId = _activeSessionId.value
-                    // Only auto-cache sessions verifiably related to the active session (child or
-                    // known child), regardless of projectBasePath. Auto-caching from untrusted SSE
-                    // is a higher trust level than user-initiated REST listing — even when
-                    // projectBasePath is null (cross-project mode), don't auto-load arbitrary
-                    // session message histories from SSE.
                     val mayBelongToProject = sessionId == activeId ||
                         _childSessionMap.value[activeId]?.any { it.id == sessionId } == true ||
-                        sessionId in _knownChildSessionIds.value
+                        childSessionTracker.isKnownChild(sessionId)
                     // Don't auto-cache if the cache is at capacity — prevent evicting useful
                     // sessions to make room for an untrusted SSE-driven auto-cache.
                     val cacheHasRoom = sessionsLock.withLock { sessions.size < MAX_CACHED_SESSIONS }
-                    // RACE WINDOW (resolved): _knownChildSessionIds may be briefly stale
+                    // RACE WINDOW (resolved): knownChildSessionIds may be briefly stale
                     // (populated by loadSessions() and session creation, both async). The
                     // mayBelongToProject check verifies the session is the active ID, a known
-                    // child of the active session, or in _knownChildSessionIds. If a child ID
-                    // was evicted from _knownChildSessionIds between population and this check,
+                    // child of the active session, or in knownChildSessionIds. If a child ID
+                    // was evicted from knownChildSessionIds between population and this check,
                     // a legitimate child event would be skipped — but the worst case is caching
                     // an extra session (bounded by MAX_CACHED_SESSIONS) or missing one cache
-                    // entry (the next loadSessions() refreshes _knownChildSessionIds). This is
+                    // entry (the next loadSessions() refreshes knownChildSessionIds). This is
                     // acceptable. Documented race window; worst case is an extra cached session,
                     // bounded by MAX_CACHED_SESSIONS.
                     if (mayBelongToProject && cacheHasRoom) {
@@ -1034,12 +981,17 @@ class SessionManager(
     }
 
     /** Get all cached sessions that have isStreaming == true.
-     *  Used by OpenCodeService.recoverBackgroundSessions() after SSE reconnection. */
+     *  Used by [recoverBackgroundSessions] after SSE reconnection. */
     internal fun getStreamingSessions(): List<SessionState> {
         return sessionsLock.withLock {
             sessions.values.filter { it.isStreaming }
         }
     }
+
+    /** Extracted background session recovery after SSE reconnection. */
+    internal val sessionRecoveryManager = SessionRecoveryManager(
+        streamingSessionsProvider = { getStreamingSessions() },
+    )
 
     /**
      * Check all cached sessions that were streaming when SSE dropped.
@@ -1048,90 +1000,15 @@ class SessionManager(
      * finalize it locally. Prevents responseDeferred from hanging until the
      * configurable response timeout.
      *
-     * SAFETY: Before finalizing, checks for in-progress tool calls. If the
-     * last assistant message has ToolUse parts without matching ToolResult
-     * parts, the session is likely still generating — we skip finalization
-     * and let the SSE reconnection deliver the remaining events. This
-     * prevents incorrectly finalizing a session that's mid-tool-execution
-     * (TDD §11 Risk 3).
-     *
-     * ASSUMPTION: The server's REST API (listMessages) returns the current
-     * state of messages, including in-progress tool parts. If this assumption
-     * is wrong, the safety check may not catch all cases.
+     * Delegated to [SessionRecoveryManager.recoverBackgroundSessions]. See its
+     * KDoc for the SAFETY and ASSUMPTION notes (in-progress tool call detection
+     * prevents incorrectly finalizing a session that's mid-tool-execution).
      *
      * @param client The OpenCodeClient to use for REST calls (passed by caller
      *   from ProcessManager.client — SessionManager does NOT own a client reference).
      */
     internal suspend fun recoverBackgroundSessions(client: OpenCodeClient?) {
-        if (client == null) return
-        val streamingSessions = getStreamingSessions()
-        if (streamingSessions.isEmpty()) return
-
-        logger.info { "[ACP] recoverBackgroundSessions: checking ${streamingSessions.size} streaming sessions" }
-
-        // Use supervisorScope instead of coroutineScope so that one failed
-        // async block (e.g., CancellationException from session eviction)
-        // does NOT cancel the other recovery attempts. Each async block
-        // catches its own exceptions internally, but supervisorScope ensures
-        // structured concurrency without cross-cancellation.
-        supervisorScope {
-            val deferreds = streamingSessions.map { session ->
-                async {
-                    val sessionId = session.sessionId
-                    try {
-                        // Fetch 20 messages (not 5) for the in-progress tool check.
-                        // A ToolUse beyond a 5-message window (e.g., a long-running subtask
-                        // that spawned its own messages) would be missed, causing premature
-                        // finalization. 20 is a balance between safety and REST payload size.
-                        val messages = client.listMessages(sessionId, limit = 20)
-                        val lastMessage = messages.lastOrNull()
-                        // RESOLVED (false positive): Current logic is correct — only
-                        // finalize if the last message is assistant (generation completed).
-                        // If the last is user, the assistant hasn't started responding yet,
-                        // so skipping finalization is the correct behavior (the SSE
-                        // reconnection will deliver the assistant's response normally).
-                        // Using lastOrNull (not lastOrNull { role == "assistant" }) is
-                        // intentional: we want to know the server's CURRENT last message,
-                        // not the most recent assistant message.
-                        val lastIsAssistant = lastMessage?.info?.role == "assistant"
-
-                        if (lastIsAssistant) {
-                            // Safety check: detect in-progress tool calls across ALL fetched messages,
-                            // not just the last one. The server returns messages in chronological order
-                            // in practice, but scanning all fetched messages is safer and bounded (limit=20).
-                            // O(n) instead of O(n²): build a Set of completed tool IDs first,
-                            // then check ToolUse membership. Single flatMap reused for both checks.
-                            val allParts = messages.flatMap { it.parts }
-                            val completedToolIds = allParts.filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolResult>()
-                                .map { it.toolUseId }
-                                .toSet()
-                            val hasInProgressTools = allParts.filterIsInstance<com.opencode.acp.adapter.OpenCodePart.ToolUse>()
-                                .any { it.id !in completedToolIds }
-
-                            if (hasInProgressTools) {
-                                logger.info { "[ACP] recoverBackgroundSessions: session $sessionId has in-progress tools — skipping finalization (will recover via SSE)" }
-                                return@async
-                            }
-
-                            val activeMsgId = session.activeMessageId
-                            if (activeMsgId != null) {
-                                session.completeStreaming(activeMsgId)
-                            } else {
-                                logger.warn { "[ACP] recoverBackgroundSessions: session $sessionId has no activeMessageId — cannot finalize, session may remain in streaming state" }
-                            }
-                            session.responseDeferred?.complete(Unit)
-                            session.responseDeferred = null
-                            logger.info { "[ACP] Recovered background session $sessionId after SSE reconnection" }
-                        }
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        logger.warn(e) { "[ACP] Failed to recover session $sessionId" }
-                    }
-                }
-            }
-            deferreds.awaitAll()
-        }
+        sessionRecoveryManager.recoverBackgroundSessions(client)
     }
 
     // ── Helpers ──
@@ -1206,7 +1083,9 @@ class SessionManager(
             emptyList()
         }
 
-        val state = SessionState(sessionId, scope, this, project)
+        val state = SessionState(sessionId, scope, this) { toolCallState, turnLifecycleState ->
+            FollowAgentDispatcher(project, toolCallState, turnLifecycleState, scope, this, logger)
+        }
         messages.forEach { state.addMessage(it.toChatMessage()) }
 
         // Adopt the last assistant message as the streaming context so subsequent
@@ -1242,7 +1121,7 @@ class SessionManager(
                                 && it.key != sessionId
                                 && !it.value.isStreaming
                                 && !it.value.hasPendingPermission
-                                && it.key !in _childPendingPermissions.value }
+                                && !childSessionTracker.hasPendingPermission(it.key) }
                         .minByOrNull { it.value.lastAccessTime }
                         ?: break
                     evictedAfterInsert.add(lru.value)
@@ -1253,7 +1132,7 @@ class SessionManager(
                 // parentID is not available here (SSE context), so check if
                 // the session is already known as a child via _childSessionMap.
                 if (_childSessionMap.value.values.flatten().any { it.id == sessionId }) {
-                    _knownChildSessionIds.update { it + sessionId }
+                    childSessionTracker.addKnownChild(sessionId)
                 }
             }
             sessionsSnapshot = sessions.values.toList()
@@ -1301,7 +1180,7 @@ class SessionManager(
                             && it.key != excludeSessionId
                             && !it.value.isStreaming
                             && !it.value.hasPendingPermission
-                            && it.key !in _childPendingPermissions.value }
+                            && !childSessionTracker.hasPendingPermission(it.key) }
                     .minByOrNull { it.value.lastAccessTime }
                     ?: break
                 toEvict.add(lru.key to lru.value)
@@ -1349,30 +1228,8 @@ class SessionManager(
         }
     }
 
-    internal suspend fun computeSessionContext(controlState: ControlBarState? = null): SessionContextState {
-        // NOTE: Do NOT acquire switchMutex here — switchSession() and
-        // createAndSwitchSession() already hold it when they call this method,
-        // and kotlinx.coroutines.sync.Mutex is non-reentrant (would deadlock).
-        // The session-switch race window (reading _activeSessionId.value then
-        // getActiveSession()) is negligible — both are thread-safe reads, and
-        // a switch between them only means slightly stale messages for one frame.
-        val currentSessionId = _activeSessionId.value ?: return SessionContextState.Loading
-        val messages = getActiveSession()?.messages?.value ?: emptyMap()
-        val c = client ?: return SessionContextState.Loading
-
-        // In-flight guard: skip if another full computation is already running.
-        // Uses a dedicated guard so local refreshes are not blocked.
-        if (!fullComputeInFlight.compareAndSet(false, true)) {
-            // Another full computation is in progress — return the current state as-is.
-            // If it's Loading, the in-progress computation will replace it soon.
-            return _sessionContextState.value
-        }
-        try {
-            return computeSessionContextInternal(currentSessionId, messages, c, controlState, fetchSession = true)
-        } finally {
-            fullComputeInFlight.set(false)
-        }
-    }
+    internal suspend fun computeSessionContext(controlState: ControlBarState? = null): SessionContextState =
+        contextComputer.compute(controlState)
 
     /**
      * Local-only context computation — no REST call. Used during streaming and on
@@ -1380,191 +1237,12 @@ class SessionManager(
      * from the local message cache only; summary/time fields reuse the last loaded
      * values (they don't change mid-stream).
      *
-     * Thread-safe via [localComputeInFlight] — local refreshes use a separate guard
-     * from full (REST) refreshes so they are not starved during streaming.
+     * Delegated to [ContextComputer.computeLocal] — thread-safe via a separate
+     * in-flight guard so local refreshes are not starved by a full computation
+     * blocked on REST getSession().
      */
-    internal suspend fun computeSessionContextLocal(controlState: ControlBarState? = null): SessionContextState {
-        val currentSessionId = _activeSessionId.value ?: return SessionContextState.Loading
-        val messages = getActiveSession()?.messages?.value ?: emptyMap()
-        val c = client ?: return SessionContextState.Loading
-
-        // Use a separate guard so local refreshes are NOT blocked by a full computation
-        // blocked on REST getSession(). Local refreshes are cheap (no REST) and should
-        // update the indicator promptly during streaming.
-        if (!localComputeInFlight.compareAndSet(false, true)) {
-            // Another local computation is in progress — return the current state as-is.
-            return _sessionContextState.value
-        }
-        try {
-            return computeSessionContextInternal(currentSessionId, messages, c, controlState, fetchSession = false)
-        } finally {
-            localComputeInFlight.set(false)
-        }
-    }
-
-    /**
-     * Shared computation logic for both full (REST) and local-only context computation.
-     *
-     * @param fetchSession if true, fetches session metadata (summary, time, model) via REST;
-     *                     if false, reuses the last loaded summary/time values (they don't
-     *                     change mid-stream) and falls back to controlState for model info.
-     */
-    private suspend fun computeSessionContextInternal(
-        currentSessionId: String,
-        messages: Map<String, ChatMessage>,
-        c: OpenCodeClient,
-        controlState: ControlBarState?,
-        fetchSession: Boolean,
-    ): SessionContextState {
-        // Best-effort session fetch — only when fetchSession=true (full path).
-        // Token/cost data comes from the local message cache (kept accurate by
-        // MessageFinalized SSE events), NOT from session.tokens/session.cost
-        // (the V1 API returns these as always-zero — see AGENTS.md § API Testing).
-        val session = if (fetchSession) {
-            try {
-                c.getSession(currentSessionId)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.error(e) { "[ACP] Failed to fetch session for context" }
-                null
-            }
-        } else {
-            // Local-only path: reuse last loaded session metadata for summary/time
-            // (they don't change mid-stream). Model falls back to controlState.
-            null
-        }
-
-        // ── Token data ──
-        // inputTokens and cacheReadTokens are CUMULATIVE (each message's value
-        // represents the full prompt context sent for that LLM call, including all
-        // prior messages). Use the LAST assistant message with non-zero tokens —
-        // NOT a sum across all messages (that would double-count).
-        // outputTokens, reasoningTokens, cacheWriteTokens, and cost are PER-MESSAGE
-        // (incremental for that step). Sum these across all assistant messages.
-        val assistantMessages = messages.values.filter { it.role == MessageRole.ASSISTANT }
-
-        // Cumulative fields: last message with non-zero input tokens (not 0L fallback).
-        // Falls back to the previous message's tokens when the last assistant is still
-        // streaming (no MessageFinalized yet) — prevents the indicator from dropping to 0.
-        val lastWithInput = assistantMessages.findLast { it.inputTokens > 0 }
-        val inputTokens = lastWithInput?.inputTokens ?: 0L
-        val cacheReadTokens = lastWithInput?.cacheReadTokens ?: 0L
-
-        // Per-message fields: sum across all assistant messages
-        val outputTokens = assistantMessages.sumOf { it.outputTokens }
-        val reasoningTokens = assistantMessages.sumOf { it.reasoningTokens }
-        val cacheWriteTokens = assistantMessages.sumOf { it.cacheWriteTokens }
-        val totalTokens = inputTokens + outputTokens + reasoningTokens + cacheReadTokens + cacheWriteTokens
-        val totalCost = assistantMessages.sumOf { it.cost }
-
-        // ── Model info: from session metadata, fallback to controlState ──
-        val modelId = session?.model?.id?.takeIf { it.isNotBlank() } ?: controlState?.selectedModel?.modelID
-        val providerId = session?.model?.providerID?.takeIf { it.isNotBlank() } ?: controlState?.selectedModel?.providerID
-
-        val (providerName, modelName) = resolveModelNames(
-            controlState?.models ?: emptyList(), modelId, providerId
-        )
-        val contextLimit = resolveContextLimit(
-            controlState?.allModels?.ifEmpty { controlState.models } ?: emptyList(),
-            providerId, modelId
-        )
-
-        val usagePercent = if (contextLimit > 0L) {
-            (totalTokens.toFloat() / contextLimit.toFloat()) * 100f
-        } else 0f
-
-        // ── Smart Context Manager: record turn for pressure monitoring ──
-        // Only record on the full (REST) path — local refreshes during streaming
-        // would produce noisy intermediate data points.
-        if (fetchSession && inputTokens > 0) {
-            try {
-                pressureMonitor.recordTurn(inputTokens, System.currentTimeMillis())
-            } catch (e: Exception) {
-                logger.warn(e) { "[ACP] pressureMonitor.recordTurn failed" }
-            }
-        }
-
-        // ── Smart Context Manager: background compaction checkpoint ──
-        // DISABLED: The server's POST /session/{id}/summarize endpoint performs ACTUAL
-        // compaction (removes/summarizes messages), not a preview. Calling it as a
-        // "background checkpoint" compacts the session immediately — the user sees
-        // their context disappear on load when usage > 60%. There is no server API
-        // to pre-compute a summary without side effects, so the BackgroundCompactor's
-        // auto-trigger is removed. Manual compaction (/compact command, "Compact Now"
-        // button) remains fully functional. The BackgroundCompactor class is retained
-        // as dead code in case a preview API is added in the future.
-        //
-        // if (fetchSession && backgroundCompactionEnabled() && backgroundCompactor != null) {
-        //     backgroundCompactor?.maybeCheckpoint(...)
-        // }
-
-        // ── Message counts: from local cache ──
-        val messageCount = messages.size
-        val userMessageCount = messages.values.count { it.role == MessageRole.USER }
-        val assistantMessageCount = assistantMessages.size
-
-        val sessionTitle = (_sessionListState.value as? SessionListState.Loaded)
-            ?.sessions?.find { it.id == currentSessionId }?.title ?: "Untitled"
-
-        // ── Summary/time: from REST (full path) or reuse last loaded (local path) ──
-        val lastLoaded = (_sessionContextState.value as? SessionContextState.Loaded)?.context
-        val additions = session?.summary?.additions ?: lastLoaded?.additions ?: 0
-        val deletions = session?.summary?.deletions ?: lastLoaded?.deletions ?: 0
-        val filesModified = session?.summary?.files ?: lastLoaded?.filesModified ?: 0
-        val sessionCreated = session?.time?.created ?: lastLoaded?.sessionCreated ?: 0L
-        val lastUpdated = session?.time?.updated ?: lastLoaded?.lastUpdated ?: 0L
-
-        // Read pruner heartbeat once — used for both breakdown adjustment and SessionContext fields
-        val currentProjectBasePath = projectBasePath
-        val prunerHeartbeat = if (currentProjectBasePath != null) {
-            try { PrunerHeartbeatReader.readHeartbeat(currentProjectBasePath) } catch (_: Exception) { null }
-        } else null
-
-        val result = SessionContextState.Loaded(
-            context = SessionContext(
-                sessionId = currentSessionId,
-                title = sessionTitle,
-                providerID = providerId ?: "",
-                modelID = modelId ?: "",
-                providerName = providerName,
-                modelName = modelName,
-                contextLimit = contextLimit,
-                totalTokens = totalTokens,
-                inputTokens = inputTokens,
-                outputTokens = outputTokens,
-                reasoningTokens = reasoningTokens,
-                cacheReadTokens = cacheReadTokens,
-                cacheWriteTokens = cacheWriteTokens,
-                usagePercent = usagePercent,
-                totalCost = totalCost,
-                messageCount = messageCount,
-                userMessageCount = userMessageCount,
-                assistantMessageCount = assistantMessageCount,
-                additions = additions,
-                deletions = deletions,
-                filesModified = filesModified,
-                sessionCreated = sessionCreated,
-                lastUpdated = lastUpdated,
-                breakdown = computeBreakdownSafely(messages, contextLimit, totalTokens, prunerHeartbeat),
-                pressure = computePressureSafely(totalTokens, contextLimit, inputTokens),
-                prunerTokensSaved = prunerHeartbeat?.tokensSaved ?: 0,
-                prunerOutputsPruned = prunerHeartbeat?.outputsPruned ?: 0,
-                prunerInputsPruned = prunerHeartbeat?.inputsPruned ?: 0,
-                prunerLastRunMs = prunerHeartbeat?.timestampMs ?: 0,
-            )
-        )
-        logger.info { "[ACP] computeSessionContext(${if (fetchSession) "full" else "local"}): session=$currentSessionId totalTokens=$totalTokens cost=$totalCost usagePercent=${"%.1f".format(usagePercent)}% model=$modelId provider=$providerId" }
-        // Staleness guard: don't publish if the active session changed during the
-        // (possibly slow) computation. Prevents session A's context from appearing
-        // under session B after a switch.
-        if (currentSessionId != _activeSessionId.value) {
-            logger.info { "[ACP] computeSessionContext: session changed during computation ($currentSessionId → ${_activeSessionId.value}) — discarding result" }
-            return result
-        }
-        _sessionContextState.value = result
-        return result
-    }
+    internal suspend fun computeSessionContextLocal(controlState: ControlBarState? = null): SessionContextState =
+        contextComputer.computeLocal(controlState)
 
     internal suspend fun fetchTodos() {
         val currentSessionId = _activeSessionId.value ?: return
@@ -1582,116 +1260,14 @@ class SessionManager(
 
     // ── Private: Helpers ──
 
-    private fun resolveModelNames(models: List<ProviderModel>, modelId: String?, providerId: String?): Pair<String, String> {
-        if (modelId.isNullOrBlank() && providerId.isNullOrBlank()) return Pair("Unknown", "Unknown")
-        if (models.isEmpty()) return Pair(providerId ?: "Unknown", modelId ?: "Unknown")
-
-        val exactMatch = models.find { it.providerID == providerId && it.modelID == modelId }
-        if (exactMatch != null) {
-            return splitDisplayName(exactMatch.displayName, exactMatch.providerID, exactMatch.modelID)
-        }
-
-        val modelOnlyMatch = models.find { it.modelID == modelId }
-        if (modelOnlyMatch != null) {
-            return splitDisplayName(modelOnlyMatch.displayName, modelOnlyMatch.providerID, modelOnlyMatch.modelID)
-        }
-
-        return Pair(providerId ?: "Unknown", modelId ?: "Unknown")
-    }
-
-    /**
-     * Split a displayName in "provider / model" format using the LAST occurrence
-     * of " / " as the delimiter. This handles provider names that contain " / "
-     * (e.g., "AI / ML Provider / gpt-4" → provider="AI / ML Provider", model="gpt-4").
-     * Falls back to the provided providerID/modelID if the format doesn't match.
-     */
-    private fun splitDisplayName(displayName: String, providerID: String, modelID: String): Pair<String, String> {
-        val separator = " / "
-        val lastIdx = displayName.lastIndexOf(separator)
-        if (lastIdx > 0) {
-            val provider = displayName.substring(0, lastIdx)
-            val model = displayName.substring(lastIdx + separator.length)
-            if (provider.isNotBlank() && model.isNotBlank()) {
-                return Pair(provider, model)
-            }
-        }
-        return Pair(providerID, modelID)
-    }
-
-    private fun resolveContextLimit(models: List<ProviderModel>, providerId: String?, modelId: String?): Long {
-        if (modelId.isNullOrBlank()) return 0L
-        if (models.isEmpty()) return 0L
-
-        val exactMatch = models.find { it.providerID == providerId && it.modelID == modelId }
-        if (exactMatch != null && exactMatch.contextWindow > 0) return exactMatch.contextWindow.toLong()
-
-        val modelOnlyMatch = models.find { it.modelID == modelId }
-        if (modelOnlyMatch != null && modelOnlyMatch.contextWindow > 0) return modelOnlyMatch.contextWindow.toLong()
-
-        return 0L
-    }
-
-    // ── Smart Context Manager helpers ──
-
-    /** Compute breakdown safely — returns null on failure (non-fatal).
-     *  If [projectDirectory] is provided, subtracts pruner-estimated tokens saved
-     *  from the tool category so the UI reflects what the LLM actually sees.
-     *  @param sessionTotalTokens the server-provided total token count, used to
-     *  normalize the breakdown so its total matches the session's token count. */
-    private fun computeBreakdownSafely(
-        messages: Map<String, ChatMessage>,
-        contextLimit: Long,
-        sessionTotalTokens: Long = 0L,
-        prunerHeartbeat: PrunerHeartbeat? = null,
-    ): com.opencode.acp.chat.model.ContextBreakdown? {
-        return try {
-            if (messages.isEmpty()) return null
-            val breakdown = BreakdownComputer.computeBreakdown(messages, contextLimit, sessionTotalTokens)
-            val prunerSaved = prunerHeartbeat?.tokensSaved ?: 0L
-            if (prunerSaved > 0) {
-                // Subtract pruner-saved tokens from tool category (pruning targets tool outputs).
-                // Clear the per-tool breakdown map because individual tool counts are unreliable
-                // after pruner adjustment — the pruner doesn't record which tools were pruned,
-                // so we can't proportionally adjust per-tool entries. The UI's tool breakdown
-                // sub-view is hidden when the map is empty.
-                val adjustedToolTokens = (breakdown.toolTokens - prunerSaved).coerceAtLeast(0L)
-                val adjustedTotal = (breakdown.totalTokens - prunerSaved).coerceAtLeast(0L)
-                return breakdown.copy(
-                    toolTokens = adjustedToolTokens,
-                    totalTokens = adjustedTotal,
-                    freeTokens = (contextLimit - adjustedTotal).coerceAtLeast(0L),
-                    toolBreakdown = emptyMap(),
-                )
-            }
-            breakdown
-        } catch (e: Exception) {
-            logger.warn(e) { "[ACP] BreakdownComputer.computeBreakdown failed" }
-            null
-        }
-    }
-
-    /** Compute pressure safely — returns null on failure or insufficient data (non-fatal). */
-    private suspend fun computePressureSafely(
-        totalTokens: Long,
-        contextLimit: Long,
-        inputTokens: Long,
-    ): com.opencode.acp.chat.model.ContextPressure? {
-        return try {
-            pressureMonitor.computePressure(totalTokens, contextLimit)
-        } catch (e: Exception) {
-            logger.warn(e) { "[ACP] pressureMonitor.computePressure failed" }
-            null
-        }
-    }
-
     /**
      * Reset smart-context state on session switch.
      * Called from [switchSession] and [createAndSwitchSession].
      */
     @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     suspend fun resetSmartContextState() {
-        BreakdownComputer.resetCalibration()
-        pressureMonitor.reset()
+        contextComputer.resetBreakdownCalibration()
+        contextComputer.resetPressureMonitor()
         fileReadCache.clear()
         backgroundCompactor?.clearCheckpoint()
     }
@@ -1702,7 +1278,7 @@ class SessionManager(
      */
     @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     suspend fun onSessionCompacted() {
-        pressureMonitor.onCompaction()
+        contextComputer.onCompaction()
         backgroundCompactor?.clearCheckpoint()
     }
 
@@ -1710,7 +1286,7 @@ class SessionManager(
      * Truncate tool output if truncation is enabled in settings.
      * Called by SessionState before storing tool results.
      */
-    fun maybeTruncateToolOutput(toolName: String, output: List<JsonObject>): List<JsonObject> {
+    override fun maybeTruncateToolOutput(toolName: String, output: List<JsonObject>): List<JsonObject> {
         if (!truncateToolOutputEnabled()) return output
         return ToolOutputTruncator.truncateIfNeeded(toolName, output, toolOutputCharLimit())
     }
@@ -1719,7 +1295,7 @@ class SessionManager(
     @Suppress("DEPRECATION") // BackgroundCompactor is deprecated (auto-trigger disabled); retained as dead code
     fun isCheckpointReady(): Boolean {
         val sessionId = _activeSessionId.value ?: return false
-        val context = _sessionContextState.value
+        val context = contextComputer.sessionContextState.value
         if (context !is SessionContextState.Loaded) return false
         val providerId = context.context.providerID
         val modelId = context.context.modelID

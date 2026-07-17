@@ -9,12 +9,15 @@ import com.opencode.acp.follow.CommandFollowManager
 import com.opencode.acp.follow.EditorFollowManager
 import com.opencode.acp.follow.SearchFollowManager
 import com.intellij.openapi.project.Project
+import com.opencode.acp.chat.util.FollowAgentDispatcherInterface
 import io.github.oshai.kotlinlogging.KLogger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 
 /**
@@ -41,7 +44,7 @@ internal class FollowAgentDispatcher(
     private val scope: CoroutineScope,
     private val sessionManager: SessionManager,
     private val logger: KLogger,
-) {
+) : FollowAgentDispatcherInterface {
     /**
      * Dispatch Follow Agent actions for a ToolUse event.
      * Handles: editor navigation, command console (EXECUTE), Find in Files (SEARCH),
@@ -61,15 +64,15 @@ internal class FollowAgentDispatcher(
      * @param existingPill The existing pill (for duplicate path kind re-detection),
      *        null for primary path.
      */
-    fun dispatchToolUse(
+    override fun dispatchToolUse(
         toolCallId: String,
         toolName: String,
         toolKind: ToolKind,
         input: JsonObject?,
         metadata: JsonObject?,
         startTimeMs: Long?,
-        isDuplicate: Boolean = false,
-        existingPill: ToolCallPill? = null,
+        isDuplicate: Boolean,
+        existingPill: ToolCallPill?,
     ) {
         // Resolve the effective tool kind once — used by editor follow, EXECUTE, and SEARCH.
         // Re-detect from input if the existing pill's kind was OTHER (duplicate path),
@@ -235,15 +238,15 @@ internal class FollowAgentDispatcher(
      * @param metadata The tool metadata (for orphan path task caching), may be null
      * @param signals The signal flow � used for FileChanged emission on orphan EDIT results
      */
-    fun dispatchToolResult(
+    override fun dispatchToolResult(
         toolCallId: String,
         resolvedKind: ToolKind,
         content: List<JsonObject>?,
         isError: Boolean,
-        isOrphan: Boolean = false,
-        input: JsonObject? = null,
-        metadata: JsonObject? = null,
-        signals: kotlinx.coroutines.flow.MutableSharedFlow<UiSignal>,
+        isOrphan: Boolean,
+        input: JsonObject?,
+        metadata: JsonObject?,
+        signals: MutableSharedFlow<UiSignal>,
     ) {
         if (!isOrphan) {
             // -- SEARCH tools � navigate to the first match result --
@@ -322,18 +325,18 @@ internal class FollowAgentDispatcher(
         if (input == null) return Pair(0, 0)
         val startLine = when {
             input.containsKey("offset") ->
-                input["offset"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+                input["offset"]?.jsonPrimitive?.intOrNull ?: 0
             input.containsKey("start_line") ->
-                input["start_line"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+                input["start_line"]?.jsonPrimitive?.intOrNull ?: 0
             else -> 0
         }
         val endLine = when {
             startLine > 0 && input.containsKey("limit") -> {
-                val limit = input["limit"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+                val limit = input["limit"]?.jsonPrimitive?.intOrNull ?: 0
                 if (limit > 0) startLine + limit - 1 else 0
             }
             input.containsKey("end_line") ->
-                input["end_line"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+                input["end_line"]?.jsonPrimitive?.intOrNull ?: 0
             else -> 0
         }
         return Pair(startLine, endLine)

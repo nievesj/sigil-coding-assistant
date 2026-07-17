@@ -40,7 +40,7 @@ class McpStatusBarWidgetFactory : StatusBarWidgetFactory {
     override fun getId(): String = "OpenCodeMCP"
     override fun getDisplayName(): String = "OpenCode MCP Servers"
     override fun isAvailable(project: Project): Boolean =
-        com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().enableIntellijMcp
+        com.opencode.acp.config.settings.OpenCodeMcpSettingsState.getInstance().enableIntellijMcp
     override fun createWidget(project: Project): StatusBarWidget = McpStatusBarWidget(project)
 }
 

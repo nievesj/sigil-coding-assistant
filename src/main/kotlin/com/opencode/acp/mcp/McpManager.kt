@@ -2,7 +2,7 @@ package com.opencode.acp.mcp
 
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.chat.model.ChatConstants
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CoroutineScope
@@ -36,11 +36,11 @@ private val mcpJson = Json { ignoreUnknownKeys = true }
  */
 class McpManager(
     private val client: OpenCodeClient,
-    private val settings: OpenCodeSettingsState,
+    private val settings: OpenCodeMcpSettingsState,
     private val scope: CoroutineScope,
     private val httpClient: HttpClient
 ) {
-    private val discovery = McpServerDiscovery(httpClient)
+    private val discovery = McpServerDiscovery()
     private val registrar = McpRegistrar(client)
 
     private val _serverStatuses = MutableStateFlow<Map<String, McpConnectionStatus>>(emptyMap())

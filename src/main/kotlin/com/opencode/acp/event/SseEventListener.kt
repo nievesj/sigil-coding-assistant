@@ -64,6 +64,15 @@ class SseEventListener(
             }
         }
 
+        // TODO (TDD Phase 1 follow-up): Replace this 267-line near-duplicate of
+        // OpenCodeClient.parseSseEvent (now extracted into SseEventParser at
+        // com.opencode.acp.adapter.sse.SseEventParser) with a call to
+        // SseEventParser.parse(). This is deferred because parseByType has a
+        // different contract (returns SseEvent? nullable, does not handle
+        // message.part.delta/message.part.updated/message.updated, uses
+        // "content" instead of "output" for tool_result, and does not pass
+        // messageId/partId). The ACP path is not used by the plugin (see
+        // AGENTS.md "ACP Mode") but is retained as a reference implementation.
         private fun parseByType(type: String, obj: JsonObject, sessionId: String): SseEvent? {
             // Strip V2 version suffix (e.g. "session.next.text.delta.1" → "session.next.text.delta")
             val normalizedType = type.replace(Regex("\\.\\d+$"), "")
@@ -262,26 +271,37 @@ class SseEventListener(
                 }
 
                 // Legacy events
-                "text_chunk" -> SseEvent.TextChunk(
-                    sessionId = sessionId,
-                    text = props["text"]?.jsonPrimitive?.content ?: ""
-                )
-                "tool_use" -> SseEvent.ToolUse(
-                    sessionId = sessionId,
-                    toolCallId = props["toolCallId"]?.jsonPrimitive?.content ?: "",
-                    toolName = props["toolName"]?.jsonPrimitive?.content ?: "",
-                    title = props["title"]?.jsonPrimitive?.content,
-                    input = props["input"]?.jsonObject
-                )
-                "tool_result" -> SseEvent.ToolResult(
-                    sessionId = sessionId,
-                    toolCallId = props["toolCallId"]?.jsonPrimitive?.content ?: "",
-                    isError = props["isError"]?.jsonPrimitive?.let {
-                        if (it.isString) it.content.lowercase() == "true" else it.toString().lowercase() == "true"
-                    } ?: false,
-                    content = (props["content"] as? kotlinx.serialization.json.JsonArray)
-                        ?.mapNotNull { (it as? JsonObject) }
-                )
+                "text_chunk" -> {
+                    val text = props["text"]?.jsonPrimitive?.contentOrNull
+                    if (text != null) SseEvent.TextChunk(sessionId = sessionId, text = text) else null
+                }
+                "tool_use" -> {
+                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull
+                    val toolName = props["toolName"]?.jsonPrimitive?.contentOrNull
+                    if (toolCallId != null && toolName != null) {
+                        SseEvent.ToolUse(
+                            sessionId = sessionId,
+                            toolCallId = toolCallId,
+                            toolName = toolName,
+                            title = props["title"]?.jsonPrimitive?.contentOrNull,
+                            input = props["input"]?.jsonObject
+                        )
+                    } else null
+                }
+                "tool_result" -> {
+                    val toolCallId = props["toolCallId"]?.jsonPrimitive?.contentOrNull
+                    if (toolCallId != null) {
+                        SseEvent.ToolResult(
+                            sessionId = sessionId,
+                            toolCallId = toolCallId,
+                            isError = props["isError"]?.jsonPrimitive?.let {
+                                if (it.isString) it.content.lowercase() == "true" else it.toString().lowercase() == "true"
+                            } ?: false,
+                            content = (props["content"] as? kotlinx.serialization.json.JsonArray)
+                                ?.mapNotNull { (it as? JsonObject) }
+                        )
+                    } else null
+                }
                 "plan" -> SseEvent.Plan(
                     sessionId = sessionId,
                     entries = (props["entries"] as? kotlinx.serialization.json.JsonArray)

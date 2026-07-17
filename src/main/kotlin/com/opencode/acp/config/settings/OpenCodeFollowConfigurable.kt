@@ -34,7 +34,7 @@ class OpenCodeFollowConfigurable : Configurable {
     override fun getDisplayName(): String = "Follow Agent"
 
     override fun createComponent(): JComponent {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
 
         followEnabledCheckBox = JBCheckBox(
             "Enable Follow Agent (auto-open files on tool calls)",
@@ -89,7 +89,7 @@ class OpenCodeFollowConfigurable : Configurable {
     }
 
     override fun isModified(): Boolean {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
         if (followEnabledCheckBox?.isSelected != settings.followAgentEnabled) return true
         if (followCommandsInConsoleCheckBox?.isSelected != settings.followCommandsInConsole) return true
         if (followSearchesInFindWindowCheckBox?.isSelected != settings.followSearchesInFindWindow) return true
@@ -97,7 +97,7 @@ class OpenCodeFollowConfigurable : Configurable {
     }
 
     override fun apply() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
         settings.followAgentEnabled = followEnabledCheckBox?.isSelected ?: false
         settings.followCommandsInConsole = followCommandsInConsoleCheckBox?.isSelected ?: settings.followCommandsInConsole
         settings.followSearchesInFindWindow = followSearchesInFindWindowCheckBox?.isSelected ?: settings.followSearchesInFindWindow
@@ -110,7 +110,7 @@ class OpenCodeFollowConfigurable : Configurable {
     }
 
     override fun reset() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
         followEnabledCheckBox?.isSelected = settings.followAgentEnabled
         followCommandsInConsoleCheckBox?.isSelected = settings.followCommandsInConsole
         followSearchesInFindWindowCheckBox?.isSelected = settings.followSearchesInFindWindow

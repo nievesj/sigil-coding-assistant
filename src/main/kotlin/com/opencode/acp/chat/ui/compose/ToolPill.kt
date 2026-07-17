@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import com.agentclientprotocol.model.ToolCallStatus
 import com.agentclientprotocol.model.ToolKind
 import com.opencode.acp.chat.model.ToolCallPill
+import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.follow.EditorFollowManager
 import com.opencode.acp.follow.CommandFollowManager
@@ -154,7 +155,7 @@ fun ToolPill(
             // Shown whenever the pill has a resolvable file path. Disabled (no-op)
             // when Follow Agent is off — keeps the affordance discoverable while
             // preventing accidental file opens from a feature the user hasn't opted into.
-            val followEnabled = OpenCodeSettingsState.getInstance().followAgentEnabled
+            val followEnabled = OpenCodeFollowSettingsState.getInstance().followAgentEnabled
             val openInEditorPath = remember(pill.kind, pill.input) {
                 pill.input?.let { input ->
                     val path = input.getString("file_path")

@@ -1,4 +1,4 @@
-package com.opencode.acp.chat.ui.compose
+package com.opencode.acp.chat.markdown
 
 /**
  * Split markdown content into segments: text (rendered by Jewel Markdown),
@@ -30,17 +30,20 @@ data class ParsedTable(
 
 object MarkdownSegmenter {
 
+    private val WHITESPACE_REGEX = Regex("\\s")
+
     /**
-     * Find the first occurrence of 3+ backticks on a line.
-     * Returns the index where the backticks start, or -1 if not found.
+     * Find the first occurrence of 3+ fence chars (backticks ``` or tildes ~~~)
+     * on a line. Returns the index where the fence starts, or -1 if not found.
      * Ignores single/double backticks (inline code).
      */
     private fun findFenceStart(line: String): Int {
         var i = 0
         while (i <= line.length - 3) {
-            if (line[i] == '`' && line[i + 1] == '`' && line[i + 2] == '`') {
-                // Found 3+ backticks — check it's not preceded by a backtick (would be 4+)
-                if (i > 0 && line[i - 1] == '`') {
+            val c = line[i]
+            if ((c == '`' || c == '~') && line[i + 1] == c && line[i + 2] == c) {
+                // Found 3+ matching fence chars — check it's not preceded by the same char (would be 4+)
+                if (i > 0 && line[i - 1] == c) {
                     i++
                     continue
                 }
@@ -55,9 +58,10 @@ object MarkdownSegmenter {
      * Count consecutive fence chars starting at position.
      */
     private fun countFenceChars(line: String, start: Int): Int {
+        val fenceChar = line[start]
         var count = 0
         var i = start
-        while (i < line.length && line[i] == '`') {
+        while (i < line.length && line[i] == fenceChar) {
             count++
             i++
         }
@@ -138,6 +142,7 @@ object MarkdownSegmenter {
         var codeLanguage: String? = null
         val codeBuilder = StringBuilder()
         var fenceLength = 3
+        var fenceChar = '`'
 
         fun flushText() {
             val text = textBuilder.toString().trim('\n', '\r')
@@ -181,14 +186,14 @@ object MarkdownSegmenter {
                     }
                 }
 
-                // Search for ``` anywhere on this line
+                // Search for ``` or ~~~ anywhere on this line
                 val fenceIdx = findFenceStart(line)
                 if (fenceIdx >= 0) {
                     // Found an opening fence
                     val fenceLen = countFenceChars(line, fenceIdx)
                     val afterFence = line.substring(fenceIdx + fenceLen).trimStart()
-                    // Language is the first non-whitespace token after ```
-                    val lang = afterFence.split(Regex("\\s")).first().ifBlank { null }
+                    // Language is the first non-whitespace token after the fence
+                    val lang = afterFence.split(WHITESPACE_REGEX).first().ifBlank { null }
 
                     // Flush text before the fence
                     if (fenceIdx > 0) {
@@ -201,6 +206,7 @@ object MarkdownSegmenter {
                     inCodeBlock = true
                     codeLanguage = lang
                     fenceLength = fenceLen
+                    fenceChar = line[fenceIdx]
                     i++
                     continue
                 }
@@ -214,9 +220,9 @@ object MarkdownSegmenter {
                 val fenceIdx = findFenceStart(trimmedLine)
 
                 if (fenceIdx == 0) {
-                    // Closing fence at start of (trimmed) line
-                    val fenceLen = countFenceChars(trimmedLine, fenceIdx)
-                    if (fenceLen >= fenceLength) {
+                    // Closing fence at start of (trimmed) line — must match opening fence char
+                    val closingFenceLen = countFenceChars(trimmedLine, fenceIdx)
+                    if (closingFenceLen >= fenceLength && trimmedLine[fenceIdx] == fenceChar) {
                         // End of code block
                         inCodeBlock = false
 
@@ -231,8 +237,8 @@ object MarkdownSegmenter {
                         codeBuilder.clear()
                         codeLanguage = null
 
-                        // Capture any text after the closing ``` on the same line
-                        val afterClosing = line.substringAfter("```", "").trimStart()
+                        // Capture any text after the closing fence on the same line
+                        val afterClosing = line.substringAfter(fenceChar.toString().repeat(3), "").trimStart()
                         if (afterClosing.isNotBlank()) {
                             textBuilder.appendLine(afterClosing)
                         }

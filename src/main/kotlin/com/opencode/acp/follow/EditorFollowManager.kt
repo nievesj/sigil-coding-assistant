@@ -19,7 +19,7 @@ import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.ide.projectView.ProjectView
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import com.opencode.acp.chat.util.EDT
 import com.opencode.acp.review.EditorHighlightSupport
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -63,7 +63,7 @@ class EditorFollowManager(private val project: Project) : Disposable {
             project.service<EditorFollowManager>()
     }
 
-    @Volatile private var lastFollowFileMs: Long = 0
+    private val lastFollowFileMs = java.util.concurrent.atomic.AtomicLong(0)
     @Volatile private var lastProjectViewSelectMs: Long = 0
     @Volatile private var pendingFollow: PendingFollow? = null
 
@@ -84,12 +84,12 @@ class EditorFollowManager(private val project: Project) : Disposable {
 
     /** Check if Follow Agent is enabled for this project. */
     fun isFollowEnabled(): Boolean {
-        return OpenCodeSettingsState.getInstance().followAgentEnabled
+        return OpenCodeFollowSettingsState.getInstance().followAgentEnabled
     }
 
     /** Enable or disable Follow Agent. */
     fun setFollowEnabled(enabled: Boolean) {
-        OpenCodeSettingsState.getInstance().followAgentEnabled = enabled
+        OpenCodeFollowSettingsState.getInstance().followAgentEnabled = enabled
     }
 
     /**
@@ -194,10 +194,11 @@ class EditorFollowManager(private val project: Project) : Disposable {
             Path.of(basePath).resolve(filePath).normalize().toString()
         }
         // CWE-22: reject paths that escape the project root.
-        // Without this, an LLM (or prompt-injection attacker) could provide
-        // "../" sequences to open files outside the project directory.
-        val baseNormalized = basePath.replace('\\', '/')
-        val absNormalized = absPath.replace('\\', '/')
+        // Use canonical paths to handle symlinks and case-insensitive filesystems correctly.
+        val canonicalBase = try { java.io.File(basePath).canonicalPath } catch (_: Exception) { basePath }
+        val canonicalAbs = try { java.io.File(absPath).canonicalPath } catch (_: Exception) { absPath }
+        val baseNormalized = canonicalBase.replace('\\', '/')
+        val absNormalized = canonicalAbs.replace('\\', '/')
         if (!absNormalized.startsWith("$baseNormalized/") && absNormalized != baseNormalized) {
             logger.warn { "[ACP] Follow Agent: path traversal blocked: $filePath resolves outside project" }
             return null
@@ -212,9 +213,9 @@ class EditorFollowManager(private val project: Project) : Disposable {
 
     private fun throttleCheck(): Boolean {
         val now = System.currentTimeMillis()
-        if (now - lastFollowFileMs < FOLLOW_FILE_COOLDOWN_MS) return false
-        lastFollowFileMs = now
-        return true
+        val last = lastFollowFileMs.get()
+        if (now - last < FOLLOW_FILE_COOLDOWN_MS) return false
+        return lastFollowFileMs.compareAndSet(last, now)
     }
 
     private fun schedulePendingFollow() {
@@ -228,7 +229,7 @@ class EditorFollowManager(private val project: Project) : Disposable {
             val label = FollowColorProvider.composeInlayLabel(
                 pending.kind, pending.agentName, pending.modelName, pending.input, pending.startTimeMs
             )
-            lastFollowFileMs = System.currentTimeMillis()
+            lastFollowFileMs.set(System.currentTimeMillis())
             navigateOnEdt(project, pending.filePath, pending.startLine, pending.endLine, color, label, focus = false)
         }
     }

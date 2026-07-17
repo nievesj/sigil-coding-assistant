@@ -20,7 +20,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
-import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -39,7 +39,8 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class SseConnectionManagerTest {
 
-    private lateinit var scope: TestScope
+    private val testScope = TestScope()
+
     private lateinit var client: OpenCodeClient
     private lateinit var sessionManager: SessionManager
     private lateinit var manager: SseConnectionManager
@@ -58,7 +59,6 @@ class SseConnectionManagerTest {
 
     @BeforeEach
     fun setUp() {
-        scope = TestScope()
         client = mockk(relaxed = true)
         sessionManager = mockk(relaxed = true)
         sseFlow = MutableSharedFlow(extraBufferCapacity = 100)
@@ -67,7 +67,7 @@ class SseConnectionManagerTest {
         coEvery { client.healthCheck() } answers { healthCheckResult.get() }
 
         manager = SseConnectionManager(
-            scope = scope,
+            scope = testScope,
             clientProvider = { client },
             sessionManager = sessionManager,
             onConnectionError = { connectionErrorCount.incrementAndGet() },
@@ -77,30 +77,33 @@ class SseConnectionManagerTest {
 
     @AfterEach
     fun tearDown() {
-        scope.cancel()
+        testScope.cancel()
     }
 
     @Test
-    fun `start subscribes to SSE events and routes to sessionManager`() = runTest {
+    fun `start subscribes to SSE events and routes to sessionManager`() = testScope.runTest {
         manager.start()
-        advanceUntilIdle()
+        runCurrent()
 
-        // Emit an event through the shared flow
-        val event = mockk<SseEvent>(relaxed = true)
-        every { event.sessionId } returns "ses_test"
-        every { event.messageId } returns "msg_test"
-        every { event::class.simpleName } returns "TestEvent"
+        // Emit a real SseEvent through the shared flow (mockk can't mock KClass properties)
+        val event = SseEvent.TextChunk(
+            sessionId = "ses_test",
+            text = "hello",
+            messageId = "msg_test",
+            partId = "part_1"
+        )
         sseFlow.tryEmit(event)
-        advanceUntilIdle()
+        runCurrent()
 
         // processEvent should have been called
         coVerify { sessionManager.processEvent(any()) }
+        manager.stop()
     }
 
     @Test
-    fun `stop cancels SSE subscription and is idempotent`() = runTest {
+    fun `stop cancels SSE subscription and is idempotent`() = testScope.runTest {
         manager.start()
-        advanceUntilIdle()
+        runCurrent()
         manager.stop()
         // Calling stop again should not throw
         manager.stop()
@@ -108,106 +111,109 @@ class SseConnectionManagerTest {
     }
 
     @Test
-    fun `start is idempotent - cancels previous jobs first`() = runTest {
+    fun `start is idempotent - cancels previous jobs first`() = testScope.runTest {
         manager.start()
-        advanceUntilIdle()
+        runCurrent()
         manager.start()
-        advanceUntilIdle()
+        runCurrent()
         // Should not throw or create duplicate subscriptions
         manager.isActive shouldBe true
+        manager.stop()
     }
 
     @Test
-    fun `start with null client returns without subscribing`() = runTest {
+    fun `start with null client returns without subscribing`() = testScope.runTest {
         val nullClientManager = SseConnectionManager(
-            scope = scope,
+            scope = testScope,
             clientProvider = { null },
             sessionManager = sessionManager,
             onConnectionError = { },
             onReconnectSuccess = { },
         )
         nullClientManager.start()
-        advanceUntilIdle()
+        runCurrent()
         nullClientManager.isActive shouldBe false
     }
 
     @Test
-    fun `circuit breaker fires onReconnectError after MAX_RECONNECT_ATTEMPTS`() = runTest {
+    fun `circuit breaker fires onReconnectError after MAX_RECONNECT_ATTEMPTS`() = testScope.runTest {
         // Make health check always fail
         healthCheckResult.set(false)
         manager.start()
-        advanceUntilIdle()
+        runCurrent()
 
         // Trigger reconnection by ending the SSE flow
-        sseFlow.tryEmit(mockk(relaxed = true)) // trigger activity
-        advanceUntilIdle()
+        sseFlow.tryEmit(SseEvent.TextChunk(sessionId = "ses_test", text = "x")) // trigger activity
+        runCurrent()
 
         // Now manually trigger reconnect and advance past MAX_RECONNECT_ATTEMPTS
         manager.triggerReconnect()
         // Advance time enough to exhaust all reconnection attempts (50 attempts with backoff)
         // Each attempt has at most 30s delay, so 50 * 30s = 1500s max
         advanceTimeBy(2_000_000)
-        advanceUntilIdle()
+        runCurrent()
 
         connectionErrorCount.get() shouldBe 1
+        manager.stop()
     }
 
     @Test
-    fun `triggerReconnect with null client gives up gracefully`() = runTest {
+    fun `triggerReconnect with null client gives up gracefully`() = testScope.runTest {
         val nullClientManager = SseConnectionManager(
-            scope = scope,
+            scope = testScope,
             clientProvider = { null },
             sessionManager = sessionManager,
             onConnectionError = { connectionErrorCount.incrementAndGet() },
             onReconnectSuccess = { reconnectSuccessCount.incrementAndGet() },
         )
         nullClientManager.triggerReconnect()
-        advanceUntilIdle()
+        runCurrent()
         // Should not call onConnectionError (that's only for circuit breaker)
         // Should not call onReconnectSuccess (client is null)
         reconnectSuccessCount.get() shouldBe 0
     }
 
     @Test
-    fun `successful reconnection calls onReconnectSuccess`() = runTest {
+    fun `successful reconnection calls onReconnectSuccess`() = testScope.runTest {
         healthCheckResult.set(true)
         manager.start()
-        advanceUntilIdle()
+        runCurrent()
 
         // Trigger reconnection
         manager.triggerReconnect()
         advanceTimeBy(2_000)
-        advanceUntilIdle()
+        runCurrent()
 
         reconnectSuccessCount.get() shouldBe 1
+        manager.stop()
     }
 
     @Test
-    fun `stop during reconnection backoff prevents new SSE job`() = runTest {
+    fun `stop during reconnection backoff prevents new SSE job`() = testScope.runTest {
         healthCheckResult.set(false)
         manager.start()
-        advanceUntilIdle()
+        runCurrent()
 
         manager.triggerReconnect()
         advanceTimeBy(500) // Partially through backoff
         manager.stop()
-        advanceUntilIdle()
+        runCurrent()
 
         // No reconnection should succeed
         reconnectSuccessCount.get() shouldBe 0
     }
 
     @Test
-    fun `health check failure after silence triggers reconnection`() = runTest {
+    fun `health check failure after silence triggers reconnection`() = testScope.runTest {
         healthCheckResult.set(false)
         manager.start()
-        advanceUntilIdle()
+        runCurrent()
 
         // Advance past SSE_HEALTH_CHECK_INTERVAL_MS (60s) to trigger a health check.
         // The health check will fail (healthCheckResult=false), which should cancel
         // the SSE job and trigger reconnection.
         advanceTimeBy(61_000)
-        advanceUntilIdle()
+        runCurrent()
 
         // Reconnection should have been triggered. Since healthCheck is still false,
         // it won't succeed, but triggerReconnect should have been called (which

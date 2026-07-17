@@ -10,6 +10,7 @@ import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
+import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.mcp.McpConfigWriter
 import com.opencode.acp.mcp.McpConnectionStatus
@@ -86,7 +87,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     private val mcpConfigWriter by lazy {
         val path = project.basePath?.let { java.nio.file.Path.of(it) }
             ?: java.nio.file.Path.of(".")
-        McpConfigWriter(path, OpenCodeSettingsState.getInstance())
+        McpConfigWriter(path, OpenCodeMcpSettingsState.getInstance())
     }
 
     val permissionManager = PermissionManager(
@@ -267,7 +268,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     /** Initialize MCP manager and register all enabled servers. */
     private suspend fun initializeMcp() {
         try {
-            val settings = OpenCodeSettingsState.getInstance()
+            val settings = OpenCodeMcpSettingsState.getInstance()
             val client = connectionManager.client
             if (client == null) {
                 logger.warn { "[ACP] MCP: skipping initialization — no client available" }
@@ -344,6 +345,9 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // (it binds to 127.0.0.1 only — never 0.0.0.0). The port is dynamic
                 // (connectionManager.port), but the host is always 127.0.0.1. Hardcoding
                 // the host here is correct and intentional.
+                // COUPLING: ProcessManager always binds to 127.0.0.1 (see ProcessManager.launchOpenCodeBinary).
+                // If ProcessManager ever supports a configurable host, read it from connectionManager.host
+                // instead of hardcoding 127.0.0.1 here.
                 val baseUrl = "http://127.0.0.1:${connectionManager.port}"
                 val mcpUrls = mcpMgr.getServerUrls()
                 logger.info { "[ACP] discoverToolsInBackground: starting discovery (${mcpUrls.size} MCP servers connected)" }
@@ -353,7 +357,7 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // Load persisted permissions so the registry has the user's
                 // saved enabled/permission state. The settings panel reads
                 // from the registry when opened.
-                val settings = OpenCodeSettingsState.getInstance()
+                val settings = OpenCodeMcpSettingsState.getInstance()
                 if (settings.toolPermissions.isNotBlank()) {
                     val persisted = parsePersistedToolPermissions(settings.toolPermissions)
                     if (persisted.isNotEmpty()) {
@@ -403,7 +407,7 @@ class OpenCodeService(private val project: Project) : Disposable {
         scope.launch {
             try {
                 disconnectAllMcp()
-                val settings = OpenCodeSettingsState.getInstance()
+                val settings = OpenCodeMcpSettingsState.getInstance()
                 // Write MCP config file — OpenCode reads it on next startup.
                 // For immediate effect (without restart), POST /mcp is also called
                 // by McpManager.initialize() below.
@@ -428,7 +432,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             try {
                 mcpManager?.resetOnServerRestart()
                 // Re-write config file in case it was stale, then re-register via POST /mcp
-                val settings = OpenCodeSettingsState.getInstance()
+                val settings = OpenCodeMcpSettingsState.getInstance()
                 val projectPath = project.basePath?.let { java.nio.file.Path.of(it) }
                     ?: java.nio.file.Path.of(".")
                 val configWriter = McpConfigWriter(projectPath, settings)
@@ -568,6 +572,7 @@ class OpenCodeService(private val project: Project) : Disposable {
             val filePartCount = parts.count { it is com.opencode.acp.adapter.OpenCodePart.File }
             logger.info { "[ACP] sendMessage: ${parts.size} parts (text + $filePartCount file attachments: ${addedFileNames.joinToString { it }})" }
 
+            // sessionId validation is handled by OpenCodeClient.sendMessageAsync (validatePathId)
             val serverMessageId = client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
             logger.info { "[ACP] sendMessage: got serverMessageId=$serverMessageId" }
 

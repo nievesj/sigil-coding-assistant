@@ -1,4 +1,4 @@
-package com.opencode.acp.chat.ui.compose
+package com.opencode.acp.chat.markdown
 
 /**
  * Heals incomplete/stale markdown formatting during streaming to prevent
@@ -34,8 +34,8 @@ object StreamHealer {
     }
 
     /**
-     * Splits text into regions that are inside fenced code blocks
-     * and regions that are outside them.
+     * Splits text into regions which are inside fenced code blocks
+     * and regions which are outside them.
      */
     private fun splitByCodeFences(text: String): List<FenceSegment> {
         val segments = mutableListOf<FenceSegment>()
@@ -125,9 +125,11 @@ object StreamHealer {
      * Only matches ** that are not part of *** (bold+italic) or inside code.
      */
     private fun closeUnclosedBold(text: String): String {
-        // Count ** occurrences outside of code spans
+        // Strip inline code spans before counting bold markers — ** inside `code`
+        // should not be counted toward the bold balance.
+        val withoutInlineCode = inlineCodeRegex.replace(text, "")
+        val boldCount = doubleStarRegex.findAll(withoutInlineCode).count()
         var result = text
-        val boldCount = doubleStarRegex.findAll(result).count()
         if (boldCount % 2 != 0) {
             result = result.trimEnd() + "**"
         }
@@ -136,7 +138,11 @@ object StreamHealer {
 
     private data class FenceSegment(val text: String, val inCode: Boolean)
 
+    // Matches incomplete links at the END of the text only (trailing incomplete link
+    // during streaming). The $ anchor ensures we don't strip mid-text content that
+    // happens to look like an incomplete link but is actually valid markdown.
     private val incompleteLinkRegex = Regex("""\[([^\]]+)\]\(([^)]*)$""")
     private val tripleBacktickRegex = Regex("""`{3,}""")
     private val doubleStarRegex = Regex("""\*\*""")
+    private val inlineCodeRegex = Regex("""`[^`]*`""")
 }

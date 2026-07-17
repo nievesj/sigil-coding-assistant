@@ -57,7 +57,7 @@ class OpenCodeContextConfigurable : Configurable {
     override fun getDisplayName(): String = "Context"
 
     override fun createComponent(): JComponent {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeContextSettingsState.getInstance()
 
         showContextBreakdownCheckbox = JBCheckBox("Show context breakdown bar", settings.showContextBreakdown)
         pressureNotificationCombo = JComboBox(arrayOf("NEVER", "ELEVATED (50%)", "HIGH (70%)", "CRITICAL (85%)")).apply {
@@ -203,7 +203,7 @@ class OpenCodeContextConfigurable : Configurable {
     }
 
     override fun isModified(): Boolean {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeContextSettingsState.getInstance()
         return showContextBreakdownCheckbox?.isSelected != settings.showContextBreakdown ||
             pressureNotificationCombo?.selectedItem?.toString()?.substringBefore(" (") != settings.pressureNotificationThreshold ||
             truncateToolOutputCheckbox?.isSelected != settings.truncateToolOutput ||
@@ -226,7 +226,7 @@ class OpenCodeContextConfigurable : Configurable {
     }
 
     override fun apply() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeContextSettingsState.getInstance()
         settings.showContextBreakdown = showContextBreakdownCheckbox?.isSelected ?: true
         val pressureLabel = pressureNotificationCombo?.selectedItem?.toString() ?: "HIGH (70%)"
         settings.pressureNotificationThreshold = pressureLabel.substringBefore(" (")
@@ -262,7 +262,7 @@ class OpenCodeContextConfigurable : Configurable {
     }
 
     override fun reset() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeContextSettingsState.getInstance()
         showContextBreakdownCheckbox?.isSelected = settings.showContextBreakdown
         val label = when (settings.pressureNotificationThreshold) {
             "NEVER" -> "NEVER"

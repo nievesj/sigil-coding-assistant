@@ -44,7 +44,7 @@ import com.opencode.acp.chat.model.SessionContext
 import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.PressureLevel
 import com.opencode.acp.chat.ui.theme.ChatTheme
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeContextSettingsState
 import org.jetbrains.jewel.ui.component.Text
 
 // ── Context indicator colors ──────────────────────────────────────────────────
@@ -423,7 +423,7 @@ private fun formatTooltipCost(cost: Double): String {
 @Composable
 private fun pressureBadgeText(level: PressureLevel?): String {
     if (level == null) return ""
-    val threshold = remember { OpenCodeSettingsState.getInstance().pressureNotificationThreshold }
+    val threshold = remember { OpenCodeContextSettingsState.getInstance().pressureNotificationThreshold }
     val thresholdLevel = when (threshold) {
         "NEVER" -> null
         "ELEVATED" -> PressureLevel.ELEVATED

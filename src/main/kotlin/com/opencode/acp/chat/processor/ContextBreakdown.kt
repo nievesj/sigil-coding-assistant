@@ -8,7 +8,8 @@ import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.OtherCategoryBreakdown
 import com.opencode.acp.chat.model.ToolCategoryBreakdown
 import io.github.oshai.kotlinlogging.KotlinLogging
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
 /**
  * Regex matching the pruner's placeholder output, capturing the embedded token count.
@@ -26,7 +27,7 @@ private val PRUNED_OUTPUT_REGEX = Regex(
 private fun extractOutputText(output: List<kotlinx.serialization.json.JsonObject>?): String {
     if (output.isNullOrEmpty()) return ""
     return output.joinToString("") { part ->
-        part["text"]?.jsonPrimitive?.content ?: ""
+        (part["text"] as? JsonPrimitive)?.contentOrNull ?: ""
     }
 }
 
@@ -310,17 +311,7 @@ object BreakdownComputer {
 
     /** Estimate total character count of a message's text content. */
     private fun estimateMessageChars(message: ChatMessage): Long {
-        var chars = 0L
-        for (part in message.parts.values) {
-            when (part) {
-                is MessagePart.Text -> chars += part.content.length
-                is MessagePart.Code -> chars += part.content.length
-                is MessagePart.Table -> chars += part.rawMarkdown.length
-                is MessagePart.Thinking -> chars += part.content.length
-                else -> { /* skip non-text parts for char estimation */ }
-            }
-        }
-        return chars
+        return message.parts.values.sumOf { it.estimatedCharCount }
     }
 
     /** Estimate character count of an assistant message's TEXT parts only (not tool calls). */
@@ -328,9 +319,9 @@ object BreakdownComputer {
         var chars = 0L
         for (part in message.parts.values) {
             when (part) {
-                is MessagePart.Text -> chars += part.content.length
-                is MessagePart.Code -> chars += part.content.length
-                is MessagePart.Table -> chars += part.rawMarkdown.length
+                is MessagePart.Text -> chars += part.estimatedCharCount
+                is MessagePart.Code -> chars += part.estimatedCharCount
+                is MessagePart.Table -> chars += part.estimatedCharCount
                 else -> { /* skip thinking, tool calls, etc. */ }
             }
         }

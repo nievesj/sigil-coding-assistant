@@ -48,6 +48,7 @@ dependencies {
     // Testing
     testImplementation(libs.junit.api)
     testImplementation(libs.junit.engine)
+    testImplementation(libs.junit.params)
     testImplementation(libs.kotest.runner)
     testImplementation(libs.kotest.assertions)
     testImplementation(libs.kotlinx.coroutines.test)
@@ -184,6 +185,6 @@ kotlin {
     }
 }
 
-tasks.test {
+tasks.withType<Test> {
     useJUnitPlatform()
 }

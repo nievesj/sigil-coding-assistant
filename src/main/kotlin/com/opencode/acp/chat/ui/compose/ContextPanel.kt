@@ -36,7 +36,7 @@ import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.CompactionState
 import com.opencode.acp.chat.model.ContextBreakdown
 import com.opencode.acp.chat.ui.theme.ChatTheme
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeContextSettingsState
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.component.OutlinedButton
@@ -126,8 +126,8 @@ private fun ContextDetails(
     val valueColor = ChatTheme.colors.component.contextPanelValue
     val separator = ChatTheme.colors.component.contextPanelSeparator
     val progressBg = ChatTheme.colors.component.contextProgressBarBg
-    val showBreakdown = OpenCodeSettingsState.getInstance().showContextBreakdown
-    val compactConfirmation = OpenCodeSettingsState.getInstance().compactConfirmation
+    val showBreakdown = OpenCodeContextSettingsState.getInstance().showContextBreakdown
+    val compactConfirmation = OpenCodeContextSettingsState.getInstance().compactConfirmation
 
     Column(
         modifier = modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp),
@@ -188,7 +188,7 @@ private fun ContextDetails(
         Spacer(Modifier.height(10.dp))
 
         // ── Pruner section ──
-        if (OpenCodeSettingsState.getInstance().enableContextPruner) {
+        if (OpenCodeContextSettingsState.getInstance().enableContextPruner) {
             PrunerSection(
                 tokensSaved = context.prunerTokensSaved,
                 outputsPruned = context.prunerOutputsPruned,

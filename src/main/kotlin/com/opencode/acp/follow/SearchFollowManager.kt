@@ -8,7 +8,7 @@ import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 
 /**
@@ -62,8 +62,8 @@ class SearchFollowManager(private val project: Project) : Disposable {
         modelName: String? = null,
     ) {
         // ── Pre-condition checks ──────────────────────────────────────
-        if (!OpenCodeSettingsState.getInstance().followAgentEnabled) return
-        if (!OpenCodeSettingsState.getInstance().followSearchesInFindWindow) return
+        if (!OpenCodeFollowSettingsState.getInstance().followAgentEnabled) return
+        if (!OpenCodeFollowSettingsState.getInstance().followSearchesInFindWindow) return
         if (project.isDisposed) return
         if (pattern.isNullOrBlank()) return
 
@@ -120,11 +120,37 @@ class SearchFollowManager(private val project: Project) : Disposable {
 
         // Scope: prefer directory if provided, otherwise search the whole project.
         if (!searchPath.isNullOrBlank()) {
-            isProjectScope = false
-            // FindModel uses directoryName for directory-scoped search.
-            // The path must be relative to the project base or absolute.
-            directoryName = searchPath
-            isWithSubdirectories = true
+            // Validate searchPath is within the project to prevent searching outside the project
+            val projectBase = project.basePath
+            if (projectBase != null) {
+                val canonicalSearch = try {
+                    java.io.File(searchPath).let { f ->
+                        if (f.isAbsolute) f.canonicalPath
+                        else java.io.File(projectBase, searchPath).canonicalPath
+                    }
+                } catch (_: Exception) { null }
+                val canonicalBase = try { java.io.File(projectBase).canonicalPath } catch (_: Exception) { null }
+                if (canonicalSearch != null && canonicalBase != null) {
+                    val searchNorm = canonicalSearch.replace('\\', '/')
+                    val baseNorm = canonicalBase.replace('\\', '/')
+                    if (!searchNorm.startsWith("$baseNorm/") && searchNorm != baseNorm) {
+                        logger.warn { "[ACP] Follow Agent: searchPath outside project blocked: $searchPath" }
+                        isProjectScope = true
+                    } else {
+                        isProjectScope = false
+                        directoryName = searchPath
+                        isWithSubdirectories = true
+                    }
+                } else {
+                    isProjectScope = false
+                    directoryName = searchPath
+                    isWithSubdirectories = true
+                }
+            } else {
+                isProjectScope = false
+                directoryName = searchPath
+                isWithSubdirectories = true
+            }
         } else {
             isProjectScope = true
         }
@@ -168,6 +194,12 @@ class SearchFollowManager(private val project: Project) : Disposable {
 
     /**
      * Heuristic check for regex patterns that could cause catastrophic backtracking (ReDoS).
+     *
+     * WARNING: This is a BEST-EFFORT heuristic, NOT a complete ReDoS defense. It may miss
+     * patterns with nested groups, character class quantifiers, or other backtracking vectors.
+     * FindInProjectManager does not impose a search timeout by default. For complete protection,
+     * consider adding a max-result-count or time-limit guard on the Find in Files call.
+     *
      * Rejects:
      * - Patterns longer than 200 characters (unnecessary complexity for search)
      * - Patterns with nested quantifiers (e.g., `(a+)+`, `(a*)*`, `(a{1,3})+`)
