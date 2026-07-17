@@ -3,7 +3,6 @@ package com.opencode.acp.chat.processor
 import com.opencode.acp.chat.model.ChatConstants
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
 private val logger = KotlinLogging.logger {}
@@ -42,7 +41,7 @@ class PrunerResourceExtractor(private val projectBasePath: java.nio.file.Path) {
                     return false
                 }
 
-            val resourceContent = resource.readAllBytes().decodeToString().removePrefix("\uFEFF")
+            val resourceContent = resource.use { it.readAllBytes() }.decodeToString().removePrefix("\uFEFF")
             val resourceHash = computeSha256OfString(resourceContent)
 
             // Check if existing file has the same version (header comment)
@@ -63,21 +62,11 @@ class PrunerResourceExtractor(private val projectBasePath: java.nio.file.Path) {
                 }
             }
 
-            // Atomic write: temp file + rename. ATOMIC_MOVE may not be supported
-            // on all filesystems (e.g., Windows NTFS cross-volume). Fall back to
-            // non-atomic move if ATOMIC_MOVE fails.
-            val temp = target.resolveSibling("${ChatConstants.PRUNER_PLUGIN_FILENAME}.tmp")
-            try {
-                Files.write(temp, resourceContent.toByteArray())
-                try {
-                    Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-                } catch (_: java.nio.file.FileSystemException) {
-                    // ATOMIC_MOVE not supported — fall back to non-atomic move
-                    Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING)
-                }
-            } catch (e: Exception) {
-                try { Files.deleteIfExists(temp) } catch (_: Exception) {}
-                throw e
+            // Atomic write via shared utility (temp file + rename with fallback)
+            val written = com.opencode.acp.chat.util.AtomicFileWriter.writeAtomically(target, resourceContent)
+            if (!written) {
+                logger.error { "[ACP] PrunerResourceExtractor: failed to write sigil-pruner.ts to $target" }
+                return false
             }
             logger.info { "[ACP] PrunerResourceExtractor: extracted sigil-pruner.ts to $target" }
 
@@ -87,6 +76,9 @@ class PrunerResourceExtractor(private val projectBasePath: java.nio.file.Path) {
                 logger.debug { "[ACP] PrunerResourceExtractor: integrity verified (SHA-256: ${diskHash.take(16)}...)" }
             } else {
                 logger.error { "[ACP] PrunerResourceExtractor: integrity check FAILED after extraction — file may be corrupted. Expected: ${resourceHash.take(16)}..., got: ${diskHash.take(16)}..." }
+                // Delete the corrupted file so it doesn't persist on disk.
+                try { Files.delete(target) } catch (_: Exception) { }
+                logger.warn { "[ACP] PrunerResourceExtractor: deleted corrupted file after integrity check failure" }
                 // Return false so the pruner is disabled rather than running
                 // with potentially corrupted code on the server.
                 return false
@@ -126,6 +118,10 @@ class PrunerResourceExtractor(private val projectBasePath: java.nio.file.Path) {
 
     /**
      * Computes SHA-256 hash of a file's content.
+     *
+     * NOTE: Returns an empty string on any failure (I/O error, digest error).
+     * Returning null would be more explicit, but empty string is used for
+     * simplicity and to match [computeSha256OfString]'s contract.
      */
     private fun computeSha256(path: java.nio.file.Path): String {
         return try {

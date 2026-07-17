@@ -167,6 +167,14 @@ internal class MessageLifecycleManager(
                 // event arrives, using the serverMessageId from that event. This is the
                 // same path used for child/subagent sessions and is well-tested.
                 //
+                // RACE WINDOW: The message is added to the map below with isStreaming=true, but
+                // activeMessageId is NOT set (the ResetTurn event was dropped). If the first SSE
+                // content event arrives before the event processing coroutine checks pendingTurnIdentity,
+                // the auto-create logic will create ANOTHER assistant message. The pendingTurnIdentity
+                // check at the start of processEventInternal closes this window for events that arrive
+                // after the check. The window between messageMap.add() and the pendingTurnIdentity check
+                // is bounded by the event processing coroutine's next iteration (microseconds).
+                //
                 // PENDING-TURN FALLBACK: Store the turn identity so the event processing
                 // coroutine can apply it at the start of processEventInternal. This closes
                 // the window where activeMessageId is null and a duplicate auto-create
@@ -277,7 +285,44 @@ internal class MessageLifecycleManager(
             parts["error"] = MessagePart.Error(reason)
             msg.copy(parts = parts, isStreaming = false, state = MessageState.Aborted)
         }
-        streamingLifecycle.emitStreamingCompleted(msgId)
+        streamingLifecycle.emitStreamingCompleted(msgId, naturalCompletion = false)
+        signals.tryEmit(UiSignal.Error(msgId, reason))
+    }
+
+    /**
+     * Abort streaming with a fallback message ID for the case where
+     * [turnLifecycleState.activeMessageId] is null because the ResetTurn control event
+     * from [createAssistantMessage] hasn't been processed yet.
+     *
+     * This happens when sendMessageAsync throws quickly (e.g., server rejects an
+     * attachment) before the event processing coroutine handles the ResetTurn.
+     * Without this fallback, the assistant message created by createAssistantMessage
+     * would be stuck in isStreaming=true, state=Created, parts=empty forever —
+     * a "ghost message" that's invisible (filtered by MessageList) but never finalized.
+     *
+     * The fallback finalizes the message directly by its ID, bypassing the
+     * activeMessageId lookup. It also sets turnLifecycleState fields so the next
+     * ResetTurn (from the next send) doesn't find stale isStreaming=true state.
+     */
+    fun abortStreamingWithFallback(reason: String, fallbackMessageId: String) = stateLock.withLock {
+        // If activeMessageId is already set (ResetTurn was processed), use the normal path.
+        val msgId = turnLifecycleState.activeMessageId ?: fallbackMessageId
+        textStreaming.freezeThinking()
+        textStreaming.flushReveal()
+        turnLifecycleState.errorMessage = reason
+        turnLifecycleState.isStreaming = false
+        // Set activeMessageId so emitStreamingCompleted and UiSignal.Error reference the
+        // correct message. If ResetTurn hasn't fired yet, this prevents the ghost message.
+        // If ResetTurn fires later, resetTurnState() will clear this — no harm.
+        if (turnLifecycleState.activeMessageId == null) {
+            turnLifecycleState.activeMessageId = msgId
+        }
+        messageMap.update(msgId) { msg ->
+            val parts = LinkedHashMap(msg.parts)
+            parts["error"] = MessagePart.Error(reason)
+            msg.copy(parts = parts, isStreaming = false, state = MessageState.Aborted)
+        }
+        streamingLifecycle.emitStreamingCompleted(msgId, naturalCompletion = false)
         signals.tryEmit(UiSignal.Error(msgId, reason))
     }
 

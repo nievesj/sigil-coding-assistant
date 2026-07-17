@@ -70,7 +70,8 @@ class HttpHelper(
     @PublishedApi internal fun io.ktor.client.request.HttpRequestBuilder.applyTimeoutProfile(profile: TimeoutProfile) {
         when (profile) {
             TimeoutProfile.SHORT -> {
-                // SHORT uses the client-wide default — no override needed.
+                // SHORT uses the client-wide default (60s) — no override needed.
+                logger.debug { "[ACP] Applying timeout profile $profile (60s default)" }
             }
             TimeoutProfile.LONG -> {
                 val settings = settingsProvider.get()
@@ -113,6 +114,10 @@ class HttpHelper(
      * concise message. Used by [getJson] / [postJson] and exposed for callers
      * that perform direct HTTP requests but want the same error handling.
      *
+     * NOTE: The response body is logged at ERROR level. If the server echoes
+     * sensitive data (auth tokens, PII, secrets) in error responses, it will be
+     * written to idea.log. Sanitize upstream if this is a concern.
+     *
      * @param method HTTP method name (e.g. "GET", "POST") for the error message
      * @param path the request path (used in log + error message)
      * @param response the HTTP response to check
@@ -128,6 +133,10 @@ class HttpHelper(
 
     /**
      * Performs an HTTP GET and deserializes the response body as [T].
+     *
+     * NOTE: On deserialization failure, a 1000-char body preview is logged at
+     * ERROR level for diagnostics. This is verbose and may leak response data
+     * to idea.log; in production it should be gated behind DEBUG level.
      */
     suspend inline fun <reified T> getJson(path: String): T {
         val response = httpClient.get("$baseUrl$path") {
@@ -148,6 +157,10 @@ class HttpHelper(
 
     /**
      * Performs an HTTP POST with a JSON body and deserializes the response as [T].
+     *
+     * NOTE: On deserialization failure, a 1000-char body preview is logged at
+     * ERROR level for diagnostics. This is verbose and may leak response data
+     * to idea.log; in production it should be gated behind DEBUG level.
      */
     suspend inline fun <reified T> postJson(
         path: String,
@@ -165,13 +178,23 @@ class HttpHelper(
             logger.error { "POST $path returned ${response.status}: ${body.take(500)}" }
             error("POST $path failed with ${response.status}: ${body.take(200)}")
         }
-        return json.decodeFromString<T>(body)
+        return try {
+            json.decodeFromString<T>(body)
+        } catch (e: Exception) {
+            logger.error(e) { "POST $path deserialization failed. Body preview: ${body.take(1000)}" }
+            throw e
+        }
     }
 
     /**
      * Performs an HTTP POST with optional JSON body and returns true if the status is successful.
      * Propagates [CancellationException] (including [kotlinx.coroutines.TimeoutCancellationException])
      * so callers can distinguish timeout/cancellation from server errors.
+     *
+     * NOTE: Returns `false` for both 'request failed' and 'server state unknown' (e.g.,
+     * network error after server processed the request). Callers must NOT assume
+     * `false` means the server definitely did not process the request — only that
+     * the client did not receive a success response.
      */
     suspend fun postSuccess(
         path: String,

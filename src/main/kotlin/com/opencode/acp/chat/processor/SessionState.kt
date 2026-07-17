@@ -267,6 +267,16 @@ class SessionState(
 
     fun abortStreaming(reason: String) = messageLifecycle.abortStreaming(reason)
 
+    /**
+     * Abort streaming with a fallback message ID. Used when [createAssistantMessage] was called
+     * with fromEventProcessing=false (the sendMessageInternal path) and the ResetTurn control
+     * event hasn't been processed yet — so [turnLifecycleState.activeMessageId] is still null.
+     * Without the fallback, [abortStreaming] would no-op and the assistant message would be
+     * stuck in isStreaming=true forever (invisible but never finalized — a "ghost message").
+     */
+    fun abortStreamingWithFallback(reason: String, fallbackMessageId: String) =
+        messageLifecycle.abortStreamingWithFallback(reason, fallbackMessageId)
+
     fun addMessage(message: ChatMessage) = messageMap.add(message)
 
     /**
@@ -408,7 +418,7 @@ class SessionState(
                 msg.copy(parts = parts, isStreaming = false, state = MessageState.Failed(reason))
             }
             _signals.tryEmit(UiSignal.Error(msgId, reason))
-            emitStreamingCompleted(msgId)
+            emitStreamingCompleted(msgId, naturalCompletion = false)
         }
         _signals.tryEmit(UiSignal.SessionError(sessionId, event.errorMessage))
     }
@@ -423,30 +433,35 @@ class SessionState(
             msg.copy(parts = parts, isStreaming = false, state = MessageState.Failed(event.message))
         }
         _signals.tryEmit(UiSignal.Error(msgId, event.message))
-        emitStreamingCompleted(msgId)
+        emitStreamingCompleted(msgId, naturalCompletion = false)
     }
 
     internal fun handlePermission(event: SseEvent.Permission, msgId: String) {
-        toolCallState.toolPartStates[event.toolCallId] = PartState.Pending
-        val existingPill = toolCallState.toolCallPills[event.toolCallId]
-        if (existingPill != null) {
-            toolCallState.toolCallPills[event.toolCallId] = existingPill.copy(status = ToolCallStatus.PENDING)
-        }
         val targetMsgId = toolCallState.toolCallIndex[event.toolCallId]
         if (targetMsgId == null) {
-            logger.warn { "[ACP] Permission: toolCallId=${event.toolCallId} not in index (evicted?) â€” skipping to avoid misrouting to activeMessageId" }
-            return
-        }
-        messageMap.update(targetMsgId) { msg ->
-            val parts = LinkedHashMap(msg.parts)
-            val existing = parts[event.toolCallId]
-            if (existing is MessagePart.ToolCall) {
-                parts[event.toolCallId] = existing.copy(
-                    pill = existing.pill.copy(status = ToolCallStatus.PENDING),
-                    state = PartState.Pending
-                )
+            // The toolCallId is not in the index (likely evicted). We must NOT return early:
+            // the server's Deferred promise for this tool call would hang indefinitely waiting
+            // for a response that never comes. Instead, skip the pill/part updates (which
+            // require the message to exist) but still surface the permission prompt so the
+            // user can approve/reject it and unblock the agent.
+            logger.warn { "[ACP] Permission: toolCallId=${event.toolCallId} not in index (evicted?) — surfacing prompt without pill update to avoid dropping the server's permission request" }
+        } else {
+            toolCallState.toolPartStates[event.toolCallId] = PartState.Pending
+            val existingPill = toolCallState.toolCallPills[event.toolCallId]
+            if (existingPill != null) {
+                toolCallState.toolCallPills[event.toolCallId] = existingPill.copy(status = ToolCallStatus.PENDING)
             }
-            msg.copy(parts = parts, isStreaming = turnLifecycleState.isStreaming)
+            messageMap.update(targetMsgId) { msg ->
+                val parts = LinkedHashMap(msg.parts)
+                val existing = parts[event.toolCallId]
+                if (existing is MessagePart.ToolCall) {
+                    parts[event.toolCallId] = existing.copy(
+                        pill = existing.pill.copy(status = ToolCallStatus.PENDING),
+                        state = PartState.Pending
+                    )
+                }
+                msg.copy(parts = parts, isStreaming = turnLifecycleState.isStreaming)
+            }
         }
         val realToolName = toolCallState.toolCallPills[event.toolCallId]?.toolName ?: event.action
         val prompt = PermissionPrompt(
@@ -550,13 +565,13 @@ class SessionState(
                 textStreamingState.textSegments.add(TextSegment(0, null))
             }
             val userText = turnLifecycleState.lastUserText
-            // Case-insensitive prefix match: the server sometimes echoes the user's
-            // input with different casing. This strips the echo so the assistant's
-            // actual response is shown. Risk: if the assistant's response legitimately
-            // starts with the same characters as the user's input (different case), the
-            // prefix is incorrectly stripped. This is a known trade-off â€” the server's
-            // echo behavior makes case-sensitive matching unreliable.
-            if (userText != null && text.startsWith(userText, ignoreCase = true) && text.length > userText.length && text[userText.length].isWhitespace()) {
+            // Case-sensitive prefix match: the server echoes the user's input verbatim,
+            // so a case-sensitive match correctly identifies the echo. Case-insensitive
+            // matching caused data loss when the assistant's response legitimately
+            // started with the same characters as the user's input but in different case
+            // (e.g., user "CSS is great" â†’ assistant "css is great for styling" had
+            // "CSS is great" stripped, leaving " for styling").
+            if (userText != null && text.startsWith(userText, ignoreCase = false)) {
                 textStreamingState.userEchoStripped = true
                 val chunk = text.substring(userText.length).trimStart()
                 textStreamingState.textBuffer.append(chunk)
@@ -607,7 +622,7 @@ class SessionState(
         textStreamingState.thinkingRevealJob = null
         textStreamingState.userEchoStripped = false
         val userText = turnLifecycleState.lastUserText
-        if (userText != null && textStreamingState.textBuffer.toString().startsWith(userText, ignoreCase = true) && textStreamingState.textBuffer.length > userText.length && textStreamingState.textBuffer[userText.length].isWhitespace()) {
+        if (userText != null && textStreamingState.textBuffer.toString().startsWith(userText, ignoreCase = false)) {
             textStreamingState.textBuffer.delete(0, userText.length)
             textStreamingState.revealBuffer.delete(0, userText.length)
             textStreamingState.revealedLen = textStreamingState.revealBuffer.length
@@ -678,6 +693,8 @@ class SessionState(
             val updatedPill = existingPill.copy(
                 metadata = event.metadata ?: existingPill.metadata,
                 title = event.title?.takeIf { it != existingPill.title } ?: existingPill.title,
+                // An empty-but-non-null input from the server is treated as 'no update' —
+                // only a non-empty input replaces the existing pill's input.
                 input = if (event.input != null && event.input.isNotEmpty()) event.input else existingPill.input,
             )
             toolCallState.toolCallPills[event.toolCallId] = updatedPill
@@ -714,6 +731,8 @@ class SessionState(
         val toolKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(event.input) else baseKind
         val resolvedTitle = event.title
             ?: event.input?.let { input ->
+                // Intentionally broad catch — should ideally only catch JsonException,
+                // but kept broad for safety against unexpected input shapes.
                 try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
             }
             ?: event.toolName
@@ -763,6 +782,8 @@ class SessionState(
                 ToolMapper.detectKindFromInput(newInput)
             } else existingPill.kind
             val resolvedTitle = newInput?.let { input ->
+                // Intentionally broad catch — should ideally only catch JsonException,
+                // but kept broad for safety against unexpected input shapes.
                 try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
             } ?: existingPill.title
             logger.info { "[ACP] ToolResult: callID=${event.toolCallId}, prevKind=${existingPill.kind}, resolvedKind=$resolvedKind, prevTitle=${existingPill.title}, resolvedTitle=$resolvedTitle, hasEventInput=${event.input != null}, eventInputKeys=${event.input?.keys}, hasNewInput=${newInput != null}, newInputKeys=${newInput?.keys}" }
@@ -810,6 +831,8 @@ class SessionState(
             val newInput = event.input
             val baseKind = ToolMapper.toAcpKind("tool")
             val resolvedKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(newInput) else baseKind
+            // Display-only guess: without a prior ToolUse we don't know the real tool name,
+            // so we derive a human-readable label from the detected kind for the pill UI.
             val derivedToolName = when (resolvedKind) {
                 ToolKind.READ -> "read"
                 ToolKind.EDIT -> "edit"
@@ -823,6 +846,8 @@ class SessionState(
                 else -> "tool"
             }
             val resolvedTitle = newInput?.let { input ->
+                // Intentionally broad catch — should ideally only catch JsonException,
+                // but kept broad for safety against unexpected input shapes.
                 try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
             } ?: derivedToolName
             val newPill = ToolCallPill(
@@ -873,6 +898,6 @@ class SessionState(
     private fun emitStreamingStartedIfNeeded(msgId: String) =
         streamingLifecycle.emitStreamingStartedIfNeeded(msgId)
 
-    private fun emitStreamingCompleted(msgId: String) =
-        streamingLifecycle.emitStreamingCompleted(msgId)
+    private fun emitStreamingCompleted(msgId: String, naturalCompletion: Boolean = true) =
+        streamingLifecycle.emitStreamingCompleted(msgId, naturalCompletion)
 }

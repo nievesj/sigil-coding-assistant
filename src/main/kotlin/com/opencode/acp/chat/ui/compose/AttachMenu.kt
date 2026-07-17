@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -42,11 +43,14 @@ import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import com.opencode.acp.chat.ui.theme.ChatTheme
 
 /**
- * Recent file entry for the attachment menu.
+ * Recent file entry for the attachment menu and @ mention palette.
+ * @param isOpen true if the file is currently open in an editor tab — used to
+ *  prioritize open files in the file picker and @ mention autocomplete.
  */
 data class RecentFile(
     val name: String,
-    val path: String
+    val path: String,
+    val isOpen: Boolean = false
 )
 
 /**
@@ -84,7 +88,11 @@ fun AttachMenu(
 
     // Combine: when searching, show search results from project files; otherwise show recent files
     val displayFiles = if (searchQuery.isNotBlank()) searchResults else filteredRecent
-    val sectionLabel = if (searchQuery.isNotBlank()) "Search results" else "Recent files"
+
+    // Split into open files (prioritized) and other files.
+    // Open files always appear first, regardless of search vs. recent mode.
+    val openFiles = displayFiles.filter { it.isOpen }
+    val otherFiles = displayFiles.filter { !it.isOpen }
 
     // Reset hover when filter changes
     LaunchedEffect(searchQuery) {
@@ -182,7 +190,7 @@ fun AttachMenu(
                 .background(dividerColor)
         )
 
-        // Files section
+        // Files section — split into "Open Files" (prioritized) and "Recent/Search results"
         if (searchQuery.isNotBlank() && displayFiles.isEmpty()) {
             // No matches for search query
             Text(
@@ -192,12 +200,9 @@ fun AttachMenu(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
             )
         } else if (displayFiles.isNotEmpty()) {
-            Text(
-                text = sectionLabel,
-                fontSize = ChatTheme.fonts.attachMenuSectionLabel,
-                color = mutedTextColor,
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-            )
+            // Running hover-index offset: 0 and 1 are reserved for "Files and Folders"
+            // and "Image..." menu items above, so file items start at index 2.
+            var hoverOffset = 2
 
             LazyColumn(
                 modifier = Modifier
@@ -205,25 +210,81 @@ fun AttachMenu(
                     .weight(1f, fill = false)
                     .heightIn(min = 0.dp),
             ) {
-                items(
-                    count = displayFiles.size,
-                    key = { displayFiles[it].path }
-                ) { index ->
-                    val file = displayFiles[index]
-                    val iconInfo = fileIconForFile(file.name)
-                    AttachMenuItem(
-                        icon = iconInfo.first,
-                        iconTint = iconInfo.second,
-                        label = file.name,
-                        subtitle = file.path,
-                        hovered = hoveredIndex == index + 2,
-                        hoverBg = hoverBg,
-                        onHover = { hoveredIndex = if (it) index + 2 else -1 },
-                        onClick = {
-                            onRecentFileClick(file)
-                            onDismiss()
-                        },
-                    )
+                // --- Open Files section (prioritized) ---
+                if (openFiles.isNotEmpty()) {
+                    item(key = "__open_header") {
+                        Text(
+                            text = "Open Files",
+                            fontSize = ChatTheme.fonts.attachMenuSectionLabel,
+                            color = ChatTheme.colors.accent.blue,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        )
+                    }
+                    items(
+                        count = openFiles.size,
+                        key = { openFiles[it].path }
+                    ) { index ->
+                        val file = openFiles[index]
+                        val iconInfo = fileIconForFile(file.name)
+                        val hoverIdx = hoverOffset + index
+                        AttachMenuItem(
+                            icon = iconInfo.first,
+                            iconTint = iconInfo.second,
+                            label = file.name,
+                            subtitle = file.path,
+                            trailing = {
+                                // Open-file indicator dot
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(ChatTheme.shapes.attachFileRowCornerRadius)
+                                        .background(ChatTheme.colors.accent.blue),
+                                )
+                            },
+                            hovered = hoveredIndex == hoverIdx,
+                            hoverBg = hoverBg,
+                            onHover = { hoveredIndex = if (it) hoverIdx else -1 },
+                            onClick = {
+                                onRecentFileClick(file)
+                                onDismiss()
+                            },
+                        )
+                    }
+                    hoverOffset += openFiles.size
+                }
+
+                // --- Other files section ---
+                if (otherFiles.isNotEmpty()) {
+                    item(key = "__other_header") {
+                        val label = if (searchQuery.isNotBlank()) "Search results" else "Recent files"
+                        Text(
+                            text = label,
+                            fontSize = ChatTheme.fonts.attachMenuSectionLabel,
+                            color = mutedTextColor,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        )
+                    }
+                    items(
+                        count = otherFiles.size,
+                        key = { otherFiles[it].path }
+                    ) { index ->
+                        val file = otherFiles[index]
+                        val iconInfo = fileIconForFile(file.name)
+                        val hoverIdx = hoverOffset + index
+                        AttachMenuItem(
+                            icon = iconInfo.first,
+                            iconTint = iconInfo.second,
+                            label = file.name,
+                            subtitle = file.path,
+                            hovered = hoveredIndex == hoverIdx,
+                            hoverBg = hoverBg,
+                            onHover = { hoveredIndex = if (it) hoverIdx else -1 },
+                            onClick = {
+                                onRecentFileClick(file)
+                                onDismiss()
+                            },
+                        )
+                    }
                 }
             }
 
@@ -290,27 +351,38 @@ private fun AttachMenuItem(
 /**
  * Returns the appropriate IntelliJ icon and tint color for a file based on its extension.
  * Only uses icons known to exist in the IntelliJ platform.
+ *
+ * Uses [PlatformIconKeys] (which wraps platform icons via
+ * [org.jetbrains.jewel.bridge.icon.fromPlatformIcon]) instead of
+ * [org.jetbrains.jewel.ui.icons.AllIconsKeys] — the latter renders magenta
+ * placeholders because its SVG resources live in the IntelliJ platform JARs,
+ * not the Jewel JARs. See [PlatformIconKeys] for details.
+ *
+ * `internal` so [MentionPalette] can reuse this mapping instead of duplicating it.
  */
 @Composable
-private fun fileIconForFile(fileName: String): Pair<org.jetbrains.jewel.ui.icon.IconKey, Color> {
+internal fun fileIconForFile(fileName: String): Pair<org.jetbrains.jewel.ui.icon.IconKey, Color> {
+    // NOTE: This extension→icon mapping is duplicated in ReviewPanel.kt's getFileTypeIcon.
+    // If you add a new file type here, update ReviewPanel.kt too. Consider extracting
+    // a shared fileTypeIconForExtension(ext: String): IconKey function.
     val ext = fileName.substringAfterLast('.', "").lowercase()
     return when {
-        ext == "kt" || ext == "kts" -> AllIconsKeys.Language.Kotlin to ChatTheme.colors.file.kotlin
-        ext == "java" -> AllIconsKeys.FileTypes.Java to ChatTheme.colors.file.java
-        ext == "js" || ext == "jsx" -> AllIconsKeys.FileTypes.JavaScript to ChatTheme.colors.file.javaScript
-        ext == "ts" || ext == "tsx" -> AllIconsKeys.FileTypes.JavaScript to ChatTheme.colors.file.typeScript
-        ext == "py" -> AllIconsKeys.Language.Python to ChatTheme.colors.file.python
-        ext == "rb" -> AllIconsKeys.Language.Ruby to ChatTheme.colors.file.ruby
-        ext == "go" -> AllIconsKeys.Language.GO to ChatTheme.colors.file.go
-        ext == "rs" -> AllIconsKeys.Language.Rust to ChatTheme.colors.file.rust
-        ext == "html" || ext == "htm" -> AllIconsKeys.FileTypes.Html to ChatTheme.colors.file.html
-        ext == "css" || ext == "scss" -> AllIconsKeys.FileTypes.Css to ChatTheme.colors.file.css
-        ext == "xml" -> AllIconsKeys.FileTypes.Xml to ChatTheme.colors.file.xml
-        ext == "json" -> AllIconsKeys.FileTypes.Json to ChatTheme.colors.file.json
-        ext == "yaml" || ext == "yml" -> AllIconsKeys.FileTypes.Yaml to ChatTheme.colors.file.yaml
-        ext == "md" -> AllIconsKeys.FileTypes.Text to ChatTheme.colors.file.markdown
-        ext == "sql" -> AllIconsKeys.FileTypes.Text to ChatTheme.colors.file.sql
-        ext == "sh" || ext == "bash" -> AllIconsKeys.Nodes.Console to ChatTheme.colors.file.shell
-        else -> AllIconsKeys.FileTypes.Text to ChatTheme.colors.component.attachmentRemoveIcon
+        ext == "kt" || ext == "kts" -> PlatformIconKeys.Language.Kotlin to ChatTheme.colors.file.kotlin
+        ext == "java" -> PlatformIconKeys.FileTypes.Java to ChatTheme.colors.file.java
+        ext == "js" || ext == "jsx" -> PlatformIconKeys.FileTypes.JavaScript to ChatTheme.colors.file.javaScript
+        ext == "ts" || ext == "tsx" -> PlatformIconKeys.FileTypes.JavaScript to ChatTheme.colors.file.typeScript
+        ext == "py" -> PlatformIconKeys.Language.Python to ChatTheme.colors.file.python
+        ext == "rb" -> PlatformIconKeys.Language.Ruby to ChatTheme.colors.file.ruby
+        ext == "go" -> PlatformIconKeys.Language.GO to ChatTheme.colors.file.go
+        ext == "rs" -> PlatformIconKeys.Language.Rust to ChatTheme.colors.file.rust
+        ext == "html" || ext == "htm" -> PlatformIconKeys.FileTypes.Html to ChatTheme.colors.file.html
+        ext == "css" || ext == "scss" -> PlatformIconKeys.FileTypes.Css to ChatTheme.colors.file.css
+        ext == "xml" -> PlatformIconKeys.FileTypes.Xml to ChatTheme.colors.file.xml
+        ext == "json" -> PlatformIconKeys.FileTypes.Json to ChatTheme.colors.file.json
+        ext == "yaml" || ext == "yml" -> PlatformIconKeys.FileTypes.Yaml to ChatTheme.colors.file.yaml
+        ext == "md" -> PlatformIconKeys.FileTypes.Text to ChatTheme.colors.file.markdown
+        ext == "sql" -> PlatformIconKeys.FileTypes.Text to ChatTheme.colors.file.sql
+        ext == "sh" || ext == "bash" -> PlatformIconKeys.Nodes.Console to ChatTheme.colors.file.shell
+        else -> PlatformIconKeys.FileTypes.Text to ChatTheme.colors.component.attachmentRemoveIcon
     }
 }

@@ -78,6 +78,7 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.opencode.acp.chat.markdown.FileReferenceLinker
 import com.opencode.acp.chat.model.ChatFileChange
 import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.MessagePart
@@ -584,6 +585,8 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
 
      // Set up markdown styling once for the entire message (needed by Text and Code parts)
      // Cache the fallback project to avoid repeated ProjectManager lookups on every recomposition.
+     // NOTE: The fallback is non-deterministic — `openProjects.firstOrNull()` depends on the
+     // order projects were opened in the IDE, which may vary across sessions/restarts.
      val currentProject = project ?: remember {
          com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
      }
@@ -674,20 +677,29 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
                              }
                          }
                       is MessagePart.Text -> {
-                          key(key) {
-                              val parsedBlocks = remember(part.content) {
-                                  val raw = markdownProcessor.processMarkdownDocument(part.content)
-                                  clampOrderedLists(raw)
-                              }
-                              Markdown(
-                                  markdownBlocks = parsedBlocks,
-                                  markdown = part.content,
-                                  modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
-                                  selectable = true,
-                                   onUrlClick = { url -> openUrlSafely(url) },
-                              )
-                          }
-                      }
+                            key(key) {
+                                // PERF: linkify() is O(n^2) in the worst case (URL exclusion lookback).
+                                // During streaming, part.content changes on every chunk, so remember
+                                // re-executes linkify on every chunk. For long responses (5000+ chars),
+                                // this could be O(n^3) total. If this becomes a bottleneck, debounce
+                                // linkify during streaming (e.g., every 500ms) and always linkify on
+                                // finalization. The 100K char cap in linkify() bounds the worst case.
+                                val linkifiedContent = remember(part.content) {
+                                    FileReferenceLinker.linkify(part.content)
+                                }
+                               val parsedBlocks = remember(linkifiedContent) {
+                                   val raw = markdownProcessor.processMarkdownDocument(linkifiedContent)
+                                   clampOrderedLists(raw)
+                               }
+                               Markdown(
+                                   markdownBlocks = parsedBlocks,
+                                   markdown = linkifiedContent,
+                                   modifier = Modifier.fillMaxWidth().padding(horizontal = ChatTheme.dims.messagePaddingH, vertical = ChatTheme.dims.messagePaddingV),
+                                   selectable = true,
+                                    onUrlClick = { url -> openUrlSafely(url, currentProject) },
+                               )
+                           }
+                       }
                        is MessagePart.Code -> key(key) {
                            Box(modifier = Modifier.padding(vertical = 8.dp)) {
                                ChatFencedCodeBlock(content = part.content, language = part.language)
@@ -1143,23 +1155,48 @@ private fun clampListItem(item: MarkdownBlock.ListItem): MarkdownBlock.ListItem 
  * Open a URL safely — only allows http and https schemes to prevent SSRF via
  * LLM-generated markdown links (e.g., file://, javascript:, data: URIs).
  * Logs and silently drops non-http(s) URLs.
+ *
+ * Also handles the custom `opencode-file://` scheme used by [FileReferenceLinker]
+ * to make file references clickable. When [project] is provided, file references
+ * are opened in the IntelliJ editor at the referenced line.
  */
-private fun openUrlSafely(url: String) {
+private fun openUrlSafely(url: String, project: Project? = null) {
     val trimmed = url.trim()
+
+    // Handle opencode-file:// scheme — open file in editor at line
+    if (trimmed.startsWith("opencode-file://", ignoreCase = true)) {
+        openFileReference(trimmed, project)
+        return
+    }
+
     if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
         try {
             val parsed = java.net.URI(trimmed)
             val host = parsed.host
-            // Block link-local (169.254.x.x) and loopback addresses to prevent
-            // browser-level SSRF (e.g., cloud metadata endpoints, internal services)
-            // unless the host matches the configured OpenCode server.
-            val isLoopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
-            val isLinkLocal = host.startsWith("169.254.")
-            if (isLoopback || isLinkLocal) {
-                // Allow only if it matches the configured OpenCode server port
+            if (host.isNullOrBlank()) {
+                logger.warn { "[ACP] Blocked URL with no host from markdown: ${trimmed.take(100)}" }
+                return
+            }
+            // String-based internal-host detection — avoids DNS resolution (SSRF vector
+            // that leaks the user's IP to attacker-controlled DNS servers). Catches
+            // common loopback/link-local representations. Unknown hosts are allowed
+            // (they're external; BrowserUtil opens them in the system browser).
+            val isInternal = host == "127.0.0.1" ||
+                host == "localhost" ||
+                host == "::1" ||
+                host == "0.0.0.0" ||
+                host.startsWith("127.") ||
+                host.startsWith("169.254.") ||
+                host.startsWith("0:0:0:0:0:0:0:") ||  // ::1 variants
+                host.startsWith("::ffff:127.")  // IPv4-mapped IPv6 loopback
+            if (isInternal) {
+                // Allow only if it matches the configured OpenCode server port.
+                // Compare the port numerically (not via string prefix) to avoid
+                // bypasses like http://127.0.0.1:40960/ matching :4096.
                 val serverPort = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().port
-                val serverUrl = "http://127.0.0.1:$serverPort"
-                if (!trimmed.startsWith(serverUrl)) {
+                val parsedPort = parsed.port
+                val portMatches = parsedPort != -1 && parsedPort == serverPort
+                if (!portMatches) {
                     logger.warn { "[ACP] Blocked internal URL from markdown: ${trimmed.take(100)}" }
                     return
                 }
@@ -1171,6 +1208,56 @@ private fun openUrlSafely(url: String) {
     } else {
         logger.warn { "[ACP] Blocked non-http URL from markdown: ${trimmed.take(100)}" }
     }
+}
+
+/**
+ * Handle an `opencode-file://` link click — open the referenced file in the
+ * IntelliJ editor at the specified line (if any). Resolves relative paths
+ * against the project base path via [com.opencode.acp.follow.EditorFollowManager],
+ * which also enforces the CWE-22 path traversal guard.
+ */
+private fun openFileReference(url: String, project: Project?) {
+    val ref = FileReferenceLinker.parseFileUrl(url)
+    if (ref == null) {
+        logger.warn { "[ACP] Could not parse opencode-file URL: ${url.take(100)}" }
+        return
+    }
+    if (project == null) {
+        logger.warn { "[ACP] Cannot open file reference without project context: ${ref.path}" }
+        return
+    }
+    // Defense-in-depth: validate the resolved path is within the project boundary
+    // at this layer, before delegating to EditorFollowManager (which also enforces
+    // a CWE-22 guard). The path comes from untrusted LLM-generated markdown.
+    val basePath = project.basePath
+    if (basePath.isNullOrBlank()) {
+        logger.warn { "[ACP] Cannot open file reference — project base path is null: ${ref.path}" }
+        return
+    }
+    try {
+        val baseFile = java.io.File(basePath).canonicalFile
+        // Resolve relative paths against the project base, then canonicalize.
+        val resolvedFile = java.io.File(ref.path).let {
+            if (it.isAbsolute) it.canonicalFile else java.io.File(baseFile, ref.path).canonicalFile
+        }
+        val resolvedPath = resolvedFile.canonicalPath
+        val baseCanon = baseFile.canonicalPath
+        if (!resolvedPath.startsWith(baseCanon + java.io.File.separator) &&
+            resolvedPath != baseCanon) {
+            logger.warn { "[ACP] Blocked file reference outside project boundary: ${ref.path} -> $resolvedPath" }
+            return
+        }
+    } catch (e: java.io.IOException) {
+        logger.warn(e) { "[ACP] Failed to canonicalize file reference: ${ref.path}" }
+        return
+    }
+    val line = ref.line ?: 0
+    com.opencode.acp.follow.EditorFollowManager.getInstance(project).openFileAtLine(
+        project = project,
+        filePath = ref.path,
+        line = line,
+        focus = true,
+    )
 }
 
 private fun parseColorOrDefault(hex: String, defaultColor: Color): Color {

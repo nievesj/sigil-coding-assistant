@@ -7,6 +7,7 @@ import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.chat.service.SendMessageResult
 import com.opencode.acp.chat.ui.compose.SlashCommand
+import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.OpenCodeNotifications
@@ -33,6 +34,12 @@ import kotlinx.coroutines.sync.Mutex
  * ISP fix (TDD §4.2.5): Does NOT implement [java.io.Closeable] — the plugin
  * lifecycle is managed explicitly via [close] called from the tool window's
  * content disposer ([ChatToolWindowFactory]).
+ *
+ * NOTE (SRP): This class owns multiple responsibilities (control bar state, stream phase,
+ * permission delegation, sidebar state, command history, compaction state, etc.).
+ * Future refactoring should extract: (1) ControlBarViewModel for model/agent/thinking state,
+ * (2) SidebarViewModel for sidebar/tab state, (3) CompactionViewModel for compaction state.
+ * The class already delegates to PermissionViewModel, CommandHistory Manager, and MessageQueueManager.
  */
 class ChatViewModel(
     val scope: CoroutineScope,
@@ -65,7 +72,10 @@ class ChatViewModel(
     val streamPhase: StateFlow<StreamPhase> = _streamPhase.asStateFlow()
 
     // --- Permission/Selection state (delegated to PermissionViewModel) ---
-    private val permissionViewModel = PermissionViewModel(scope, service, project)
+    private val permissionViewModel = PermissionViewModel(
+        scope, service, project,
+        braveModeProvider = { _braveModeEnabled.value },
+    )
     val permissionPrompt: StateFlow<PermissionPrompt?> = permissionViewModel.permissionPrompt
     val childPermissionPrompts: StateFlow<Map<String, List<ChildPermissionPrompt>>> = permissionViewModel.childPermissionPrompts
     val selectionPrompt: StateFlow<SelectionPrompt?> = permissionViewModel.selectionPrompt
@@ -99,6 +109,15 @@ class ChatViewModel(
         EditorFollowManager.getInstance(project).isFollowEnabled()
     )
     val followAgentEnabled: StateFlow<Boolean> = _followAgentEnabled.asStateFlow()
+
+    /** Brave Mode enabled state — synced with [OpenCodeFollowSettingsState].
+     *  When ON, all permission prompts are auto-approved with ALLOW_ONCE
+     *  without showing the UI dialog. The server still enforces explicit
+     *  `deny` rules, so Brave Mode cannot override hard denials. */
+    private val _braveModeEnabled = MutableStateFlow(
+        OpenCodeFollowSettingsState.getInstance().braveModeEnabled
+    )
+    val braveModeEnabled: StateFlow<Boolean> = _braveModeEnabled.asStateFlow()
 
     /** Review comment changes — forwarded from [ReviewCommentManager]. */
     val commentChangeSignal: StateFlow<ReviewIndex> by lazy {
@@ -219,8 +238,17 @@ class ChatViewModel(
                     is UiSignal.StreamingCompleted -> {
                         logger.info { "[ACP] signal: StreamingCompleted → _streamPhase = IDLE (current=${_streamPhase.value})" }
                         _streamPhase.value = StreamPhase.IDLE
-                        // IDE notification — only when user is not looking at the IDE
-                        OpenCodeNotifications.notifyResponseComplete(project)
+                        // IDE notification — only when:
+                        //  1. The response ended naturally (not aborted/errored/timed out)
+                        //  2. The active session is NOT a child/subtask session
+                        //  3. The user is not looking at the IDE
+                        // Check if the completing message belongs to the active session.
+                        // If the user switched sessions, isActiveSessionChild may be stale.
+                        // Verify the message is in the active session before notifying.
+                        val isActiveMessage = service.messages.value.containsKey(signal.messageId)
+                        if (signal.naturalCompletion && !isActiveSessionChild.value && isActiveMessage) {
+                            OpenCodeNotifications.notifyResponseComplete(project)
+                        }
                         // Refresh context and todos after response completes.
                         // Ordered sequentially: loadSessions must complete before
                         // drainQueue runs (drainQueue sends the next queued message,
@@ -331,15 +359,15 @@ class ChatViewModel(
                             service.permissionManager.cancelPermissionTimeout()
                         }
                         // Handle child prompts based on reply type
+                        // Check failed POST notification regardless of whether prompts
+                        // were cleared by a concurrent timeout — the user must still see
+                        // that the server processed the failed POST (TDD §4.2.4).
+                        if (signal.sessionId in permissionViewModel.failedPermissionPostSessions) {
+                            OpenCodeNotifications.notifyPermissionProcessedDespiteError(project, signal.sessionId)
+                            permissionViewModel.failedPermissionPostSessions.remove(signal.sessionId)
+                        }
+                        // Then handle child prompts if they still exist
                         if (permissionViewModel.childPermissionPrompts.value.containsKey(signal.sessionId)) {
-                            // If the last POST for this session failed (rolled back to pending),
-                            // the server still processed it. Surface a notification instead of
-                            // silently clearing (TDD §4.2.4 error handling).
-                            if (signal.sessionId in permissionViewModel.failedPermissionPostSessions) {
-                                OpenCodeNotifications.notifyPermissionProcessedDespiteError(project, signal.sessionId)
-                                // Remove AFTER the reject check below — the reject cascade
-                                // needs to know about the failed POST for notification.
-                            }
                             if (signal.reply == "reject") {
                                 // Cascade: server rejects all pending permissions in the session
                                 permissionViewModel.removeChildPrompts(signal.sessionId)
@@ -355,8 +383,6 @@ class ChatViewModel(
                                     permissionViewModel.startChildPermissionTimeout(signal.sessionId, newFirstToolName)
                                 }
                             }
-                            // Now safe to remove — notification has been shown and reject cascade is done
-                            permissionViewModel.failedPermissionPostSessions.remove(signal.sessionId)
                         }
                     }
                     is UiSignal.PermissionTimedOut -> {
@@ -1074,7 +1100,7 @@ class ChatViewModel(
         project = project,
         gitService = gitService,
         controlStateProvider = { _controlState.value },
-        sendFunction = { text -> sendMessage(text) },
+        sendFunction = { text, files -> sendMessage(text, files) },
         sendWithModelFunction = { text, modelID, providerID, variant, model ->
             sendMessageWithModel(
                 text = text,
@@ -1187,6 +1213,18 @@ class ChatViewModel(
         EditorFollowManager.getInstance(project).setFollowEnabled(newValue)
         _followAgentEnabled.value = newValue
         logger.info { "[ACP] Follow agent toggled: $newValue" }
+    }
+
+    // --- Brave Mode toggle ---
+
+    /** Toggle Brave Mode (auto-approve all permission prompts). When enabled,
+     *  permission prompts are auto-approved with ALLOW_ONCE instead of showing
+     *  the UI dialog. Explicit `deny` rules are still enforced server-side. */
+    fun toggleBraveMode() {
+        val newValue = !_braveModeEnabled.value
+        OpenCodeFollowSettingsState.getInstance().braveModeEnabled = newValue
+        _braveModeEnabled.value = newValue
+        logger.info { "[ACP] Brave mode toggled: $newValue" }
     }
 
     // --- Permission persistence ---

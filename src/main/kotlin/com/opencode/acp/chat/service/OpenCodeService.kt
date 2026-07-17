@@ -180,6 +180,33 @@ class OpenCodeService(private val project: Project) : Disposable {
                             if (relayed != null) {
                                 sessionManager.emitGlobalSignal(relayed)
                                 sessionManager.markChildPendingPermission(sessionId)
+                            } else {
+                                // Orphan: the child's parent mapping is not yet populated.
+                                // This happens when a subtask requests permission before
+                                // loadSessions() has refreshed the child→parent reverse index.
+                                // The Subtask SSE event carries the PARENT's sessionId (the
+                                // session owning the message with the subtask part), NOT the
+                                // child's — so the reverse index can't be populated from it.
+                                // Trigger loadSessions() to fetch the child's SessionItem
+                                // (which has parentID) and populate the reverse index, then
+                                // retry the relay.
+                                logger.info { "[ACP] Orphan permission for session $sessionId — triggering loadSessions() to populate parent mapping" }
+                                scope.launch {
+                                    try {
+                                        sessionManager.loadSessions()
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        logger.warn(e) { "[ACP] loadSessions() failed during orphan permission retry for $sessionId" }
+                                    }
+                                    val retryRelayed = childPermissionRelay.relayChildPermission(sessionId, signal.prompt)
+                                    if (retryRelayed != null) {
+                                        sessionManager.emitGlobalSignal(retryRelayed)
+                                        sessionManager.markChildPendingPermission(sessionId)
+                                    } else {
+                                        logger.warn { "[ACP] Orphan permission for $sessionId — still no parent after loadSessions(), prompt dropped" }
+                                    }
+                                }
                             }
                         }
                         // If sessionId == activeSessionId, it's already handled via activeSignals
@@ -572,12 +599,6 @@ class OpenCodeService(private val project: Project) : Disposable {
             val filePartCount = parts.count { it is com.opencode.acp.adapter.OpenCodePart.File }
             logger.info { "[ACP] sendMessage: ${parts.size} parts (text + $filePartCount file attachments: ${addedFileNames.joinToString { it }})" }
 
-            // sessionId validation is handled by OpenCodeClient.sendMessageAsync (validatePathId)
-            val serverMessageId = client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
-            logger.info { "[ACP] sendMessage: got serverMessageId=$serverMessageId" }
-
-            sessionManager.updateServerMessageId(assistantMsgId, serverMessageId)
-
             // Activity-aware response timeout: resets whenever SSE events arrive.
             // Prevents false timeouts during long-running generations (subtasks, tool chains)
             // where the LLM is actively producing output but total wall-clock time
@@ -588,35 +609,62 @@ class OpenCodeService(private val project: Project) : Disposable {
             // receives no events between tool.start and tool.result. Without the running-tool
             // guard, the activity monitor would false-positive after responseTimeoutSeconds
             // even though the server is actively working.
+            //
+            // The monitor is started BEFORE sendMessageAsync so it also covers the send phase.
+            // lastActivityTimeMs is reset here so the send-phase timeout is measured from this point.
+            // sendMessageAsync uses TimeoutProfile.INFINITE (the POST blocks until generation
+            // finishes) — do NOT wrap it in withTimeoutOrNull, as that would cancel the POST
+            // client-side while the server is still actively generating.
+            sendSession?.let { it.turnLifecycleState.lastActivityTimeMs = System.currentTimeMillis() }
             val activityMonitorJob = responseTimeoutMonitor.startMonitoring(
-                onTimeout = { msg -> sessionManager.abortStreaming(msg) },
-                onToolStuck = { msg -> sessionManager.abortStreaming(msg) },
+                onTimeout = { msg -> sessionManager.abortStreamingWithFallback(msg, assistantMsgId) },
+                onToolStuck = { msg -> sessionManager.abortStreamingWithFallback(msg, assistantMsgId) },
+                effectiveLastActivityMsProvider = { sessionManager.getEffectiveLastActivityMs() },
+                childActivityProvider = { sessionManager.isAnyChildActivelyGenerating() },
             )
             try {
+                // sessionId validation is handled by OpenCodeClient.sendMessageAsync (validatePathId)
+                // sendMessageAsync uses TimeoutProfile.INFINITE because the server POST blocks
+                // until the LLM finishes generating (can be minutes for complex tool chains).
+                // The activity monitor (started above) handles generation timeouts with its
+                // tool-running guard — do NOT wrap in withTimeoutOrNull here, as that would
+                // cancel the POST client-side while the server is still actively generating.
+                val serverMessageId = client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
+                logger.info { "[ACP] sendMessage: got serverMessageId=$serverMessageId" }
+                sessionManager.updateServerMessageId(assistantMsgId, serverMessageId)
                 deferred.await()
             } finally {
                 activityMonitorJob.cancel()
             }
             // If the monitor completed the deferred (timeout), isStreaming is now false
             // and the message was aborted. Check for that case.
-            // Re-fetch the active session — the sendSession reference captured above may be stale
-            // if the session was evicted/switched during the long-running send.
-            val currentSession = sessionManager.getActiveSession()
-            val wasAborted = currentSession != null && !currentSession.isStreaming && currentSession.errorMessage != null
+            // Use the session captured at send time (sendSession) rather than re-fetching
+            // the active session — the user may have switched sessions during the send,
+            // and we must check the streaming/error state of the session that was sending,
+            // not whatever session is now active.
+            val wasAborted = sendSession != null && !sendSession.isStreaming && sendSession.errorMessage != null
             return if (wasAborted) {
-                SendMessageResult.Error(currentSession.errorMessage ?: "Response timed out")
+                SendMessageResult.Error(sendSession?.errorMessage ?: "Response timed out")
             } else {
                 SendMessageResult.Success(assistantMsgId)
             }
         } catch (e: CancellationException) {
-            // Use the session captured at send time (sendSession) rather than
-            // re-fetching the active session — the user may have switched sessions
-            // between send and cancel, and we must finalize the original session.
+            // Use sendSession only if it's still the active session and not closed.
+            // If the session was evicted during the send, completeStreaming is a no-op
+            // on a closed SessionState — re-fetch to ensure we finalize the right session.
+            val currentSession = sessionManager.getActiveSession()
+            val sessionToFinalize = if (currentSession != null && !currentSession.isClosed && currentSession === sendSession) {
+                currentSession
+            } else {
+                sendSession?.takeIf { it.isClosed.not() }
+            }
             // Wrap in withTimeoutOrNull to avoid hanging the cancellation path if
             // the event processing coroutine is holding stateLock (e.g., inside
             // resegmentDirect's long markdown parse).
             try {
-                withTimeoutOrNull(5000) { sendSession?.completeStreaming(assistantMsgId) }
+                withTimeoutOrNull(5000) { sessionToFinalize?.completeStreaming(assistantMsgId) } ?: run {
+                    logger.warn { "[ACP] completeStreaming timed out after 5s during CancellationException handling — message may be stuck in isStreaming=true (ghost message). msgId=$assistantMsgId" }
+                }
             } catch (ex: kotlinx.coroutines.CancellationException) {
                 throw ex
             } catch (ex: Exception) {
@@ -624,6 +672,21 @@ class OpenCodeService(private val project: Project) : Disposable {
             }
             throw e
         } catch (e: Exception) {
+            // Diagnostic logging for timeout investigation: capture the exception
+            // type, whether any sessions were streaming (subagent activity), and
+            // the streaming session IDs. This helps distinguish:
+            // - SHORT-profile POST timeout (60s) during active generation
+            // - Permission timeout (60s) interrupting subagent
+            // - Genuine network timeout with no streaming activity
+            val streamingIds = sessionManager.streamingSessionIds.value
+            when (e) {
+                is kotlinx.coroutines.TimeoutCancellationException -> {
+                    logger.error { "[ACP] sendMessage: TimeoutCancellationException — streamingSessions=$streamingIds activeSessionStreaming=${sendSession?.isStreaming} childActive=${sessionManager.isAnyChildActivelyGenerating()}" }
+                }
+                is java.net.SocketTimeoutException -> {
+                    logger.error { "[ACP] sendMessage: SocketTimeoutException — streamingSessions=$streamingIds activeSessionStreaming=${sendSession?.isStreaming} childActive=${sessionManager.isAnyChildActivelyGenerating()}" }
+                }
+            }
             val errorMsg = when {
                 e is kotlinx.coroutines.TimeoutCancellationException ->
                     "Request timed out. Check that the server is running."
@@ -635,7 +698,7 @@ class OpenCodeService(private val project: Project) : Disposable {
                     "Connection refused by server."
                 else -> "Error: ${e.message ?: e.javaClass.simpleName}"
             }
-            sessionManager.abortStreaming(errorMsg)
+            sessionManager.abortStreamingWithFallback(errorMsg, assistantMsgId)
             return SendMessageResult.Error(errorMsg)
         } finally {
             // Re-fetch the active session — the reference captured at L680 may be stale
@@ -715,7 +778,8 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // is non-suspending and either succeeds or fails immediately.
                 // Polling with 50ms interval — up to 50ms latency before detecting a released
                 // mutex. Acceptable for steer use case (user is waiting for UI feedback).
-                // A Channel-based signal would provide instant notification but adds complexity.
+                // A Channel-based signal would be better (instant notification, no polling
+                // latency) but adds complexity; the 50ms latency is acceptable here.
                 while (isActive) {
                     if (sendMutex.tryLock()) {
                         sendMutex.unlock()

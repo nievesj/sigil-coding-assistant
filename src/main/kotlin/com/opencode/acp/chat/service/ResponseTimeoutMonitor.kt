@@ -14,21 +14,31 @@ import kotlinx.coroutines.launch
  *
  * Launched per sendMessage() call. Periodically checks:
  * 1. If tools are running (InProgress/Pending): skip activity timeout, but enforce
- *    a hard tool-stuck ceiling based on tool start time (not lastActivityTimeMs).
- * 2. If no tools running: check elapsed time since last SSE activity.
+ *    a hard tool-stuck ceiling. The ceiling is SUSPENDED while any child/subagent
+ *    session is actively generating (via [childActivityProvider]) — this prevents
+ *    false-positive aborts during long-running subagents. The ceiling still fires
+ *    for genuinely stuck tools (no child activity = lost ToolResult, crashed child,
+ *    SSE gap).
+ * 2. If no tools running: check elapsed time since last SSE activity across the
+ *    active session tree (parent + children, via [effectiveLastActivityMsProvider]).
  *    If > responseTimeoutSeconds, abort streaming.
+ *
+ * SUBAGENT AWARENESS: During subagent execution, SSE events flow to the CHILD
+ * session, not the parent. The parent's own lastActivityTimeMs goes stale. The
+ * [effectiveLastActivityMsProvider] returns the max activity across the whole
+ * active tree, so child generation keeps the parent's timeouts alive. The
+ * [childActivityProvider] returns true if any child is actively generating,
+ * suspending the tool-stuck ceiling.
  *
  * The timeout is re-read each iteration from the injected providers — changes take
  * effect mid-response. Both providers' return values are clamped internally:
  * - `responseTimeoutSeconds` clamped to [10, 3600]
  * - `toolStuckTimeoutSeconds` clamped to [60, 3600]
- * This matches the current inline behavior (OpenCodeService.kt:970, 1010).
  *
  * Session eviction safety: the monitor re-fetches `sessionManager.getActiveSession()`
  * on EACH iteration (NOT a captured reference). If the session was evicted from the
  * cache (e.g., LRU eviction during a long send), `getActiveSession()` returns null
- * and the monitor skips that iteration. This matches the current inline behavior
- * (OpenCodeService.kt:978-984) and handles both session switching and LRU eviction.
+ * and the monitor skips that iteration.
  *
  * @param scope Coroutine scope for the monitor job
  * @param sessionManager Provides session lookup (re-fetched each iteration for eviction safety)
@@ -57,6 +67,19 @@ internal class ResponseTimeoutMonitor(
     fun startMonitoring(
         onTimeout: (String) -> Unit,
         onToolStuck: (String) -> Unit,
+        /**
+         * Returns the effective last-activity timestamp across the active session tree
+         * (parent + children). Defaults to the active session's own lastActivityTimeMs
+         * (backward-compatible with pre-subagent-awareness behavior).
+         */
+        effectiveLastActivityMsProvider: () -> Long = { sessionManager.getActiveSession()?.lastActivityTimeMs ?: System.currentTimeMillis() },
+        /**
+         * Returns true if any child/subagent session of the active session is actively
+         * generating. When true, the tool-stuck ceiling is suspended (the tool is waiting
+         * on a working subagent, not stuck). Defaults to false (backward-compatible —
+         * ceiling always enforced if no provider is given).
+         */
+        childActivityProvider: () -> Boolean = { false },
     ): Job = scope.launch {
         while (isActive) {
             delay(ACTIVITY_CHECK_INTERVAL_MS)
@@ -95,11 +118,16 @@ internal class ResponseTimeoutMonitor(
             }
             if (hasRunningTools) {
                 // Tools are running — skip the normal activity timeout, BUT enforce
-                // a hard ceiling based on tool START TIME (not lastActivityTimeMs,
-                // which is reset by metadata events and thus unreliable for detecting
-                // truly stuck tools). If a tool's ToolResult is lost (child crash, SSE
-                // reconnect gap), the tool stays InProgress forever. This ceiling
-                // ensures recovery.
+                // a hard ceiling based on tool START TIME. If a tool's ToolResult is
+                // lost (child crash, SSE reconnect gap), the tool stays InProgress
+                // forever. This ceiling ensures recovery.
+                //
+                // SUBAGENT AWARENESS: The ceiling is SUSPENDED while any child session
+                // is actively generating (childActivityProvider returns true). This
+                // prevents false-positive aborts during long-running subagents — the
+                // tool is InProgress because it's waiting on a working subagent, not
+                // because it's stuck. The ceiling still fires when no child is active
+                // (genuinely stuck tool, crashed child, lost ToolResult).
                 val toolStuckTimeoutSec = toolStuckTimeoutSecondsProvider()
                     .coerceIn(TOOL_STUCK_TIMEOUT_MIN_SECONDS, TOOL_STUCK_TIMEOUT_MAX_SECONDS)
                 val toolStuckTimeoutMs = toolStuckTimeoutSec * 1000L
@@ -113,7 +141,15 @@ internal class ResponseTimeoutMonitor(
                 if (oldestToolStartMs != null) {
                     val toolElapsed = System.currentTimeMillis() - oldestToolStartMs
                     if (toolElapsed > toolStuckTimeoutMs) {
-                        logger.error { "[ACP] sendMessage: tool stuck for ${toolElapsed}ms (> ${toolStuckTimeoutSec}s) — aborting" }
+                        // Check if a child/subagent is actively generating — if so,
+                        // the "stuck" tool is actually waiting on a working subagent.
+                        // Suspend the ceiling; the safety net still fires when the
+                        // child goes silent (crash, SSE gap, lost ToolResult).
+                        if (childActivityProvider()) {
+                            logger.debug { "[ACP] sendMessage: tool running ${toolElapsed}ms (> ${toolStuckTimeoutSec}s) but child actively generating — suspending tool-stuck ceiling" }
+                            continue
+                        }
+                        logger.error { "[ACP] sendMessage: tool stuck for ${toolElapsed}ms (> ${toolStuckTimeoutSec}s) and no child activity — aborting" }
                         onToolStuck("Tool stuck for >${toolStuckTimeoutSec}s.")
                         break
                     }
@@ -121,7 +157,11 @@ internal class ResponseTimeoutMonitor(
                 logger.debug { "[ACP] sendMessage: tools still running, skipping activity check" }
                 continue
             }
-            val lastActivity = monitorSession.lastActivityTimeMs
+            // Use the effective last-activity across the active session tree (parent +
+            // children). During subagent generation, the parent's own lastActivityTimeMs
+            // goes stale (child events route to the child's SessionState), but the
+            // effective value includes child activity, so the activity timeout resets.
+            val lastActivity = effectiveLastActivityMsProvider()
             // RESOLVED: lastActivityTimeMs is @Volatile in TurnLifecycleState,
             // ensuring visibility across coroutines. It's written on the SSE event
             // processing coroutine and read here on the activity monitor coroutine.

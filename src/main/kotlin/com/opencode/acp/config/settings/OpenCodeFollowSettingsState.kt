@@ -44,6 +44,16 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
      * they can navigate, filter, and group.
      */
     var followSearchesInFindWindow: Boolean = true
+
+    /**
+     * Whether Brave Mode (auto-approve all permission prompts) is enabled.
+     * Default OFF — the feature auto-approves tool permission requests without
+     * showing the UI prompt, which is a security-relevant decision. The server
+     * still enforces explicit `deny` rules before sending the permission SSE
+     * event, so Brave Mode cannot override hard denials.
+     */
+    var braveModeEnabled: Boolean = false
+
     /** Highlight color for READ tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
     var followReadColor: String = "#5078C888"
     /** Highlight color for EDIT tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
@@ -67,6 +77,7 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
         followAgentEnabled = state.followAgentEnabled
         followCommandsInConsole = state.followCommandsInConsole
         followSearchesInFindWindow = state.followSearchesInFindWindow
+        braveModeEnabled = state.braveModeEnabled
         followReadColor = state.followReadColor
         followEditColor = state.followEditColor
         followSearchColor = state.followSearchColor
@@ -80,6 +91,10 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
     /**
      * Returns the persisted hex color for a [com.agentclientprotocol.model.ToolKind].
      * THINK and SWITCH_MODE have no persisted color and fall back to OTHER.
+     *
+     * Asymmetry with [setFollowColor]: get returns OTHER's color for THINK/SWITCH_MODE
+     * (read fallback), but set is a no-op for those kinds (no persistence). This is
+     * intentional — they have no dedicated UI color picker and inherit OTHER's color.
      */
     fun getFollowColor(kind: com.agentclientprotocol.model.ToolKind): String = when (kind) {
         com.agentclientprotocol.model.ToolKind.READ -> followReadColor

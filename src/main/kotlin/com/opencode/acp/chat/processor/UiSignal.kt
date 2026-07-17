@@ -14,8 +14,14 @@ sealed interface UiSignal {
     /** First text or thinking chunk received — streaming has started. */
     data class StreamingStarted(val messageId: String) : UiSignal
 
-    /** Stop event processed — streaming is complete. */
-    data class StreamingCompleted(val messageId: String, val fileChanges: List<ChatFileChange>) : UiSignal
+    /** Stop event processed — streaming is complete.
+     *  @param naturalCompletion true when the response ended naturally (Stop/idle/debounced).
+     *         false when forcibly ended or interrupted (abort, error, timeout). */
+    data class StreamingCompleted(
+        val messageId: String,
+        val fileChanges: List<ChatFileChange>,
+        val naturalCompletion: Boolean = true,
+    ) : UiSignal
 
     /** Intermediate message update (token/cost data applied) — triggers local-only context refresh. */
     data class MessageUpdated(val messageId: String) : UiSignal
@@ -35,7 +41,9 @@ sealed interface UiSignal {
     /** Selection/question prompt received from the server. */
     data class SelectionRequested(val prompt: SelectionPrompt) : UiSignal
 
-    /** File changed by an edit tool — triggers review panel refresh. */
+    /** File changed by an edit tool — triggers review panel refresh.
+     *  The `val unit: Unit = Unit` is a workaround for a data class with no fields
+     *  (forces a constructor parameter); prefer `data object` on Kotlin 1.9+. */
     data class FileChanged(val unit: Unit = Unit) : UiSignal
 
     /** Todo list updated via SSE. */

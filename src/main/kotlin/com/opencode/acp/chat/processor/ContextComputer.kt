@@ -62,6 +62,17 @@ class ContextComputer(
      *  cheap and should not be starved by a full computation blocked on getSession(). */
     private val localComputeInFlight = AtomicBoolean(false)
 
+    /** Monotonic sequence counter — each compute (full or local) gets a unique seq.
+     *  A local compute will NOT publish its result if a full compute with a higher
+     *  sequence has already published (the full compute has richer REST-fetched data).
+     *  This prevents a fast local compute from overwriting a full compute's result
+     *  with stale local-only data. */
+    private val computeSeq = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** Sequence of the last published result. A local compute only publishes if its
+     *  seq is >= lastPublishedSeq (no full compute with a higher seq has published). */
+    private val lastPublishedSeq = java.util.concurrent.atomic.AtomicLong(0L)
+
     // ── Smart Context Manager: pressure monitor ──
 
     /** Tracks context pressure via rolling growth rate. Reset on session switch/compaction. */
@@ -88,8 +99,9 @@ class ContextComputer(
             // If it's Loading, the in-progress computation will replace it soon.
             return _sessionContextState.value
         }
+        val mySeq = computeSeq.incrementAndGet()
         try {
-            return computeInternal(currentSessionId, messages, c, controlState, fetchSession = true)
+            return computeInternal(currentSessionId, messages, c, controlState, fetchSession = true, seq = mySeq)
         } finally {
             fullComputeInFlight.set(false)
         }
@@ -116,8 +128,9 @@ class ContextComputer(
             // Another local computation is in progress — return the current state as-is.
             return _sessionContextState.value
         }
+        val mySeq = computeSeq.incrementAndGet()
         try {
-            return computeInternal(currentSessionId, messages, c, controlState, fetchSession = false)
+            return computeInternal(currentSessionId, messages, c, controlState, fetchSession = false, seq = mySeq)
         } finally {
             localComputeInFlight.set(false)
         }
@@ -138,6 +151,7 @@ class ContextComputer(
         c: OpenCodeClient,
         controlState: ControlBarState?,
         fetchSession: Boolean,
+        seq: Long,
     ): SessionContextState {
         // Best-effort session fetch — only when fetchSession=true (full path).
         // Token/cost data comes from the local message cache (kept accurate by
@@ -171,6 +185,10 @@ class ContextComputer(
         // Cumulative fields: last message with non-zero input tokens (not 0L fallback).
         // Falls back to the previous message's tokens when the last assistant is still
         // streaming (no MessageFinalized yet) — prevents the indicator from dropping to 0.
+        // NOTE: If the last assistant message is still streaming (no MessageFinalized yet),
+        // its inputTokens is 0, so findLast skips it and returns the PREVIOUS message's tokens.
+        // This shows stale (last-completed-turn) token counts during streaming rather than
+        // dropping to 0 — a deliberate UX choice to avoid the indicator flashing to 0 mid-stream.
         val lastWithInput = assistantMessages.findLast { it.inputTokens > 0 }
         val inputTokens = lastWithInput?.inputTokens ?: 0L
         val cacheReadTokens = lastWithInput?.cacheReadTokens ?: 0L
@@ -272,6 +290,23 @@ class ContextComputer(
             logger.info { "[ACP] computeSessionContext: session changed during computation ($currentSessionId → ${activeSessionIdProvider()}) — discarding result" }
             return result
         }
+        // Sequence guard (atomic): a compute must NOT publish its result if a
+        // compute with a higher sequence has already published. This prevents
+        // both the local-overwriting-full race AND the full-regressing-sequence
+        // race. Uses a CAS loop for atomicity (get-check-set is TOCTOU).
+        // NOTE: The loop has no backoff, but contention is bounded — expected max
+        // is 2 concurrent computes (one full + one local), so retries are rare.
+        while (true) {
+            val lastSeq = lastPublishedSeq.get()
+            if (lastSeq > seq) {
+                logger.info { "[ACP] computeSessionContext(${if (fetchSession) "full" else "local"}): skipping publish — seq=$lastSeq > my seq=$seq" }
+                return result
+            }
+            if (lastPublishedSeq.compareAndSet(lastSeq, seq)) {
+                break
+            }
+            // CAS failed — another compute published concurrently; retry
+        }
         _sessionContextState.value = result
         return result
     }
@@ -352,14 +387,14 @@ class ContextComputer(
                 // sub-view is hidden when the map is empty.
                 val adjustedToolTokens = (breakdown.toolTokens - prunerSaved).coerceAtLeast(0L)
                 val adjustedTotal = (breakdown.totalTokens - prunerSaved).coerceAtLeast(0L)
-                breakdown.copy(
+                return breakdown.copy(
                     toolTokens = adjustedToolTokens,
                     totalTokens = adjustedTotal,
                     freeTokens = (contextLimit - adjustedTotal).coerceAtLeast(0L),
                     toolBreakdown = emptyMap(),
                 )
             }
-            breakdown
+            return breakdown
         } catch (e: Exception) {
             logger.warn(e) { "[ACP] BreakdownComputer.computeBreakdown failed" }
             null

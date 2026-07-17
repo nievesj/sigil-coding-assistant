@@ -92,6 +92,12 @@ internal class StreamingLifecycleManager(
             // and leave isStreaming=true forever.
             logger.info { "[ACP] finalizeStreaming (idle): immediate finalization (no debounce)" }
             stateLock.withLock {
+                // Guard against the new-message race: if a new turn started (activeMessageId changed),
+                // don't finalize the old message — it would kill the new turn's isStreaming flag.
+                if (turnLifecycleState.activeMessageId != null && turnLifecycleState.activeMessageId != msgId) {
+                    logger.info { "[ACP] finalizeStreaming (idle): SKIP — activeMessageId changed from $msgId to ${turnLifecycleState.activeMessageId}" }
+                    return@withLock
+                }
                 if (!turnLifecycleState.isStreaming) return@withLock
                 turnLifecycleState.isStreaming = false
                 messageMap.update(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
@@ -110,12 +116,28 @@ internal class StreamingLifecycleManager(
             // set _streamPhase=IDLE while the new message is actively streaming.
             logger.info { "[ACP] finalizeStreaming (new_message): immediate finalization (no debounce, no StreamingCompleted)" }
             stateLock.withLock {
+                // Guard against the new-message race: if a ResetTurn arrived and
+                // activeMessageId changed to a different message, the captured
+                // msgId refers to an old message — mutating it would update the
+                // WRONG message. The null check is important: if activeMessageId
+                // is null (ResetTurn hasn't been processed yet), proceed with the
+                // fallback finalization.
+                if (turnLifecycleState.activeMessageId != null && turnLifecycleState.activeMessageId != msgId) {
+                    logger.info { "[ACP] finalizeStreaming (new_message): SKIP — activeMessageId changed from $msgId to ${turnLifecycleState.activeMessageId}" }
+                    return@withLock
+                }
                 turnLifecycleState.isStreaming = false
                 messageMap.update(msgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
                 // Complete the old turn's responseDeferred so sendMessageInternal unblocks.
-                // Don't emit StreamingCompleted � the new message's completion will handle
+                // Don't emit StreamingCompleted — the new message's completion will handle
                 // that. The ViewModel's _streamPhase stays STREAMING (set by the new
                 // message's StreamingStarted), avoiding a brief IDLE flicker.
+                //
+                // NOTE: responseDeferred is replaced (not reused) between turns — see
+                // OpenCodeService.sendMessageInternal which creates a fresh
+                // CompletableDeferred<Unit>() and assigns it to activeSession.responseDeferred
+                // on each send. Completing the old deferred here does NOT affect the new
+                // turn's deferred (it's a different instance).
                 completeResponseDeferred()
             }
         } else {
@@ -153,10 +175,11 @@ internal class StreamingLifecycleManager(
         }
     }
 
-    /** Emit StreamingCompleted signal once per turn (idempotent via turnLifecycleState.streamingCompletedEmitted). */
-    fun emitStreamingCompleted(msgId: String) {
+    /** Emit StreamingCompleted signal once per turn (idempotent via turnLifecycleState.streamingCompletedEmitted).
+     *  @param naturalCompletion true for natural end (Stop/idle/debounce), false for abort/error/timeout. */
+    fun emitStreamingCompleted(msgId: String, naturalCompletion: Boolean = true) {
         if (turnLifecycleState.streamingCompletedEmitted) return
         turnLifecycleState.streamingCompletedEmitted = true
-        signals.tryEmit(UiSignal.StreamingCompleted(msgId, toolCallState.pendingFileChanges.toList()))
+        signals.tryEmit(UiSignal.StreamingCompleted(msgId, toolCallState.pendingFileChanges.toList(), naturalCompletion))
     }
 }

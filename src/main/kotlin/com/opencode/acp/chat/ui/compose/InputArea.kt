@@ -98,6 +98,27 @@ import kotlinx.coroutines.withContext
 
 private val logger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
+/**
+ * Validates that an attached file's canonical path is within the allowed directories
+ * (project base, project .opencode/attachments, or user home .opencode/attachments).
+ * Returns true if the path is allowed, false otherwise.
+ */
+private fun isAttachedPathAllowed(
+    attachedPath: String,
+    projectBase: String?,
+    userHome: String?,
+): Boolean {
+    val canonicalAttached = try { java.io.File(attachedPath).canonicalPath } catch (_: Exception) { return false }
+    if (projectBase != null) {
+        if (canonicalAttached.startsWith(projectBase + java.io.File.separator) || canonicalAttached == projectBase) return true
+        if (canonicalAttached.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) return true
+    }
+    if (userHome != null) {
+        if (canonicalAttached.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) return true
+    }
+    return false
+}
+
 /** Result of reading the clipboard — either an image/file attachment or plain text. */
 sealed class ClipboardResult {
     data class FileResult(val file: AttachedFile) : ClipboardResult()
@@ -339,6 +360,10 @@ fun InputArea(
     onRecentFileClick: (RecentFile) -> Unit = {},
     onSlashCommand: (SlashCommand) -> Unit = {},
     commands: List<SlashCommand> = emptyList(),
+    // @ mention file autocomplete
+    mentionFiles: List<RecentFile> = emptyList(),
+    onMentionSearch: (String) -> Unit = {},
+    onMentionFileSelected: (RecentFile) -> Unit = {},
     todos: List<TodoItem> = emptyList(),
     commandHistory: List<CommandHistoryEntry> = emptyList(),
     onLoadHistoryEntry: (CommandHistoryEntry) -> Unit = {},
@@ -348,6 +373,8 @@ fun InputArea(
     isFollowEnabled: Boolean = false,                // NEW
     onDisconnect: () -> Unit = {},                   // NEW
     onToggleFollow: () -> Unit = {},                 // NEW
+    isBraveModeEnabled: Boolean = false,               // NEW: brave mode state
+    onToggleBraveMode: () -> Unit = {},               // NEW: brave mode toggle
     placeholderText: String = "Type a message...",
     ) {
     val textState = remember { TextFieldState() }
@@ -376,6 +403,28 @@ fun InputArea(
         if (slashQuery.startsWith(cmd.name, ignoreCase = true) && slashQuery.length > cmd.name.length) {
             slashQuery.substring(cmd.name.length).trim()
         } else ""
+
+    // @ mention palette state: shown when the user types "@" followed by a file query.
+    // The @ can appear anywhere in the text (not just at the start like slash commands).
+    // We detect the last "@" and extract the query text between it and the cursor/next space.
+    var showMentionPalette by remember { mutableStateOf(false) }
+    var mentionSelectedIndex by remember { mutableStateOf(0) }
+    var mentionQuery by remember { mutableStateOf("") }
+    var mentionStartIndex by remember { mutableStateOf(-1) } // text offset of the "@" char
+
+    // Filter mention files by the current query — open files first, then others
+    val filteredMentionFiles = remember(mentionQuery, mentionFiles) {
+        if (mentionQuery.isBlank()) {
+            mentionFiles.take(20)
+        } else {
+            mentionFiles.filter {
+                it.name.contains(mentionQuery, ignoreCase = true) ||
+                it.path.contains(mentionQuery, ignoreCase = true)
+            }.take(20)
+        }
+    }
+
+    LaunchedEffect(filteredMentionFiles.size) { mentionSelectedIndex = 0 }
 
     // Command history navigation state
     var historyIndex by remember { mutableStateOf(-1) }  // -1 = not navigating, 0 = newest, 1 = next older...
@@ -424,15 +473,15 @@ fun InputArea(
                                 // Reject non-file URI schemes (e.g. http://, ftp://) to
                                 // prevent attaching arbitrary remote resources. Only
                                 // local file:// URIs are allowed for drag-and-drop.
-                                if (!uri.startsWith("file:")) {
+                                if (!uri.startsWith("file:", ignoreCase = true)) {
                                     logger.warn { "[ACP] Drag-and-drop: rejecting non-file URI scheme: ${uri.take(50)}" }
                                     null
                                 } else {
                                     val file = java.io.File(java.net.URI(uri))
                                     // Validate path is within project or allowed attachment dirs
                                     val canonicalPath = file.canonicalPath
-                                    val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }
-                                    val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
+                                    val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }?.trimEnd(java.io.File.separatorChar)
+                                    val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }?.trimEnd(java.io.File.separatorChar)
                                     val isInsideProject = projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator)
                                     val isInsideAttachments = (projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
                                         (userHome != null && canonicalPath.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))
@@ -441,7 +490,16 @@ fun InputArea(
                                         // the service guard will catch it. Log for visibility.
                                         logger.debug { "[ACP] Drag-and-drop: file outside allowed dirs, will attempt copy: ${file.name}" }
                                     }
-                                    file.toAttachedFile(project)
+                                    // Post-condition: verify the returned AttachedFile.path is within
+                                    // allowed dirs after toAttachedFile (which copies external files in).
+                                    // This guards against a copy failure silently returning the raw external
+                                    // path, which would bypass the attachment security boundary.
+                                    val attached = file.toAttachedFile(project)
+                                    val isAllowed = isAttachedPathAllowed(attached.path, projectBase, userHome)
+                                    if (isAllowed) attached else {
+                                        logger.warn { "[ACP] Drag-and-drop: attached file path outside allowed dirs after copy: ${attached.path}" }
+                                        null
+                                    }
                                 }
                             } catch (e: Exception) {
                                 logger.warn(e) { "[ACP] Drag-and-drop: failed to process file URI: ${uri.take(50)}" }
@@ -499,10 +557,22 @@ fun InputArea(
                         @Suppress("UNCHECKED_CAST")
                         val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
                         var anyAttached = false
+                        val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }?.trimEnd(java.io.File.separatorChar)
+                        val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }?.trimEnd(java.io.File.separatorChar)
                         files?.forEach { file ->
                             try {
-                                onAttachFile(file.toAttachedFile(project))
-                                anyAttached = true
+                                val attached = file.toAttachedFile(project)
+                                // Post-condition: verify the returned AttachedFile.path is within
+                                // allowed dirs after toAttachedFile (which copies external files in).
+                                // This guards against a copy failure silently returning the raw external
+                                // path, which would bypass the attachment security boundary.
+                                val isAllowed = isAttachedPathAllowed(attached.path, projectBase, userHome)
+                                if (isAllowed) {
+                                    onAttachFile(attached)
+                                    anyAttached = true
+                                } else {
+                                    logger.warn { "[ACP] Drag-and-drop AWT fallback: attached file path outside allowed dirs after copy: ${attached.path}" }
+                                }
                             } catch (e: Exception) {
                                 logger.warn(e) { "[ACP] Drag-and-drop AWT fallback: file attach failed" }
                             }
@@ -551,6 +621,36 @@ fun InputArea(
             }
     }
 
+    // Watch text changes to detect "@" mention triggers.
+    // The "@" can appear anywhere in the text. We find the last "@" before the
+    // cursor and extract the query between it and the next whitespace or cursor.
+    // The palette is dismissed if:
+    //   - there's no "@" in the text
+    //   - the text after "@" contains whitespace (user typed a space, ending the mention)
+    //   - the slash palette is active (slash commands take priority)
+    LaunchedEffect(Unit) {
+        androidx.compose.runtime.snapshotFlow { textState.text.toString() }
+            .collect { text ->
+                if (showSlashPalette) {
+                    showMentionPalette = false
+                    return@collect
+                }
+                val cursorPos = textState.selection.start
+                val result = detectMentionTrigger(text, cursorPos)
+                if (result.active) {
+                    showMentionPalette = true
+                    mentionQuery = result.query
+                    mentionStartIndex = result.startIndex
+                    // Trigger search for the query
+                    onMentionSearch(result.query)
+                } else {
+                    showMentionPalette = false
+                    mentionQuery = ""
+                    mentionStartIndex = -1
+                }
+            }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -583,6 +683,44 @@ fun InputArea(
                             onSlashCommand(command.copy(args = args))
                         },
                         onDismiss = { showSlashPalette = false },
+                    )
+                }
+            }
+        }
+
+        // @ mention palette — shown above the input when the user types "@query"
+        if (showMentionPalette && !showSlashPalette) {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.BottomStart
+            ) {
+                Popup(
+                    alignment = Alignment.BottomStart,
+                    offset = IntOffset(0, -4),
+                    properties = PopupProperties(
+                        focusable = false,
+                        dismissOnBackPress = true,
+                        dismissOnClickOutside = true,
+                    ),
+                    onDismissRequest = { showMentionPalette = false },
+                ) {
+                    MentionPalette(
+                        filtered = filteredMentionFiles,
+                        selectedIndex = mentionSelectedIndex,
+                        onSelectedIndexChange = { mentionSelectedIndex = it },
+                        onFileSelected = { file ->
+                            // Replace the "@query" text with "@filename" and attach the file
+                            val text = textState.text.toString()
+                            val endIdx = textState.selection.start.coerceIn(0, text.length)
+                            if (mentionStartIndex >= 0 && endIdx > mentionStartIndex) {
+                                textState.edit {
+                                    replace(mentionStartIndex, endIdx, "@${file.name}")
+                                }
+                            }
+                            showMentionPalette = false
+                            onMentionFileSelected(file)
+                        },
+                        onDismiss = { showMentionPalette = false },
                     )
                 }
             }
@@ -866,11 +1004,40 @@ fun InputArea(
                                                 selectedIndex = (selectedIndex + 1).coerceAtMost(filtered.lastIndex)
                                                 true
                                             }
+                                            // Up arrow — navigate mention palette selection
+                                            event.key == Key.DirectionUp && !event.isShiftPressed && showMentionPalette && filteredMentionFiles.isNotEmpty() -> {
+                                                mentionSelectedIndex = (mentionSelectedIndex - 1).coerceAtLeast(0)
+                                                true
+                                            }
+                                            // Down arrow — navigate mention palette selection
+                                            event.key == Key.DirectionDown && !event.isShiftPressed && showMentionPalette && filteredMentionFiles.isNotEmpty() -> {
+                                                mentionSelectedIndex = (mentionSelectedIndex + 1).coerceAtMost(filteredMentionFiles.lastIndex)
+                                                true
+                                            }
+                                            // Enter with mention palette: select the file, replace @query with @filename, attach file
+                                            event.key == Key.Enter && !event.isShiftPressed && showMentionPalette && filteredMentionFiles.isNotEmpty() -> {
+                                                val file = filteredMentionFiles.getOrNull(mentionSelectedIndex) ?: filteredMentionFiles.first()
+                                                val text = textState.text.toString()
+                                                val endIdx = textState.selection.start.coerceIn(0, text.length)
+                                                if (mentionStartIndex >= 0 && endIdx > mentionStartIndex) {
+                                                    textState.edit {
+                                                        replace(mentionStartIndex, endIdx, "@${file.name}")
+                                                    }
+                                                }
+                                                showMentionPalette = false
+                                                onMentionFileSelected(file)
+                                                true
+                                            }
+                                            // Escape with mention palette: dismiss it
+                                            event.key == Key.Escape && showMentionPalette -> {
+                                                showMentionPalette = false
+                                                true
+                                            }
                                             // Up arrow — navigate command history (older).
                                             // By design: matches documented shell-history behavior —
                                             // Up recalls older entries, Down recalls newer, Escape
                                             // restores the draft. See AGENTS.md "Input Command History".
-                                            event.key == Key.DirectionUp && !event.isShiftPressed && !showSlashPalette && commandHistory.isNotEmpty() -> {
+                                            event.key == Key.DirectionUp && !event.isShiftPressed && !showSlashPalette && !showMentionPalette && commandHistory.isNotEmpty() -> {
                                                 saveDraftIfNeeded(attachedFiles)
                                                 val newIndex = if (historyIndex < 0) 0 else (historyIndex + 1).coerceAtMost(commandHistory.size - 1)
                                                 if (newIndex != historyIndex || historyIndex < 0) {
@@ -879,7 +1046,7 @@ fun InputArea(
                                                 true
                                             }
                                             // Down arrow — navigate command history (newer) or restore draft
-                                            event.key == Key.DirectionDown && !event.isShiftPressed && !showSlashPalette && inHistoryMode -> {
+                                            event.key == Key.DirectionDown && !event.isShiftPressed && !showSlashPalette && !showMentionPalette && inHistoryMode -> {
                                                 val newIndex = historyIndex - 1
                                                 if (newIndex < 0) {
                                                     // Restore draft
@@ -960,6 +1127,7 @@ fun InputArea(
                                                 val pos = textState.selection.start
                                                 textState.edit { replace(pos, pos, "\n") }
                                                 showSlashPalette = false
+                                                showMentionPalette = false
                                                 true
                                             }
                                             event.key == Key.Escape -> {
@@ -1186,6 +1354,12 @@ fun InputArea(
                 onToggle = onToggleFollow,
             )
 
+            // NEW: Brave Mode checkbox — auto-approve all permission prompts
+            BraveModeCheckbox(
+                enabled = isBraveModeEnabled,
+                onToggle = onToggleBraveMode,
+            )
+
             // NEW: Separator + disconnect (only when connected or reconnecting)
             if (isConnected || isReconnecting) {
                 Box(
@@ -1326,6 +1500,66 @@ private fun FollowAgentCheckbox(enabled: Boolean, onToggle: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun BraveModeCheckbox(enabled: Boolean, onToggle: () -> Unit) {
+    TooltipArea(
+        tooltip = {
+            Box(
+                modifier = Modifier
+                    .background(ChatTheme.colors.component.tooltipBg, RoundedCornerShape(4.dp))
+                    .border(1.dp, ChatTheme.colors.component.tooltipBorder, RoundedCornerShape(4.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    "When enabled, all tool permission prompts are auto-approved without asking. Explicit deny rules are still enforced.",
+                    color = ChatTheme.colors.component.tooltipText,
+                    fontSize = ChatTheme.fonts.selectorChip,
+                )
+            }
+        },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clip(ChatTheme.shapes.chipCornerRadius)
+                .clickable(enabled = true) { onToggle() }
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(14.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(
+                        if (enabled) Color(0xFFE8A030)
+                        else Color.Transparent
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (enabled) Color(0xFFE8A030)
+                                else ChatTheme.colors.component.inputText.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(3.dp),
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (enabled) {
+                    Text(
+                        text = "\u2713",  // checkmark
+                        fontSize = 10.sp,
+                        color = ChatTheme.colors.text.inverse,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = "Brave Mode",
+                fontSize = ChatTheme.fonts.selectorChip,
+                color = ChatTheme.colors.component.inputText,
+            )
+        }
+    }
+}
+
 /**
  * Converts a java.io.File into an AttachedFile by reading its MIME type from the filename.
  * No bytes are read — the file content is referenced by path on the wire.
@@ -1347,8 +1581,8 @@ private fun java.io.File.toAttachedFile(project: com.intellij.openapi.project.Pr
     } else {
         // Copy failed — check if source is within allowed dirs
         val canonicalSource = canonicalPath
-        val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }
-        val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
+        val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }?.trimEnd(java.io.File.separatorChar)
+        val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }?.trimEnd(java.io.File.separatorChar)
         val isInsideProject = projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator)
         val isInsideAttachments = (projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
             (userHome != null && canonicalSource.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))

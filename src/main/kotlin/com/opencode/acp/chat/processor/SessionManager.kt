@@ -477,43 +477,57 @@ class SessionManager(
                     sessionList = if (currentProjectBase != null) {
                         val canonicalBase = try {
                             java.io.File(currentProjectBase).canonicalPath
-                        } catch (_: Exception) { currentProjectBase }
-                        val filtered = unfilteredList.filter { session ->
-                            // Canonicalize the server-provided directory before
-                            // prefix comparison to prevent path traversal bypass
-                            // (e.g., "C:\Projects\MyApp\..\OtherProject" would
-                            // pass a naive startsWith check but resolve to a
-                            // different project).
-                            val dir = session.directory
-                            if (dir.isBlank()) {
-                                false
-                            } else {
-                                val canonicalDir = try {
-                                    java.io.File(dir).canonicalPath
-                                } catch (_: Exception) { return@filter false }
-                                canonicalDir == canonicalBase ||
-                                    canonicalDir.startsWith(canonicalBase + java.io.File.separator)
-                            }
+                        } catch (e: Exception) {
+                            logger.warn(e) { "[ACP] SessionManager.loadSessions: failed to canonicalize project base '$currentProjectBase' — will return empty list to prevent cross-project leak" }
+                            null
                         }
-                        if (filtered.isNotEmpty()) {
-                            logger.info { "[ACP] SessionManager.loadSessions: filtered ${unfilteredList.size} → ${filtered.size} sessions matching project" }
-                            filtered
-                        } else {
-                            // No matches after filtering — do NOT fall back to showing
-                            // all sessions. On a shared server, the unfiltered list may
-                            // contain sessions from other projects (data isolation leak).
-                            // Keep the empty list and let the user see "No sessions" with
-                            // the option to create a new session.
-                            logger.warn { "[ACP] SessionManager.loadSessions: no sessions match project path ($currentProjectBase) — ${unfilteredList.size} unfiltered sessions exist but are not shown (cross-project leak prevented)" }
+                        if (canonicalBase == null) {
+                            // Canonicalization failed — return empty list for security.
+                            // On a shared server, the unfiltered list may contain sessions
+                            // from other projects. Without canonicalization, we cannot
+                            // verify the project boundary, so we must NOT show any sessions
+                            // to prevent cross-project data leakage. The user can still
+                            // create a new session.
+                            logger.warn { "[ACP] SessionManager.loadSessions: canonicalization failed for project base '$currentProjectBase' — returning empty list to prevent cross-project leak" }
                             emptyList()
+                        } else {
+                            val filtered = unfilteredList.filter { session ->
+                                // Canonicalize the server-provided directory before
+                                // prefix comparison to prevent path traversal bypass
+                                // (e.g., "C:\Projects\MyApp\..\OtherProject" would
+                                // pass a naive startsWith check but resolve to a
+                                // different project).
+                                val dir = session.directory
+                                if (dir.isBlank()) {
+                                    false
+                                } else {
+                                    val canonicalDir = try {
+                                        java.io.File(dir).canonicalPath
+                                    } catch (_: Exception) { return@filter false }
+                                    canonicalDir == canonicalBase ||
+                                        canonicalDir.startsWith(canonicalBase + java.io.File.separator)
+                                }
+                            }
+                            if (filtered.isNotEmpty()) {
+                                logger.info { "[ACP] SessionManager.loadSessions: filtered ${unfilteredList.size} → ${filtered.size} sessions matching project" }
+                                filtered
+                            } else {
+                                // No matches after filtering — do NOT fall back to showing
+                                // all sessions. On a shared server, the unfiltered list may
+                                // contain sessions from other projects (data isolation leak).
+                                // Keep the empty list and let the user see "No sessions" with
+                                // the option to create a new session.
+                                logger.warn { "[ACP] SessionManager.loadSessions: no sessions match project path ($currentProjectBase) — ${unfilteredList.size} unfiltered sessions exist but are not shown (cross-project leak prevented)" }
+                                emptyList()
+                            }
                         }
                     } else {
                         unfilteredList
                     }
                 } catch (e: CancellationException) {
                     throw e
-                } catch (_: Exception) {
-                    // Already have empty list — keep it
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] SessionManager.loadSessions: unfiltered retry also failed — keeping empty list" }
                 }
             }
 
@@ -584,6 +598,7 @@ class SessionManager(
             // Retry once — stale _childSessionMap can cause orphaned children
             try { loadSessions() } catch (e: CancellationException) { throw e } catch (e: Exception) {
                 logger.warn(e) { "[ACP] archiveSession: loadSessions retry also failed — proceeding with stale data" }
+                logger.error { "[ACP] archiveSession: both loadSessions() attempts failed — child sessions may be orphaned. Proceeding with direct deletion of $targetSessionId only." }
             }
         }
 
@@ -683,6 +698,7 @@ class SessionManager(
         // deletion of top-level sessions still works.
         try { loadSessions() } catch (e: CancellationException) { throw e } catch (e: Exception) {
             logger.error(e) { "[ACP] clearAllSessions: loadSessions failed — child sessions may be orphaned" }
+            logger.error { "[ACP] clearAllSessions: loadSessions() failed — child sessions may be orphaned. Proceeding with direct deletion of top-level sessions only." }
         }
 
         // Re-read the loaded state AFTER loadSessions() so we use fresh data
@@ -823,21 +839,23 @@ class SessionManager(
                 return
             }
             is SseEvent.Subtask -> {
-                // The Subtask event's `sessionId` field is the CHILD's session ID.
-                // The `processEvent` routing context (`sessionId` variable) is also
-                // `event.sessionId` (the child's ID), NOT the parent's ID — the SSE
-                // parser sets `SseEvent.Subtask.sessionId` to the child's session ID.
-                // The parent's session ID is NOT available in the Subtask event payload.
+                // The Subtask event is parsed from a "message.part.updated" SSE event
+                // where the part type is "subtask". The `sessionId` here is the session
+                // that OWNS the message containing the subtask part — i.e., the PARENT
+                // session (the parent's assistant message includes the subtask part).
+                // The child's session ID is NOT present in the Subtask event payload
+                // (OpenCodePart.Subtask has only prompt, description, agent, model).
                 //
                 // We CANNOT populate the childToParent reverse index from Subtask
-                // events because we don't know the parent's session ID. Mapping
-                // childId as both child and parent would create a
-                // self-referential mapping (childId → childId), which would cause
-                // getParentSession to return the child's own ID as its parent.
-                //
+                // events because we don't know the child's session ID from this event.
                 // The reverse index is populated solely from loadSessions(), which
                 // has `parentID` on each SessionItem. The agent label is still
                 // captured from the Subtask event for display purposes.
+                //
+                // When a child session needs permission before loadSessions() has
+                // populated the reverse index, the orphan-permission retry in
+                // OpenCodeService.startGlobalSignalCollection() triggers a
+                // loadSessions() to fetch the child's parentID and retry the relay.
                 val childSessionId = event.sessionId
                 val agent = event.agent
                 // Only capture the agent label — don't populate the reverse index
@@ -845,7 +863,7 @@ class SessionManager(
                     childSessionTracker.setChildAgentLabel(childSessionId, agent)
                 }
                 childSessionTracker.addKnownChild(childSessionId)
-                logger.info { "[ACP] Subtask event: childSessionId=$childSessionId, agent=$agent — agent label captured, reverse index NOT populated (parent unknown from Subtask event)" }
+                logger.info { "[ACP] Subtask event: parentSessionId=$childSessionId, agent=$agent — agent label captured, reverse index NOT populated (child session ID unknown from Subtask event)" }
                 // Still route to SessionState for existing ToolPill rendering behavior
                 sessionsLock.withLock { sessions[sessionId] }?.let { state ->
                     state.processEvent(event)
@@ -929,6 +947,17 @@ class SessionManager(
 
     fun abortStreaming(reason: String) {
         getActiveSession()?.abortStreaming(reason)
+    }
+
+    /**
+     * Abort streaming with a fallback message ID for the case where [createAssistantMessage]
+     * sent a ResetTurn control event that hasn't been processed yet (activeMessageId is still
+     * null). The fallback ID is the assistant message ID returned by [createAssistantMessage].
+     * Without this, a fast-failing send (e.g., server rejects attachment) would leave the
+     * assistant message stuck in isStreaming=true forever (a "ghost message").
+     */
+    fun abortStreamingWithFallback(reason: String, fallbackMessageId: String) {
+        getActiveSession()?.abortStreamingWithFallback(reason, fallbackMessageId)
     }
 
     fun addMessage(message: ChatMessage) {
@@ -1018,6 +1047,81 @@ class SessionManager(
     internal fun getActiveSession(): SessionState? {
         val id = _activeSessionId.value ?: return null
         return sessionsLock.withLock { sessions[id] }
+    }
+
+    /**
+     * Latest SSE activity timestamp across the active session AND all known
+     * cached descendants. Lets the activity monitor treat child/subagent
+     * generation as activity on the parent turn, so timeouts reset when
+     * subagents are actively generating.
+     *
+     * Returns the max of (parent's lastActivityTimeMs, max over all cached
+     * children's lastActivityTimeMs). Children are identified via both
+     * [_childSessionMap] (from loadSessions) and [childSessionTracker.knownChildSessionIds]
+     * (from Subtask SSE events, covers the pre-loadSessions window).
+     *
+     * Returns current time if no active session (defensive — avoids false-positive).
+     *
+     * Thread safety: reads `lastActivityTimeMs` which is `@Volatile` in
+     * [TurnLifecycleState]. The `sessionsLock` is held only for the O(children)
+     * map lookups — brief, no contention.
+     */
+    internal fun getEffectiveLastActivityMs(): Long {
+        val activeId = _activeSessionId.value ?: return System.currentTimeMillis()
+        val parentTs = sessionsLock.withLock { sessions[activeId] }
+            ?.lastActivityTimeMs ?: return System.currentTimeMillis()
+        val childIds = (_childSessionMap.value[activeId]?.map { it.id } ?: emptyList())
+            .plus(childSessionTracker.knownChildSessionIds.value)
+            .distinct()
+        if (childIds.isEmpty()) return parentTs
+        var maxTs = parentTs
+        sessionsLock.withLock {
+            for (cid in childIds) {
+                sessions[cid]?.let { if (!it.isClosed) maxTs = maxOf(maxTs, it.lastActivityTimeMs) }
+            }
+        }
+        return maxTs
+    }
+
+    /**
+     * Whether any known child session of the active session is actively generating.
+     *
+     * A child is "actively generating" if EITHER:
+     * - It is in [_streamingSessionIds] (StreamingStarted fired, StreamingCompleted/SessionIdle
+     *   not yet fired), OR
+     * - It has received an SSE event in the last [idleThresholdMs] (default 60s,
+     *   matching SSE_HEALTH_CHECK_INTERVAL_MS).
+     *
+     * Used by [ResponseTimeoutMonitor] to suspend the tool-stuck ceiling while
+     * subagents are working. The ceiling is PRESERVED as a safety net — it still
+     * fires when no child is active (genuinely stuck tool, crashed child, lost
+     * ToolResult after SSE gap).
+     *
+     * The `_streamingSessionIds` check survives LRU eviction of the child's
+     * SessionState (the set is maintained independently of the cache), so a
+     * child that is evicted but still streaming on the server still counts as
+     * active.
+     *
+     * Returns false if no active session or no known children are active.
+     */
+    internal fun isAnyChildActivelyGenerating(idleThresholdMs: Long = 60_000L): Boolean {
+        val activeId = _activeSessionId.value ?: return false
+        val now = System.currentTimeMillis()
+        val candidateIds = (_childSessionMap.value[activeId]?.map { it.id } ?: emptyList())
+            .plus(childSessionTracker.knownChildSessionIds.value)
+            .distinct()
+        val streamingIds = _streamingSessionIds.value
+        sessionsLock.withLock {
+            for (cid in candidateIds) {
+                // A child in the streaming set is active regardless of cache state
+                // (survives LRU eviction — the set is maintained from allSessionSignals).
+                if (cid in streamingIds) return true
+                val state = sessions[cid] ?: continue
+                if (state.isClosed) continue
+                if (now - state.lastActivityTimeMs < idleThresholdMs) return true
+            }
+        }
+        return false
     }
 
     /**

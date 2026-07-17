@@ -1,6 +1,7 @@
 package com.opencode.acp.chat.viewmodel
 
 import com.opencode.acp.adapter.OpenCodeClient
+import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.chat.service.SendMessageResult
@@ -54,7 +55,7 @@ class ReviewCommandHandler(
     private val project: Project,
     private val gitService: GitService,
     private val controlStateProvider: () -> com.opencode.acp.chat.model.ControlBarState,
-    private val sendFunction: suspend (String) -> SendMessageResult,
+    private val sendFunction: suspend (String, List<AttachedFile>) -> SendMessageResult,
     private val sendWithModelFunction: suspend (
         text: String,
         modelID: String?,
@@ -130,7 +131,7 @@ class ReviewCommandHandler(
             val index = ReviewCommentManager.getInstance(project).getIndex()
             // Route through the ViewModel's sendMessage() so _streamPhase,
             // streamingSessionIds, and recordCommand() stay consistent with the UI.
-            sendFunction(ReviewSkill.buildResolvePrompt(index))
+            sendFunction(ReviewSkill.buildResolvePrompt(index), emptyList())
         }
     }
 
@@ -189,7 +190,7 @@ class ReviewCommandHandler(
             // No model args — use the currently-selected control-bar model.
             // Route through the ViewModel's sendMessage() so _streamPhase and
             // streamingSessionIds stay consistent with the UI.
-            sendFunction(prompt)
+            sendFunction(prompt, emptyList())
             return
         }
 
@@ -255,10 +256,15 @@ class ReviewCommandHandler(
             // continuing with the remaining models if the session is in a
             // bad state.
             if (result is SendMessageResult.Error) {
-                injectLocalMessage(
-                    "⚠️ Review with ${model.displayName} failed: ${result.message}. " +
-                        "Remaining models skipped."
-                )
+                // If the user cancelled AND the send failed, prefer the cancel message
+                if (isCancelledProvider()) {
+                    injectLocalMessage("⏹ Review cancelled by user. Remaining models skipped.")
+                } else {
+                    injectLocalMessage(
+                        "⚠️ Review with ${model.displayName} failed: ${result.message}. " +
+                            "Remaining models skipped."
+                    )
+                }
                 break
             }
         }

@@ -9,7 +9,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 
 private val logger = KotlinLogging.logger {}
 
@@ -43,29 +42,20 @@ class PrunerConfigWriter(private val projectBasePath: java.nio.file.Path) {
     fun writeConfig(settings: OpenCodeContextSettingsState): Boolean {
         return try {
             val opencodeDir = projectBasePath.resolve(".opencode")
+            // NOTE: createDirectories throws on read-only filesystems (e.g. CI
+            // sandboxes, containerized mounts). The error is logged at ERROR
+            // level, which may alarm users in read-only environments even though
+            // the pruner is non-essential. Consider downgrading to WARN.
             Files.createDirectories(opencodeDir)
 
             val configFile = opencodeDir.resolve(ChatConstants.PRUNER_CONFIG_FILENAME)
             val config = buildConfigObject(settings)
-
-            // Write atomically via temp file + rename. ATOMIC_MOVE may not be
-            // supported on all filesystems (e.g., Windows NTFS cross-volume).
-            // Fall back to non-atomic move if ATOMIC_MOVE fails.
-            val tempFile = Files.createTempFile(opencodeDir, "sigil-pruner.", ".tmp")
-            try {
-                Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), config))
-                try {
-                    Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-                } catch (_: java.nio.file.FileSystemException) {
-                    // ATOMIC_MOVE not supported — fall back to non-atomic move
-                    Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING)
-                }
+            val content = json.encodeToString(JsonObject.serializer(), config)
+            val written = com.opencode.acp.chat.util.AtomicFileWriter.writeAtomically(configFile, content)
+            if (written) {
                 logger.info { "[ACP] PrunerConfigWriter: wrote config to $configFile" }
-                true
-            } catch (e: Exception) {
-                try { Files.deleteIfExists(tempFile) } catch (_: Exception) {}
-                throw e
             }
+            written
         } catch (e: Exception) {
             logger.error(e) { "[ACP] PrunerConfigWriter: failed to write config" }
             false
@@ -135,6 +125,9 @@ class PrunerConfigWriter(private val projectBasePath: java.nio.file.Path) {
             put("compress", buildJsonObject {
                 put("enabled", JsonPrimitive(settings.prunerCompressEnabled))
                 put("mode", JsonPrimitive(settings.prunerCompressMode))
+                // MAINTENANCE: This list is hardcoded. When new protected tools are added to
+                // the OpenCode server, update this list manually. Consider making this configurable
+                // via settings or reading from ToolRegistry at write time.
                 put("protectedTools", kotlinx.serialization.json.buildJsonArray {
                     listOf("task", "skill", "todowrite", "todoread", "write", "edit").forEach {
                         add(JsonPrimitive(it))

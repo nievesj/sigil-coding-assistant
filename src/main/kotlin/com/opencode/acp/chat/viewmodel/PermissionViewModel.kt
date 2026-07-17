@@ -15,12 +15,14 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -48,6 +50,14 @@ class PermissionViewModel(
     private val scope: CoroutineScope,
     private val service: OpenCodeService,
     private val project: Project,
+    /**
+     * Provider for Brave Mode state. When `true`, all permission prompts are
+     * auto-approved with [PermissionResponse.ALLOW_ONCE] instead of showing the
+     * UI dialog. The server still enforces explicit `deny` rules before
+     * sending the permission SSE event, so Brave Mode cannot override hard
+     * denials. Defaults to always-off for backward compatibility.
+     */
+    private val braveModeProvider: () -> Boolean = { false },
 ) {
 
     private val logger = KotlinLogging.logger {}
@@ -76,21 +86,65 @@ class PermissionViewModel(
 
     // ── Active-session permission ──────────────────────────────────────────
 
-    /** Set the active-session permission prompt (from [UiSignal.PermissionRequested]). */
+    /** Set the active-session permission prompt (from [UiSignal.PermissionRequested]).
+     *
+     *  When Brave Mode is enabled, the prompt is NOT shown to the user. Instead,
+     *  the permission is auto-approved with [PermissionResponse.ALLOW_ONCE] on a
+     *  background coroutine. The server still enforces explicit `deny` rules
+     *  before sending the permission SSE event, so Brave Mode cannot override
+     *  hard denials — the event would not arrive for denied tools. */
     fun setPermissionPrompt(prompt: PermissionPrompt?) {
+        if (prompt != null && braveModeProvider()) {
+            logger.info { "[ACP] Brave Mode: auto-approving permission ${prompt.permissionId} (tool=${prompt.toolName})" }
+            scope.launch {
+                try {
+                    withContext(NonCancellable) {
+                        service.respondPermission(
+                            prompt.permissionId, prompt.toolCallId, prompt.sessionId,
+                            PermissionResponse.ALLOW_ONCE,
+                            toolName = prompt.toolName,
+                            patterns = prompt.patterns,
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    // Scope cancelled (tool window closed). The POST was wrapped in
+                    // NonCancellable so it completed if it started. Don't re-throw —
+                    // the ViewModel is being disposed, no point showing the prompt.
+                    logger.info { "[ACP] Brave Mode auto-approve cancelled (scope disposed) for ${prompt.permissionId}" }
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] Brave Mode auto-approve failed for ${prompt.permissionId} — falling back to manual prompt" }
+                    // Fall back to showing the prompt so the user can retry manually.
+                    // The calling code has already returned (this runs async), so setting
+                    // the StateFlow here surfaces the prompt for manual approval.
+                    _permissionPrompt.value = prompt
+                    // Start the timeout so the fallback prompt doesn't hang the agent
+                    // indefinitely if the user doesn't notice it. Mirrors the non-Brave
+                    // path where setPermissionPrompt + startPermissionTimeout are paired.
+                    startPermissionTimeout()
+                }
+            }
+            return
+        }
         _permissionPrompt.value = prompt
     }
 
     /** Start the active-session permission timeout. Reads the timeout from
      *  [OpenCodeSettingsState] at call time — if the user changes the setting
      *  while a prompt is pending, the current timeout is NOT restarted; the
-     *  new value applies to the next prompt. */
+     *  new value applies to the next prompt.
+     *
+     *  On timeout, sends REJECT_ONCE to the server so the agent isn't blocked
+     *  indefinitely waiting for a response. The server's Deferred promise must
+     *  be resolved — without this, the tool stays PENDING and the agent hangs
+     *  silently with no way for the user to re-trigger the prompt. */
     fun startPermissionTimeout() {
         val toolName = _permissionPrompt.value?.toolName ?: ""
-        // Capture permissionId at START time, not at fire time.
+        // Capture all prompt fields at START time, not at fire time.
         // If a new permission prompt arrives before this timeout fires, the
         // callback must NOT clear the new prompt — only the one it was started for.
         val capturedPermId = _permissionPrompt.value?.permissionId ?: ""
+        val capturedSessionId = _permissionPrompt.value?.sessionId ?: ""
+        val capturedToolCallId = _permissionPrompt.value?.toolCallId ?: ""
         service.permissionManager.startPermissionTimeout(
             timeoutSeconds = OpenCodeSettingsState.getInstance().state.permissionTimeoutSeconds,
             toolName = toolName,
@@ -102,6 +156,29 @@ class PermissionViewModel(
             }
             OpenCodeNotifications.notifyPermissionTimedOut(project, toolName)
             logger.info { "[ACP] Permission timed out: permissionId=$capturedPermId, tool=$toolName" }
+            // Send REJECT_ONCE to the server so the agent isn't blocked indefinitely.
+            // Use service.scope + NonCancellable so the reject POST survives tool
+            // window disposal — the server's Deferred must be resolved regardless.
+            // Call permissionManager.respondPermission directly (not the ViewModel
+            // wrapper) to avoid touching UI state (already cleared above).
+            if (capturedPermId.isNotEmpty() && capturedSessionId.isNotEmpty()) {
+                service.scope.launch {
+                    withContext(NonCancellable) {
+                        try {
+                            service.permissionManager.respondPermission(
+                                permissionId = capturedPermId,
+                                toolCallId = capturedToolCallId,
+                                sessionId = capturedSessionId,
+                                response = PermissionResponse.REJECT_ONCE,
+                            )
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            logger.warn(e) { "[ACP] Timeout reject failed for permission $capturedPermId" }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -131,6 +208,11 @@ class PermissionViewModel(
             // prompt open so the user can retry. Track the failure so the
             // PermissionReplied handler can surface a notification if the server
             // still processed it despite the network error (TDD §4.2.4).
+            // NOTE: The original permission timeout is still active — we do NOT call
+            // cancelPermissionTimeout() here. If the user retries and the retry also fails,
+            // the timeout from the FIRST attempt may fire and send REJECT_ONCE. This is
+            // acceptable: the server handles duplicate responses idempotently, and the
+            // reject unblocks the agent if the user walks away without retrying.
             failedPermissionPostSessions.add(prompt.sessionId)
             logger.warn(e) { "[ACP] Permission response failed — keeping prompt open for retry" }
         }
@@ -138,8 +220,51 @@ class PermissionViewModel(
 
     // ── Child-session permission ───────────────────────────────────────────
 
-    /** Add a child permission prompt (from [UiSignal.ChildPermissionRequested]). */
+    /** Add a child permission prompt (from [UiSignal.ChildPermissionRequested]).
+     *
+     *  When Brave Mode is enabled, the prompt is NOT shown to the user. Instead,
+     *  the permission is auto-approved with [PermissionResponse.ALLOW_ONCE] on a
+     *  background coroutine. The server still enforces explicit `deny` rules
+     *  before sending the permission SSE event, so Brave Mode cannot override
+     *  hard denials. */
     fun addChildPermissionPrompt(prompt: ChildPermissionPrompt) {
+        if (braveModeProvider()) {
+            val childId = prompt.childSessionId
+            logger.info { "[ACP] Brave Mode: auto-approving child permission ${prompt.permissionId} (tool=${prompt.toolName}, child=$childId)" }
+            // Use service.scope (not the ViewModel scope) so the auto-approve POST
+            // survives tool window disposal. The withContext(NonCancellable) below
+            // protects the POST itself, but using service.scope ensures the
+            // coroutine isn't cancelled when the ViewModel scope is disposed —
+            // otherwise a disposal mid-POST would silently drop the permission and
+            // leave the server's Deferred hanging.
+            service.scope.launch {
+                try {
+                    withContext(NonCancellable) {
+                        service.permissionManager.respondPermission(
+                            prompt.permissionId,
+                            prompt.toolCallId,
+                            childId,
+                            PermissionResponse.ALLOW_ONCE,
+                            prompt.toolName,
+                            prompt.patterns,
+                            if (prompt.agentLabelVerified) prompt.subAgentLabel else "",
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    logger.info { "[ACP] Brave Mode child auto-approve cancelled (scope disposed) for ${prompt.permissionId}" }
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] Brave Mode auto-approve failed for child permission ${prompt.permissionId} — falling back to manual prompt" }
+                    // Fall back to the non-Brave-Mode path: add the prompt to the map
+                    // and start the timeout so the user can retry manually.
+                    _childPermissionPrompts.update { prompts ->
+                        val existing = prompts[childId] ?: emptyList()
+                        prompts + (childId to (existing + prompt))
+                    }
+                    startChildPermissionTimeout(childId, prompt.toolName)
+                }
+            }
+            return
+        }
         val childId = prompt.childSessionId
         _childPermissionPrompts.update { prompts ->
             val existing = prompts[childId] ?: emptyList()

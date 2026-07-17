@@ -22,6 +22,7 @@ import io.mockk.just
 import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.runs
+import io.mockk.slot
 import io.mockk.verify
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
@@ -193,6 +194,113 @@ class PermissionViewModelTest {
                 toolName = "",
                 any(),
             )
+        }
+    }
+
+    @Test
+    fun `startPermissionTimeout callback sends REJECT_ONCE to server on timeout`() = runTest {
+        // Override service.scope to use the test scope for virtual time control
+        every { service.scope } returns this
+        val vm = PermissionViewModel(
+            scope = this,
+            service = service,
+            project = project,
+        )
+        val prompt = makePermissionPrompt(
+            permissionId = "perm_timeout",
+            sessionId = "ses_timeout",
+            toolCallId = "tc_timeout",
+            toolName = "bash",
+        )
+        vm.setPermissionPrompt(prompt)
+
+        // Capture the timeout callback passed to permissionManager
+        val callbackSlot = slot<() -> Unit>()
+        every { permissionManager.startPermissionTimeout(any(), any(), capture(callbackSlot)) } just runs
+
+        vm.startPermissionTimeout()
+
+        // Simulate the timeout firing
+        callbackSlot.captured.invoke()
+        advanceUntilIdle()
+
+        // Verify REJECT_ONCE was sent to the server with the captured prompt fields
+        coVerify {
+            permissionManager.respondPermission(
+                permissionId = "perm_timeout",
+                toolCallId = "tc_timeout",
+                sessionId = "ses_timeout",
+                response = PermissionResponse.REJECT_ONCE,
+            )
+        }
+        // The prompt should have been cleared (it was still the captured one)
+        vm.permissionPrompt.value shouldBe null
+    }
+
+    @Test
+    fun `startPermissionTimeout callback does not clear a newer prompt but still sends REJECT for the original`() = runTest {
+        every { service.scope } returns this
+        val vm = PermissionViewModel(
+            scope = this,
+            service = service,
+            project = project,
+        )
+        val original = makePermissionPrompt(
+            permissionId = "perm_original",
+            sessionId = "ses_1",
+            toolCallId = "tc_1",
+        )
+        vm.setPermissionPrompt(original)
+
+        val callbackSlot = slot<() -> Unit>()
+        every { permissionManager.startPermissionTimeout(any(), any(), capture(callbackSlot)) } just runs
+        vm.startPermissionTimeout()
+
+        // A newer permission prompt arrives before the timeout fires
+        val newer = makePermissionPrompt(
+            permissionId = "perm_newer",
+            sessionId = "ses_1",
+            toolCallId = "tc_2",
+        )
+        vm.setPermissionPrompt(newer)
+
+        // The original timeout fires
+        callbackSlot.captured.invoke()
+        advanceUntilIdle()
+
+        // REJECT is still sent for the ORIGINAL prompt (its agent is blocked and
+        // needs the reject — the server resolves the original Deferred promise).
+        coVerify {
+            permissionManager.respondPermission(
+                permissionId = "perm_original",
+                toolCallId = "tc_1",
+                sessionId = "ses_1",
+                response = PermissionResponse.REJECT_ONCE,
+            )
+        }
+        // The newer prompt must NOT have been cleared by the stale timeout
+        vm.permissionPrompt.value shouldBe newer
+    }
+
+    @Test
+    fun `startPermissionTimeout callback does not send REJECT when prompt was empty at start time`() = runTest {
+        every { service.scope } returns this
+        val vm = PermissionViewModel(
+            scope = this,
+            service = service,
+            project = project,
+        )
+        // No prompt set — startPermissionTimeout captures empty IDs
+        val callbackSlot = slot<() -> Unit>()
+        every { permissionManager.startPermissionTimeout(any(), any(), capture(callbackSlot)) } just runs
+        vm.startPermissionTimeout()
+
+        callbackSlot.captured.invoke()
+        advanceUntilIdle()
+
+        // REJECT should NOT be sent because capturedPermId/capturedSessionId are empty
+        coVerify(exactly = 0) {
+            permissionManager.respondPermission(any(), any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -427,5 +535,155 @@ class PermissionViewModelTest {
         viewModel.close()
         viewModel.permissionPrompt.value shouldBe null
         viewModel.childPermissionPrompts.value shouldBe emptyMap()
+    }
+
+    // ── Brave Mode (auto-approve) ──────────────────────────────────────────
+
+    @Test
+    fun `brave mode auto-approves active-session permission without showing prompt`() = runBlocking {
+        var braveMode = true
+        val vm = PermissionViewModel(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            service = service,
+            project = project,
+            braveModeProvider = { braveMode },
+        )
+        val prompt = makePermissionPrompt(permissionId = "perm_brave", toolName = "bash")
+        coEvery { service.respondPermission(any(), any(), any(), any(), any(), any(), any()) } just runs
+
+        vm.setPermissionPrompt(prompt)
+
+        // Prompt should NOT be shown
+        vm.permissionPrompt.value shouldBe null
+        // Server should have received ALLOW_ONCE
+        coVerify {
+            service.respondPermission(
+                "perm_brave", "tc_1", "ses_1",
+                PermissionResponse.ALLOW_ONCE,
+                toolName = "bash",
+                patterns = emptyList(),
+            )
+        }
+    }
+
+    @Test
+    fun `brave mode off shows active-session prompt normally`() {
+        var braveMode = false
+        val vm = PermissionViewModel(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            service = service,
+            project = project,
+            braveModeProvider = { braveMode },
+        )
+        val prompt = makePermissionPrompt()
+
+        vm.setPermissionPrompt(prompt)
+
+        vm.permissionPrompt.value shouldBe prompt
+    }
+
+    @Test
+    fun `brave mode auto-approves child-session permission without showing prompt`() = runBlocking {
+        var braveMode = true
+        val vm = PermissionViewModel(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            service = service,
+            project = project,
+            braveModeProvider = { braveMode },
+        )
+        val prompt = makeChildPermissionPrompt(childSessionId = "child_brave", permissionId = "perm_cb", toolName = "edit")
+        coEvery { permissionManager.respondPermission(any(), any(), any(), any(), any(), any(), any()) } just runs
+
+        vm.addChildPermissionPrompt(prompt)
+
+        // Child prompt should NOT be shown
+        vm.childPermissionPrompts.value.containsKey("child_brave") shouldBe false
+        // Server should have received ALLOW_ONCE for the child session
+        coVerify {
+            permissionManager.respondPermission(
+                "perm_cb", "tc_c1", "child_brave",
+                PermissionResponse.ALLOW_ONCE,
+                "edit",
+                emptyList(),
+                "fixer",
+            )
+        }
+    }
+
+    @Test
+    fun `brave mode off shows child-session prompt normally`() {
+        var braveMode = false
+        val vm = PermissionViewModel(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            service = service,
+            project = project,
+            braveModeProvider = { braveMode },
+        )
+        val prompt = makeChildPermissionPrompt(childSessionId = "child_normal")
+
+        vm.addChildPermissionPrompt(prompt)
+
+        vm.childPermissionPrompts.value["child_normal"]!! shouldHaveSize 1
+    }
+
+    @Test
+    fun `brave mode toggle at runtime switches from auto-approve to showing prompt`() = runBlocking {
+        var braveMode = true
+        val vm = PermissionViewModel(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            service = service,
+            project = project,
+            braveModeProvider = { braveMode },
+        )
+        val prompt1 = makePermissionPrompt(permissionId = "perm_1")
+        coEvery { service.respondPermission(any(), any(), any(), any(), any(), any(), any()) } just runs
+
+        // Brave mode ON — auto-approve, no prompt shown
+        vm.setPermissionPrompt(prompt1)
+        vm.permissionPrompt.value shouldBe null
+
+        // Disable brave mode at runtime
+        braveMode = false
+        val prompt2 = makePermissionPrompt(permissionId = "perm_2")
+        vm.setPermissionPrompt(prompt2)
+
+        // Now the prompt should be shown
+        vm.permissionPrompt.value shouldBe prompt2
+    }
+
+    @Test
+    fun `brave mode auto-approve failure falls back to showing prompt`() = runBlocking {
+        var braveMode = true
+        val vm = PermissionViewModel(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            service = service,
+            project = project,
+            braveModeProvider = { braveMode },
+        )
+        val prompt = makePermissionPrompt(permissionId = "perm_fail")
+        coEvery { service.respondPermission(any(), any(), any(), any(), any(), any(), any()) } throws RuntimeException("network error")
+
+        vm.setPermissionPrompt(prompt)
+
+        // On failure, Brave Mode should fall back to showing the prompt
+        vm.permissionPrompt.value shouldBe prompt
+    }
+
+    @Test
+    fun `brave mode child auto-approve failure falls back to showing prompt`() = runBlocking {
+        var braveMode = true
+        val vm = PermissionViewModel(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            service = service,
+            project = project,
+            braveModeProvider = { braveMode },
+        )
+        val prompt = makeChildPermissionPrompt(childSessionId = "child_fail_brave", permissionId = "perm_cfb", toolName = "edit")
+        coEvery { permissionManager.respondPermission(any(), any(), any(), any(), any(), any(), any()) } throws RuntimeException("network error")
+
+        vm.addChildPermissionPrompt(prompt)
+
+        // On failure, child prompt should be shown (fallback to manual approval)
+        vm.childPermissionPrompts.value.containsKey("child_fail_brave") shouldBe true
     }
 }
