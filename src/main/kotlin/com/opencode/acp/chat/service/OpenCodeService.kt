@@ -98,12 +98,34 @@ class OpenCodeService(private val project: Project) : Disposable {
     )
     val childPermissionRelay = ChildPermissionRelay(sessionManager)
 
+    // Extracted subsystem — handles child-session permission requests from the
+    // global allSessionSignals flow. Encapsulates Brave Mode relay-point
+    // auto-approve and orphan-retry fallback logic. See [PermissionRelayHandler].
+    private val permissionRelayHandler = PermissionRelayHandler(
+        scope = scope,
+        sessionManager = sessionManager,
+        permissionManager = permissionManager,
+        childPermissionRelay = childPermissionRelay,
+    )
+
     // NEW: extracted subsystem — attachment security validation + encoding.
     // projectBasePath and userHomePath MUST be canonicalized — the startsWith
     // boundary check depends on canonical form to handle symlinked project roots.
     private val attachmentValidator = AttachmentValidator(
-        projectBasePath = project.basePath?.let { java.io.File(it).canonicalPath },
-        userHomePath = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath },
+        projectBasePath = project.basePath?.let {
+            try { java.io.File(it).canonicalPath }
+            catch (e: java.io.IOException) {
+                logger.warn(e) { "[ACP] Failed to canonicalize project base path: $it — using non-canonical form" }
+                it
+            }
+        },
+        userHomePath = System.getProperty("user.home")?.let {
+            try { java.io.File(it).canonicalPath }
+            catch (e: java.io.IOException) {
+                logger.warn(e) { "[ACP] Failed to canonicalize user home path: $it — using non-canonical form" }
+                it
+            }
+        },
     )
     private val responseTimeoutMonitor = ResponseTimeoutMonitor(
         scope = scope,
@@ -119,9 +141,16 @@ class OpenCodeService(private val project: Project) : Disposable {
         onReconnectSuccess = {
             // All three post-reconnect calls stay in OpenCodeService — SseConnectionManager
             // signals success via this callback and stays focused on transport.
-            sessionManager.recoverBackgroundSessions(connectionManager.client)
-            sessionManager.fetchTodos()
-            sessionManager.computeSessionContext()
+            // Each call is independently wrapped so a failure in one doesn't skip the others.
+            try { sessionManager.recoverBackgroundSessions(connectionManager.client) }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { logger.warn(e) { "[ACP] recoverBackgroundSessions failed on reconnect" } }
+            try { sessionManager.fetchTodos() }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { logger.warn(e) { "[ACP] fetchTodos failed on reconnect" } }
+            try { sessionManager.computeSessionContext() }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { logger.warn(e) { "[ACP] computeSessionContext failed on reconnect" } }
         },
     )
 
@@ -174,42 +203,10 @@ class OpenCodeService(private val project: Project) : Disposable {
                         session?.responseDeferred = null
                     }
                     is UiSignal.PermissionRequested -> {
-                        // Relay child permissions to parent (non-active sessions only)
-                        if (sessionId != sessionManager.activeSessionId.value) {
-                            val relayed = childPermissionRelay.relayChildPermission(sessionId, signal.prompt)
-                            if (relayed != null) {
-                                sessionManager.emitGlobalSignal(relayed)
-                                sessionManager.markChildPendingPermission(sessionId)
-                            } else {
-                                // Orphan: the child's parent mapping is not yet populated.
-                                // This happens when a subtask requests permission before
-                                // loadSessions() has refreshed the child→parent reverse index.
-                                // The Subtask SSE event carries the PARENT's sessionId (the
-                                // session owning the message with the subtask part), NOT the
-                                // child's — so the reverse index can't be populated from it.
-                                // Trigger loadSessions() to fetch the child's SessionItem
-                                // (which has parentID) and populate the reverse index, then
-                                // retry the relay.
-                                logger.info { "[ACP] Orphan permission for session $sessionId — triggering loadSessions() to populate parent mapping" }
-                                scope.launch {
-                                    try {
-                                        sessionManager.loadSessions()
-                                    } catch (e: CancellationException) {
-                                        throw e
-                                    } catch (e: Exception) {
-                                        logger.warn(e) { "[ACP] loadSessions() failed during orphan permission retry for $sessionId" }
-                                    }
-                                    val retryRelayed = childPermissionRelay.relayChildPermission(sessionId, signal.prompt)
-                                    if (retryRelayed != null) {
-                                        sessionManager.emitGlobalSignal(retryRelayed)
-                                        sessionManager.markChildPendingPermission(sessionId)
-                                    } else {
-                                        logger.warn { "[ACP] Orphan permission for $sessionId — still no parent after loadSessions(), prompt dropped" }
-                                    }
-                                }
-                            }
-                        }
-                        // If sessionId == activeSessionId, it's already handled via activeSignals
+                        // Delegate to PermissionRelayHandler — handles Brave Mode
+                        // relay-point auto-approve and orphan-retry fallback. Returns
+                        // false for active-session requests (handled via activeSignals).
+                        permissionRelayHandler.handlePermissionRequested(sessionId, signal)
                     }
                     is UiSignal.PermissionReplied -> {
                         // Confirm server processed the reply — clear child pending permission flag
@@ -308,7 +305,16 @@ class OpenCodeService(private val project: Project) : Disposable {
                 return
             }
             logger.info { "[ACP] MCP: initializing ${configs.size} server(s): ${configs.map { it.name }}" }
-            mcpManager!!.initialize()
+            // Pass a callback that re-runs tool discovery when a BUILTIN_IDE server
+            // connects via background retry. The JetBrains MCP Server starts
+            // asynchronously and may not be ready when initialize() runs. The
+            // background retry in McpManager keeps trying for 60s; when it
+            // connects, this callback re-discovers tools so MCP tools become
+            // available without restarting the session.
+            mcpManager!!.initialize(onServerConnected = {
+                logger.info { "[ACP] MCP: background retry connected — re-running tool discovery" }
+                discoverToolsInBackground()
+            })
 
             // Wire ToolRegistry after MCP is initialized (McpManager has server URLs)
             toolRegistry = com.opencode.acp.mcp.ToolRegistry(
@@ -375,6 +381,8 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // COUPLING: ProcessManager always binds to 127.0.0.1 (see ProcessManager.launchOpenCodeBinary).
                 // If ProcessManager ever supports a configurable host, read it from connectionManager.host
                 // instead of hardcoding 127.0.0.1 here.
+                // TODO: If ProcessManager ever supports a configurable host, read it from
+                // connectionManager.host instead of hardcoding 127.0.0.1. See OpenCodeService.kt:377-383.
                 val baseUrl = "http://127.0.0.1:${connectionManager.port}"
                 val mcpUrls = mcpMgr.getServerUrls()
                 logger.info { "[ACP] discoverToolsInBackground: starting discovery (${mcpUrls.size} MCP servers connected)" }
@@ -416,12 +424,15 @@ class OpenCodeService(private val project: Project) : Disposable {
                 toolName to Pair(enabled, permission)
             }
         } catch (e: Exception) {
-            // Log the failure — the corrupted value will be overwritten naturally
-            // when the user next saves settings. Don't destructively clear it here
-            // because this parse function is called from background coroutines
-            // (discoverToolsInBackground) where a transient race could destroy
-            // valid saved permissions.
-            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — value will be overwritten on next settings save" }
+            // Log at ERROR — corrupted tool permissions is a security-relevant failure.
+            // Returning emptyMap() means loadEnabledAndPermissions() iterates zero entries,
+            // leaving tools at their discovery default (ALLOW for all). This is a fail-open
+            // pattern — the user's ASK/DENY choices are lost until they re-save settings.
+            // We accept this because: (1) the corrupted value is overwritten on next save,
+            // (2) destructively clearing the persisted value from a background coroutine
+            // could destroy valid permissions on a transient race, and (3) the server-side
+            // permission rules still enforce hard denials regardless of client state.
+            logger.error(e) { "[ACP] Failed to parse persisted tool permissions — tools will use discovery defaults (ALLOW) until settings are re-saved" }
             emptyMap()
         }
     }
@@ -489,14 +500,14 @@ class OpenCodeService(private val project: Project) : Disposable {
     suspend fun archiveSession(sessionId: String) = sessionManager.archiveSession(sessionId)
     suspend fun clearAllSessions() = sessionManager.clearAllSessions()
 
-    // ── Streaming session tracking (sidebar shimmer) ─────────────────────────
+    // ── Streaming session tracking (sidebar spinner) ──────────────────────────
 
-    /** Imperatively add a session ID to the streaming set (activates sidebar shimmer).
-     *  Used by ChatViewModel.sendMessage() before the suspend call so the shimmer
+    /** Imperatively add a session ID to the streaming set (activates sidebar spinner).
+     *  Used by ChatViewModel.sendMessage() before the suspend call so the spinner
      *  appears immediately on send. Idempotent. */
     fun addStreamingSession(sessionId: String) = sessionManager.addStreamingSession(sessionId)
 
-    /** Imperatively remove a session ID from the streaming set (deactivates sidebar shimmer).
+    /** Imperatively remove a session ID from the streaming set (deactivates sidebar spinner).
      *  Used by ChatViewModel on cancel/switch/error. Idempotent. */
     fun removeStreamingSession(sessionId: String) = sessionManager.removeStreamingSession(sessionId)
 
@@ -662,8 +673,17 @@ class OpenCodeService(private val project: Project) : Disposable {
             // the event processing coroutine is holding stateLock (e.g., inside
             // resegmentDirect's long markdown parse).
             try {
-                withTimeoutOrNull(5000) { sessionToFinalize?.completeStreaming(assistantMsgId) } ?: run {
-                    logger.warn { "[ACP] completeStreaming timed out after 5s during CancellationException handling — message may be stuck in isStreaming=true (ghost message). msgId=$assistantMsgId" }
+                val finalized = withTimeoutOrNull(5000) { sessionToFinalize?.completeStreaming(assistantMsgId) }
+                if (finalized == null && sessionToFinalize != null) {
+                    // completeStreaming timed out — force-set isStreaming=false to prevent
+                    // a perpetual streaming indicator (ghost message). The user must restart
+                    // the session for full recovery, but at least the UI isn't stuck.
+                    logger.warn { "[ACP] completeStreaming timed out after 5s during CancellationException handling — force-finalizing message. msgId=$assistantMsgId" }
+                    try {
+                        sessionManager.forceFinalizeMessage(assistantMsgId)
+                    } catch (ex: Exception) {
+                        logger.debug(ex) { "[ACP] forceFinalizeMessage also failed" }
+                    }
                 }
             } catch (ex: kotlinx.coroutines.CancellationException) {
                 throw ex
@@ -792,8 +812,11 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // Scope cancelled — complete deferred so caller unblocks
                 deferred.complete(Unit)
                 throw e
-            } catch (_: Exception) {
-                // Mutex acquisition failed — complete deferred to unblock caller
+            } catch (e: Exception) {
+                // Mutex acquisition failed — complete deferred to unblock caller.
+                // Log the exception so unexpected failures (e.g., IllegalMonitorStateException)
+                // are visible rather than silently masked.
+                logger.warn(e) { "[ACP] steerCancel: unexpected exception during mutex poll — completing deferred" }
                 deferred.complete(Unit)
             }
         }

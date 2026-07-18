@@ -2,6 +2,8 @@
 
 package com.opencode.acp.chat.ui.compose
 
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -16,9 +18,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
 import com.opencode.acp.chat.model.PartState
 import com.opencode.acp.chat.ui.theme.ChatTheme
@@ -26,7 +33,6 @@ import com.opencode.acp.config.settings.OpenCodeSettingsState
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.markdown.Markdown
 import org.jetbrains.jewel.markdown.processing.MarkdownProcessor
-import org.jetbrains.jewel.ui.component.CircularProgressIndicator
 import org.jetbrains.jewel.ui.component.Text
 
 /**
@@ -65,7 +71,7 @@ private fun ThinkingHeader(
             style = TextStyle(fontSize = ChatTheme.fonts.thinkingLabel)
         )
         if (streaming) {
-            CircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingStreamingSpinnerSize))
+            ThrottledCircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingStreamingSpinnerSize))
         }
     }
 }
@@ -84,7 +90,7 @@ fun ThinkingIndicator(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.padding(vertical = 2.dp),
         ) {
-            CircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingStreamingSpinnerSize))
+            ThrottledCircularProgressIndicator(modifier = Modifier.size(ChatTheme.dims.thinkingStreamingSpinnerSize))
             Text(
                 text = label,
                 fontStyle = FontStyle.Italic,
@@ -132,5 +138,49 @@ fun CollapsibleThinkingPill(
                 selectable = false,
             )
         }
+    }
+}
+
+/**
+ * Throttled circular progress spinner — replaces Jewel's [CircularProgressIndicator]
+ * which uses unthrottled [androidx.compose.animation.core.InfiniteTransition] at 60fps.
+ * This uses [rememberThrottledInfiniteAnimation] (30fps default) to halve GPU frame
+ * pressure during streaming. Visually identical: a rotating arc.
+ */
+@Composable
+private fun ThrottledCircularProgressIndicator(
+    modifier: Modifier = Modifier,
+    tint: Color = ChatTheme.colors.component.thinkingChevron,
+) {
+    val rotationState = rememberThrottledInfiniteAnimation(
+        active = true,
+        initialValue = 0f,
+        targetValue = 360f,
+        durationMillis = 1000,
+        repeatMode = RepeatMode.Restart,
+        label = "thinkingSpinner",
+    )
+    Canvas(modifier = modifier) {
+        val stroke = size.minDimension * 0.12f
+        val diameter = size.width
+        val radius = diameter / 2f - stroke / 2f
+        drawArc(
+            color = tint.copy(alpha = 0.25f),
+            startAngle = 0f,
+            sweepAngle = 360f,
+            useCenter = false,
+            topLeft = Offset(stroke / 2f, stroke / 2f),
+            size = Size(diameter - stroke, diameter - stroke),
+            style = Stroke(width = stroke, cap = StrokeCap.Round)
+        )
+        drawArc(
+            color = tint,
+            startAngle = rotationState.value - 90f,
+            sweepAngle = 90f,
+            useCenter = false,
+            topLeft = Offset(stroke / 2f, stroke / 2f),
+            size = Size(diameter - stroke, diameter - stroke),
+            style = Stroke(width = stroke, cap = StrokeCap.Round)
+        )
     }
 }

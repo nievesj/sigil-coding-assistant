@@ -8,6 +8,7 @@ import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
+import com.opencode.acp.chat.service.FreezeDetector
 import com.opencode.acp.chat.service.OpenCodeService
 import com.opencode.acp.chat.ui.compose.ChatScreen
 import com.opencode.acp.chat.ui.theme.ChatTheme
@@ -64,7 +65,7 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
                         com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
                             .warn("[ACP] disposeActiveComposePanelAsync: ComposePanel.dispose() failed: ${e.message}")
                     }
-                }, "opencode-compose-dispose-${project.name}").apply { isDaemon = true; start() }
+                }, "opencode-compose-dispose-${System.identityHashCode(project)}").apply { isDaemon = true; start() }
             }
         }
 
@@ -79,6 +80,10 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
         val service = project.service<OpenCodeService>()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        // Register the scope with IntelliJ's Disposer so IDE shutdown cancels it
+        // even if the content disposer doesn't fire (e.g., IDE crash).
+        val scopeDisposable = com.intellij.openapi.Disposable { scope.cancel() }
+        com.intellij.openapi.util.Disposer.register(project, scopeDisposable)
         val viewModel = ChatViewModel(scope, service, project)
 
         // Reload the review comment index from disk when the tool window opens.
@@ -93,6 +98,17 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         // editor (the second waits for the first, then re-reads — idempotent).
         scope.launch {
             ReviewCommentManager.getInstance(project).loadAll()
+        }
+
+        // Start freeze detector — captures thread dumps on EDT hangs without
+        // depending on the EDT itself. Writes to <project>/.opencode/freezes/.
+        // Skip when basePath is null (default/virtual projects, scratch files)
+        // to avoid NPE from java.io.File(null, ...).
+        val freezeDumpDir = project.basePath?.let { java.io.File(it, ".opencode/freezes") }
+        val freezeDetector = if (freezeDumpDir != null) {
+            FreezeDetector(freezeDumpDir).also { it.start() }
+        } else {
+            null
         }
 
         toolWindow.addComposeTab("") {
@@ -122,8 +138,11 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
                 override fun dispose() {
                     val logger = com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
                     logger.info("[ACP] ContentDisposer: disposing tool window content")
-                    scope.cancel()
+                    freezeDetector?.stop()
+                    // Close the ViewModel BEFORE cancelling the scope so any async cleanup
+                    // coroutines launched by close() can execute on a still-alive scope.
                     viewModel.close()
+                    scope.cancel()
                     try { component.isVisible = false } catch (_: Exception) {}
                     // CRITICAL: Do NOT call ComposePanel.dispose() synchronously on EDT.
                     // Skiko's render thread may be mid-frame, causing EDT to block → IDE lockup.
@@ -134,8 +153,20 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
                         logger.info("[ACP] ContentDisposer: async disposing ComposePanel=$panel")
                         Thread({
                             try {
+                                // Timeout the dispose to prevent thread accumulation under rapid toggle.
+                                // If dispose() hangs (Skiko mid-frame), log and move on — the JVM
+                                // will reclaim native resources on shutdown.
+                                val disposeThread = Thread.currentThread()
+                                val timeoutThread = Thread({
+                                    try { Thread.sleep(10_000) } catch (_: InterruptedException) { return@Thread }
+                                    if (disposeThread.isAlive) {
+                                        logger.warn("[ACP] ContentDisposer: ComposePanel.dispose() timed out after 10s — thread may leak")
+                                        disposeThread.interrupt()
+                                    }
+                                }, "opencode-compose-dispose-timeout").apply { isDaemon = true; start() }
                                 panel.isVisible = false
                                 panel.dispose()
+                                timeoutThread.interrupt()
                             } catch (e: Exception) {
                                 logger.warn("[ACP] ContentDisposer: ComposePanel.dispose() failed: ${e.message}")
                             }

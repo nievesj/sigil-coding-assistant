@@ -510,7 +510,12 @@ private fun SessionList(
     val streamingChildIds = remember(streamingSessionIds, sessions, hiddenChildIds) {
         val childIds = sessions.filter { it.parentID != null && it.id !in hiddenChildIds }.map { it.id }.toSet()
         val streamingChildren = streamingSessionIds.filter { it in childIds }
-        streamingChildren.take(com.opencode.acp.chat.model.ChatConstants.MAX_VISIBLE_CHILD_SPINNERS).toSet()
+        // Prioritize by recency (updatedAt desc) so the most recently active
+        // streaming children get spinners first when the cap is hit.
+        streamingChildren
+            .sortedByDescending { id -> sessions.find { it.id == id }?.updatedAt ?: 0L }
+            .take(com.opencode.acp.chat.model.ChatConstants.MAX_VISIBLE_CHILD_SPINNERS)
+            .toSet()
     }
 
     // Compute visible items by walking the tree with indices (O(n) instead of
@@ -689,7 +694,8 @@ private fun SessionRow(
             .background(bgColor)
             .border(
                 width = if (isSelected) 1.dp else 0.dp,
-                color = if (isSelected) retrieveColorOrUnspecified("List.selectionForeground").copy(alpha = 0.3f) else Color.Transparent,
+                color = if (isSelected) (retrieveColorOrUnspecified("List.selectionForeground")
+                    .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.text.inverse).copy(alpha = 0.3f) else Color.Transparent,
                 shape = RoundedCornerShape(6.dp)
             )
             .hoverable(interactionSource),
@@ -707,7 +713,7 @@ private fun SessionRow(
                     contentAlignment = Alignment.Center,
                 ) {
                     if (indicator != SessionIndicator.NONE) {
-                        SessionSpinner(modifier = Modifier.size(16.dp), tint = iconTint)
+                        SessionSpinner(modifier = Modifier.size(16.dp), tint = iconTint, active = true)
                     } else {
                         Icon(
                             key = if (isExpanded) AllIconsKeys.General.ChevronDown else AllIconsKeys.General.ChevronRight,
@@ -725,7 +731,7 @@ private fun SessionRow(
                     contentAlignment = Alignment.Center,
                 ) {
                     if (indicator != SessionIndicator.NONE) {
-                        SessionSpinner(modifier = Modifier.size(14.dp), tint = iconTint)
+                        SessionSpinner(modifier = Modifier.size(14.dp), tint = iconTint, active = true)
                     } else {
                         Icon(
                             key = AllIconsKeys.Actions.Forward,
@@ -743,7 +749,7 @@ private fun SessionRow(
                     contentAlignment = Alignment.Center,
                 ) {
                     if (indicator != SessionIndicator.NONE) {
-                        SessionSpinner(modifier = Modifier.size(14.dp), tint = iconTint)
+                        SessionSpinner(modifier = Modifier.size(14.dp), tint = iconTint, active = true)
                     } else {
                         Icon(
                             key = AllIconsKeys.FileTypes.Text,
@@ -877,9 +883,9 @@ private fun SessionRow(
  * The throttle FPS is configurable via Settings → Tools → Sigil → "Animation FPS".
  */
 @Composable
-private fun SessionSpinner(modifier: Modifier = Modifier, tint: Color = Color.Gray) {
+private fun SessionSpinner(modifier: Modifier = Modifier, tint: Color = Color.Gray, active: Boolean = true) {
     val rotationState = rememberThrottledInfiniteAnimation(
-        active = true,
+        active = active,
         initialValue = 0f,
         targetValue = 360f,
         durationMillis = 1000,

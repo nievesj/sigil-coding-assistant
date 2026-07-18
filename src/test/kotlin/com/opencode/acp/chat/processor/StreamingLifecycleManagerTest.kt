@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.time.Duration.Companion.milliseconds
 import java.util.LinkedHashMap
@@ -55,6 +56,12 @@ class StreamingLifecycleManagerTest {
         // The production code uses extraBufferCapacity only (no replay), but for testing
         // we need to capture the signal. The emitStreamingCompleted method calls
         // signals.tryEmit() which works the same with or without replay.
+        //
+        // NOTE: This test setup could mask timing-dependent bugs where a late subscriber
+        // misses a signal (production has no replay, so late subscribers don't see prior
+        // emissions). For emitStreamingCompleted this is fine — the ViewModel is always
+        // subscribed before the signal is emitted. If timing-dependent bugs are suspected,
+        // add a test variant with no replay and a pre-subscribed collector.
         signals = MutableSharedFlow(replay = 1, extraBufferCapacity = 64)
 
         messageMap = MessageMapManager(
@@ -112,7 +119,7 @@ class StreamingLifecycleManagerTest {
             parts = linkedMapOf(),
             isStreaming = true,
             state = MessageState.Created,
-            timestamp = System.currentTimeMillis(),
+            timestamp = 1_000_000L,
         ))
         turnLifecycleState.activeMessageId = msgId
         turnLifecycleState.isStreaming = true
@@ -136,7 +143,7 @@ class StreamingLifecycleManagerTest {
             parts = linkedMapOf(),
             isStreaming = true,
             state = MessageState.Created,
-            timestamp = System.currentTimeMillis(),
+            timestamp = 1_000_000L,
         ))
         turnLifecycleState.activeMessageId = msgId
         turnLifecycleState.isStreaming = true
@@ -160,7 +167,7 @@ class StreamingLifecycleManagerTest {
             parts = linkedMapOf(),
             isStreaming = true,
             state = MessageState.Created,
-            timestamp = System.currentTimeMillis(),
+            timestamp = 1_000_000L,
         ))
         turnLifecycleState.activeMessageId = msgId
         turnLifecycleState.isStreaming = true
@@ -190,7 +197,7 @@ class StreamingLifecycleManagerTest {
         val msgId = "msg_tc"
         messageMap.add(ChatMessage(
             id = msgId, role = MessageRole.ASSISTANT, parts = linkedMapOf(),
-            isStreaming = true, state = MessageState.Created, timestamp = System.currentTimeMillis(),
+            isStreaming = true, state = MessageState.Created, timestamp = 1_000_000L,
         ))
         turnLifecycleState.activeMessageId = msgId
         turnLifecycleState.isStreaming = true
@@ -204,7 +211,7 @@ class StreamingLifecycleManagerTest {
         val msgId = "msg_idle"
         messageMap.add(ChatMessage(
             id = msgId, role = MessageRole.ASSISTANT, parts = linkedMapOf(),
-            isStreaming = true, state = MessageState.Created, timestamp = System.currentTimeMillis(),
+            isStreaming = true, state = MessageState.Created, timestamp = 1_000_000L,
         ))
         turnLifecycleState.activeMessageId = msgId
         turnLifecycleState.isStreaming = true
@@ -220,7 +227,7 @@ class StreamingLifecycleManagerTest {
         val msgId = "msg_nm"
         messageMap.add(ChatMessage(
             id = msgId, role = MessageRole.ASSISTANT, parts = linkedMapOf(),
-            isStreaming = true, state = MessageState.Created, timestamp = System.currentTimeMillis(),
+            isStreaming = true, state = MessageState.Created, timestamp = 1_000_000L,
         ))
         turnLifecycleState.activeMessageId = msgId
         turnLifecycleState.isStreaming = true
@@ -269,7 +276,7 @@ class StreamingLifecycleManagerTest {
         val msgId = "msg_stop"
         messageMap.add(ChatMessage(
             id = msgId, role = MessageRole.ASSISTANT, parts = linkedMapOf(),
-            isStreaming = true, state = MessageState.Created, timestamp = System.currentTimeMillis(),
+            isStreaming = true, state = MessageState.Created, timestamp = 1_000_000L,
         ))
         turnLifecycleState.activeMessageId = msgId
         turnLifecycleState.isStreaming = true
@@ -278,15 +285,17 @@ class StreamingLifecycleManagerTest {
         lifecycle.finalizeStreaming(msgId, "stop")
 
         // Before the debounce elapses, the message should still be streaming.
+        // Do NOT call advanceUntilIdle() here — it would advance past the 300ms
+        // debounce delay and fire the debounce before we can assert.
         advanceTimeBy(100.milliseconds)
-        advanceUntilIdle()
         turnLifecycleState.isStreaming shouldBe true
         messages.value[msgId]!!.isStreaming shouldBe true
         messages.value[msgId]!!.state shouldBe MessageState.Created
 
-        // Advance past the 300ms debounce window and let the launch coroutine run.
+        // Advance past the 300ms debounce window (100 + 250 = 350ms total) and
+        // run any tasks that became ready.
         advanceTimeBy(250.milliseconds)
-        advanceUntilIdle()
+        runCurrent()
 
         turnLifecycleState.isStreaming shouldBe false
         messages.value[msgId]!!.isStreaming shouldBe false
@@ -322,11 +331,11 @@ class StreamingLifecycleManagerTest {
         val newMsgId = "msg_new"
         messageMap.add(ChatMessage(
             id = oldMsgId, role = MessageRole.ASSISTANT, parts = linkedMapOf(),
-            isStreaming = true, state = MessageState.Created, timestamp = System.currentTimeMillis(),
+            isStreaming = true, state = MessageState.Created, timestamp = 1_000_000L,
         ))
         messageMap.add(ChatMessage(
             id = newMsgId, role = MessageRole.ASSISTANT, parts = linkedMapOf(),
-            isStreaming = true, state = MessageState.Created, timestamp = System.currentTimeMillis(),
+            isStreaming = true, state = MessageState.Created, timestamp = 1_000_000L,
         ))
         turnLifecycleState.activeMessageId = oldMsgId
         turnLifecycleState.isStreaming = true
@@ -335,14 +344,16 @@ class StreamingLifecycleManagerTest {
         lifecycle.finalizeStreaming(oldMsgId, "stop")
 
         // Before the debounce elapses, a new turn starts: activeMessageId changes.
+        // Do NOT call advanceUntilIdle() here — it would advance past the 300ms
+        // debounce delay and fire the debounce before we can change activeMessageId.
         advanceTimeBy(100.milliseconds)
-        advanceUntilIdle()
         turnLifecycleState.activeMessageId = newMsgId
         // isStreaming stays true for the new turn.
 
-        // Advance past the 300ms debounce window.
+        // Advance past the 300ms debounce window (100 + 250 = 350ms total) and
+        // run any tasks that became ready.
         advanceTimeBy(250.milliseconds)
-        advanceUntilIdle()
+        runCurrent()
 
         // The old message must NOT have been finalized by the debounce job.
         messages.value[oldMsgId]!!.isStreaming shouldBe true

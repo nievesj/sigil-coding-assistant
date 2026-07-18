@@ -202,7 +202,10 @@ class ReviewCommandHandler(
 
         // Surface unresolved args as a chat message so the user sees the typo.
         if (resolution.unresolved.isNotEmpty()) {
-            val unresolvedStr = resolution.unresolved.joinToString(", ") { "`$it`" }
+            // Escape user-provided args to prevent markdown injection (e.g., [evil](http://malicious.com)
+            // rendering as a link). Backticks are kept for code-span formatting, but
+            // markdown link syntax is neutralized by escaping brackets.
+            val unresolvedStr = resolution.unresolved.joinToString(", ") { "`${escapeMarkdownInline(it)}`" }
             val availableHints = models.take(5).joinToString(", ") {
                 "`${it.providerID}/${it.modelID}`"
             }
@@ -244,7 +247,7 @@ class ReviewCommandHandler(
                 break
             }
             // Route through the ViewModel's sendMessageWithModel() so _streamPhase and
-            // streamingSessionIds stay consistent with the UI (stop button, shimmer).
+            // streamingSessionIds stay consistent with the UI (stop button, spinner).
             val result = sendWithModelFunction(
                 header + prompt,
                 model.modelID,
@@ -272,4 +275,15 @@ class ReviewCommandHandler(
         // error/cancel) so the next review invocation starts with a clean state.
         resetCancelled()
     }
+
+    /**
+     * Escape markdown inline syntax that could be used for injection (links, images).
+     * Keeps backticks (used for code spans) but escapes brackets and parens that
+     * form link/image syntax: [text](url) and ![alt](url).
+     */
+    private fun escapeMarkdownInline(text: String): String =
+        text.replace("[", "\\[")
+            .replace("]", "\\]")
+            .replace("(", "\\(")
+            .replace(")", "\\)")
 }

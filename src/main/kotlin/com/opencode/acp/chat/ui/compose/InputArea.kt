@@ -121,7 +121,7 @@ private fun isAttachedPathAllowed(
 
 /** Result of reading the clipboard — either an image/file attachment or plain text. */
 sealed class ClipboardResult {
-    data class FileResult(val file: AttachedFile) : ClipboardResult()
+    data class FileResult(val files: List<AttachedFile>) : ClipboardResult()
     data class TextResult(val text: String) : ClipboardResult()
 }
 
@@ -135,26 +135,38 @@ sealed class ClipboardResult {
  *   If null, images are saved to `user.home` (will not be auto-cleaned).
  */
 suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? = null): ClipboardResult? {
-    val clipResult: Any? = if (java.awt.EventQueue.isDispatchThread()) {
-        readClipboardOnEdt()
-    } else {
-        withContext(kotlinx.coroutines.Dispatchers.IO) {
-            try {
-                val deferred = kotlinx.coroutines.CompletableDeferred<Any?>()
-                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+    // ALWAYS use invokeLater + withTimeoutOrNull, even when already on EDT.
+    // The direct EDT path (readClipboardOnEdt() with no timeout) can block for
+    // 5-9 seconds when another app holds the OLE clipboard lock (Windows
+    // OleGetClipboard), freezing the entire IDE. The invokeLater path posts
+    // the clipboard read as the next EDT event and times out after 5s if the
+    // clipboard is locked, returning null instead of hanging.
+    val clipResult: Any? = withContext(kotlinx.coroutines.Dispatchers.IO) {
+        try {
+            val deferred = kotlinx.coroutines.CompletableDeferred<Any?>()
+            // Cancellation flag: if the timeout fires, the invokeLater callback
+            // checks this flag before performing the expensive clipboard read.
+            // This prevents the EDT from being blocked by a clipboard read that
+            // nobody is waiting for anymore (resource leak fix).
+            val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                if (!cancelled.get()) {
                     deferred.complete(readClipboardOnEdt())
                 }
-                kotlinx.coroutines.withTimeoutOrNull(5000) { deferred.await() } ?: run {
-                    logger.warn { "[ACP] readClipboardContent: EDT timed out after 5s — clipboard read failed" }
-                    null
-                }
-            } catch (e: SecurityException) {
-                logger.warn(e) { "[ACP] readClipboardContent: clipboard access denied (SecurityException)" }
-                null
-            } catch (e: Exception) {
-                logger.debug(e) { "[ACP] readClipboardContent: clipboard read failed" }
+            }
+            kotlinx.coroutines.withTimeoutOrNull(5000) { deferred.await() } ?: run {
+                // Mark as cancelled so the invokeLater callback (if it hasn't run yet)
+                // skips the expensive clipboard read.
+                cancelled.set(true)
+                logger.warn { "[ACP] readClipboardContent: EDT timed out after 5s — clipboard read failed (clipboard may be locked by another application)" }
                 null
             }
+        } catch (e: SecurityException) {
+            logger.warn(e) { "[ACP] readClipboardContent: clipboard access denied (SecurityException)" }
+            null
+        } catch (e: Exception) {
+            logger.debug(e) { "[ACP] readClipboardContent: clipboard read failed" }
+            null
         }
     }
 
@@ -169,7 +181,7 @@ suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? 
                         // always writes inside .opencode/attachments/ by construction,
                         // so the path is guaranteed to be within the allowed dir.
                         val filename = java.io.File(savedPath).name
-                        ClipboardResult.FileResult(AttachedFile(name = filename, path = savedPath, mime = "image/png"))
+                        ClipboardResult.FileResult(listOf(AttachedFile(name = filename, path = savedPath, mime = "image/png")))
                     } else {
                         logger.warn { "[ACP] Clipboard image save failed; skipping attachment" }
                         null
@@ -178,7 +190,7 @@ suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? 
                     is List<*> -> {
                     val files = clipResult.filterIsInstance<java.io.File>()
                     if (files.isEmpty()) return@withContext null
-                    ClipboardResult.FileResult(files.first().toAttachedFile(project))
+                    ClipboardResult.FileResult(files.mapNotNull { it.toAttachedFile(project) })
                 }
                 is String -> {
                     if (clipResult.isNotBlank()) {
@@ -199,9 +211,14 @@ suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? 
  * Reads clipboard content on the EDT. Returns java.awt.Image, List<java.io.File>, String (text), or null.
  */
 private fun readClipboardOnEdt(): Any? {
+    val startTime = System.currentTimeMillis()
     try {
         val clipboard = Toolkit.getDefaultToolkit().systemClipboard
         val transferable = clipboard.getContents(null)
+        val clipAcquireMs = System.currentTimeMillis() - startTime
+        if (clipAcquireMs > 500) {
+            logger.warn { "[ACP] readClipboardOnEdt: clipboard acquisition took ${clipAcquireMs}ms (slow — another app may hold the clipboard lock)" }
+        }
         if (transferable == null) {
 
             return null
@@ -271,6 +288,10 @@ private fun readClipboardOnEdt(): Any? {
         logger.warn(e) { "[ACP] readClipboardOnEdt: clipboard access denied (SecurityException)" }
     } catch (e: Exception) {
         logger.debug(e) { "[ACP] readClipboardOnEdt: clipboard access failed" }
+    }
+    val totalMs = System.currentTimeMillis() - startTime
+    if (totalMs > 500) {
+        logger.warn { "[ACP] readClipboardOnEdt: total clipboard read took ${totalMs}ms" }
     }
     return null
 }
@@ -473,11 +494,17 @@ fun InputArea(
                                 // Reject non-file URI schemes (e.g. http://, ftp://) to
                                 // prevent attaching arbitrary remote resources. Only
                                 // local file:// URIs are allowed for drag-and-drop.
-                                if (!uri.startsWith("file:", ignoreCase = true)) {
-                                    logger.warn { "[ACP] Drag-and-drop: rejecting non-file URI scheme: ${uri.take(50)}" }
+                                val parsed = try { java.net.URI(uri) } catch (e: java.net.URISyntaxException) {
+                                    logger.warn { "[ACP] Drag-and-drop: malformed URI: ${uri.take(50)}" }
+                                    null
+                                }
+                                if (parsed == null) {
+                                    null
+                                } else if (parsed.scheme?.lowercase() != "file") {
+                                    logger.warn { "[ACP] Drag-and-drop: rejecting non-file URI scheme: ${parsed.scheme}" }
                                     null
                                 } else {
-                                    val file = java.io.File(java.net.URI(uri))
+                                    val file = java.io.File(parsed)
                                     // Validate path is within project or allowed attachment dirs
                                     val canonicalPath = file.canonicalPath
                                     val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }?.trimEnd(java.io.File.separatorChar)
@@ -495,9 +522,9 @@ fun InputArea(
                                     // This guards against a copy failure silently returning the raw external
                                     // path, which would bypass the attachment security boundary.
                                     val attached = file.toAttachedFile(project)
-                                    val isAllowed = isAttachedPathAllowed(attached.path, projectBase, userHome)
+                                    val isAllowed = attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
                                     if (isAllowed) attached else {
-                                        logger.warn { "[ACP] Drag-and-drop: attached file path outside allowed dirs after copy: ${attached.path}" }
+                                        logger.warn { "[ACP] Drag-and-drop: attached file path outside allowed dirs after copy: ${attached?.path}" }
                                         null
                                     }
                                 }
@@ -566,12 +593,12 @@ fun InputArea(
                                 // allowed dirs after toAttachedFile (which copies external files in).
                                 // This guards against a copy failure silently returning the raw external
                                 // path, which would bypass the attachment security boundary.
-                                val isAllowed = isAttachedPathAllowed(attached.path, projectBase, userHome)
+                                val isAllowed = attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
                                 if (isAllowed) {
                                     onAttachFile(attached)
                                     anyAttached = true
                                 } else {
-                                    logger.warn { "[ACP] Drag-and-drop AWT fallback: attached file path outside allowed dirs after copy: ${attached.path}" }
+                                    logger.warn { "[ACP] Drag-and-drop AWT fallback: attached file path outside allowed dirs after copy: ${attached?.path}" }
                                 }
                             } catch (e: Exception) {
                                 logger.warn(e) { "[ACP] Drag-and-drop AWT fallback: file attach failed" }
@@ -1571,7 +1598,7 @@ private fun BraveModeCheckbox(enabled: Boolean, onToggle: () -> Unit) {
  * chip shows the copied path. If the copy fails, the original path is used and the
  * service guard will log/skip it.
  */
-private fun java.io.File.toAttachedFile(project: com.intellij.openapi.project.Project? = null): AttachedFile {
+private fun java.io.File.toAttachedFile(project: com.intellij.openapi.project.Project? = null): AttachedFile? {
     val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(name)
     val copied = if (project != null) {
         com.opencode.acp.util.copyExternalAttachmentToAllowedDir(this, project)
@@ -1587,7 +1614,12 @@ private fun java.io.File.toAttachedFile(project: com.intellij.openapi.project.Pr
         val isInsideAttachments = (projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
             (userHome != null && canonicalSource.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))
         if (!isInsideProject && !isInsideAttachments) {
-            logger.warn { "[ACP] toAttachedFile: file outside allowed dirs and copy failed: $name ($absolutePath)" }
+            // Defense-in-depth: skip the file entirely instead of returning a path
+            // outside allowed dirs. The server-side AttachmentValidator is the real
+            // guard, but this prevents sending arbitrary paths (e.g., C:\Windows\System32\config\sam)
+            // to the server when the copy fails.
+            logger.warn { "[ACP] toAttachedFile: file outside allowed dirs and copy failed — skipping: $name ($absolutePath)" }
+            return null
         }
         canonicalSource
     }

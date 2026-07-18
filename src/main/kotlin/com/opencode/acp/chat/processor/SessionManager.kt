@@ -63,6 +63,10 @@ class SessionManager(
     /** Mutex to serialize session switches. */
     private val switchMutex = Mutex()
 
+    /** Mutex to serialize loadSessions() calls — prevents concurrent mutation
+     *  of _sessionListState, _childSessionMap, and childSessionTracker. */
+    private val loadSessionsMutex = kotlinx.coroutines.sync.Mutex()
+
     /** The currently active session ID. Null if no session is active. */
     private val _activeSessionId = MutableStateFlow<String?>(null)
     val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
@@ -144,14 +148,10 @@ class SessionManager(
     internal var client: OpenCodeClient? = null
         set(value) {
             field = value
-            // Recreate the background compactor when the client becomes available
-            if (value != null && backgroundCompactor == null) {
-                try {
-                    backgroundCompactor = createBackgroundCompactor()
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] Failed to create BackgroundCompactor" }
-                }
-            }
+            // BackgroundCompactor auto-trigger is disabled (server /summarize performs
+            // actual compaction, not a preview). Do NOT instantiate it — the class is
+            // retained as dead code only in case a preview API is added in the future.
+            // See AGENTS.md "Smart Compaction & Context Management".
         }
 
     /**
@@ -281,7 +281,7 @@ class SessionManager(
     }
 
     /** Imperatively add a session ID to the streaming set.
-     *  Used by ChatViewModel.sendMessage() to activate the sidebar shimmer
+     *  Used by ChatViewModel.sendMessage() to activate the sidebar spinner
      *  immediately on send, before any SSE events arrive.
      *  Idempotent — duplicate adds are harmless (Set semantics). */
     fun addStreamingSession(sessionId: String) {
@@ -289,7 +289,7 @@ class SessionManager(
     }
 
     /** Imperatively remove a session ID from the streaming set.
-     *  Used by ChatViewModel on cancel/switch/error to deactivate the shimmer
+     *  Used by ChatViewModel on cancel/switch/error to deactivate the spinner
      *  immediately, without waiting for StreamingCompleted.
      *  Idempotent — duplicate removes are harmless. */
     fun removeStreamingSession(sessionId: String) {
@@ -440,7 +440,7 @@ class SessionManager(
      *    [projectBasePath].  Pass `null` to list all sessions (no filter).
      *    If the filtered list is empty or the request fails, falls back to
      *    unfiltered listing so the user always sees sessions. */
-    suspend fun loadSessions(directory: String? = projectBasePath) {
+    suspend fun loadSessions(directory: String? = projectBasePath) = loadSessionsMutex.withLock {
         val c = client ?: run {
             logger.warn { "[ACP] SessionManager.loadSessions: client is null" }
             return
@@ -943,6 +943,24 @@ class SessionManager(
 
     fun completeStreaming(messageId: String) {
         getActiveSession()?.completeStreaming(messageId)
+    }
+
+    /**
+     * Force-finalize a message's streaming state without going through completeStreaming.
+     * Used as a recovery path when completeStreaming times out (e.g., stateLock held
+     * during a long markdown parse). Sets isStreaming=false and state=Completed directly
+     * on the message, bypassing the normal finalization path.
+     */
+    fun forceFinalizeMessage(messageId: String) {
+        val session = getActiveSession() ?: return
+        try {
+            val messages = session.messages.value
+            val msg = messages[messageId] ?: return
+            val updated = msg.copy(isStreaming = false, state = com.opencode.acp.chat.model.MessageState.Completed)
+            session.messageMap.update(messageId) { updated }
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] forceFinalizeMessage failed for $messageId" }
+        }
     }
 
     fun abortStreaming(reason: String) {

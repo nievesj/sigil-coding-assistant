@@ -347,7 +347,7 @@ fun
         viewModel.pasteImageSignal.collectLatest {
             when (val result = readClipboardContent(project)) {
                 is ClipboardResult.FileResult -> {
-                    attachedFiles.add(result.file)
+                    result.files.forEach { attachedFiles.add(it) }
                 }
                 is ClipboardResult.TextResult -> {
                     viewModel.requestTextPaste(result.text)

@@ -130,11 +130,11 @@ class OpenCodeSettingsPanel {
             "TRACE = everything, ALL = no filtering."
     }
 
-    /** Animation throttle FPS — target frame rate for glow/pulse/shimmer animations.
+    /** Animation throttle FPS — target frame rate for glow/pulse/spinner animations.
      *  Lower values reduce GPU pressure (DirectContextKt._nFlushAndSubmit stalls on Windows).
      *  60 = full vsync, 30 = half pressure (default), 15 = quarter pressure. */
     val animationThrottleFpsField: JBTextField = JBTextField("30", 3).apply {
-        toolTipText = "Target FPS for streaming animations (glow, pulse, shimmer).\n" +
+        toolTipText = "Target FPS for streaming animations (glow, pulse, spinner).\n" +
             "60 = full vsync (original smoothness), 30 = half GPU pressure (default, visually identical),\n" +
             "15 = quarter pressure (may look slightly less smooth).\n" +
             "Lower this if you experience IDE freezes during streaming on Windows."
@@ -236,12 +236,15 @@ class OpenCodeSettingsPanel {
         // port) are handled by coerceIn() below. Invalid fields are reset to their
         // coerced/default values so the UI matches what will be applied.
         val invalidFields = mutableListOf<String>()
-        if (portField.text.trim().toIntOrNull() == null && portField.text.trim().isNotBlank()) invalidFields.add("Server port")
-        if (timeoutField.text.trim().toIntOrNull() == null && timeoutField.text.trim().isNotBlank()) invalidFields.add("Permission timeout")
-        if (commandHistorySizeField.text.trim().toIntOrNull() == null && commandHistorySizeField.text.trim().isNotBlank()) invalidFields.add("Command history size")
-        if (responseTimeoutField.text.trim().toIntOrNull() == null && responseTimeoutField.text.trim().isNotBlank()) invalidFields.add("Response timeout")
-        if (longTimeoutBufferField.text.trim().toIntOrNull() == null && longTimeoutBufferField.text.trim().isNotBlank()) invalidFields.add("Long timeout buffer")
-        if (toolStuckTimeoutField.text.trim().toIntOrNull() == null && toolStuckTimeoutField.text.trim().isNotBlank()) invalidFields.add("Tool stuck timeout")
+        // Detect both invalid (non-parseable) and blank fields. Blank fields
+        // silently use defaults — surface them so the user knows their input was replaced.
+        if (portField.text.trim().toIntOrNull() == null) invalidFields.add("Server port" + if (portField.text.trim().isBlank()) " (empty, using default)" else "")
+        if (timeoutField.text.trim().toIntOrNull() == null) invalidFields.add("Permission timeout" + if (timeoutField.text.trim().isBlank()) " (empty, using default)" else "")
+        if (commandHistorySizeField.text.trim().toIntOrNull() == null) invalidFields.add("Command history size" + if (commandHistorySizeField.text.trim().isBlank()) " (empty, using default)" else "")
+        if (responseTimeoutField.text.trim().toIntOrNull() == null) invalidFields.add("Response timeout" + if (responseTimeoutField.text.trim().isBlank()) " (empty, using default)" else "")
+        if (longTimeoutBufferField.text.trim().toIntOrNull() == null) invalidFields.add("Long timeout buffer" + if (longTimeoutBufferField.text.trim().isBlank()) " (empty, using default)" else "")
+        if (toolStuckTimeoutField.text.trim().toIntOrNull() == null) invalidFields.add("Tool stuck timeout" + if (toolStuckTimeoutField.text.trim().isBlank()) " (empty, using default)" else "")
+        if (animationThrottleFpsField.text.trim().toIntOrNull() == null) invalidFields.add("Animation FPS" + if (animationThrottleFpsField.text.trim().isBlank()) " (empty, using default)" else "")
         val port = portField.text.trim().toIntOrNull()
         if (port != null && port !in 1024..65535) invalidFields.add("Server port (must be 1024-65535)")
         if (invalidFields.isNotEmpty()) {
@@ -255,25 +258,35 @@ class OpenCodeSettingsPanel {
             responseTimeoutField.text = responseTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600)?.toString() ?: "300"
             longTimeoutBufferField.text = longTimeoutBufferField.text.trim().toIntOrNull()?.coerceAtLeast(10)?.toString() ?: "30"
             toolStuckTimeoutField.text = toolStuckTimeoutField.text.trim().toIntOrNull()?.coerceIn(60, 3600)?.toString() ?: "300"
+            animationThrottleFpsField.text = animationThrottleFpsField.text.trim().toIntOrNull()?.coerceIn(15, 60)?.toString() ?: "30"
         }
 
         val binPath = binaryPathField.text.trim()
         if (binPath.isNotBlank()) {
             val file = java.io.File(binPath)
             if (!file.exists()) {
-                showStatus("Warning: '$binPath' does not exist", false)
-            } else if (System.getProperty("os.name").lowercase().contains("win")) {
-                // On Windows, canExecute() is unreliable (always true for readable files).
-                // Check the file extension instead.
-                val ext = file.extension.lowercase()
-                if (ext !in listOf("exe", "bat", "cmd", "ps1")) {
-                    showStatus("Warning: '$binPath' may not be an executable (expected .exe, .bat, .cmd, or .ps1)", false)
+                // Reject non-existent paths entirely — don't set settings.binaryPath
+                // to a path that will cause confusing runtime errors.
+                showStatus("Error: '$binPath' does not exist — binary path not updated", false)
+            } else {
+                if (System.getProperty("os.name").lowercase().contains("win")) {
+                    // On Windows, canExecute() is unreliable (always true for readable files).
+                    // Check the file extension instead.
+                    val ext = file.extension.lowercase()
+                    if (ext !in listOf("exe", "bat", "cmd", "ps1", "com", "vbs")) {
+                        showStatus("Warning: '$binPath' may not be an executable (expected .exe, .bat, .cmd, .ps1, .com, or .vbs)", false)
+                    }
+                    settings.binaryPath = binPath
+                } else if (!file.canExecute()) {
+                    showStatus("Warning: '$binPath' may not be executable", false)
+                    settings.binaryPath = binPath
+                } else {
+                    settings.binaryPath = binPath
                 }
-            } else if (!file.canExecute()) {
-                showStatus("Warning: '$binPath' may not be executable", false)
             }
+        } else {
+            settings.binaryPath = binPath
         }
-        settings.binaryPath = binPath
         settings.port = portField.text.trim().toIntOrNull()?.coerceIn(1024, 65535) ?: 4096
         settings.permissionTimeoutSeconds = timeoutField.text.trim().toIntOrNull()?.coerceIn(5, 300) ?: 60
         settings.commandHistorySize = commandHistorySizeField.text.trim().toIntOrNull()?.coerceIn(1, 100) ?: 15
@@ -316,7 +329,7 @@ class OpenCodeSettingsPanel {
                 queueInsteadOfSteerCheckbox.isSelected != settings.queueInsteadOfSteer ||
                 showDisconnectCheckbox.isSelected != settings.showDisconnectConfirmation ||
                 (logLevelCombo.selectedItem as? String ?: "INFO") != settings.logLevel ||
-                animationThrottleFpsField.text.trim().toIntOrNull()?.coerceIn(15, 60) != settings.animationThrottleFps ||
+                isNumericModified(animationThrottleFpsField, settings.animationThrottleFps, 30) ||
                 expandedKinds != currentExpandedKinds ||
                 expandTaskPillsCheckbox.isSelected != settings.expandTaskPillsByDefault
     }
@@ -332,6 +345,8 @@ class OpenCodeSettingsPanel {
     }
 
     companion object {
+        private val panelLogger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+
         private val HEX_COLOR_REGEX = Regex("^#[0-9A-Fa-f]{6}$")
 
         /** Validate hex color format. Returns [fallback] if invalid. */
@@ -345,8 +360,7 @@ class OpenCodeSettingsPanel {
             return try {
                 java.awt.Color(clean.toInt(16))
             } catch (e: NumberFormatException) {
-                io.github.oshai.kotlinlogging.KotlinLogging.logger {}
-                    .debug(e) { "[ACP] Failed to parse hex color: $hex" }
+                panelLogger.debug(e) { "[ACP] Failed to parse hex color: $hex" }
                 java.awt.Color(60, 60, 60)
             }
         }

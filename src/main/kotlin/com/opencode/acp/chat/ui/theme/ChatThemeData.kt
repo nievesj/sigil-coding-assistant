@@ -187,9 +187,8 @@ data class ChatThemeData(
      *  star, selected row, thinking, mime, review, table, streaming glow, hover, interrupted. */
     @Immutable
     data class ComponentColors(
-        // Sidebar shimmer
+        // Sidebar session indicator colors (used by ConnectionSplashScreen)
         val sidebarShimmerCreating: Color,
-        val sidebarShimmerStreaming: Color,
         // Splash screen
         val splashConnected: Color,
         val splashError: Color,
@@ -539,7 +538,6 @@ data class ChatThemeData(
     data class Animations(
         val glowPulseMs: Int,
         val contextPulseMs: Int,
-        val shimmerSweepMs: Int,
         val chipHoverMs: Int,
         val thinkingIndicatorDelayMs: Long,
     )

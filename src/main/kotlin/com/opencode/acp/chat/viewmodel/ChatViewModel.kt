@@ -116,7 +116,7 @@ class ChatViewModel(
      *  `deny` rules, so Brave Mode cannot override hard denials. */
     private val _braveModeEnabled = MutableStateFlow(
         OpenCodeFollowSettingsState.getInstance().braveModeEnabled
-    )
+    ).also { logger.info { "[ACP] Brave Mode initial state from settings: ${it.value}" } }
     val braveModeEnabled: StateFlow<Boolean> = _braveModeEnabled.asStateFlow()
 
     /** Review comment changes — forwarded from [ReviewCommentManager]. */
@@ -155,7 +155,7 @@ class ChatViewModel(
     // --- Computed input state (exhaustive state machine) ---
 
     /** Last logged inputState value — used to suppress duplicate log lines. */
-    @Volatile private var lastLoggedInputState: ChatInputState? = null
+    private val lastLoggedInputState = java.util.concurrent.atomic.AtomicReference<ChatInputState?>(null)
 
     /**
      * Exhaustive input-area state derived from connection, streaming, and prompt StateFlows.
@@ -183,9 +183,10 @@ class ChatViewModel(
         // Only log when the derived state actually changes — avoids excessive
         // logging on every combine emission (e.g., during streaming when phase
         // toggles but the derived state stays the same).
-        if (state != lastLoggedInputState) {
+        // Use compareAndSet for a true dedup — prevents duplicate log lines from
+        // concurrent combine() emissions racing on the @Volatile field.
+        if (lastLoggedInputState.getAndSet(state) != state) {
             logger.info { "[ACP] inputState: conn=$conn ready=$ready perm=$perm sel=$sel phase=$phase → $state" }
-            lastLoggedInputState = state
         }
         state
     }.stateIn(scope, SharingStarted.WhileSubscribed(5_000), ChatInputState.Disabled)
@@ -254,10 +255,13 @@ class ChatViewModel(
                         // drainQueue runs (drainQueue sends the next queued message,
                         // which depends on the session list being up to date).
                         scope.launch {
-                            computeSessionContext()
-                            fetchTodos()
-                            service.loadSessions()
-                            messageQueueManager.drainQueue()
+                            // Each operation is independently wrapped so a failure in one
+                            // doesn't skip the others — especially drainQueue(), which would
+                            // leave the user's queued message permanently stuck.
+                            try { computeSessionContext() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { logger.warn(e) { "[ACP] computeSessionContext failed after StreamingCompleted" } }
+                            try { fetchTodos() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { logger.warn(e) { "[ACP] fetchTodos failed after StreamingCompleted" } }
+                            try { service.loadSessions() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { logger.warn(e) { "[ACP] loadSessions failed after StreamingCompleted" } }
+                            try { messageQueueManager.drainQueue() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { logger.warn(e) { "[ACP] drainQueue failed after StreamingCompleted" } }
                         }
                         // Refresh review comments — the LLM may have written .review/ files
                         // during the response. StreamingCompleted fires once per response
@@ -334,7 +338,7 @@ class ChatViewModel(
                         // could miss the reset if the user switched sessions between
                         // signal emission and this handler. Resetting is idempotent.
                         _streamPhase.value = StreamPhase.IDLE
-                        // Always remove the specific session from shimmer (not just active)
+                        // Always remove the specific session from spinner set (not just active)
                         service.removeStreamingSession(signal.sessionId)
                         logger.warn { "[ACP] ViewModel received session error: session=${signal.sessionId}, error=${signal.errorMessage}" }
                     }
@@ -809,7 +813,7 @@ class ChatViewModel(
         commandHistoryManager.recordCommand(text, files)
 
         // Activate streaming indicators BEFORE the suspend call.
-        // This ensures the glow, stop button, pulse, and shimmer appear
+        // This ensures the glow, stop button, pulse, and spinner appear
         // immediately when the user clicks Send, not after the first token.
         logger.info { "[ACP] sendMessage: setting _streamPhase = SENDING (current=${_streamPhase.value})" }
         _streamPhase.value = StreamPhase.SENDING

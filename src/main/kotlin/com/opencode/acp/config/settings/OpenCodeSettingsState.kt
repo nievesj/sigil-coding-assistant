@@ -204,7 +204,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerDefaultContextLimit"))
     var prunerDefaultContextLimit: Int = 128000
 
-    /** Target FPS for throttled infinite animations (glow, pulse, shimmer).
+    /** Target FPS for throttled infinite animations (glow, pulse, spinner).
      *  Lower values reduce GPU command flush pressure (DirectContextKt._nFlushAndSubmit stalls)
      *  by generating fewer Skiko frames per second. 60 = full vsync (original behavior),
      *  30 = half pressure (default, visually identical for slow animations), 15 = quarter pressure.
@@ -224,6 +224,12 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * made via the new configurables. This prevents data loss on restart.
      */
     var settingsMigratedToChildClasses: Boolean = false
+
+    /** Per-class migration flags — only re-attempt the class that failed, not all three.
+     *  Prevents overwriting user edits made via new configurables between restarts. */
+    var mcpSettingsMigrated: Boolean = false
+    var followSettingsMigrated: Boolean = false
+    var contextSettingsMigrated: Boolean = false
 
     // ── Follow Agent ──────────────────────────────────────────────────
     /**
@@ -309,6 +315,84 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     }
 
     @Suppress("DEPRECATION") // migrated fields retained for one release cycle
+    private fun forwardToMcpSettings(state: OpenCodeSettingsState): Boolean {
+        return try {
+            OpenCodeMcpSettingsState.getInstance().loadState(
+                OpenCodeMcpSettingsState().apply {
+                    enableIntellijMcp = state.enableIntellijMcp
+                    mcpServerUrl = state.mcpServerUrl
+                    additionalMcpServers = state.additionalMcpServers
+                    toolPermissions = state.toolPermissions
+                    savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
+                    discoveredToolsJson = state.discoveredToolsJson
+                }
+            )
+            true
+        } catch (e: Exception) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeMcpSettingsState" }
+            false
+        }
+    }
+
+    @Suppress("DEPRECATION") // migrated fields retained for one release cycle
+    private fun forwardToFollowSettings(state: OpenCodeSettingsState): Boolean {
+        return try {
+            OpenCodeFollowSettingsState.getInstance().loadState(
+                OpenCodeFollowSettingsState().apply {
+                    followAgentEnabled = state.followAgentEnabled
+                    followCommandsInConsole = state.followCommandsInConsole
+                    followSearchesInFindWindow = state.followSearchesInFindWindow
+                    followReadColor = state.followReadColor
+                    followEditColor = state.followEditColor
+                    followSearchColor = state.followSearchColor
+                    followExecuteColor = state.followExecuteColor
+                    followDeleteColor = state.followDeleteColor
+                    followMoveColor = state.followMoveColor
+                    followFetchColor = state.followFetchColor
+                    followOtherColor = state.followOtherColor
+                }
+            )
+            true
+        } catch (e: Exception) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeFollowSettingsState" }
+            false
+        }
+    }
+
+    @Suppress("DEPRECATION") // migrated fields retained for one release cycle
+    private fun forwardToContextSettings(state: OpenCodeSettingsState): Boolean {
+        return try {
+            OpenCodeContextSettingsState.getInstance().loadState(
+                OpenCodeContextSettingsState().apply {
+                    truncateToolOutput = state.truncateToolOutput
+                    toolOutputCharLimit = state.toolOutputCharLimit
+                    detectDuplicateReads = state.detectDuplicateReads
+                    enableBackgroundCompaction = state.enableBackgroundCompaction
+                    checkpointThresholdPercent = state.checkpointThresholdPercent
+                    swapThresholdPercent = state.swapThresholdPercent
+                    showContextBreakdown = state.showContextBreakdown
+                    pressureNotificationThreshold = state.pressureNotificationThreshold
+                    compactConfirmation = state.compactConfirmation
+                    enableContextPruner = state.enableContextPruner
+                    prunerMaxToolOutputMessages = state.prunerMaxToolOutputMessages
+                    prunerErroredToolTurns = state.prunerErroredToolTurns
+                    prunerCompressEnabled = state.prunerCompressEnabled
+                    prunerCompressMode = state.prunerCompressMode
+                    prunerNudgeEnabled = state.prunerNudgeEnabled
+                    prunerNudgeThresholdPercent = state.prunerNudgeThresholdPercent
+                    prunerNudgeUrgentPercent = state.prunerNudgeUrgentPercent
+                    prunerNudgeCooldownTurns = state.prunerNudgeCooldownTurns
+                    prunerDefaultContextLimit = state.prunerDefaultContextLimit
+                }
+            )
+            true
+        } catch (e: Exception) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeContextSettingsState" }
+            false
+        }
+    }
+
+    @Suppress("DEPRECATION") // migrated fields retained for one release cycle
     override fun loadState(state: OpenCodeSettingsState) {
         binaryPath = state.binaryPath
         permissionTimeoutSeconds = state.permissionTimeoutSeconds
@@ -331,6 +415,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             state.sseSocketTimeoutSeconds != 60 -> state.sseSocketTimeoutSeconds.coerceAtLeast(60)
             else -> 300
         }
+        // NOTE: If the user explicitly set responseTimeoutSeconds to 300 (the default)
+        // AND had a non-default sseSocketTimeoutSeconds, the migration uses the legacy
+        // value. This is a known limitation of comparing to the default to detect "not
+        // explicitly set" — affects a narrow user group during one-time migration only.
         longTimeoutBufferSeconds = state.longTimeoutBufferSeconds.coerceAtLeast(10)
         toolStuckTimeoutSeconds = state.toolStuckTimeoutSeconds.coerceIn(60, 3600)
         // Clear deprecated field after migration to prevent it from being
@@ -359,8 +447,14 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         mcpServerUrl = state.mcpServerUrl
         additionalMcpServers = try {
             if (state.additionalMcpServers.isNotBlank()) {
-                kotlinx.serialization.json.Json.parseToJsonElement(state.additionalMcpServers)
-                state.additionalMcpServers
+                val parsed = kotlinx.serialization.json.Json.parseToJsonElement(state.additionalMcpServers)
+                // Validate structure: must be a JSON array (not an object or primitive)
+                if (parsed is kotlinx.serialization.json.JsonArray) {
+                    state.additionalMcpServers
+                } else {
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] Invalid additionalMcpServers in settings: expected JSON array, got ${parsed::class.simpleName} — clearing" }
+                    ""
+                }
             } else ""
         } catch (e: Exception) {
             io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] Invalid additionalMcpServers in settings, clearing" }
@@ -412,86 +506,22 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         // Only forward on the first migration. After that, the child classes have
         // their own persistence and the old fields are stale — re-forwarding would
         // overwrite user edits made via the new configurables (data loss bug).
-        if (!state.settingsMigratedToChildClasses) {
-            // Each forwarding is in its own try-catch so a failure in one class
-            // doesn't prevent the others from loading. The old state fields above
-            // are already set, so the deprecated accessors still work regardless.
-            //
-            // The migration flag is only set to true when ALL three forwardings
-            // succeed. If any fails, the flag stays false and the next restart
-            // re-attempts migration for all three classes — the successful ones
-            // just re-forward the same values, which is idempotent. This prevents
-            // a partial-migration data-loss bug where an early success would mark
-            // migration complete and skip a still-failing class on restart.
-            var allForwardingsSucceeded = true
-            try {
-                OpenCodeMcpSettingsState.getInstance().loadState(
-                    OpenCodeMcpSettingsState().apply {
-                        enableIntellijMcp = state.enableIntellijMcp
-                        mcpServerUrl = state.mcpServerUrl
-                        additionalMcpServers = state.additionalMcpServers
-                        toolPermissions = state.toolPermissions
-                        savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
-                        discoveredToolsJson = state.discoveredToolsJson
-                    }
-                )
-            } catch (e: Exception) {
-                allForwardingsSucceeded = false
-                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeMcpSettingsState" }
-            }
-            try {
-                OpenCodeFollowSettingsState.getInstance().loadState(
-                    OpenCodeFollowSettingsState().apply {
-                        followAgentEnabled = state.followAgentEnabled
-                        followCommandsInConsole = state.followCommandsInConsole
-                        followSearchesInFindWindow = state.followSearchesInFindWindow
-                        followReadColor = state.followReadColor
-                        followEditColor = state.followEditColor
-                        followSearchColor = state.followSearchColor
-                        followExecuteColor = state.followExecuteColor
-                        followDeleteColor = state.followDeleteColor
-                        followMoveColor = state.followMoveColor
-                        followFetchColor = state.followFetchColor
-                        followOtherColor = state.followOtherColor
-                    }
-                )
-            } catch (e: Exception) {
-                allForwardingsSucceeded = false
-                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeFollowSettingsState" }
-            }
-            try {
-                OpenCodeContextSettingsState.getInstance().loadState(
-                    OpenCodeContextSettingsState().apply {
-                        truncateToolOutput = state.truncateToolOutput
-                        toolOutputCharLimit = state.toolOutputCharLimit
-                        detectDuplicateReads = state.detectDuplicateReads
-                        enableBackgroundCompaction = state.enableBackgroundCompaction
-                        checkpointThresholdPercent = state.checkpointThresholdPercent
-                        swapThresholdPercent = state.swapThresholdPercent
-                        showContextBreakdown = state.showContextBreakdown
-                        pressureNotificationThreshold = state.pressureNotificationThreshold
-                        compactConfirmation = state.compactConfirmation
-                        enableContextPruner = state.enableContextPruner
-                        prunerMaxToolOutputMessages = state.prunerMaxToolOutputMessages
-                        prunerErroredToolTurns = state.prunerErroredToolTurns
-                        prunerCompressEnabled = state.prunerCompressEnabled
-                        prunerCompressMode = state.prunerCompressMode
-                        prunerNudgeEnabled = state.prunerNudgeEnabled
-                        prunerNudgeThresholdPercent = state.prunerNudgeThresholdPercent
-                        prunerNudgeUrgentPercent = state.prunerNudgeUrgentPercent
-                        prunerNudgeCooldownTurns = state.prunerNudgeCooldownTurns
-                        prunerDefaultContextLimit = state.prunerDefaultContextLimit
-                    }
-                )
-            } catch (e: Exception) {
-                allForwardingsSucceeded = false
-                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeContextSettingsState" }
-            }
-            if (allForwardingsSucceeded) {
-                settingsMigratedToChildClasses = true
-            } else {
-                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] One or more settings forwardings failed; migration flag not set — will retry on next restart" }
-            }
+        // Per-class migration: only re-attempt the class that failed, not all three.
+        // This prevents overwriting user edits made via the new configurables between
+        // restarts when only one class's forwarding failed.
+        if (!state.mcpSettingsMigrated) {
+            state.mcpSettingsMigrated = forwardToMcpSettings(state)
+        }
+        if (!state.followSettingsMigrated) {
+            state.followSettingsMigrated = forwardToFollowSettings(state)
+        }
+        if (!state.contextSettingsMigrated) {
+            state.contextSettingsMigrated = forwardToContextSettings(state)
+        }
+        // Set the aggregate flag for backward compatibility (old code checks this).
+        settingsMigratedToChildClasses = state.mcpSettingsMigrated && state.followSettingsMigrated && state.contextSettingsMigrated
+        if (!settingsMigratedToChildClasses) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] One or more settings forwardings failed; per-class flags set — failed classes will retry on next restart" }
         }
     }
 
