@@ -68,11 +68,14 @@ internal class AttachmentValidator(
                 return@forEach
             }
             val fileObj = java.io.File(file.path)
-            if (!fileObj.exists() || !fileObj.canRead()) {
-                // File was deleted or unreadable (e.g., auto-cleaned clipboard image).
-                // Skip with warning instead of sending a file:// URL the server can't read.
-                logger.warn { "[ACP] Skipping attached file '${file.name}' — file not found or unreadable: ${file.path}" }
-                rejectedFiles.add(RejectedAttachment(file.name, file.path, "file not found or unreadable"))
+            if (!fileObj.exists() || !fileObj.canRead() || !fileObj.isFile) {
+                // File was deleted, unreadable, or is not a regular file (e.g., a
+                // directory, named pipe, or device file on Unix). Directories and
+                // devices pass exists()+canRead() but readBytes() would throw or
+                // attempt to read directory entry data as raw bytes. Reject early
+                // with a clear reason instead of relying on the downstream try/catch.
+                logger.warn { "[ACP] Skipping attached file '${file.name}' — file not found, unreadable, or not a regular file: ${file.path}" }
+                rejectedFiles.add(RejectedAttachment(file.name, file.path, "file not found, unreadable, or not a regular file"))
                 return@forEach
             }
             // CWE-22 path traversal guard: reject paths with .. sequences that escape
@@ -81,19 +84,16 @@ internal class AttachmentValidator(
             // Project files are under basePath. System temp directory is NOT allowed
             // (too broad — any process can write there on shared machines).
             val canonicalPath = fileObj.canonicalPath
+            // CWE-22 path traversal guard: delegate boundary check to the consolidated
+            // AttachmentPathValidator. The trailing-separator trimming is handled
+            // internally by AttachmentPathValidator.isAllowed, so passing the raw
+            // canonicalized projectBasePath/userHomePath is safe.
             // RESOLVED (false positive): File.separator IS appended to projectBase
             // before startsWith, so the path boundary is enforced. E.g.,
             // `C:\Project2\file`.startsWith(`C:\Project\`) is FALSE because
             // `C:\Project2` != `C:\Project\`. The separator prevents the
             // C:\Project → C:\Project2 prefix-confusion attack (CWE-22).
-            val isInsideProject = projectBasePath != null && canonicalPath.startsWith(projectBasePath + java.io.File.separator)
-            // NOTE: isInsideProjectAttachments is a strict subset of isInsideProject (any path
-            // under .opencode/attachments/ is also under the project). Retained for readability
-            // — the intent is explicit even though the check is logically redundant.
-            val isInsideProjectAttachments = projectBasePath != null && canonicalPath.startsWith(projectBasePath + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)
-            val isInsideUserHomeAttachments = userHomePath != null && canonicalPath.startsWith(userHomePath + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)
-            val isAllowed = isInsideProject || isInsideProjectAttachments || isInsideUserHomeAttachments
-            if (!isAllowed) {
+            if (!com.opencode.acp.chat.util.AttachmentPathValidator.isAllowed(canonicalPath, projectBasePath, userHomePath)) {
                 logger.warn { "[ACP] Skipping attached file '${file.name}' — path escapes allowed directories: ${file.path}" }
                 rejectedFiles.add(RejectedAttachment(file.name, file.path, "path escapes allowed directories"))
                 return@forEach
@@ -109,6 +109,11 @@ internal class AttachmentValidator(
             // variation (e.g., a symlink named ".ENV" pointing to secrets). The false-positive
             // risk (rejecting a legitimate "Build" directory on Linux) is acceptable given the
             // security context — attachment paths should not include build output directories.
+            // SCOPE: DENYLIST_SEGMENTS applies to ALL path segments (sensitive regardless of
+            // location: .env, .git, .hg, .svn). ROOT_ONLY_DENYLIST applies only to the first
+            // segment relative to the project base (build, target, out, .idea, node_modules —
+            // almost always root-level, and global matching would cause false positives for
+            // non-standard layouts like design/.idea/mockups.txt).
             val pathSegments = canonicalPath.lowercase()
                 .split(java.io.File.separatorChar, '/')
                 .filter { it.isNotEmpty() }
@@ -152,6 +157,17 @@ internal class AttachmentValidator(
                         rejectedFiles.add(RejectedAttachment(file.name, file.path, "image too large"))
                         return@forEach
                     }
+                    // TOCTOU size-check-then-read race: fileObj.length() is a stat() call,
+                    // and fileObj.readBytes() below re-resolves the path. If the file is
+                    // swapped to a larger file between the size check and readBytes(), the
+                    // read could exceed the 10MB limit (consuming up to whatever size the
+                    // attacker swaps in). For the current threat model (local IDE,
+                    // user-initiated attachments from the user's own filesystem), this
+                    // residual risk is acceptable — an attacker who can swap files on the
+                    // user's local filesystem already has broader capabilities. A
+                    // high-security fix would use Files.readAllBytes(Path) with a
+                    // pre-opened FileChannel and verify the channel's path after reading,
+                    // pinning the file descriptor across the size check and read.
                     val bytes = fileObj.readBytes()
                     // Re-verify canonical path after read to detect TOCTOU symlink swap
                     val postReadCanonical = fileObj.canonicalPath
@@ -204,20 +220,28 @@ internal class AttachmentValidator(
 
         // Denylist segments — moved here from inline setOf() in sendMessageInternal.
         // These segments are checked against ALL path segments globally (see isDenylisted
-        // below). They are sensitive regardless of location in the path tree.
+        // below). They are sensitive regardless of location in the path tree — e.g.,
+        // a `.env` file or `.git` directory anywhere is always sensitive.
+        // NOTE: `.idea` and `node_modules` are NOT here — they are almost always
+        // root-level, and a subdirectory named `.idea` (e.g., design/.idea/mockups.txt)
+        // or `node_modules` (e.g., src/node_modules_utils/helper.kt) would be a false
+        // positive. They are checked only at the project-root level via
+        // ROOT_ONLY_DENYLIST to avoid rejecting legitimate files in non-standard
+        // project layouts.
         // NOTE: "build", "target", "out" are intentionally NOT here — they are legitimate
         // package/directory names under src/ (e.g., src/main/build/). They are checked
         // only at the project-root level via ROOT_ONLY_DENYLIST to avoid false positives.
         val DENYLIST_SEGMENTS = setOf(
             ".env", ".env.local", ".env.production",
             ".git", ".hg", ".svn",
-            ".idea",
-            "node_modules",
         )
         // Root-only denylist: checked against the first path segment RELATIVE to the
         // project base (see projectRelativeFirstSegment below). "build"/"target"/"out"
         // at the project root are build-output directories and rejected, but the same
         // names nested under src/ are legitimate source directories and allowed.
-        val ROOT_ONLY_DENYLIST = setOf("build", "target", "out")
+        // ".idea" and "node_modules" are also root-only — they are almost always at the
+        // project root, and rejecting them globally would cause false positives for
+        // non-standard project layouts (e.g., a design/.idea/ mockups directory).
+        val ROOT_ONLY_DENYLIST = setOf("build", "target", "out", ".idea", "node_modules")
     }
 }

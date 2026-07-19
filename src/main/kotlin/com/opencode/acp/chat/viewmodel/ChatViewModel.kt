@@ -4,13 +4,12 @@ import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.model.ChildPermissionPrompt
 import com.opencode.acp.chat.processor.UiSignal
-import com.opencode.acp.chat.service.OpenCodeService
+import com.opencode.acp.chat.service.OpenCodeServiceApi
 import com.opencode.acp.chat.service.SendMessageResult
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
-import com.opencode.acp.chat.OpenCodeNotifications
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.follow.EditorFollowManager
 import com.opencode.acp.mcp.ToolPermission
@@ -43,7 +42,7 @@ import kotlinx.coroutines.sync.Mutex
  */
 class ChatViewModel(
     val scope: CoroutineScope,
-    private val service: OpenCodeService,
+    private val service: OpenCodeServiceApi,
     private val project: Project
 ) {
 
@@ -65,8 +64,13 @@ class ChatViewModel(
     val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = service.sessionCachedFlow
 
     // --- UI-specific state ---
-    private val _controlState = MutableStateFlow(ControlBarState())
-    val controlState: StateFlow<ControlBarState> = _controlState.asStateFlow()
+    // Control bar state (agent/model/thinking effort) — delegated to ControlBarViewModel
+    // (TDD §9 step 6, Phase 3). ChatViewModel exposes the same public API via delegation.
+    private val controlBarViewModel = ControlBarViewModel(
+        service = service,
+        settings = OpenCodeSettingsState.getInstance(),
+    )
+    val controlState: StateFlow<ControlBarState> = controlBarViewModel.controlState
 
     private val _streamPhase = MutableStateFlow(StreamPhase.IDLE)
     val streamPhase: StateFlow<StreamPhase> = _streamPhase.asStateFlow()
@@ -130,20 +134,55 @@ class ChatViewModel(
     )
     val queuedMessages: StateFlow<List<QueuedMessage>> = messageQueueManager.queuedMessages
 
+    // --- Signal routing (delegated to SignalRouter + SignalSideEffectExecutor) ---
+    // Extracted per TDD §9 step 5 (Phase 3). The router maps UiSignal → SignalEffect
+    // (pure, no state); the executor runs each effect with injected dependencies.
+    // The StreamingCompleted ordered side effects are preserved exactly:
+    //   SetStreamPhaseIdle → NotifyResponseComplete (conditional) →
+    //   ComputeSessionContext → FetchTodos → LoadSessions → DrainQueue →
+    //   RefreshReviewFiles.
+    private val signalRouter = SignalRouter(scope)
+    private val signalSideEffectExecutor = SignalSideEffectExecutor(
+        service = service,
+        project = project,
+        permissionViewModel = permissionViewModel,
+        messageQueueManager = messageQueueManager,
+        refreshReviewFiles = { refreshReviewFiles() },
+        computeSessionContext = { computeSessionContext() },
+        fetchTodos = { fetchTodos() },
+        computeSessionContextLocal = { computeSessionContextLocal() },
+        setStreamPhaseIdle = { _streamPhase.value = StreamPhase.IDLE },
+        // Gate on sessionId: only reset the ACTIVE session's stream phase if the SessionError
+        // was for the active session. Without this gate, a SessionError on an inactive/background
+        // session would incorrectly reset the active session's stream phase, potentially hiding
+        // the stop button while the active session is still streaming.
+        setStreamPhaseIdleForSession = { sessionId ->
+            if (sessionId == service.activeSessionId.value) {
+                _streamPhase.value = StreamPhase.IDLE
+            }
+        },
+        emitFileChangeSignal = { _fileChangeSignal.tryEmit(Unit) },
+        isActiveSessionChild = { isActiveSessionChild.value },
+        isActiveMessage = { messageId -> service.messages.value.containsKey(messageId) },
+        scope = scope,
+    )
+
     private val _readyState = MutableStateFlow(ReadyState.NOT_STARTED)
     val readyState: StateFlow<ReadyState> = _readyState.asStateFlow()
 
-    /** Manual compaction UI state — Idle / InProgress / Error. */
-    private val _compactionState = MutableStateFlow<CompactionState>(CompactionState.Idle)
-    val compactionState: StateFlow<CompactionState> = _compactionState.asStateFlow()
+    /** Manual compaction UI state — Idle / InProgress / Error.
+     *  Delegated to [CompactionViewModel] (TDD §9 step 6, Phase 3). */
+    private val compactionViewModel = CompactionViewModel(
+        service = service,
+        scope = scope,
+        selectedModelProvider = { controlBarViewModel.controlState.value.selectedModel },
+    )
+    val compactionState: StateFlow<CompactionState> = compactionViewModel.compactionState
 
-    /** In-flight guard for compaction — prevents concurrent compaction requests
-     *  that could corrupt server-side session state on timeout+retry. */
-    private val compactionInProgress = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /** Whether a background compaction checkpoint is ready for instant swap. */
-    private val _checkpointReady = MutableStateFlow(false)
-    val checkpointReady: StateFlow<Boolean> = _checkpointReady.asStateFlow()
+    /** Whether a background compaction checkpoint is ready for instant swap.
+     *  Owned by [CompactionViewModel]; written by [computeSessionContext] via
+     *  `compactionViewModel.setCheckpointReady()`. */
+    val checkpointReady: StateFlow<Boolean> = compactionViewModel.checkpointReady
 
     private val initMutex = Mutex()
     private var initJob: Job? = null
@@ -228,211 +267,49 @@ class ChatViewModel(
             }
         }
 
-        // Collect active session signals and update UI state
+        // Collect active session signals and update UI state.
+        //
+        // Signal routing is delegated to [signalRouter] + [signalSideEffectExecutor]
+        // (TDD §9 step 5, Phase 3). The router maps UiSignal → SignalEffect (pure,
+        // no state); the executor runs each effect with injected dependencies.
+        //
+        // The StreamingCompleted ordered side effects are preserved exactly:
+        //   SetStreamPhaseIdle → NotifyResponseComplete (conditional) →
+        //   ComputeSessionContext → FetchTodos → LoadSessions → DrainQueue →
+        //   RefreshReviewFiles.
+        //
+        // StreamingStarted is handled inline here (simple StateFlow update, no
+        // side effect) — the router only emits effects for side-effectful ops.
+        // The router also collects service.signals but its StreamingStarted
+        // branch is a no-op, so there's no conflict.
         scope.launch {
             service.signals.collect { signal ->
-                when (signal) {
-                    is UiSignal.StreamingStarted -> {
-                        logger.info { "[ACP] signal: StreamingStarted → _streamPhase = STREAMING (current=${_streamPhase.value})" }
-                        _streamPhase.value = StreamPhase.STREAMING
-                    }
-                    is UiSignal.StreamingCompleted -> {
-                        logger.info { "[ACP] signal: StreamingCompleted → _streamPhase = IDLE (current=${_streamPhase.value})" }
-                        _streamPhase.value = StreamPhase.IDLE
-                        // IDE notification — only when:
-                        //  1. The response ended naturally (not aborted/errored/timed out)
-                        //  2. The active session is NOT a child/subtask session
-                        //  3. The user is not looking at the IDE
-                        // Check if the completing message belongs to the active session.
-                        // If the user switched sessions, isActiveSessionChild may be stale.
-                        // Verify the message is in the active session before notifying.
-                        val isActiveMessage = service.messages.value.containsKey(signal.messageId)
-                        if (signal.naturalCompletion && !isActiveSessionChild.value && isActiveMessage) {
-                            OpenCodeNotifications.notifyResponseComplete(project)
-                        }
-                        // Refresh context and todos after response completes.
-                        // Ordered sequentially: loadSessions must complete before
-                        // drainQueue runs (drainQueue sends the next queued message,
-                        // which depends on the session list being up to date).
-                        scope.launch {
-                            // Each operation is independently wrapped so a failure in one
-                            // doesn't skip the others — especially drainQueue(), which would
-                            // leave the user's queued message permanently stuck.
-                            try { computeSessionContext() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { logger.warn(e) { "[ACP] computeSessionContext failed after StreamingCompleted" } }
-                            try { fetchTodos() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { logger.warn(e) { "[ACP] fetchTodos failed after StreamingCompleted" } }
-                            try { service.loadSessions() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { logger.warn(e) { "[ACP] loadSessions failed after StreamingCompleted" } }
-                            try { messageQueueManager.drainQueue() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { logger.warn(e) { "[ACP] drainQueue failed after StreamingCompleted" } }
-                        }
-                        // Refresh review comments — the LLM may have written .review/ files
-                        // during the response. StreamingCompleted fires once per response
-                        // (after all tool calls finish), so this is the correct timing point.
-                        // Not gated on fileChanges because .review/ files can be written by
-                        // non-edit tools (bash, custom review tools, undetected kinds).
-                        refreshReviewFiles()
-                    }
-                    is UiSignal.PermissionRequested -> {
-                        permissionViewModel.setPermissionPrompt(signal.prompt)
-                        OpenCodeNotifications.notifyPermissionNeeded(project)
-                        // NOTE: timeoutSeconds is read at call time from settings. If the user
-                        // changes the setting while a prompt is pending, the current timeout
-                        // is NOT restarted — the new value applies to the next prompt.
-                        permissionViewModel.startPermissionTimeout()
-                    }
-                    is UiSignal.SelectionRequested -> {
-                        permissionViewModel.setSelectionPrompt(signal.prompt)
-                        OpenCodeNotifications.notifyQuestionAsked(project)
-                    }
-                    // Informational signals — processor handles state updates directly
-                    is UiSignal.Error -> Unit
-                    is UiSignal.TodoUpdated -> Unit
-                    is UiSignal.FileChanged -> {
-                        _fileChangeSignal.tryEmit(Unit)
-                        // Trigger a VFS refresh so the ReviewCommentManager's
-                        // AsyncFileListener picks up any new .review/ JSON files
-                        // written by the LLM agent. Without this, gutter icons
-                        // and highlights don't appear until the user manually
-                        // refreshes (Ctrl+Alt+Y) or alt-tabs away and back.
-                        refreshReviewFiles()
-                    }
-                    is UiSignal.MessageUpdated -> {
-                        // Intermediate token/cost update — local-only refresh (no REST).
-                        // Keeps the context indicator live during streaming without
-                        // spamming the server. Full REST refresh on StreamingCompleted.
-                        scope.launch { computeSessionContextLocal() }
-                    }
-                    // Global-only signals — should not arrive on activeSignals,
-                    // but must be present for exhaustive when.
-                    is UiSignal.SessionCreated -> Unit
-                    is UiSignal.SessionIdle -> Unit
-                    is UiSignal.SessionError -> Unit
-                    is UiSignal.SessionCompacted -> Unit
-                    is UiSignal.ChildPermissionRequested -> Unit
-                    is UiSignal.PermissionReplied -> Unit
-                    is UiSignal.PermissionTimedOut -> Unit
+                if (signal is UiSignal.StreamingStarted) {
+                    logger.info { "[ACP] signal: StreamingStarted → _streamPhase = STREAMING (current=${_streamPhase.value})" }
+                    _streamPhase.value = StreamPhase.STREAMING
                 }
             }
         }
 
-        // Collect global signals (SessionCreated, etc.)
+        // Collect SessionCompacted from globalSignals to release the compaction
+        // in-flight guard early (short-circuits the COMPACT_TIMEOUT_BACKOFF_MS
+        // backoff when the server confirms the compaction). The router's
+        // RefreshActiveSessionMessages + ComputeSessionContext effects still run
+        // for message refresh; this collector only handles the guard release.
         scope.launch {
             service.globalSignals.collect { signal ->
-                when (signal) {
-                    is UiSignal.SessionCreated -> {
-                        scope.launch { service.loadSessions() }
-                    }
-                    is UiSignal.SessionIdle -> {
-                        // Server-authoritative idle signal — refresh context immediately
-                        // (eliminates the 300ms debounce dependency from StreamingCompleted)
-                        scope.launch { computeSessionContext() }
-                    }
-                    is UiSignal.SessionError -> {
-                        // SessionState's SseEvent.SessionError handler now finalizes
-                        // streaming and emits StreamingCompleted (which completes
-                        // responseDeferred and transitions to IDLE via the signals
-                        // collector above). This handler is a belt-and-suspenders reset
-                        // for the edge case where StreamingCompleted was already emitted
-                        // (streamingCompletedEmitted guard) and the phase is stuck.
-                        //
-                        // Reset phase for any session error — the signal carries the
-                        // sessionId that errored. Using service.sessionId (mutable) here
-                        // could miss the reset if the user switched sessions between
-                        // signal emission and this handler. Resetting is idempotent.
-                        _streamPhase.value = StreamPhase.IDLE
-                        // Always remove the specific session from spinner set (not just active)
-                        service.removeStreamingSession(signal.sessionId)
-                        logger.warn { "[ACP] ViewModel received session error: session=${signal.sessionId}, error=${signal.errorMessage}" }
-                    }
-                    is UiSignal.SessionCompacted -> {
-                        // Server performed auto-compaction — local message cache is stale.
-                        // Refresh messages from server, then recompute context.
-                        scope.launch {
-                            service.refreshActiveSessionMessages()
-                            computeSessionContext()
-                        }
-                    }
-                    is UiSignal.ChildPermissionRequested -> {
-                        permissionViewModel.addChildPermissionPrompt(signal.prompt)
-                        OpenCodeNotifications.notifyPermissionNeeded(project)
-                        // NOTE: Do NOT change _streamPhase or inputState — child permissions are non-blocking
-                    }
-                    is UiSignal.PermissionReplied -> {
-                        // Confirm server processed our reply
-                        if (permissionViewModel.permissionPrompt.value?.permissionId == signal.permissionId) {
-                            // Active-session permission: clear it
-                            permissionViewModel.setPermissionPrompt(null)
-                            service.permissionManager.cancelPermissionTimeout()
-                        }
-                        // Handle child prompts based on reply type
-                        // Check failed POST notification regardless of whether prompts
-                        // were cleared by a concurrent timeout — the user must still see
-                        // that the server processed the failed POST (TDD §4.2.4).
-                        if (signal.sessionId in permissionViewModel.failedPermissionPostSessions) {
-                            OpenCodeNotifications.notifyPermissionProcessedDespiteError(project, signal.sessionId)
-                            permissionViewModel.failedPermissionPostSessions.remove(signal.sessionId)
-                        }
-                        // Then handle child prompts if they still exist
-                        if (permissionViewModel.childPermissionPrompts.value.containsKey(signal.sessionId)) {
-                            if (signal.reply == "reject") {
-                                // Cascade: server rejects all pending permissions in the session
-                                permissionViewModel.removeChildPrompts(signal.sessionId)
-                                permissionViewModel.cancelChildPermissionTimeout(signal.sessionId)
-                            } else {
-                                // Non-reject reply: remove only the FIRST prompt (FIFO)
-                                val newFirstToolName = permissionViewModel.dropFirstChildPrompt(signal.sessionId)
-                                if (newFirstToolName == null) {
-                                    // No more prompts — cancel the timeout
-                                    permissionViewModel.cancelChildPermissionTimeout(signal.sessionId)
-                                } else {
-                                    // Remaining prompts — restart the timeout for the new first prompt
-                                    permissionViewModel.startChildPermissionTimeout(signal.sessionId, newFirstToolName)
-                                }
-                            }
-                        }
-                    }
-                    is UiSignal.PermissionTimedOut -> {
-                        OpenCodeNotifications.notifyPermissionTimedOut(project, signal.toolName)
-                        // Only clear active prompt if the timeout is for the active session's
-                        // permission (non-empty permissionId matching the current prompt).
-                        // Child permission timeouts use permissionId="" — they must NOT
-                        // clear the active session's permission prompt.
-                        if (signal.permissionId.isNotEmpty() && permissionViewModel.permissionPrompt.value?.permissionId == signal.permissionId) {
-                            permissionViewModel.setPermissionPrompt(null)
-                        }
-                        // Clear child prompts for the timed-out child session.
-                        // POST reject to the server for each remaining pending prompt before
-                        // clearing locally — the server is still waiting on Deferred promises
-                        // and would block indefinitely without a reply.
-                        if (signal.sessionId.isNotEmpty()) {
-                            val pending = permissionViewModel.getChildPrompts(signal.sessionId)
-                            if (pending.isNotEmpty()) {
-                                // Use service.scope (not ViewModel scope) so reject POSTs survive
-                                // tool window disposal — the server's Deferred promises must be
-                                // resolved even if the user closes the tool window.
-                                service.scope.launch {
-                                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                                        pending.forEach { p ->
-                                            try {
-                                                service.permissionManager.respondPermission(
-                                                    p.permissionId, p.toolCallId, signal.sessionId,
-                                                    PermissionResponse.REJECT_ONCE,
-                                                )
-                                            } catch (e: kotlinx.coroutines.CancellationException) {
-                                                throw e
-                                            } catch (e: Exception) {
-                                                logger.warn(e) { "[ACP] Timeout reject failed for permission ${p.permissionId}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            permissionViewModel.removeChildPrompts(signal.sessionId)
-                            permissionViewModel.cancelChildPermissionTimeout(signal.sessionId)
-                        }
-                    }
-                    else -> { /* other global signals */ }
+                if (signal is UiSignal.SessionCompacted) {
+                    compactionViewModel.onSessionCompacted()
                 }
             }
         }
+
+        // Start the SignalRouter → SignalSideEffectExecutor pipeline.
+        // The router collects service.signals and service.globalSignals and
+        // emits SignalEffect values; the executor collects the effects and
+        // runs each with the injected dependencies.
+        signalRouter.start(service.signals, service.globalSignals)
+        signalSideEffectExecutor.start(signalRouter.effects)
 
         // Load persisted command history
         commandHistoryManager.loadFromSettings()
@@ -520,98 +397,32 @@ class ChatViewModel(
 
                     _readyState.value = ReadyState.LOADING_AGENTS
                     try {
-                        val agents = withTimeoutOrNull(30_000) { service.listAgents() }
-                        if (agents == null) {
-                            logger.warn { "[ACP] Agent loading timed out after 30s — continuing with defaults" }
-                        } else {
-                            val filtered = agents.filter { it.mode != "subagent" && it.hidden != true }
-                            _controlState.value = _controlState.value.copy(
-                                agents = filtered.map { info ->
-                                    OpenCodeAgentInfo(id = info.id, name = info.name, description = info.description)
-                                }
-                            )
-                            val defaultAgentInfo = filtered.firstOrNull { it.name == "orchestrator" }
-                                ?: filtered.firstOrNull()
-                            if (defaultAgentInfo != null) {
-                                val agentInfo = _controlState.value.agents.find { it.id == defaultAgentInfo.id }
-                                if (agentInfo != null) {
-                                    _controlState.value = _controlState.value.copy(selectedAgent = agentInfo)
-                                }
-                            }
-                            logger.info { "[ACP] ReadyState: LOADING_AGENTS → LOADING_PROVIDERS (agents=${filtered.size} loaded, defaultAgent=${defaultAgentInfo?.id})" }
-                        }
+                        controlBarViewModel.loadAgentsAndProviders()
+                        logger.info { "[ACP] ReadyState: LOADING_AGENTS → LOADING_PROVIDERS (agents=${controlBarViewModel.controlState.value.agents.size} loaded, defaultAgent=${controlBarViewModel.controlState.value.selectedAgent?.id})" }
                     } catch (e: Exception) {
-                        logger.warn { "[ACP] Agent loading failed: ${e.message}" }
+                        logger.warn { "[ACP] Agent/provider loading failed: ${e.message}" }
                     }
                     // Always progress — agent loading is optional (chat works with defaults)
 
                     _readyState.value = ReadyState.LOADING_PROVIDERS
-                    try {
-                        val providers = withTimeoutOrNull(30_000) { service.listProviders() }
-                        if (providers == null) {
-                            logger.warn { "[ACP] Provider loading timed out after 30s" }
-                        } else {
-                            val connectedIds = providers.connected.toSet()
-                            fun buildProviderModels(providerList: List<com.opencode.acp.adapter.ProviderData>): List<ProviderModel> {
-                                return providerList.flatMap { provider ->
-                                    provider.models.map { (_, modelData) ->
-                                        ProviderModel(
-                                            providerID = provider.id,
-                                            modelID = modelData.id,
-                                            displayName = "${provider.name} / ${modelData.name}",
-                                            reasoning = modelData.reasoning,
-                                            contextWindow = modelData.limit?.context ?: 0,
-                                            providerIconId = provider.id,
-                                            variants = modelData.variants?.keys?.toList() ?: emptyList()
-                                        )
-                                    }
-                                }
-                            }
-                            val models = buildProviderModels(providers.all.filter { it.id in connectedIds })
-                            val allModels = buildProviderModels(providers.all)
-                            val savedKey = OpenCodeSettingsState.getInstance().lastSelectedModelKey
-                            val restoredModel = if (savedKey.isNotEmpty()) {
-                                models.find {
-                                    OpenCodeSettingsState.modelKey(it.providerID, it.modelID) == savedKey
-                                }
-                            } else null
-                            _controlState.value = _controlState.value.copy(
-                                models = models,
-                                allModels = allModels,
-                                selectedModel = restoredModel ?: models.firstOrNull()
-                            )
-                            // Restore persisted agent selection
-                            val savedAgentId = OpenCodeSettingsState.getInstance().lastSelectedAgent
-                            if (savedAgentId.isNotEmpty()) {
-                                val restoredAgent = _controlState.value.agents.find { it.id == savedAgentId }
-                                if (restoredAgent != null) {
-                                    _controlState.value = _controlState.value.copy(selectedAgent = restoredAgent)
-                                }
-                            }
-                            // Restore persisted thinking effort
-                            val savedEffortName = OpenCodeSettingsState.getInstance().lastSelectedThinkingEffort
-                            if (savedEffortName.isNotEmpty()) {
-                                val restoredEffort = ThinkingEffort.entries.firstOrNull { it.name == savedEffortName }
-                                if (restoredEffort != null) {
-                                    _controlState.value = _controlState.value.copy(thinkingEffort = restoredEffort)
-                                }
-                            }
-                            logger.info { "[ACP] ReadyState: LOADING_PROVIDERS → LOADING_MCP (providers=${providers.all.size} loaded)" }
-                        }
-                    } catch (e: Exception) {
-                        logger.warn { "[ACP] Provider loading failed: ${e.message}" }
-                    }
+                    // Provider loading is performed inside controlBarViewModel.loadAgentsAndProviders()
+                    // (it loads agents then providers in sequence). The LOADING_PROVIDERS state is
+                    // kept for UI continuity — it briefly shows after loadAgentsAndProviders()
+                    // returns before transitioning to LOADING_MCP.
+                    logger.info { "[ACP] ReadyState: LOADING_PROVIDERS → LOADING_MCP (providers=${controlBarViewModel.controlState.value.models.size} loaded)" }
 
                     _readyState.value = ReadyState.LOADING_MCP
                     try {
                         val registry = service.toolRegistry
                         if (registry != null) {
-                            val baseUrl = "http://127.0.0.1:${service.connectionManager.port}"
+                            val baseUrl = "http://${service.connectionManager.host}:${service.connectionManager.port}"
                             val mcpUrls = service.mcpManager?.getServerUrls() ?: emptyMap()
                             withTimeoutOrNull(60_000) {
                                 registry.discoverAll(baseUrl, mcpUrls)
-                                // Merge persisted permissions after discovery
-                                val persisted = loadPersistedPermissions()
+                                // Merge persisted permissions after discovery.
+                                // loadPersistedPermissions() applies fail-closed
+                                // (all tools → ASK) if the persisted JSON is corrupted.
+                                val persisted = loadPersistedPermissions(registry)
                                 if (persisted.isNotEmpty()) {
                                     registry.loadEnabledAndPermissions(persisted)
                                 }
@@ -655,21 +466,11 @@ class ChatViewModel(
 
     // --- Control bar actions ---
 
-    fun selectAgent(agent: OpenCodeAgentInfo) {
-        _controlState.value = _controlState.value.copy(selectedAgent = agent)
-        OpenCodeSettingsState.getInstance().lastSelectedAgent = agent.id
-    }
+    fun selectAgent(agent: OpenCodeAgentInfo) = controlBarViewModel.selectAgent(agent)
 
-    fun selectModel(model: ProviderModel) {
-        _controlState.value = _controlState.value.copy(selectedModel = model)
-        val settings = OpenCodeSettingsState.getInstance()
-        settings.lastSelectedModelKey = OpenCodeSettingsState.modelKey(model.providerID, model.modelID)
-    }
+    fun selectModel(model: ProviderModel) = controlBarViewModel.selectModel(model)
 
-    fun selectThinkingEffort(effort: ThinkingEffort) {
-        _controlState.value = _controlState.value.copy(thinkingEffort = effort)
-        OpenCodeSettingsState.getInstance().lastSelectedThinkingEffort = effort.name
-    }
+    fun selectThinkingEffort(effort: ThinkingEffort) = controlBarViewModel.selectThinkingEffort(effort)
 
     fun toggleSidebar() {
         val newValue = !_isSidebarVisible.value
@@ -780,7 +581,7 @@ class ChatViewModel(
     // --- Message sending ---
 
     suspend fun sendMessage(text: String, files: List<AttachedFile> = emptyList()): SendMessageResult {
-        val state = _controlState.value
+        val state = controlBarViewModel.controlState.value
         return sendMessageWithModel(
             text = text,
             files = files,
@@ -957,7 +758,7 @@ class ChatViewModel(
     suspend fun respondPermission(response: PermissionResponse) {
         permissionViewModel.respondPermission(
             response,
-            agentName = _controlState.value.selectedAgent?.id ?: "orchestrator",
+            agentName = controlBarViewModel.controlState.value.selectedAgent?.id ?: "orchestrator",
         )
     }
 
@@ -980,12 +781,12 @@ class ChatViewModel(
     // --- Context ---
 
     suspend fun computeSessionContext() {
-        service.computeSessionContext(_controlState.value)
-        _checkpointReady.value = service.isCheckpointReady()
+        service.computeSessionContext(controlBarViewModel.controlState.value)
+        compactionViewModel.setCheckpointReady(service.isCheckpointReady())
     }
 
     private suspend fun computeSessionContextLocal() {
-        service.computeSessionContextLocal(_controlState.value)
+        service.computeSessionContextLocal(controlBarViewModel.controlState.value)
     }
 
     fun retryContextFetch() {
@@ -1001,79 +802,10 @@ class ChatViewModel(
      * guidance features, but they were dropped after research confirmed the server
      * ignores unknown fields.
      */
-    fun compactSession() {
-        val sessionId = service.sessionId
-        if (sessionId == null) {
-            _compactionState.value = CompactionState.Error(CompactionError.NoActiveSession)
-            return
-        }
-        val client = service.connectionManager.client
-        if (client == null) {
-            _compactionState.value = CompactionState.Error(CompactionError.NotConnected)
-            return
-        }
-
-        // In-flight guard: prevent concurrent compaction requests. If the server
-        // is already processing a compaction (e.g., from a timed-out retry), sending
-        // a second request could corrupt session state.
-        if (!compactionInProgress.compareAndSet(false, true)) {
-            logger.warn { "[ACP] Manual compaction rejected — already in progress" }
-            return
-        }
-
-        logger.info { "[ACP] Manual compaction triggered for session $sessionId" }
-        _compactionState.value = CompactionState.InProgress
-
-        // The guard is reset in the launched coroutine's finally block below.
-        scope.launch {
-            try {
-                val state = _controlState.value
-                val providerID = state.selectedModel?.providerID ?: ""
-                val modelID = state.selectedModel?.modelID ?: ""
-                if (providerID.isBlank() || modelID.isBlank()) {
-                    _compactionState.value = CompactionState.Error(
-                        CompactionError.ServerError("No model selected")
-                    )
-                    return@launch
-                }
-                val success = kotlinx.coroutines.withTimeout(
-                    com.opencode.acp.chat.model.CompactionConstants.COMPACT_TIMEOUT_MS
-                ) {
-                    client.compactSession(sessionId, providerID, modelID, auto = false)
-                }
-                if (success) {
-                    _compactionState.value = CompactionState.Idle
-                    // SSE session.compacted event handles message refresh + context update
-                    logger.info { "[ACP] Manual compaction succeeded for session $sessionId" }
-                } else {
-                    _compactionState.value = CompactionState.Error(
-                        CompactionError.ServerError("Compaction failed")
-                    )
-                }
-            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-                _compactionState.value = CompactionState.Error(CompactionError.Timeout)
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: java.net.ConnectException) {
-                _compactionState.value = CompactionState.Error(CompactionError.NotConnected)
-            } catch (e: Exception) {
-                val msg = e.message ?: "Unknown error"
-                // Detect timeout-like exceptions from Ktor
-                if (msg.contains("timeout", ignoreCase = true) || e is java.net.SocketTimeoutException) {
-                    _compactionState.value = CompactionState.Error(CompactionError.Timeout)
-                } else {
-                    _compactionState.value = CompactionState.Error(CompactionError.ServerError(msg))
-                }
-            } finally {
-                compactionInProgress.set(false)
-            }
-        }
-    }
+    fun compactSession() = compactionViewModel.compactSession()
 
     /** Reset compaction state to Idle (e.g., after user dismisses an error). */
-    fun resetCompactionState() {
-        _compactionState.value = CompactionState.Idle
-    }
+    fun resetCompactionState() = compactionViewModel.resetCompactionState()
 
     // --- Todos ---
 
@@ -1103,7 +835,7 @@ class ChatViewModel(
         scope = scope,
         project = project,
         gitService = gitService,
-        controlStateProvider = { _controlState.value },
+        controlStateProvider = { controlBarViewModel.controlState.value },
         sendFunction = { text, files -> sendMessage(text, files) },
         sendWithModelFunction = { text, modelID, providerID, variant, model ->
             sendMessageWithModel(
@@ -1120,16 +852,18 @@ class ChatViewModel(
         resetCancelled = { multiModelReviewCancelled = false },
     )
 
-    /** Execute `/review-perform [model...]` — instructs the LLM to adversarially
+    /** Execute `/review-perform model...` — instructs the LLM to adversarially
      *  review the VCS-changed files and add review comments to `.review/` JSON files.
      *  See [ReviewCommandHandler.executeReviewPerformCommand] for model-selection
      *  semantics. */
+    @Suppress("KDocUnresolvedReference")
     fun executeReviewPerformCommand(args: String = "") =
         reviewCommandHandler.executeReviewPerformCommand(args)
 
-    /** Execute `/review-perform-gaming [model...]` — like
-     *  [executeReviewPerformCommand] but injects the game-engine-specific
+    /** Execute `/review-perform-gaming model...` — like
+     *  executeReviewPerformCommand but injects the game-engine-specific
      *  adversarial checklist. Delegated to [ReviewCommandHandler]. */
+    @Suppress("KDocUnresolvedReference")
     fun executeReviewPerformGamingCommand(args: String = "") =
         reviewCommandHandler.executeReviewPerformGamingCommand(args)
 
@@ -1139,10 +873,11 @@ class ChatViewModel(
     fun executeReviewResolveCommand() =
         reviewCommandHandler.executeReviewResolveCommand()
 
-    /** Execute `/review-recheck [model...]` — re-runs the adversarial review with
+    /** Execute `/review-recheck model...` — re-runs the adversarial review with
      *  existing comments + replies as context. Delegated to [ReviewCommandHandler].
      *  See [ReviewCommandHandler.executeReviewRecheckCommand] for the reply
      *  preservation safety net. */
+    @Suppress("KDocUnresolvedReference")
     fun executeReviewRecheckCommand(args: String = "") =
         reviewCommandHandler.executeReviewRecheckCommand(args)
 
@@ -1233,7 +968,9 @@ class ChatViewModel(
 
     // --- Permission persistence ---
 
-    private fun loadPersistedPermissions(): Map<String, Pair<Boolean, ToolPermission>> {
+    private fun loadPersistedPermissions(
+        registry: com.opencode.acp.mcp.ToolRegistry? = service.toolRegistry
+    ): Map<String, Pair<Boolean, ToolPermission>> {
         val settings = OpenCodeMcpSettingsState.getInstance()
         val permsJson = settings.toolPermissions
         if (permsJson.isBlank()) return emptyMap()
@@ -1245,8 +982,21 @@ class ChatViewModel(
                 Pair(pair.first, ToolPermission.fromActionString(pair.second))
             }
         } catch (e: Exception) {
-            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — corrupted settings, clearing" }
-            emptyMap()
+            // FAIL-CLOSED: corrupted permissions JSON → set all discovered tools to ASK
+            // (safest interactive default) instead of leaving them at ALLOW. See
+            // OpenCodeService.discoverToolsInBackground for the full rationale.
+            logger.error(e) { "[ACP] Corrupted tool permissions JSON — failing closed (all tools → ASK)" }
+            val allDiscovered = registry?.tools?.values ?: emptyList()
+            if (allDiscovered.isEmpty()) {
+                emptyMap()
+            } else {
+                val failClosed = mutableMapOf<String, Pair<Boolean, ToolPermission>>()
+                for (tool in allDiscovered) {
+                    failClosed[tool.id] = Pair(true, ToolPermission.ASK)
+                    failClosed[tool.name] = Pair(true, ToolPermission.ASK)
+                }
+                failClosed.toMap()
+            }
         }
     }
 
@@ -1255,6 +1005,9 @@ class ChatViewModel(
     fun close() {
         connectionObserverJob?.cancel()
         initJob?.cancel()
+        // Stop the SignalRouter → SignalSideEffectExecutor pipeline.
+        signalSideEffectExecutor.stop()
+        signalRouter.stop()
         service.permissionManager.cancelPermissionTimeout()
         // Cancel child permission timeout jobs and clear prompt state —
         // delegated to PermissionViewModel, which owns both.

@@ -138,7 +138,7 @@ class AttachmentValidatorTest {
         val result = v.validateAndEncode(listOf(file))
         result.acceptedFileNames shouldHaveSize 0
         result.rejectedFiles shouldHaveSize 1
-        result.rejectedFiles[0].reason shouldContain "not found or unreadable"
+        result.rejectedFiles[0].reason shouldContain "not found"
     }
 
     @Test

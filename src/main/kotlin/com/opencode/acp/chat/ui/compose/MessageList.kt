@@ -407,6 +407,14 @@ fun MessageList(
                     // messagesState changes, re-invoking this lambda with fresh data
                     // — bypassing LazyColumn's key-diffing. This eliminates both the
                     // flicker (no dispose+recreate) and the stale-data bug (fresh read).
+                    //
+                    // Transient stale-message window on removal: if a message is removed
+                    // from messagesState between the `messages` derivation and this lambda
+                    // executing, `messagesState.value[messages[index].id]` returns null and
+                    // the `?: messages[index]` fallback renders the (now-removed) message
+                    // for one frame. This is acceptable for a chat UI: compaction removals
+                    // are rare and the next recomposition removes the item from `messages`
+                    // (so the LazyColumn slot is disposed). No logic change needed.
                     val currentMessage = messagesState.value[messages[index].id] ?: messages[index]
                     MessageItem(currentMessage, project, onImagePreview, getStreamingText = getStreamingText, onOpenSubtask = onOpenSubtask)
                     if (index < messages.size - 1) {
@@ -524,7 +532,15 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
                     if (file.mime.startsWith("image/")) {
                         var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
                         LaunchedEffect(file.path) {
-                            bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
+                            // decodeFileToBitmap already returns null for missing/unreadable/corrupt
+                            // files (see ImageUtils.kt), but wrap in try-catch as a defense-in-depth
+                            // measure so a pathological failure (e.g., Error from the image decoder)
+                            // can never crash the composition. file.path may point to a deleted or
+                            // moved file when reconstructed from command history — graceful null is
+                            // the correct behavior; the image simply won't render.
+                            bitmap = withContext(Dispatchers.IO) {
+                                try { decodeFileToBitmap(file.path) } catch (_: Throwable) { null }
+                            }
                         }
                         bitmap?.let { bm ->
                             Box(
@@ -815,10 +831,10 @@ private fun StepFinishPill(stepFinish: MessagePart.StepFinish) {
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         val tokenParts = buildList {
-            stepFinish.inputTokens?.let { add("${formatTokenCount(it)} in") }
-            stepFinish.outputTokens?.let { add("${formatTokenCount(it)} out") }
-            stepFinish.reasoningTokens?.let { add("${formatTokenCount(it)} reasoning") }
-            stepFinish.totalCost?.let { add("$${"%.4f".format(it)}") }
+            stepFinish.inputTokens?.let { add("${TokenFormatters.formatTokens(it)} in") }
+            stepFinish.outputTokens?.let { add("${TokenFormatters.formatTokens(it)} out") }
+            stepFinish.reasoningTokens?.let { add("${TokenFormatters.formatTokens(it)} reasoning") }
+            stepFinish.totalCost?.let { add(TokenFormatters.formatCost(it)) }
         }
         val label = if (tokenParts.isNotEmpty()) {
             "Step — ${tokenParts.joinToString(" / ")}"
@@ -835,12 +851,6 @@ private fun StepFinishPill(stepFinish: MessagePart.StepFinish) {
             ),
         )
     }
-}
-
-private fun formatTokenCount(count: Long): String = when {
-    count >= 1_000_000 -> "${String.format(java.util.Locale.US, "%.1f", count / 1_000_000.0)}M"
-    count >= 1_000 -> "${String.format(java.util.Locale.US, "%.1f", count / 1_000.0)}k"
-    else -> count.toString()
 }
 
 @Composable
@@ -960,7 +970,7 @@ private fun FileChangeCard(
 
     // Resolve file type icon
     val fileIconKey = remember(change.fileName) {
-        getFileTypeIcon(change.fileName)
+        FileTypeIcons.iconKeyForFileName(change.fileName)
     }
 
     // Resolve virtual file for diff/open actions

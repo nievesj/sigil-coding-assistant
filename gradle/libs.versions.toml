@@ -13,6 +13,7 @@ junit = "5.12.2"
 kotest = "6.0.0.M3"
 wiremock = "3.12.1"
 mockk = "1.14.11"
+compose-ui-test = "1.11.0"
 
 [libraries]
 # ACP SDK
@@ -51,6 +52,7 @@ kotest-runner = { group = "io.kotest", name = "kotest-runner-junit5", version.re
 kotest-assertions = { group = "io.kotest", name = "kotest-assertions-core", version.ref = "kotest" }
 wiremock = { group = "org.wiremock", name = "wiremock-standalone", version.ref = "wiremock" }
 mockk = { group = "io.mockk", name = "mockk", version.ref = "mockk" }
+compose-uitest-jvm = { group = "org.jetbrains.compose.ui", name = "ui-test", version.ref = "compose-ui-test" }
 
 [bundles]
 acp = ["acp-sdk"]

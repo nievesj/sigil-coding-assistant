@@ -61,12 +61,8 @@ import org.jetbrains.jewel.ui.icon.IconKey
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
 import org.jetbrains.jewel.foundation.theme.JewelTheme
 import androidx.compose.ui.window.Dialog
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.concurrent.TimeUnit
 
-private val sidebarLogger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+internal val sidebarLogger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
 // ── SessionSidebar ──────────────────────────────────────────────────────────
 
@@ -312,13 +308,6 @@ private fun NewSessionButton(onClick: () -> Unit) {
 
 // ── Session List ────────────────────────────────────────────────────────────
 
-/** A flattened tree item with depth and whether it has children. */
-private data class TreeItem(
-    val session: SessionItem,
-    val depth: Int,
-    val hasChildren: Boolean,
-)
-
 /**
  * Builds a flat list from a tree of sessions, preserving parent-child order.
  * Parents appear first, then their children indented one level deeper.
@@ -333,86 +322,9 @@ private data class TreeItem(
  * appears under two parents is a data inconsistency — rendering it once (under
  * the first parent encountered) is the correct behavior. The duplicate is logged
  * via sidebarLogger.warn so the inconsistency is visible without crashing.
+ *
+ * Extracted to [SessionTreeBuilder.buildSessionTree] (TDD §9 step 12).
  */
-private fun buildSessionTree(
-    sessions: List<SessionItem>,
-    hiddenChildIds: Set<String> = emptySet(),
-): List<TreeItem> {
-    // Filter out hidden children BEFORE building the tree.
-    // Hidden children are skipped entirely; their parent still renders (with other visible
-    // children, or as a leaf if all children are hidden).
-    val visibleSessions = sessions.filter { it.id !in hiddenChildIds }
-    val sessionMap = visibleSessions.associateBy { it.id }
-    val childrenMap = visibleSessions.mapNotNull { s -> s.parentID?.let { p -> s to p } }.groupBy({ it.second }, { it.first })
-    val processed = mutableSetOf<String>()
-    val result = mutableListOf<TreeItem>()
-
-    fun addWithChildren(session: SessionItem, depth: Int) {
-        if (session.id in processed) {
-            sidebarLogger.warn { "[ACP] buildSessionTree: cycle detected for session ${session.id}" }
-            return
-        }
-        processed.add(session.id)
-        val children = childrenMap[session.id]
-            ?.filter { it.id !in processed }
-            ?.sortedBy { it.updatedAt }
-            ?: emptyList()
-        result.add(TreeItem(session, depth, hasChildren = children.isNotEmpty()))
-        for (child in children) {
-            addWithChildren(child, depth + 1)
-        }
-    }
-
-    // Add parent sessions (no parentID) first, sorted by most-recently-updated (updatedAt desc)
-    val parents = visibleSessions
-        .filter { it.parentID == null }
-        .sortedByDescending { it.updatedAt }
-    for (parent in parents) {
-        addWithChildren(parent, 0)
-    }
-
-    // Add any orphaned children (parent not in the list) at top level
-    for (session in visibleSessions) {
-        if (session.id !in processed) {
-            val hasParent = session.parentID != null && session.parentID in sessionMap
-            if (!hasParent) {
-                addWithChildren(session, 0)
-            }
-        }
-    }
-
-    return result
-}
-
-/**
- * Determines which parent session IDs should be expanded by default.
- * Only the parent of the currently selected session (if any) is expanded.
- */
-private fun defaultExpandedParents(
-    fullTree: List<TreeItem>,
-    selectedId: String?,
-): Set<String> {
-    if (selectedId == null) return emptySet()
-    val selectedIdx = fullTree.indexOfFirst { it.session.id == selectedId }
-    if (selectedIdx < 0) return emptySet()
-    // Walk backwards from the selected item, collecting ALL ancestors
-    // (items with strictly decreasing depth). Each ancestor that has
-    // children must be expanded so the selected item is visible.
-    val expanded = mutableSetOf<String>()
-    var currentDepth = fullTree[selectedIdx].depth
-    for (i in selectedIdx downTo 0) {
-        val item = fullTree[i]
-        if (item.depth < currentDepth) {
-            // This is an ancestor — it must be expanded
-            if (item.hasChildren) {
-                expanded.add(item.session.id)
-            }
-            currentDepth = item.depth
-            if (currentDepth == 0) break
-        }
-    }
-    return expanded
-}
 
 @Composable
 private fun SessionList(
@@ -430,7 +342,7 @@ private fun SessionList(
     listState: LazyListState = rememberLazyListState(),
     clearAllState: ClearAllState = ClearAllState.Idle,
 ) {
-    val fullTree = remember(sessions, hiddenChildIds) { buildSessionTree(sessions, hiddenChildIds) }
+    val fullTree = remember(sessions, hiddenChildIds) { SessionTreeBuilder.buildSessionTree(sessions, hiddenChildIds) }
 
     // Persist expand/collapse state across session switches.
     // Keyed on nothing (persists for the lifetime of SessionList) — selectedId
@@ -443,7 +355,7 @@ private fun SessionList(
     // Merge ancestors of the newly selected session into expandedIds without
     // clearing existing manual expand/collapse state. Respects userCollapsed.
     LaunchedEffect(selectedId, fullTree) {
-        for (pid in defaultExpandedParents(fullTree, selectedId)) {
+        for (pid in SessionTreeBuilder.defaultExpandedParents(fullTree, selectedId)) {
             if (pid !in expandedIds && userCollapsed[pid] != true) {
                 expandedIds[pid] = true
             }
@@ -829,7 +741,7 @@ private fun SessionRow(
 
                     // Timestamp
                     Text(
-                        text = formatRelativeTime(session.updatedAt),
+                        text = SessionTreeBuilder.formatRelativeTime(session.updatedAt),
                         fontSize = 11.sp,
                         color = metaColor,
                         maxLines = 1,
@@ -845,7 +757,7 @@ private fun SessionRow(
 
                     // Cost
                     Text(
-                        text = formatCost(session.cost),
+                        text = TokenFormatters.formatCost(session.cost),
                         fontSize = 11.sp,
                         color = metaColor,
                         maxLines = 1,
@@ -861,7 +773,7 @@ private fun SessionRow(
 
                     // Tokens
                     Text(
-                        text = formatTokens(session.inputTokens + session.outputTokens),
+                        text = TokenFormatters.formatTokens(session.inputTokens + session.outputTokens),
                         fontSize = 11.sp,
                         color = metaColor,
                         maxLines = 1,
@@ -1097,58 +1009,5 @@ fun ClearAllConfirmationDialog(
 
 // ── Formatting helpers ──────────────────────────────────────────────────────
 
-/**
- * Formats a timestamp as a relative time string.
- * - "just now" for < 1 minute
- * - "5m ago" for < 1 hour
- * - "2h ago" for < 24 hours
- * - "Yesterday" for previous day
- * - "MM/dd" for older dates
- */
-internal fun formatRelativeTime(epochMillis: Long): String {
-    val now = System.currentTimeMillis()
-    val diff = now - epochMillis
-
-    if (diff < 0) return "just now"
-
-    val minutes = TimeUnit.MILLISECONDS.toMinutes(diff)
-    val hours = TimeUnit.MILLISECONDS.toHours(diff)
-
-    return when {
-        minutes < 1 -> "just now"
-        minutes < 60 -> "${minutes}m ago"
-        hours < 24 -> "${hours}h ago"
-        hours < 48 -> "Yesterday"
-        else -> {
-            // Create a new SimpleDateFormat on each call — SimpleDateFormat is
-            // NOT thread-safe and Compose recomposition can happen on different
-            // threads. The overhead is negligible for a formatting helper.
-            val sdf = SimpleDateFormat("MM/dd", Locale.US)
-            sdf.format(Date(epochMillis))
-        }
-    }
-}
-
-/**
- * Formats a cost value as "$0.00" or "$1.23".
- */
-internal fun formatCost(cost: Double): String {
-    return if (cost == 0.0) "$0.00" else "$${String.format(Locale.US, "%.2f", cost)}"
-}
-
-/**
- * Formats token counts with shorthand suffixes:
- * - "0" for 0
- * - "1.2k" for 1000+
- */
-internal fun formatTokens(tokens: Long): String {
-    return when {
-        tokens == 0L -> "0"
-        tokens < 1000L -> tokens.toString()
-        else -> {
-            val k = tokens / 1000.0
-            if (k < 10.0) "${String.format(Locale.US, "%.1f", k)}k"
-            else "${String.format(Locale.US, "%.0f", k)}k"
-        }
-    }
-}
+// formatRelativeTime extracted to SessionTreeBuilder.formatRelativeTime
+// (TDD §9 step 12). TokenFormatters.formatCost/formatTokens remain in TokenFormatters.kt.

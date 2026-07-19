@@ -18,10 +18,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,7 +41,9 @@ import androidx.compose.ui.unit.sp
 import com.intellij.openapi.editor.colors.EditorColors
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.colors.EditorFontType
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import java.awt.datatransfer.StringSelection
 import org.jetbrains.jewel.foundation.code.highlighting.LocalCodeHighlighter
@@ -82,29 +87,6 @@ private fun mapLanguageId(lang: String): String {
     }
 }
 
-/**
- * Map language name to IntelliJ platform icon for the code block header.
- */
-private fun languageIcon(lang: String): org.jetbrains.jewel.ui.icon.IconKey = when (lang.lowercase()) {
-    "javascript", "js", "jsx"     -> AllIconsKeys.FileTypes.JavaScript
-    "typescript", "ts", "tsx"     -> AllIconsKeys.FileTypes.JavaScript
-    "css", "scss", "less"         -> AllIconsKeys.FileTypes.Css
-    "java"                        -> AllIconsKeys.FileTypes.Java
-    "kotlin", "kt", "kts"         -> AllIconsKeys.Language.Kotlin
-    "python", "py"                -> AllIconsKeys.Language.Python
-    "ruby", "rb"                  -> AllIconsKeys.Language.Ruby
-    "rust", "rs"                  -> AllIconsKeys.Language.Rust
-    "go"                          -> AllIconsKeys.Language.GO
-    "scala"                       -> AllIconsKeys.Language.Scala
-    "php"                         -> AllIconsKeys.Language.Php
-    "html", "htm"                 -> AllIconsKeys.FileTypes.Html
-    "xml"                         -> AllIconsKeys.FileTypes.Xml
-    "json"                        -> AllIconsKeys.FileTypes.Json
-    "yaml", "yml"                 -> AllIconsKeys.FileTypes.Yaml
-    "shell", "bash", "zsh", "sh"  -> AllIconsKeys.Nodes.Console
-    "sql"                         -> AllIconsKeys.FileTypes.Text
-    else                          -> AllIconsKeys.FileTypes.Text
-}
 
 @Composable
 fun ChatFencedCodeBlock(
@@ -115,15 +97,23 @@ fun ChatFencedCodeBlock(
     val lang = language.orEmpty().let { mapLanguageId(it) }
     val displayName = language.orEmpty().ifBlank { "Code" }
 
-    val annotatedCode by LocalCodeHighlighter.current
-        .highlight(content, lang)
-        .collectAsState(AnnotatedString(content))
+    // Use a local mutableStateOf updated via a LaunchedEffect keyed on (content, lang)
+    // to avoid the plain-text flash that collectAsState(AnnotatedString(content))
+    // produces when lang changes mid-stream (the Flow restarts and the initial
+    // AnnotatedString briefly shows unhighlighted text before the new result arrives).
+    val highlighter = LocalCodeHighlighter.current
+    var highlighted by remember { mutableStateOf(AnnotatedString(content)) }
+    LaunchedEffect(content, lang) {
+        highlighter.highlight(content, lang).collect { annotated ->
+            highlighted = annotated
+        }
+    }
 
     val editorScheme = remember {
         EditorColorsManager.getInstance().globalScheme
     }
     val editorFontSize = remember {
-        try { editorScheme.getFont(EditorFontType.PLAIN).size } catch (_: Exception) { 13 }
+        editorScheme.getFont(EditorFontType.PLAIN)?.size ?: 13
     }
     val editorFgColor = remember {
         Color(editorScheme.defaultForeground.rgb)
@@ -147,8 +137,8 @@ fun ChatFencedCodeBlock(
     val clipboard = LocalClipboard.current
     val coroutineScope = rememberCoroutineScope()
 
-    // Derive everything from annotatedCode to avoid streaming race
-    val lines = remember(annotatedCode) { annotatedCode.text.lines() }
+    // Derive everything from highlighted to avoid streaming race
+    val lines = remember(highlighted) { highlighted.text.lines() }
     val lineCount = lines.size
 
     // Line number text: "1\n2\n3\n..." — same line count as code, uses same TextStyle
@@ -183,7 +173,7 @@ fun ChatFencedCodeBlock(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        key = languageIcon(language.orEmpty()),
+                        key = FileTypeIcons.iconKeyForLanguageId(language.orEmpty()),
                         contentDescription = displayName,
                         modifier = Modifier.size(ChatTheme.dims.codeLanguageIconSize),
                         tint = ChatTheme.colors.component.codeCopyIcon,
@@ -202,7 +192,12 @@ fun ChatFencedCodeBlock(
                         .size(ChatTheme.dims.codeCopyIconSize)
                         .clickable {
                             coroutineScope.launch {
-                                clipboard.setClipEntry(ClipEntry(StringSelection(content)))
+                                // StringSelection is an AWT class; clipboard writes
+                                // may require the EDT on some platforms. Dispatch
+                                // to Main to be safe.
+                                withContext(Dispatchers.Main) {
+                                    clipboard.setClipEntry(ClipEntry(StringSelection(content)))
+                                }
                             }
                         },
                     tint = ChatTheme.colors.component.codeLanguageLabel,
@@ -230,7 +225,7 @@ fun ChatFencedCodeBlock(
             // Code — selectable, scrollable for long lines
             SelectionContainer {
                 Text(
-                    text = annotatedCode,
+                    text = highlighted,
                     style = codeTextStyle,
                     softWrap = false,
                     modifier = Modifier

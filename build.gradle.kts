@@ -187,4 +187,15 @@ kotlin {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    jvmArgs = buildList {
+        add("-Dskiko.renderApi=SOFTWARE")
+        add("-Djava.awt.headless=true")
+        // NOTE: ComposePanel-based UI tests are @Disabled because ComposePanel.addNotify()
+        // triggers androidx.lifecycle → MainDispatcherChecker → IntelliJ's
+        // ImmediateEdtCoroutineDispatcher → ModalityState, which requires
+        // ApplicationManager.getApplication() to be initialized (only available
+        // in the IntelliJ Platform test framework, not plain unit tests).
+        // See ComposePanelTestBase.kt for details.
+    }
+    maxParallelForks = 1
 }

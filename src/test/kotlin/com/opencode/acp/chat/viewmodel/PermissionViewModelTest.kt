@@ -9,7 +9,7 @@ import com.opencode.acp.chat.model.SelectionPrompt
 import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.processor.UiSignal
-import com.opencode.acp.chat.service.OpenCodeService
+import com.opencode.acp.chat.service.OpenCodeServiceApi
 import com.opencode.acp.chat.service.PermissionManager
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.intellij.openapi.project.Project
@@ -47,7 +47,7 @@ import org.junit.jupiter.api.Test
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PermissionViewModelTest {
 
-    private lateinit var service: OpenCodeService
+    private lateinit var service: OpenCodeServiceApi
     private lateinit var project: Project
     private lateinit var permissionManager: PermissionManager
     private lateinit var sessionManager: SessionManager
@@ -57,7 +57,7 @@ class PermissionViewModelTest {
 
     @BeforeEach
     fun setUp() {
-        service = mockk<OpenCodeService>(relaxed = true)
+        service = mockk<OpenCodeServiceApi>(relaxed = true)
         project = mockk<Project>(relaxed = true)
         permissionManager = mockk<PermissionManager>(relaxed = true)
         sessionManager = mockk<SessionManager>(relaxed = true)

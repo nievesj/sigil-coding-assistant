@@ -550,6 +550,13 @@ enum class PressureLevel {
 sealed interface CompactionState {
     data object Idle : CompactionState
     data object InProgress : CompactionState
+    /**
+     * Compaction timed out client-side, but the server may still be processing it.
+     * The in-flight guard stays set until the server confirms via `session.compacted`
+     * SSE or the backoff period elapses. The user should wait for server confirmation
+     * before retrying to avoid concurrent compactions that could corrupt session state.
+     */
+    data object TimedOut : CompactionState
     data class Error(val error: CompactionError) : CompactionState
 }
 

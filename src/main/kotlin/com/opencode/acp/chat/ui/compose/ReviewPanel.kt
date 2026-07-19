@@ -85,8 +85,6 @@ import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
 
 // ── Review Panel (sidebar tab content) ───────────────────────────────────────
 
@@ -341,7 +339,7 @@ private fun ChangedFileRow(
         ) {
             // File type icon
             Icon(
-                key = getFileTypeIcon(file.fileName),
+                key = FileTypeIcons.iconKeyForFileName(file.fileName),
                 contentDescription = file.fileName,
                 modifier = Modifier.size(ChatTheme.dims.reviewFileIconSize),
                 tint = Color.Unspecified
@@ -587,75 +585,9 @@ private fun severityIconKey(severity: ReviewSeverity): IconKey = when (severity)
 
 // ── File type icons ────────────────────────────────────────────────────────────
 
-internal fun getFileTypeIcon(fileName: String): org.jetbrains.jewel.ui.icon.IconKey {
-    // NOTE: This extension→icon mapping is duplicated in AttachMenu.kt's fileIconForFile.
-    // If you add a new file type here, update AttachMenu.kt too. Consider extracting
-    // a shared fileTypeIconForExtension(ext: String): IconKey function.
-    val extension = fileName.substringAfterLast('.', "").lowercase()
-    return when (extension) {
-        "kt" -> PlatformIconKeys.Language.Kotlin
-        "kts" -> PlatformIconKeys.Language.Kotlin
-        "java" -> PlatformIconKeys.FileTypes.Java
-        "xml" -> PlatformIconKeys.FileTypes.Xml
-        "json" -> PlatformIconKeys.FileTypes.Json
-        "yaml", "yml" -> PlatformIconKeys.FileTypes.Yaml
-        "md" -> PlatformIconKeys.FileTypes.Text
-        "txt" -> PlatformIconKeys.FileTypes.Text
-        "js", "jsx" -> PlatformIconKeys.FileTypes.JavaScript
-        "ts", "tsx" -> PlatformIconKeys.FileTypes.JavaScript
-        "css" -> PlatformIconKeys.FileTypes.Css
-        "html", "htm" -> PlatformIconKeys.FileTypes.Html
-        "py" -> PlatformIconKeys.Language.Python
-        "rb" -> PlatformIconKeys.Language.Ruby
-        "rs" -> PlatformIconKeys.Language.Rust
-        "go" -> PlatformIconKeys.Language.GO
-        "scala" -> PlatformIconKeys.Language.Scala
-        "php" -> PlatformIconKeys.Language.Php
-        "gradle" -> PlatformIconKeys.FileTypes.Text  // Generic file icon (no Gradle-specific icon available)
-        "properties" -> PlatformIconKeys.FileTypes.Text
-        "gitignore" -> PlatformIconKeys.FileTypes.Text
-        "svg" -> PlatformIconKeys.FileTypes.Image
-        "png", "jpg", "jpeg", "gif", "bmp", "webp" -> PlatformIconKeys.FileTypes.Image
-        else -> resolveFileTypeIconFromPlatform(fileName)
-    }
-}
-
-/**
- * Fallback for file types not covered by the static [PlatformIconKeys] map above.
- *
- * The platform's [AllIcons]/[PlatformIconKeys] only ship icons for a handful of
- * languages (Kotlin, Java, Python, …). Rider-specific languages — C#, C++,
- * F#, VB, Razor, .csproj/.sln, etc. — and CLion's C/C++ have **no** constant
- * in `AllIcons.FileTypes`/`AllIcons.Language`. Their icons are contributed by
- * the host IDE's file-type registry instead.
- *
- * This asks [FileTypeManager] for the registered [FileType] for the file name
- * and wraps its icon as a Jewel [IconKey] via
- * [IntelliJIconKey.fromPlatformIcon]. On Rider this resolves the real C#/C++/
- * F#/VB/Razor/csproj/sln icons; on IntelliJ IDEA (no .NET plugin) it falls
- * back to the plain-text file-type icon, which is the same as the previous
- * hard-coded `PlatformIconKeys.FileTypes.Text` fallback. The lookup is cheap and
- * read-safe ([FileTypeManager.getFileTypeByFileName] does not require a read
- * action), so it is safe to call from composition.
- *
- * Guarded with a try/catch so a misbehaving FileType extension can never break
- * the review tab — it degrades to the generic text icon. Only [Exception] is
- * caught; JVM-level errors (OutOfMemoryError, StackOverflowError) are allowed to
- * propagate so they are not masked.
- */
-private fun resolveFileTypeIconFromPlatform(fileName: String): org.jetbrains.jewel.ui.icon.IconKey {
-    return try {
-        val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
-        val icon = fileType.icon
-        if (icon != null) {
-            IntelliJIconKey.fromPlatformIcon(icon)
-        } else {
-            PlatformIconKeys.FileTypes.Text
-        }
-    } catch (e: Exception) {
-        PlatformIconKeys.FileTypes.Text
-    }
-}
+// The extension→icon mapping and platform fallback have been consolidated into
+// FileTypeIcons. See FileTypeIcons.iconKeyForFileName and
+// FileTypeIcons.resolveFileTypeIconFromPlatform.
 
 // ── State composables ──────────────────────────────────────────────────────────
 
@@ -849,6 +781,15 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
             // NoClassDefFoundError on a diff-viewer open is a per-attempt failure —
             // surfacing a notification on every failed diff open would be intrusive.
             // The error-level log entry is sufficient for diagnosis via idea.log.
+            //
+            // Deliberate design decision (not an oversight): swallowing
+            // NoClassDefFoundError here is intentional. NoClassDefFoundError is a
+            // JVM-level error indicating a missing class (broken plugin install,
+            // optional dependency absent), but it is recoverable — the rest of the
+            // plugin continues to work. Re-throwing would surface an IDE error
+            // dialog on every failed diff open, which is intrusive for a per-attempt
+            // failure. The error-level log is the diagnostic trail; users diagnosing
+            // a non-opening diff viewer can grep idea.log for [ACP] NoClassDefFoundError.
             com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
                 .error("[ACP] Failed to open diff viewer for $filePath — missing dependency: ${e.message}")
         } catch (e: Exception) {

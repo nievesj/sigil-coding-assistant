@@ -6,6 +6,89 @@ that are intentionally left for future implementation.
 
 ---
 
+## Testing Policy
+
+**New functionality requires tests added, and the full test suite must be run to
+check that there are no regressions before work is considered complete.**
+
+- **Add tests alongside new code.** Every new feature, bug fix, or refactor must
+  include tests covering the new behavior. Pure-logic extractions should have unit
+  tests; composables that cannot be unit-tested (see "Compose UI Tests" below)
+  must have an explanatory comment and, where possible, a pure-logic test of the
+  extracted function.
+- **Run the full suite before declaring done.** After any code change, run
+  `.\gradlew.bat test` (or the "Run Tests" IDE configuration) and confirm 0 failures.
+  The baseline is **1171 tests, 0 failures**. Do not mark work complete with
+  failing tests.
+- **Do not commit with failing tests.** If a test is genuinely broken by an
+  intentional change, update the test (not the behavior) and document why. If a
+  test cannot pass due to an environmental limitation (e.g., ComposePanel requiring
+  the IntelliJ application context), mark it `@Disabled` with a clear reason
+  referencing the relevant AGENTS.md section.
+- **Skipped tests are allowed only with justification.** The current baseline has
+  21 skipped tests: 18 `@Disabled` Compose UI tests (see "Compose UI Tests —
+  ComposePanel Cannot Render in Plain Unit Tests" below) and 3 pre-existing skips.
+  Do not add new `@Disabled` tests without documenting the reason in AGENTS.md.
+
+### Compose UI Tests — ComposePanel Cannot Render in Plain Unit Tests
+
+`ComposePanel.addNotify()` triggers `androidx.lifecycle` → `MainDispatcherChecker`
+→ IntelliJ Platform's `ImmediateEdtCoroutineDispatcher` → `ModalityState.java:79`,
+which requires `ApplicationManager.getApplication()` to be initialized. This only
+happens when the IntelliJ Platform test framework (`LightPlatformTestCase` /
+`TestApplication`) is set up — plain unit tests do not bootstrap the application
+context.
+
+**Symptom:** `NullPointerException at ModalityState.java:79` during
+`ComposePanel.addNotify()`, before any composable runs.
+
+**What does NOT work:**
+- Providing a minimal `JewelTheme` / `ChatThemeData` directly — the failure is in
+  `addNotify()`, before any composable composition starts.
+- Hosting `ComposePanel` in a `JFrame` to trigger `addNotify()` — same NPE.
+- Setting `-Djava.awt.headless=false` — fixes `HeadlessException` but not the
+  `ModalityState` NPE.
+
+**What works (current approach):**
+- `@Disabled` the Compose UI rendering tests with a clear reason.
+- Guard the bug-fix regressions via pure-logic tests instead:
+  - MessageList State-read stale-data fix → `ChatViewModelMessagesForwardingTest`
+    (verifies `viewModel.messages === service.messages` reference identity).
+  - Streaming jump fix → `StreamingLifecycleManagerTest`.
+  - StreamHealer → `StreamHealerTest`.
+  - SSE V1/V2 parsing → `SseEventParserTest`.
+  - Tool pill dedup → `SessionStateTest` / `ChatViewModelTest`.
+
+**To enable these tests in the future:**
+1. Add the IntelliJ Platform test framework dependency
+   (`intellijPlatform.testFramework()`) and use `LightPlatformTestCase` or
+   `TestApplication` to bootstrap the application context. This is a heavy change
+   that affects all test JVM startup time.
+2. Or extract pure-logic portions of composables (e.g., `ConnectionBanner`'s
+   `bannerText` computation) into non-composable functions and test those directly.
+
+**Files:** `ComposePanelTestBase.kt` (base class + full docs),
+`CheckboxChipTest.kt`, `ConnectionBannerStatesTest.kt`,
+`MessageListStaleDataTest.kt` (all `@Disabled`).
+
+### MockK SharedFlow/StateFlow — Must Stub with Real Flows
+
+When a test constructs a real object (e.g., `ChatViewModel`) that launches
+coroutines collecting from `service.signals`, `service.globalSignals`, or
+`service.connectionState`, a relaxed mockk's default `Flow` returns `Nothing` on
+collect suspension → `KotlinNothingValueException` in background coroutines. This
+leaks into subsequent test classes as `UncaughtExceptionsBeforeTest`.
+
+**Fix:** Always stub `service.signals` / `service.globalSignals` with real
+`MutableSharedFlow(extraBufferCapacity = 256)` and `service.connectionState` with
+a real `MutableStateFlow(...)`. Cancel all scopes (both `service.scope` and any
+scope passed to the constructed object) in `@AfterEach`.
+
+**Reference:** `ChatViewModelMessagesForwardingTest.kt` — the canonical example
+of this pattern.
+
+---
+
 ## Developer Notes
 
 ### Reading the Plugin Log File (idea.log)

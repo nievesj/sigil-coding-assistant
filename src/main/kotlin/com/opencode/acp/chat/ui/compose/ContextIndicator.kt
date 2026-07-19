@@ -345,16 +345,16 @@ private fun ContextTooltip(
                     // Usage line
                     Text(
                         text = if (ctx.contextLimit > 0L) {
-                            "Usage: ${formatTooltipPercent(ctx.usagePercent)}% (${formatTooltipTokens(ctx.totalTokens)} / ${formatTooltipTokens(ctx.contextLimit)})"
+                            "Usage: ${TokenFormatters.formatPercent(ctx.usagePercent)} (${TokenFormatters.formatTokens(ctx.totalTokens)} / ${TokenFormatters.formatTokens(ctx.contextLimit)})"
                         } else {
-                            "Usage: ${formatTooltipTokens(ctx.totalTokens)} tokens (limit unknown)"
+                            "Usage: ${TokenFormatters.formatTokens(ctx.totalTokens)} tokens (limit unknown)"
                         },
                         fontSize = fonts.contextTooltipLabel,
                         color = contextColorForPercent(ctx.usagePercent)
                     )
                     // Cost line
                     Text(
-                        text = "Cost: ${formatTooltipCost(ctx.totalCost)}",
+                        text = "Cost: ${TokenFormatters.formatCost(ctx.totalCost)}",
                         fontSize = fonts.contextTooltipLabel,
                         color = colors.component.tooltipMuted
                     )
@@ -396,23 +396,6 @@ private fun ContextTooltip(
 
 // ── Format helpers for tooltip ─────────────────────────────────────────────
 
-private fun formatTooltipPercent(percent: Float): String {
-    return if (percent >= 100f) "${percent.toInt()}%" else "${String.format("%.1f", percent)}%"
-}
-
-private fun formatTooltipTokens(tokens: Long): String {
-    return when {
-        tokens == 0L -> "0"
-        tokens < 1000L -> tokens.toString()
-        tokens < 1_000_000L -> "${String.format("%.1f", tokens / 1000.0)}k"
-        else -> "${String.format("%.1f", tokens / 1_000_000.0)}M"
-    }
-}
-
-private fun formatTooltipCost(cost: Double): String {
-    return if (cost == 0.0) "$0.00" else "$${String.format("%.4f", cost)}"
-}
-
 /**
  * Returns a short pressure badge suffix to append to the percent label, or empty string
  * if pressure is null or below the user's configured notification threshold.
@@ -423,7 +406,11 @@ private fun formatTooltipCost(cost: Double): String {
 @Composable
 private fun pressureBadgeText(level: PressureLevel?): String {
     if (level == null) return ""
-    val threshold = remember { OpenCodeContextSettingsState.getInstance().pressureNotificationThreshold }
+    // Read fresh on every recomposition (no `remember`) so a settings change in
+    // Settings → Tools → Sigil → Context propagates immediately after Apply.
+    // This is cheap — a settings object read — and avoids the stale-cache UX bug
+    // where the badge would keep using the old threshold until tool window toggle.
+    val threshold = OpenCodeContextSettingsState.getInstance().pressureNotificationThreshold
     val thresholdLevel = when (threshold) {
         "NEVER" -> null
         "ELEVATED" -> PressureLevel.ELEVATED

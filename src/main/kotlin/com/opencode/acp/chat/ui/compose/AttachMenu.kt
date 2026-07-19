@@ -225,7 +225,8 @@ fun AttachMenu(
                         key = { openFiles[it].path }
                     ) { index ->
                         val file = openFiles[index]
-                        val iconInfo = fileIconForFile(file.name)
+                        val ext = file.name.substringAfterLast('.', "").lowercase()
+                        val iconInfo = FileTypeIcons.iconKeyForFileName(file.name) to FileTypeIcons.fileColorForExtension(ext)
                         val hoverIdx = hoverOffset + index
                         AttachMenuItem(
                             icon = iconInfo.first,
@@ -269,7 +270,8 @@ fun AttachMenu(
                         key = { otherFiles[it].path }
                     ) { index ->
                         val file = otherFiles[index]
-                        val iconInfo = fileIconForFile(file.name)
+                        val ext = file.name.substringAfterLast('.', "").lowercase()
+                        val iconInfo = FileTypeIcons.iconKeyForFileName(file.name) to FileTypeIcons.fileColorForExtension(ext)
                         val hoverIdx = hoverOffset + index
                         AttachMenuItem(
                             icon = iconInfo.first,
@@ -349,40 +351,6 @@ private fun AttachMenuItem(
 }
 
 /**
- * Returns the appropriate IntelliJ icon and tint color for a file based on its extension.
- * Only uses icons known to exist in the IntelliJ platform.
- *
- * Uses [PlatformIconKeys] (which wraps platform icons via
- * [org.jetbrains.jewel.bridge.icon.fromPlatformIcon]) instead of
- * [org.jetbrains.jewel.ui.icons.AllIconsKeys] — the latter renders magenta
- * placeholders because its SVG resources live in the IntelliJ platform JARs,
- * not the Jewel JARs. See [PlatformIconKeys] for details.
- *
- * `internal` so [MentionPalette] can reuse this mapping instead of duplicating it.
+ * File-type icon and color resolution is consolidated in [FileTypeIcons].
+ * See [FileTypeIcons.iconKeyForFileName] and [FileTypeIcons.fileColorForExtension].
  */
-@Composable
-internal fun fileIconForFile(fileName: String): Pair<org.jetbrains.jewel.ui.icon.IconKey, Color> {
-    // NOTE: This extension→icon mapping is duplicated in ReviewPanel.kt's getFileTypeIcon.
-    // If you add a new file type here, update ReviewPanel.kt too. Consider extracting
-    // a shared fileTypeIconForExtension(ext: String): IconKey function.
-    val ext = fileName.substringAfterLast('.', "").lowercase()
-    return when {
-        ext == "kt" || ext == "kts" -> PlatformIconKeys.Language.Kotlin to ChatTheme.colors.file.kotlin
-        ext == "java" -> PlatformIconKeys.FileTypes.Java to ChatTheme.colors.file.java
-        ext == "js" || ext == "jsx" -> PlatformIconKeys.FileTypes.JavaScript to ChatTheme.colors.file.javaScript
-        ext == "ts" || ext == "tsx" -> PlatformIconKeys.FileTypes.JavaScript to ChatTheme.colors.file.typeScript
-        ext == "py" -> PlatformIconKeys.Language.Python to ChatTheme.colors.file.python
-        ext == "rb" -> PlatformIconKeys.Language.Ruby to ChatTheme.colors.file.ruby
-        ext == "go" -> PlatformIconKeys.Language.GO to ChatTheme.colors.file.go
-        ext == "rs" -> PlatformIconKeys.Language.Rust to ChatTheme.colors.file.rust
-        ext == "html" || ext == "htm" -> PlatformIconKeys.FileTypes.Html to ChatTheme.colors.file.html
-        ext == "css" || ext == "scss" -> PlatformIconKeys.FileTypes.Css to ChatTheme.colors.file.css
-        ext == "xml" -> PlatformIconKeys.FileTypes.Xml to ChatTheme.colors.file.xml
-        ext == "json" -> PlatformIconKeys.FileTypes.Json to ChatTheme.colors.file.json
-        ext == "yaml" || ext == "yml" -> PlatformIconKeys.FileTypes.Yaml to ChatTheme.colors.file.yaml
-        ext == "md" -> PlatformIconKeys.FileTypes.Text to ChatTheme.colors.file.markdown
-        ext == "sql" -> PlatformIconKeys.FileTypes.Text to ChatTheme.colors.file.sql
-        ext == "sh" || ext == "bash" -> PlatformIconKeys.Nodes.Console to ChatTheme.colors.file.shell
-        else -> PlatformIconKeys.FileTypes.Text to ChatTheme.colors.component.attachmentRemoveIcon
-    }
-}

@@ -39,7 +39,7 @@ import kotlinx.serialization.json.jsonPrimitive
  * The [ChatViewModel] is a thin UI wrapper that delegates here.
  */
 @Service(Service.Level.PROJECT)
-class OpenCodeService(private val project: Project) : Disposable {
+class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Disposable {
 
     private val logger = KotlinLogging.logger {}
 
@@ -48,7 +48,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     // needs sessionManager, but sessionManager needs scope.
     @Volatile private var errorSurfacer: ((String) -> Unit)? = null
 
-    internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, throwable ->
+    override val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, throwable ->
         logger.error(throwable) { "[ACP] Uncaught coroutine exception in OpenCodeService scope" }
         // Surface critical errors to the UI via the global signals flow.
         // SessionManager._globalSignals is collected by the ViewModel and routed
@@ -73,10 +73,10 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     // ── Sub-components ─────────────────────────────────────────────────────
 
-    val connectionManager = ProcessManager(scope).apply {
+    override val connectionManager = ProcessManager(scope).apply {
         onMcpReset = { resetMcpOnServerRestart() }
     }
-    val sessionManager = SessionManager(scope, project).also {
+    override val sessionManager = SessionManager(scope, project).also {
         // Wire the error surfer now that sessionManager exists.
         errorSurfacer = { msg -> it.emitGlobalError(msg) }
     }
@@ -90,7 +90,7 @@ class OpenCodeService(private val project: Project) : Disposable {
         McpConfigWriter(path, OpenCodeMcpSettingsState.getInstance())
     }
 
-    val permissionManager = PermissionManager(
+    override val permissionManager = PermissionManager(
         scope = scope,
         clientProvider = { connectionManager.client },
         sessionManager = sessionManager,
@@ -155,32 +155,32 @@ class OpenCodeService(private val project: Project) : Disposable {
     )
 
     /** ToolRegistry singleton, created during initializeMcp(). Settings panel reads this. */
-    var toolRegistry: com.opencode.acp.mcp.ToolRegistry? = null
+    override var toolRegistry: com.opencode.acp.mcp.ToolRegistry? = null
         private set
 
     // ── State flows ────────────────────────────────────────────────────────
 
-    val messages: StateFlow<Map<String, ChatMessage>> = sessionManager.activeMessages
-    val signals: SharedFlow<UiSignal> = sessionManager.activeSignals
-    val globalSignals: SharedFlow<UiSignal> = sessionManager.globalSignals
-    val connectionState: StateFlow<ConnectionState> = connectionManager.connectionState
-    val connectionErrorReason: StateFlow<ConnectionErrorReason?> = connectionManager.connectionErrorReason
-    val sessionListState: StateFlow<SessionListState> = sessionManager.sessionListState
-    val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = sessionManager.childSessionMap
-    val todoItems: StateFlow<List<TodoItem>> = sessionManager.todoItems
-    val sessionContextState: StateFlow<SessionContextState> = sessionManager.sessionContextState
-    val streamingSessionIds: StateFlow<Set<String>> = sessionManager.streamingSessionIds
-    val pendingCreationSessionIds: StateFlow<Set<String>> = sessionManager.pendingCreationSessionIds
-    val hiddenChildSessionIds: StateFlow<Set<String>> = sessionManager.hiddenChildSessionIds
-    val knownChildSessionIds: StateFlow<Set<String>> = sessionManager.knownChildSessionIds
-    val childToParent: StateFlow<Map<String, String>> = sessionManager.childToParent
-    val activeSessionId: StateFlow<String?> = sessionManager.activeSessionId
-    val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = sessionManager.sessionCachedFlow
+    override val messages: StateFlow<Map<String, ChatMessage>> = sessionManager.activeMessages
+    override val signals: SharedFlow<UiSignal> = sessionManager.activeSignals
+    override val globalSignals: SharedFlow<UiSignal> = sessionManager.globalSignals
+    override val connectionState: StateFlow<ConnectionState> = connectionManager.connectionState
+    override val connectionErrorReason: StateFlow<ConnectionErrorReason?> = connectionManager.connectionErrorReason
+    override val sessionListState: StateFlow<SessionListState> = sessionManager.sessionListState
+    override val childSessionMap: StateFlow<Map<String, List<SessionItem>>> = sessionManager.childSessionMap
+    override val todoItems: StateFlow<List<TodoItem>> = sessionManager.todoItems
+    override val sessionContextState: StateFlow<SessionContextState> = sessionManager.sessionContextState
+    override val streamingSessionIds: StateFlow<Set<String>> = sessionManager.streamingSessionIds
+    override val pendingCreationSessionIds: StateFlow<Set<String>> = sessionManager.pendingCreationSessionIds
+    override val hiddenChildSessionIds: StateFlow<Set<String>> = sessionManager.hiddenChildSessionIds
+    override val knownChildSessionIds: StateFlow<Set<String>> = sessionManager.knownChildSessionIds
+    override val childToParent: StateFlow<Map<String, String>> = sessionManager.childToParent
+    override val activeSessionId: StateFlow<String?> = sessionManager.activeSessionId
+    override val sessionCachedFlow: kotlinx.coroutines.flow.SharedFlow<String> = sessionManager.sessionCachedFlow
 
     // ── Internal state ─────────────────────────────────────────────────────
 
     private var signalCollectionJob: Job? = null
-    internal var mcpManager: McpManager? = null
+    override var mcpManager: McpManager? = null
 
     /**
      * Serializes sendMessage() calls.
@@ -188,7 +188,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     private val sendMutex = kotlinx.coroutines.sync.Mutex()
 
     /** Session ID convenience accessor. */
-    val sessionId: String? get() = sessionManager.activeSessionId.value
+    override val sessionId: String? get() = sessionManager.activeSessionId.value
 
     // ── Global signal collection (completes responseDeferred on background session Stop) ──
 
@@ -237,7 +237,7 @@ class OpenCodeService(private val project: Project) : Disposable {
      *   filter (server returns all sessions).  The connection manager
      *   receives a non-null CWD for ProcessBuilder (falls back to ".").
      */
-    suspend fun initialize(projectBasePath: String? = null): Boolean {
+    override suspend fun initialize(projectBasePath: String?): Boolean {
         logger.info { "[ACP] OpenCodeService.initialize: START (projectBasePath=$projectBasePath)" }
         val connectionPath = projectBasePath ?: "."
         val connected = connectionManager.initialize(connectionPath)
@@ -337,7 +337,7 @@ class OpenCodeService(private val project: Project) : Disposable {
      * Disconnect all MCP servers. Called before re-initialization when settings change.
      * Also called when the user toggles MCP off entirely.
      */
-    suspend fun disconnectAllMcp() {
+    override suspend fun disconnectAllMcp() {
         mcpManager?.let { mgr ->
             val statuses = mgr.serverStatuses.value
             for (name in statuses.keys) {
@@ -350,7 +350,7 @@ class OpenCodeService(private val project: Project) : Disposable {
      * Re-initialize MCP with current settings. Called after settings change.
      * Creates a fresh McpManager and runs discovery/registration.
      */
-    suspend fun reinitializeMcp() {
+    override suspend fun reinitializeMcp() {
         // Disconnect the existing manager before replacing it to avoid leaking
         // SSE connections, HTTP clients, and in-flight registrations.
         disconnectAllMcp()
@@ -374,16 +374,10 @@ class OpenCodeService(private val project: Project) : Disposable {
         val mcpMgr = mcpManager ?: return
         scope.launch {
             try {
-                // RESOLVED: Server is always launched on localhost by ProcessManager
-                // (it binds to 127.0.0.1 only — never 0.0.0.0). The port is dynamic
-                // (connectionManager.port), but the host is always 127.0.0.1. Hardcoding
-                // the host here is correct and intentional.
-                // COUPLING: ProcessManager always binds to 127.0.0.1 (see ProcessManager.launchOpenCodeBinary).
-                // If ProcessManager ever supports a configurable host, read it from connectionManager.host
-                // instead of hardcoding 127.0.0.1 here.
-                // TODO: If ProcessManager ever supports a configurable host, read it from
-                // connectionManager.host instead of hardcoding 127.0.0.1. See OpenCodeService.kt:377-383.
-                val baseUrl = "http://127.0.0.1:${connectionManager.port}"
+                // Host comes from ProcessManager (which binds to AcpDefaults.DEFAULT_OPENCODE_HOST,
+                // i.e. 127.0.0.1). Reading connectionManager.host keeps this in sync if
+                // ProcessManager ever supports a configurable binding address — no hardcoding.
+                val baseUrl = "http://${connectionManager.host}:${connectionManager.port}"
                 val mcpUrls = mcpMgr.getServerUrls()
                 logger.info { "[ACP] discoverToolsInBackground: starting discovery (${mcpUrls.size} MCP servers connected)" }
                 val tools = registry.discoverAll(baseUrl, mcpUrls)
@@ -394,11 +388,48 @@ class OpenCodeService(private val project: Project) : Disposable {
                 // from the registry when opened.
                 val settings = OpenCodeMcpSettingsState.getInstance()
                 if (settings.toolPermissions.isNotBlank()) {
-                    val persisted = parsePersistedToolPermissions(settings.toolPermissions)
+                    var permissionsCorrupted = false
+                    val persisted: Map<String, Pair<Boolean, String>> = try {
+                        parsePersistedToolPermissions(settings.toolPermissions)
+                    } catch (parseError: Exception) {
+                        // FAIL-CLOSED: On corrupted tool-permissions JSON, do NOT leave
+                        // all tools at their discovery default (ALLOW). Instead, set
+                        // every discovered tool to ASK — the safest interactive default,
+                        // which requires explicit user approval per call. This preserves
+                        // safety while the user re-saves their settings. Without this,
+                        // a corrupted settings file (disk error, partial write, encoding
+                        // issue) would silently downgrade all tool permissions to ALLOW,
+                        // which is security-relevant (an attacker who can corrupt the
+                        // settings file would gain auto-approval for all tools).
+                        permissionsCorrupted = true
+                        logger.error(parseError) { "[ACP] Corrupted tool permissions JSON — failing closed (all tools set to ASK) until settings are re-saved" }
+                        val allDiscovered = registry.tools.values
+                        if (allDiscovered.isEmpty()) {
+                            // No tools discovered yet — nothing to fail-close over.
+                            emptyMap()
+                        } else {
+                            // Map every discovered tool to (enabled=true, permission="ask").
+                            // Keying by both id and name ensures loadEnabledAndPermissions
+                            // matches every tool (it matches by id OR raw name).
+                            val failClosed = mutableMapOf<String, Pair<Boolean, String>>()
+                            for (tool in allDiscovered) {
+                                failClosed[tool.id] = Pair(true, "ask")
+                                failClosed[tool.name] = Pair(true, "ask")
+                            }
+                            failClosed.toMap()
+                        }
+                    }
                     if (persisted.isNotEmpty()) {
                         registry.loadEnabledAndPermissions(persisted.mapValues { (_, pair) ->
                             Pair(pair.first, com.opencode.acp.mcp.ToolPermission.fromActionString(pair.second))
                         })
+                    }
+                    // Surface a user-visible ERROR notification so the user knows their
+                    // permission choices were lost and they should re-save settings.
+                    if (permissionsCorrupted) {
+                        com.opencode.acp.chat.OpenCodeNotifications.showRestartWarning(
+                            "[ACP] Tool permissions settings file is corrupted. All tools have been set to ASK for safety. Please re-save your tool permissions in Settings → Tools → Sigil → MCP."
+                        )
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -413,27 +444,21 @@ class OpenCodeService(private val project: Project) : Disposable {
      * Parse persisted tool permissions JSON into a map of toolName → (enabled, permission).
      * Internal so ChatViewModel can delegate to it instead of duplicating the logic.
      */
-    internal fun parsePersistedToolPermissions(perms: String): Map<String, Pair<Boolean, String>> {
+    override fun parsePersistedToolPermissions(perms: String): Map<String, Pair<Boolean, String>> {
         if (perms.isBlank()) return emptyMap()
-        return try {
-            val obj = kotlinx.serialization.json.Json.parseToJsonElement(perms).jsonObject
-            obj.entries.associate { (toolName, element) ->
-                val toolObj = element.jsonObject
-                val enabled = toolObj["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
-                val permission = toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow"
-                toolName to Pair(enabled, permission)
-            }
-        } catch (e: Exception) {
-            // Log at ERROR — corrupted tool permissions is a security-relevant failure.
-            // Returning emptyMap() means loadEnabledAndPermissions() iterates zero entries,
-            // leaving tools at their discovery default (ALLOW for all). This is a fail-open
-            // pattern — the user's ASK/DENY choices are lost until they re-save settings.
-            // We accept this because: (1) the corrupted value is overwritten on next save,
-            // (2) destructively clearing the persisted value from a background coroutine
-            // could destroy valid permissions on a transient race, and (3) the server-side
-            // permission rules still enforce hard denials regardless of client state.
-            logger.error(e) { "[ACP] Failed to parse persisted tool permissions — tools will use discovery defaults (ALLOW) until settings are re-saved" }
-            emptyMap()
+        // On parse failure, this method THROWS. Callers are responsible for
+        // applying fail-closed behavior (set all discovered tools to ASK) and
+        // surfacing a user-visible notification. Returning emptyMap() here would
+        // be a fail-open pattern — the user's ASK/DENY choices would be silently
+        // lost and every tool would revert to its discovery default (ALLOW),
+        // which is a security risk (a corrupted settings file would auto-approve
+        // all tools). See discoverToolsInBackground for the fail-closed handler.
+        val obj = kotlinx.serialization.json.Json.parseToJsonElement(perms).jsonObject
+        return obj.entries.associate { (toolName, element) ->
+            val toolObj = element.jsonObject
+            val enabled = toolObj["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
+            val permission = toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow"
+            toolName to Pair(enabled, permission)
         }
     }
 
@@ -441,7 +466,7 @@ class OpenCodeService(private val project: Project) : Disposable {
      * Non-suspend wrapper for settings panel (runs on EDT).
      * Launches disconnect + config write + reinitialize on the service scope.
      */
-    fun reinitializeMcpFromSettings() {
+    override fun reinitializeMcpFromSettings() {
         scope.launch {
             try {
                 disconnectAllMcp()
@@ -465,7 +490,7 @@ class OpenCodeService(private val project: Project) : Disposable {
     }
 
     /** Reset MCP state on OpenCode server restart. Called by ProcessManager. */
-    fun resetMcpOnServerRestart() {
+    override fun resetMcpOnServerRestart() {
         scope.launch {
             try {
                 mcpManager?.resetOnServerRestart()
@@ -488,31 +513,31 @@ class OpenCodeService(private val project: Project) : Disposable {
     private val emptyMcpStatuses = MutableStateFlow<Map<String, McpConnectionStatus>>(emptyMap())
 
     /** MCP server connection statuses (empty if MCP not initialized). */
-    val mcpServerStatuses: StateFlow<Map<String, McpConnectionStatus>>
+    override val mcpServerStatuses: StateFlow<Map<String, McpConnectionStatus>>
         get() = mcpManager?.serverStatuses ?: emptyMcpStatuses.asStateFlow()
 
     // ── Session management (delegated) ─────────────────────────────────────
 
-    suspend fun loadSessions() = sessionManager.loadSessions()
-    fun loadMoreSessions() = sessionManager.loadMoreSessions()
-    suspend fun switchSession(sessionId: String) = sessionManager.switchSession(sessionId)
-    suspend fun createAndSwitchSession(title: String? = null) = sessionManager.createAndSwitchSession(title)
-    suspend fun archiveSession(sessionId: String) = sessionManager.archiveSession(sessionId)
-    suspend fun clearAllSessions() = sessionManager.clearAllSessions()
+    override suspend fun loadSessions() = sessionManager.loadSessions()
+    override fun loadMoreSessions() = sessionManager.loadMoreSessions()
+    override suspend fun switchSession(sessionId: String) = sessionManager.switchSession(sessionId)
+    override suspend fun createAndSwitchSession(title: String?) = sessionManager.createAndSwitchSession(title)
+    override suspend fun archiveSession(sessionId: String) = sessionManager.archiveSession(sessionId)
+    override suspend fun clearAllSessions() = sessionManager.clearAllSessions()
 
     // ── Streaming session tracking (sidebar spinner) ──────────────────────────
 
     /** Imperatively add a session ID to the streaming set (activates sidebar spinner).
      *  Used by ChatViewModel.sendMessage() before the suspend call so the spinner
      *  appears immediately on send. Idempotent. */
-    fun addStreamingSession(sessionId: String) = sessionManager.addStreamingSession(sessionId)
+    override fun addStreamingSession(sessionId: String) = sessionManager.addStreamingSession(sessionId)
 
     /** Imperatively remove a session ID from the streaming set (deactivates sidebar spinner).
      *  Used by ChatViewModel on cancel/switch/error. Idempotent. */
-    fun removeStreamingSession(sessionId: String) = sessionManager.removeStreamingSession(sessionId)
+    override fun removeStreamingSession(sessionId: String) = sessionManager.removeStreamingSession(sessionId)
 
     /** Un-hide a child session (e.g., when switching to it via ToolPill "open child"). */
-    fun unhideChildSession(sessionId: String) = sessionManager.unhideChildSession(sessionId)
+    override fun unhideChildSession(sessionId: String) = sessionManager.unhideChildSession(sessionId)
 
     // ── Connection stop ─────────────────────────────────────────────────────
 
@@ -525,7 +550,7 @@ class OpenCodeService(private val project: Project) : Disposable {
      *  In all cases, killing the server process is correct because the plugin
      *  owns the process — it was launched by ProcessManager.initialize(). The
      *  user can reconnect via the "Connect" button which re-launches the server. */
-    fun stopConnection() {
+    override fun stopConnection() {
         sseConnectionManager.stop()
         // Use shutdown() (not disconnect()) to also kill the launched opencode process.
         // The user clicked "Stop" — they expect everything to stop, including the process
@@ -535,14 +560,14 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     // ── Message sending ────────────────────────────────────────────────────
 
-    suspend fun sendMessage(
+    override suspend fun sendMessage(
         text: String,
-        files: List<AttachedFile> = emptyList(),
-        modelID: String? = null,
-        providerID: String? = null,
-        variant: String? = null,
-        agent: String? = null,
-        model: OpenCodeClient.MessageModel? = null
+        files: List<AttachedFile>,
+        modelID: String?,
+        providerID: String?,
+        variant: String?,
+        agent: String?,
+        model: OpenCodeClient.MessageModel?
     ): SendMessageResult {
         if (!sendMutex.tryLock()) {
             logger.warn { "[ACP] sendMessage: rejected — another send is already in progress" }
@@ -721,9 +746,14 @@ class OpenCodeService(private val project: Project) : Disposable {
             sessionManager.abortStreamingWithFallback(errorMsg, assistantMsgId)
             return SendMessageResult.Error(errorMsg)
         } finally {
-            // Re-fetch the active session — the reference captured at L680 may be stale
-            // if the session was evicted/switched during the long-running send.
-            sessionManager.getActiveSession()?.responseDeferred = null
+            // No responseDeferred cleanup needed here. The send session's deferred is
+            // already completed and nulled by the StreamingCompleted handler
+            // (startGlobalSignalCollection, line ~203). The sendMutex guarantees no
+            // concurrent send can run on the same session, so there is no race that
+            // could leave a dangling deferred. Re-fetching the *current* active session
+            // (which may have been switched/evicted during the long-running send) and
+            // nulling its deferred would be misleading — it targets a session that was
+            // never the sender. Intentionally a no-op.
         }
     }
 
@@ -734,7 +764,7 @@ class OpenCodeService(private val project: Project) : Disposable {
      *  messages (e.g. unresolved model args in `/review-perform`, review
      *  failure notices) that should appear in the chat but don't need an LLM
      *  response. The message is marked [MessageState.Completed] immediately. */
-    fun injectLocalMessage(text: String) {
+    override fun injectLocalMessage(text: String) {
         val msg = ChatMessage(
             id = generateId(),
             role = MessageRole.ASSISTANT,
@@ -745,7 +775,7 @@ class OpenCodeService(private val project: Project) : Disposable {
         sessionManager.addMessage(msg)
     }
 
-    suspend fun cancel() {
+    override suspend fun cancel() {
         val client = connectionManager.client
         val currentSessionId = sessionManager.activeSessionId.value
         // Capture the active session reference at the same time as the session ID so
@@ -771,7 +801,7 @@ class OpenCodeService(private val project: Project) : Disposable {
      * If the mutex is not held (no send in progress), returns an already-completed
      * deferred without calling cancel().
      */
-    suspend fun steerCancel(): CompletableDeferred<Unit> {
+    override suspend fun steerCancel(): CompletableDeferred<Unit> {
         // Always call cancel() — it's idempotent (abortSession is a no-op if
         // nothing is streaming).
         cancel()
@@ -825,53 +855,53 @@ class OpenCodeService(private val project: Project) : Disposable {
         return deferred
     }
 
-    suspend fun respondPermission(
+    override suspend fun respondPermission(
         permissionId: String, toolCallId: String, sessionId: String,
         response: PermissionResponse,
-        toolName: String = "",
-        patterns: List<String> = emptyList(),
-        agentName: String = "orchestrator",
+        toolName: String,
+        patterns: List<String>,
+        agentName: String,
     ) = permissionManager.respondPermission(permissionId, toolCallId, sessionId, response, toolName, patterns, agentName)
 
-    suspend fun respondQuestion(promptId: String, answers: List<List<String>>, sessionId: String) =
+    override suspend fun respondQuestion(promptId: String, answers: List<List<String>>, sessionId: String) =
         permissionManager.respondQuestion(promptId, answers, sessionId)
 
-    suspend fun rejectQuestion(promptId: String, sessionId: String) =
+    override suspend fun rejectQuestion(promptId: String, sessionId: String) =
         permissionManager.rejectQuestion(promptId, sessionId)
 
     // ── Data fetching ──────────────────────────────────────────────────────
 
-    suspend fun computeSessionContext(controlState: ControlBarState? = null) {
+    override suspend fun computeSessionContext(controlState: ControlBarState?) {
         sessionManager.computeSessionContext(controlState)
     }
 
-    suspend fun computeSessionContextLocal(controlState: ControlBarState? = null) {
+    override suspend fun computeSessionContextLocal(controlState: ControlBarState?) {
         sessionManager.computeSessionContextLocal(controlState)
     }
 
-    suspend fun refreshActiveSessionMessages() {
+    override suspend fun refreshActiveSessionMessages() {
         sessionManager.refreshActiveSessionMessages()
     }
 
     /** Whether the background compactor has a valid checkpoint for the active session. */
-    fun isCheckpointReady(): Boolean = sessionManager.isCheckpointReady()
+    override fun isCheckpointReady(): Boolean = sessionManager.isCheckpointReady()
 
-    suspend fun fetchTodos() = sessionManager.fetchTodos()
+    override suspend fun fetchTodos() = sessionManager.fetchTodos()
 
-    suspend fun fetchAvailableCommands(): List<SlashCommand> =
+    override suspend fun fetchAvailableCommands(): List<SlashCommand> =
         commandManager.fetchAvailableCommands()
 
-    suspend fun executeServerCommand(commandName: String, args: String = "") =
+    override suspend fun executeServerCommand(commandName: String, args: String) =
         commandManager.executeServerCommand(commandName, args)
 
     /** Get messages StateFlow for a cached session (returns null if not cached). */
-    fun getSessionMessages(sessionId: String) = sessionManager.getSessionMessages(sessionId)
+    override fun getSessionMessages(sessionId: String) = sessionManager.getSessionMessages(sessionId)
 
-    fun getStreamingText(sessionId: String) = sessionManager.getStreamingText(sessionId)
+    override fun getStreamingText(sessionId: String) = sessionManager.getStreamingText(sessionId)
 
     // ── Data access (delegate methods for ViewModel) ───────────────────────
 
-    suspend fun listAgents(): List<com.opencode.acp.adapter.AgentInfo> {
+    override suspend fun listAgents(): List<com.opencode.acp.adapter.AgentInfo> {
         val client = connectionManager.client
         if (client == null) {
             logger.warn { "[ACP] listAgents: client is null" }
@@ -881,7 +911,7 @@ class OpenCodeService(private val project: Project) : Disposable {
         return client.listAgents()
     }
 
-    suspend fun listProviders(): com.opencode.acp.adapter.ProviderResponse? {
+    override suspend fun listProviders(): com.opencode.acp.adapter.ProviderResponse? {
         val client = connectionManager.client
         if (client == null) {
             logger.warn { "[ACP] listProviders: client is null" }

@@ -205,18 +205,18 @@ private fun ContextDetails(
 
         // ── Tokens section ──
         SectionHeader("Tokens", sectionColor)
-        DetailRow(label = "Input", value = formatPanelTokens(context.inputTokens), labelColor, valueColor)
-        DetailRow(label = "Output", value = formatPanelTokens(context.outputTokens), labelColor, valueColor)
+        DetailRow(label = "Input", value = TokenFormatters.formatTokens(context.inputTokens), labelColor, valueColor)
+        DetailRow(label = "Output", value = TokenFormatters.formatTokens(context.outputTokens), labelColor, valueColor)
         if (context.reasoningTokens > 0) {
-            DetailRow(label = "Reasoning", value = formatPanelTokens(context.reasoningTokens), labelColor, valueColor)
+            DetailRow(label = "Reasoning", value = TokenFormatters.formatTokens(context.reasoningTokens), labelColor, valueColor)
         }
         if (context.cacheReadTokens > 0) {
-            DetailRow(label = "Cache Read", value = formatPanelTokens(context.cacheReadTokens), labelColor, valueColor)
+            DetailRow(label = "Cache Read", value = TokenFormatters.formatTokens(context.cacheReadTokens), labelColor, valueColor)
         }
         if (context.cacheWriteTokens > 0) {
-            DetailRow(label = "Cache Write", value = formatPanelTokens(context.cacheWriteTokens), labelColor, valueColor)
+            DetailRow(label = "Cache Write", value = TokenFormatters.formatTokens(context.cacheWriteTokens), labelColor, valueColor)
         }
-        DetailRow(label = "Total", value = formatPanelTokens(context.totalTokens), labelColor, valueColor, bold = true)
+        DetailRow(label = "Total", value = TokenFormatters.formatTokens(context.totalTokens), labelColor, valueColor, bold = true)
 
         Spacer(Modifier.height(10.dp))
         HorizontalSeparator(separator)
@@ -224,7 +224,7 @@ private fun ContextDetails(
 
         // ── Cost section ──
         SectionHeader("Cost", sectionColor)
-        DetailRow(label = "Total", value = formatPanelCost(context.totalCost), labelColor, valueColor, bold = true)
+        DetailRow(label = "Total", value = TokenFormatters.formatCost(context.totalCost), labelColor, valueColor, bold = true)
 
         Spacer(Modifier.height(10.dp))
         HorizontalSeparator(separator)
@@ -248,10 +248,10 @@ private fun ContextDetails(
         DetailRow(label = "User", value = "${context.userMessageCount}", labelColor, valueColor)
         DetailRow(label = "Assistant", value = "${context.assistantMessageCount}", labelColor, valueColor)
         if (context.sessionCreated > 0) {
-            DetailRow(label = "Created", value = formatRelativeTime(context.sessionCreated), labelColor, valueColor)
+            DetailRow(label = "Created", value = SessionTreeBuilder.formatRelativeTime(context.sessionCreated), labelColor, valueColor)
         }
         if (context.lastUpdated > 0) {
-            DetailRow(label = "Updated", value = formatRelativeTime(context.lastUpdated), labelColor, valueColor)
+            DetailRow(label = "Updated", value = SessionTreeBuilder.formatRelativeTime(context.lastUpdated), labelColor, valueColor)
         }
     }
 }
@@ -316,13 +316,13 @@ private fun UsageBar(
             )
             if (!isUnknown) {
                 Text(
-                    text = "${formatPanelTokens(totalTokens)} / ${formatPanelTokens(contextLimit)}",
+                    text = "${TokenFormatters.formatTokens(totalTokens)} / ${TokenFormatters.formatTokens(contextLimit)}",
                     fontSize = 10.sp,
                     color = ChatTheme.colors.component.contextPanelLabel
                 )
             } else {
                 Text(
-                    text = "${formatPanelTokens(totalTokens)} tokens",
+                    text = "${TokenFormatters.formatTokens(totalTokens)} tokens",
                     fontSize = 10.sp,
                     color = ChatTheme.colors.component.contextPanelLabel
                 )
@@ -419,19 +419,6 @@ private fun HorizontalSeparator(color: Color) {
 }
 
 // ── Format helpers ─────────────────────────────────────────────────────────
-
-private fun formatPanelTokens(tokens: Long): String {
-    return when {
-        tokens == 0L -> "0"
-        tokens < 1000L -> tokens.toString()
-        tokens < 1_000_000L -> "${String.format(java.util.Locale.US, "%.1f", tokens / 1000.0)}k"
-        else -> "${String.format(java.util.Locale.US, "%.1f", tokens / 1_000_000.0)}M"
-    }
-}
-
-private fun formatPanelCost(cost: Double): String {
-    return if (cost == 0.0) "$0.00" else "$${String.format(java.util.Locale.US, "%.4f", cost)}"
-}
 
 // ── Breakdown Legend ────────────────────────────────────────────────────────
 
@@ -558,7 +545,7 @@ private fun LegendRow(label: String, tokens: Long, percent: Float, color: Color,
             modifier = Modifier.weight(1f)
         )
         Text(
-            text = "${formatPanelTokens(tokens)} (${String.format(java.util.Locale.US, "%.0f", percent)}%)",
+            text = "${TokenFormatters.formatTokens(tokens)} (${String.format(java.util.Locale.US, "%.0f", percent)}%)",
             fontSize = ChatTheme.fonts.contextDetailValue,
             color = valueColor,
         )
@@ -585,6 +572,18 @@ private fun CompactButtonRow(
                 fontSize = ChatTheme.fonts.contextDetailValue,
                 color = ChatTheme.colors.accent.contextYellow,
             )
+        }
+        is CompactionState.TimedOut -> {
+            // Compaction timed out client-side; server may still be processing.
+            // The in-flight guard is held until session.compacted SSE or backoff,
+            // so the Retry button is disabled to avoid a concurrent compaction.
+            Text(
+                text = "Compaction timed out — waiting for server confirmation...",
+                fontSize = ChatTheme.fonts.contextDetailValue,
+                color = ChatTheme.colors.accent.contextYellow,
+            )
+            Spacer(Modifier.height(4.dp))
+            OutlinedButton(onClick = onCompact, enabled = false) { Text("Retry") }
         }
         is CompactionState.Error -> {
             val msg = when (compactionState.error) {
@@ -691,7 +690,7 @@ private fun PrunerSection(
     } else {
         DetailRow(
             label = "Tokens saved",
-            value = formatPanelTokens(tokensSaved),
+            value = TokenFormatters.formatTokens(tokensSaved),
             labelColor,
             valueColor,
             bold = true,
@@ -702,7 +701,7 @@ private fun PrunerSection(
     if (lastRunMs > 0) {
         DetailRow(
             label = "Last run",
-            value = formatRelativeTime(lastRunMs),
+            value = SessionTreeBuilder.formatRelativeTime(lastRunMs),
             labelColor,
             valueColor,
         )

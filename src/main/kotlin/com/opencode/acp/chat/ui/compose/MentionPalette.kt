@@ -151,7 +151,8 @@ private fun MentionItem(
         if (isHovered) onHover()
     }
 
-    val iconInfo = fileIconForFile(file.name)
+    val iconInfo = FileTypeIcons.iconKeyForFileName(file.name) to
+        FileTypeIcons.fileColorForExtension(file.name.substringAfterLast('.', "").lowercase())
 
     Row(
         modifier = Modifier

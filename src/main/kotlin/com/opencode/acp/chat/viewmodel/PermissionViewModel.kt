@@ -8,7 +8,7 @@ import com.opencode.acp.chat.model.SelectionPrompt
 import com.opencode.acp.chat.model.SelectionResponse
 import com.opencode.acp.chat.OpenCodeNotifications
 import com.opencode.acp.chat.processor.UiSignal
-import com.opencode.acp.chat.service.OpenCodeService
+import com.opencode.acp.chat.service.OpenCodeServiceApi
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -48,7 +48,7 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class PermissionViewModel(
     private val scope: CoroutineScope,
-    private val service: OpenCodeService,
+    private val service: OpenCodeServiceApi,
     private val project: Project,
     /**
      * Provider for Brave Mode state. When `true`, all permission prompts are
@@ -92,7 +92,15 @@ class PermissionViewModel(
      *  the permission is auto-approved with [PermissionResponse.ALLOW_ONCE] on a
      *  background coroutine. The server still enforces explicit `deny` rules
      *  before sending the permission SSE event, so Brave Mode cannot override
-     *  hard denials — the event would not arrive for denied tools. */
+     *  hard denials — the event would not arrive for denied tools.
+     *
+     *  Security note: Brave Mode's security boundary is enforced SERVER-SIDE by
+     *  the OpenCode server's explicit `deny` rules. The client does NOT maintain
+     *  an independent denylist of high-risk tools (e.g., `bash` with `rm -rf`
+     *  patterns). This is intentional — the server is the single source of truth
+     *  for permission policy. A client-side denylist could be added in the future
+     *  as defense-in-depth, but is not implemented here (requires design discussion
+     *  to avoid diverging from server policy). */
     fun setPermissionPrompt(prompt: PermissionPrompt?) {
         if (prompt != null && braveModeProvider()) {
             logger.info { "[ACP] Brave Mode: auto-approving permission ${prompt.permissionId} (tool=${prompt.toolName})" }
@@ -116,11 +124,20 @@ class PermissionViewModel(
                     // Fall back to showing the prompt so the user can retry manually.
                     // The calling code has already returned (this runs async), so setting
                     // the StateFlow here surfaces the prompt for manual approval.
-                    _permissionPrompt.value = prompt
-                    // Start the timeout so the fallback prompt doesn't hang the agent
-                    // indefinitely if the user doesn't notice it. Mirrors the non-Brave
-                    // path where setPermissionPrompt + startPermissionTimeout are paired.
-                    startPermissionTimeout()
+                    // COMPARE-AND-SET GUARD: only set the fallback prompt if no newer
+                    // prompt has arrived between the auto-approve attempt and this
+                    // fallback. Without this guard, a newer PermissionRequested signal
+                    // that arrived in the interim would be overwritten by this stale
+                    // (failed) prompt, losing the newer prompt.
+                    if (_permissionPrompt.value == null) {
+                        _permissionPrompt.value = prompt
+                        // Start the timeout so the fallback prompt doesn't hang the agent
+                        // indefinitely if the user doesn't notice it. Mirrors the non-Brave
+                        // path where setPermissionPrompt + startPermissionTimeout are paired.
+                        startPermissionTimeout()
+                    } else {
+                        logger.info { "[ACP] Brave Mode fallback skipped — a newer prompt is already pending" }
+                    }
                 }
             }
             return
@@ -256,6 +273,15 @@ class PermissionViewModel(
                     logger.warn(e) { "[ACP] Brave Mode auto-approve failed for child permission ${prompt.permissionId} — falling back to manual prompt" }
                     // Fall back to the non-Brave-Mode path: add the prompt to the map
                     // and start the timeout so the user can retry manually.
+                    // CONCURRENCY SAFETY: this fallback runs in a service.scope.launch
+                    // coroutine. If two fallbacks for the same child race, the
+                    // _childPermissionPrompts.update { } call is atomic (MutableStateFlow
+                    // retries the lambda on concurrent modification), so both prompts are
+                    // preserved. The startChildPermissionTimeout call outside the update
+                    // block is also safe: it cancels the previous timeout for the child
+                    // (line 339: childPermissionTimeoutJobs[childSessionId]?.cancel()),
+                    // so only one timeout is active per child. No bug — relies on
+                    // update atomicity + startChildPermissionTimeout idempotency.
                     _childPermissionPrompts.update { prompts ->
                         val existing = prompts[childId] ?: emptyList()
                         prompts + (childId to (existing + prompt))
