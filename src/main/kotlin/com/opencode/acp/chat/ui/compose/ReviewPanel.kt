@@ -85,9 +85,6 @@ import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Link
 import org.jetbrains.jewel.ui.component.Text
 import org.jetbrains.jewel.ui.icon.IconKey
-import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
-import org.jetbrains.jewel.ui.icon.IntelliJIconKey
-import org.jetbrains.jewel.ui.icons.AllIconsKeys
 
 // ── Review Panel (sidebar tab content) ───────────────────────────────────────
 
@@ -131,6 +128,9 @@ fun ReviewPanel(
         val vfsListener = object : AsyncFileListener {
             override fun prepareChange(events: List<VFileEvent>): AsyncFileListener.ChangeApplier? {
                 // Emit on any non-transactional file event (skip .git internal, build dirs, etc.)
+                // NOTE: `.review/` writes are intentionally NOT filtered out — the review panel
+                // should refresh when the LLM agent writes review JSON. There is no feedback loop
+                // because the refresh only READS files (it never writes to `.review/`).
                 val relevant = events.any { ev ->
                     val path = ev.file?.path?.replace('\\', '/') ?: return@any false
                     !path.contains("/.git/") &&
@@ -339,7 +339,7 @@ private fun ChangedFileRow(
         ) {
             // File type icon
             Icon(
-                key = getFileTypeIcon(file.fileName),
+                key = FileTypeIcons.iconKeyForFileName(file.fileName),
                 contentDescription = file.fileName,
                 modifier = Modifier.size(ChatTheme.dims.reviewFileIconSize),
                 tint = Color.Unspecified
@@ -431,7 +431,7 @@ private fun ChangedFileRow(
                     contentAlignment = Alignment.Center
                 ) {
                 Icon(
-                    key = AllIconsKeys.Actions.Diff,
+                    key = PlatformIconKeys.Actions.Diff,
                     contentDescription = "Diff",
                     modifier = Modifier.size(ChatTheme.dims.reviewOpenFileIconSize),
                     tint = if (isLocateHovered) ChatTheme.colors.text.link else pathColor
@@ -458,8 +458,8 @@ private fun ChangedFileRow(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
-                    key = if (expanded) AllIconsKeys.General.ChevronDown
-                          else AllIconsKeys.General.ChevronRight,
+                    key = if (expanded) PlatformIconKeys.General.ChevronDown
+                          else PlatformIconKeys.General.ChevronRight,
                     contentDescription = if (expanded) "Collapse" else "Expand",
                     modifier = Modifier.size(12.dp),
                     tint = commentColor
@@ -578,77 +578,16 @@ private fun ReviewCommentChildRow(
 
 /** Map a review severity to a Jewel icon key matching [ReviewIcons]. */
 private fun severityIconKey(severity: ReviewSeverity): IconKey = when (severity) {
-    ReviewSeverity.ERROR   -> AllIconsKeys.General.BalloonError
-    ReviewSeverity.WARNING -> AllIconsKeys.General.Warning
-    ReviewSeverity.INFO    -> AllIconsKeys.General.BalloonInformation
+    ReviewSeverity.ERROR   -> PlatformIconKeys.General.BalloonError
+    ReviewSeverity.WARNING -> PlatformIconKeys.General.Warning
+    ReviewSeverity.INFO    -> PlatformIconKeys.General.BalloonInformation
 }
 
 // ── File type icons ────────────────────────────────────────────────────────────
 
-internal fun getFileTypeIcon(fileName: String): org.jetbrains.jewel.ui.icon.IconKey {
-    val extension = fileName.substringAfterLast('.', "").lowercase()
-    return when (extension) {
-        "kt" -> AllIconsKeys.Language.Kotlin
-        "kts" -> AllIconsKeys.Language.Kotlin
-        "java" -> AllIconsKeys.FileTypes.Java
-        "xml" -> AllIconsKeys.FileTypes.Xml
-        "json" -> AllIconsKeys.FileTypes.Json
-        "yaml", "yml" -> AllIconsKeys.FileTypes.Yaml
-        "md" -> AllIconsKeys.FileTypes.Text
-        "txt" -> AllIconsKeys.FileTypes.Text
-        "js", "jsx" -> AllIconsKeys.FileTypes.JavaScript
-        "ts", "tsx" -> AllIconsKeys.FileTypes.JavaScript
-        "css" -> AllIconsKeys.FileTypes.Css
-        "html", "htm" -> AllIconsKeys.FileTypes.Html
-        "py" -> AllIconsKeys.Language.Python
-        "rb" -> AllIconsKeys.Language.Ruby
-        "rs" -> AllIconsKeys.Language.Rust
-        "go" -> AllIconsKeys.Language.GO
-        "scala" -> AllIconsKeys.Language.Scala
-        "php" -> AllIconsKeys.Language.Php
-        "gradle" -> AllIconsKeys.Nodes.Folder  // Fallback for Gradle
-        "properties" -> AllIconsKeys.FileTypes.Text
-        "gitignore" -> AllIconsKeys.FileTypes.Text
-        "svg" -> AllIconsKeys.FileTypes.Image
-        "png", "jpg", "jpeg", "gif", "bmp", "webp" -> AllIconsKeys.FileTypes.Image
-        else -> resolveFileTypeIconFromPlatform(fileName)
-    }
-}
-
-/**
- * Fallback for file types not covered by the static [AllIconsKeys] map above.
- *
- * The platform's [AllIcons]/[AllIconsKeys] only ship icons for a handful of
- * languages (Kotlin, Java, Python, …). Rider-specific languages — C#, C++,
- * F#, VB, Razor, .csproj/.sln, etc. — and CLion's C/C++ have **no** constant
- * in `AllIcons.FileTypes`/`AllIcons.Language`. Their icons are contributed by
- * the host IDE's file-type registry instead.
- *
- * This asks [FileTypeManager] for the registered [FileType] for the file name
- * and wraps its icon as a Jewel [IconKey] via
- * [IntelliJIconKey.fromPlatformIcon]. On Rider this resolves the real C#/C++/
- * F#/VB/Razor/csproj/sln icons; on IntelliJ IDEA (no .NET plugin) it falls
- * back to the plain-text file-type icon, which is the same as the previous
- * hard-coded `AllIconsKeys.FileTypes.Text` fallback. The lookup is cheap and
- * read-safe ([FileTypeManager.getFileTypeByFileName] does not require a read
- * action), so it is safe to call from composition.
- *
- * Guarded with a try/catch so a misbehaving FileType extension can never break
- * the review tab — it degrades to the generic text icon.
- */
-private fun resolveFileTypeIconFromPlatform(fileName: String): org.jetbrains.jewel.ui.icon.IconKey {
-    return try {
-        val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
-        val icon = fileType.icon
-        if (icon != null) {
-            IntelliJIconKey.fromPlatformIcon(icon)
-        } else {
-            AllIconsKeys.FileTypes.Text
-        }
-    } catch (t: Throwable) {
-        AllIconsKeys.FileTypes.Text
-    }
-}
+// The extension→icon mapping and platform fallback have been consolidated into
+// FileTypeIcons. See FileTypeIcons.iconKeyForFileName and
+// FileTypeIcons.resolveFileTypeIconFromPlatform.
 
 // ── State composables ──────────────────────────────────────────────────────────
 
@@ -691,7 +630,7 @@ private fun ReviewRefreshBar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                key = AllIconsKeys.Actions.Refresh,
+                key = PlatformIconKeys.Actions.Refresh,
                 contentDescription = "Refresh reviews",
                 modifier = Modifier.size(14.dp),
                 tint = iconColor,
@@ -746,7 +685,7 @@ private fun ReviewErrorContent(
         verticalArrangement = Arrangement.Center
     ) {
         Icon(
-            key = AllIconsKeys.General.BalloonError,
+            key = PlatformIconKeys.General.BalloonError,
             contentDescription = null,
             modifier = Modifier.size(24.dp),
             tint = ChatTheme.colors.text.error,
@@ -838,6 +777,19 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
         } catch (e: NoClassDefFoundError) {
             // Missing optional dependency — indicates a broken plugin installation.
             // Log at ERROR level so the user is aware of the configuration issue.
+            // NOTE: We intentionally do NOT show a user-visible notification here.
+            // NoClassDefFoundError on a diff-viewer open is a per-attempt failure —
+            // surfacing a notification on every failed diff open would be intrusive.
+            // The error-level log entry is sufficient for diagnosis via idea.log.
+            //
+            // Deliberate design decision (not an oversight): swallowing
+            // NoClassDefFoundError here is intentional. NoClassDefFoundError is a
+            // JVM-level error indicating a missing class (broken plugin install,
+            // optional dependency absent), but it is recoverable — the rest of the
+            // plugin continues to work. Re-throwing would surface an IDE error
+            // dialog on every failed diff open, which is intrusive for a per-attempt
+            // failure. The error-level log is the diagnostic trail; users diagnosing
+            // a non-opening diff viewer can grep idea.log for [ACP] NoClassDefFoundError.
             com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
                 .error("[ACP] Failed to open diff viewer for $filePath — missing dependency: ${e.message}")
         } catch (e: Exception) {

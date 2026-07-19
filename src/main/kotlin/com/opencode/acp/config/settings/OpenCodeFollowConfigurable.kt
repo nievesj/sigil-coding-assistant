@@ -26,6 +26,7 @@ class OpenCodeFollowConfigurable : Configurable {
     private var followEnabledCheckBox: JBCheckBox? = null
     private var followCommandsInConsoleCheckBox: JBCheckBox? = null
     private var followSearchesInFindWindowCheckBox: JBCheckBox? = null
+    private var braveModeCheckBox: JBCheckBox? = null
 
     /** Per-row model: holds the text field and remembers the ToolKind it edits. */
     private data class ColorRow(val kind: ToolKind, val textField: JBTextField)
@@ -34,7 +35,7 @@ class OpenCodeFollowConfigurable : Configurable {
     override fun getDisplayName(): String = "Follow Agent"
 
     override fun createComponent(): JComponent {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
 
         followEnabledCheckBox = JBCheckBox(
             "Enable Follow Agent (auto-open files on tool calls)",
@@ -53,10 +54,17 @@ class OpenCodeFollowConfigurable : Configurable {
         )
         followSearchesInFindWindowCheckBox?.toolTipText = "When Follow Agent is on, open IntelliJ's native Find in Files when the agent searches"
 
+        braveModeCheckBox = JBCheckBox(
+            "Enable Brave Mode (auto-approve all permission prompts)",
+            settings.braveModeEnabled
+        )
+        braveModeCheckBox?.toolTipText = "When enabled, all tool permission prompts are auto-approved with ALLOW_ONCE without showing the UI dialog. Explicit deny rules in opencode.json are still enforced. Note: if the auto-approve POST fails (network error), the prompt will fall back to showing in the UI for manual approval."
+
         val builder = FormBuilder()
             .addComponent(followEnabledCheckBox!!)
             .addComponent(followCommandsInConsoleCheckBox!!)
             .addComponent(followSearchesInFindWindowCheckBox!!)
+            .addComponent(braveModeCheckBox!!)
             .addVerticalGap(8)
             .addSeparator()
             .addVerticalGap(4)
@@ -70,7 +78,7 @@ class OpenCodeFollowConfigurable : Configurable {
             val defaultHex = com.opencode.acp.follow.FollowColorProvider.getDefaultHex(kind) ?: continue
             val label = com.opencode.acp.follow.FollowColorProvider.getInlayLabel(kind) ?: continue
             val textField = JBTextField(settings.getFollowColor(kind), 10)
-            textField.toolTipText = "$label (default: $defaultHex)"
+            textField.toolTipText = "$label (default: $defaultHex). Format: #RRGGBB (alpha defaults to FF) or #RRGGBBAA where AA is alpha (00=transparent, FF=opaque)."
             // Mark the field invalid on bad input so the user gets immediate feedback.
             // We do not block apply() — the setter stores whatever the user types, but
             // FollowColorProvider.getColor() will fall back to "no highlight" on bad
@@ -89,31 +97,40 @@ class OpenCodeFollowConfigurable : Configurable {
     }
 
     override fun isModified(): Boolean {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
         if (followEnabledCheckBox?.isSelected != settings.followAgentEnabled) return true
         if (followCommandsInConsoleCheckBox?.isSelected != settings.followCommandsInConsole) return true
         if (followSearchesInFindWindowCheckBox?.isSelected != settings.followSearchesInFindWindow) return true
+        if (braveModeCheckBox?.isSelected != settings.braveModeEnabled) return true
         return colorRows.any { (kind, field) -> field.text.trim() != settings.getFollowColor(kind) }
     }
 
     override fun apply() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
         settings.followAgentEnabled = followEnabledCheckBox?.isSelected ?: false
         settings.followCommandsInConsole = followCommandsInConsoleCheckBox?.isSelected ?: settings.followCommandsInConsole
         settings.followSearchesInFindWindow = followSearchesInFindWindowCheckBox?.isSelected ?: settings.followSearchesInFindWindow
+        settings.braveModeEnabled = braveModeCheckBox?.isSelected ?: false
         for ((kind, field) in colorRows) {
-            // Persist whatever the user typed; FollowColorProvider.getColor() falls
-            // back to "no highlight" on bad input. We do not coerce to default here —
-            // that would silently lose user input on apply.
-            settings.setFollowColor(kind, field.text.trim())
+            val trimmed = field.text.trim()
+            // Invalid hex values are silently reset to defaults here (no error dialog);
+            // the user gets visual feedback via the pink background on the field itself.
+            val hexToPersist = if (isValidHex(trimmed)) trimmed else {
+                val defaultHex = com.opencode.acp.follow.FollowColorProvider.getDefaultHex(kind) ?: trimmed
+                // Reset the field to the default so the UI shows the corrected value
+                field.text = defaultHex
+                defaultHex
+            }
+            settings.setFollowColor(kind, hexToPersist)
         }
     }
 
     override fun reset() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeFollowSettingsState.getInstance()
         followEnabledCheckBox?.isSelected = settings.followAgentEnabled
         followCommandsInConsoleCheckBox?.isSelected = settings.followCommandsInConsole
         followSearchesInFindWindowCheckBox?.isSelected = settings.followSearchesInFindWindow
+        braveModeCheckBox?.isSelected = settings.braveModeEnabled
         for ((kind, field) in colorRows) {
             field.text = settings.getFollowColor(kind)
         }
@@ -121,7 +138,8 @@ class OpenCodeFollowConfigurable : Configurable {
 
     private fun isValidHex(hex: String): Boolean {
         val h = hex.removePrefix("#")
-        if (h.length != 8) return false  // #RRGGBBAA — alpha required (per label)
+        // Accept #RRGGBB (6 chars, alpha defaults to FF) or #RRGGBBAA (8 chars, alpha required)
+        if (h.length != 6 && h.length != 8) return false
         return h.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
     }
 

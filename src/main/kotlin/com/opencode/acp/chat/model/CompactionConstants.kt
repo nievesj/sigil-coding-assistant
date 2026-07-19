@@ -40,6 +40,15 @@ object CompactionConstants {
     /** Timeout for manual compaction HTTP call. */
     const val COMPACT_TIMEOUT_MS = 120_000L  // 2 minutes
 
+    /**
+     * Backoff period after a compaction timeout before the in-flight guard auto-resets.
+     * The server may still be processing the timed-out compaction; keeping the guard set
+     * for this period prevents a retry from sending a SECOND concurrent compaction that
+     * could corrupt session state. If no `session.compacted` SSE arrives within this
+     * window, the guard is released so the user can retry. 30 seconds.
+     */
+    const val COMPACT_TIMEOUT_BACKOFF_MS = 30_000L
+
     // ── FileReadCache ──
     /** Maximum cache entries before LRU eviction kicks in. */
     const val FILE_READ_CACHE_MAX_ENTRIES = 500

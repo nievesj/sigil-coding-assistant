@@ -24,6 +24,15 @@ object ChatConstants {
     const val MCP_FETCH_TOOLS_TIMEOUT_MS = 5_000L
     /** Server name for the built-in IntelliJ MCP server. */
     const val MCP_SERVER_NAME_INTELLIJ = "intellij"
+    /** Initial delay (ms) before retrying MCP server connection after a failure.
+     *  The JetBrains MCP Server starts asynchronously — it may not be ready when
+     *  the plugin's initialize() runs. This is the first retry delay. */
+    const val MCP_RETRY_INITIAL_DELAY_MS = 2_000L
+    /** Maximum delay (ms) between MCP server connection retries (exponential backoff cap). */
+    const val MCP_RETRY_MAX_DELAY_MS = 10_000L
+    /** Total time (ms) to keep retrying MCP server connection before giving up.
+     *  60 seconds covers the typical JetBrains MCP Server startup window. */
+    const val MCP_RETRY_TOTAL_TIMEOUT_MS = 60_000L
 
     // ── Context Pruner ─────────────────────────────────────────────────
     /** Resource path of the TS plugin inside the JAR. */

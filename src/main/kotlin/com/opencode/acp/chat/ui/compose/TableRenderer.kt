@@ -20,6 +20,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.opencode.acp.chat.ui.theme.ChatTheme
+import com.opencode.acp.chat.markdown.MarkdownSegmenter
+import com.opencode.acp.chat.markdown.ParsedTable
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Text
 

@@ -58,12 +58,7 @@ import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.rotate
 import kotlin.math.sqrt
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.isShiftPressed
-import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.node.ModifierNodeElement
 import androidx.compose.ui.platform.InspectorInfo
@@ -87,9 +82,7 @@ import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
 import androidx.compose.foundation.TooltipArea
 import org.jetbrains.jewel.ui.icons.AllIconsKeys
-import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
-import java.awt.image.BufferedImage
 import com.opencode.acp.util.decodeFileToBitmap
 import com.opencode.acp.util.saveClipboardImageToDisk
 import kotlinx.coroutines.Dispatchers
@@ -98,179 +91,32 @@ import kotlinx.coroutines.withContext
 
 private val logger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
-/** Result of reading the clipboard — either an image/file attachment or plain text. */
-sealed class ClipboardResult {
-    data class FileResult(val file: AttachedFile) : ClipboardResult()
-    data class TextResult(val text: String) : ClipboardResult()
+/**
+ * Validates that an attached file's canonical path is within the allowed directories
+ * (project base, project .opencode/attachments, or user home .opencode/attachments).
+ * Returns true if the path is allowed, false otherwise.
+ */
+private fun isAttachedPathAllowed(
+    attachedPath: String,
+    projectBase: String?,
+    userHome: String?,
+): Boolean {
+    val canonicalAttached = com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(attachedPath) ?: return false
+    return com.opencode.acp.chat.util.AttachmentPathValidator.isAllowed(canonicalAttached, projectBase, userHome)
 }
 
 /**
- * Reads the system clipboard for images, files, or text.
- * Returns [ClipboardResult] if content is present, null otherwise.
+ * Thin wrapper that delegates to [ClipboardReader.readClipboardContent].
  *
- * AWT clipboard access MUST happen on the Event Dispatch Thread.
+ * Kept as a top-level function so the existing `InputAreaClipboardTest` regression
+ * test (which calls `readClipboardContent(null)` as a top-level function) continues
+ * to compile and pass unchanged after the Phase 4 extraction
+ * (TDD `docs/tdd/ui-testability-refactor.md` §9 step 9).
  *
- * @param project Used to determine the save location for clipboard images.
- *   If null, images are saved to `user.home` (will not be auto-cleaned).
+ * The actual implementation lives in [ClipboardReader] (extracted from this file).
  */
-suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? = null): ClipboardResult? {
-    val clipResult: Any? = if (java.awt.EventQueue.isDispatchThread()) {
-        readClipboardOnEdt()
-    } else {
-        withContext(kotlinx.coroutines.Dispatchers.IO) {
-            try {
-                val deferred = kotlinx.coroutines.CompletableDeferred<Any?>()
-                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
-                    deferred.complete(readClipboardOnEdt())
-                }
-                kotlinx.coroutines.withTimeoutOrNull(5000) { deferred.await() } ?: run {
-                    logger.warn { "[ACP] readClipboardContent: EDT timed out after 5s — clipboard read failed" }
-                    null
-                }
-            } catch (e: SecurityException) {
-                logger.warn(e) { "[ACP] readClipboardContent: clipboard access denied (SecurityException)" }
-                null
-            } catch (e: Exception) {
-                logger.debug(e) { "[ACP] readClipboardContent: clipboard read failed" }
-                null
-            }
-        }
-    }
-
-    return withContext(Dispatchers.IO) {
-        try {
-            when (clipResult) {
-                is java.awt.Image -> {
-                    val bufferedImage = clipResult.toBufferedImage()
-                    val savedPath = saveClipboardImageToDisk(bufferedImage, project)
-                    if (savedPath != null) {
-                        // No path validation needed here: saveClipboardImageToDisk
-                        // always writes inside .opencode/attachments/ by construction,
-                        // so the path is guaranteed to be within the allowed dir.
-                        val filename = java.io.File(savedPath).name
-                        ClipboardResult.FileResult(AttachedFile(name = filename, path = savedPath, mime = "image/png"))
-                    } else {
-                        logger.warn { "[ACP] Clipboard image save failed; skipping attachment" }
-                        null
-                    }
-                }
-                    is List<*> -> {
-                    val files = clipResult.filterIsInstance<java.io.File>()
-                    if (files.isEmpty()) return@withContext null
-                    ClipboardResult.FileResult(files.first().toAttachedFile(project))
-                }
-                is String -> {
-                    if (clipResult.isNotBlank()) {
-
-                        ClipboardResult.TextResult(clipResult)
-                    } else null
-                }
-                else -> null
-            }
-        } catch (e: Exception) {
-            logger.debug(e) { "[ACP] readClipboardContent: failed to read clipboard" }
-            null
-        }
-    }
-}
-
-/**
- * Reads clipboard content on the EDT. Returns java.awt.Image, List<java.io.File>, String (text), or null.
- */
-private fun readClipboardOnEdt(): Any? {
-    try {
-        val clipboard = Toolkit.getDefaultToolkit().systemClipboard
-        val transferable = clipboard.getContents(null)
-        if (transferable == null) {
-
-            return null
-        }
-
-        val flavors = transferable.transferDataFlavors
-
-        // 1. Try stringFlavor / plain text FIRST — if the clipboard has text
-        //    content, it should be treated as text even if it also has an image
-        //    representation (many apps put both on the clipboard).
-        for (flavor in flavors) {
-            if (flavor.mimeType.startsWith("text/plain") && flavor.isRepresentationClassReader) {
-                try {
-                    val reader = transferable.getTransferData(flavor) as? java.io.Reader
-                    if (reader != null) {
-                        val text = reader.readText()
-                        if (text.isNotBlank()) {
-                            return text
-                        }
-                    }
-                } catch (e: SecurityException) {
-                    logger.warn(e) { "[ACP] readClipboardOnEdt: clipboard access denied (SecurityException)" }
-                } catch (_: Exception) { }
-            }
-        }
-        // Also try stringFlavor directly (common for macOS)
-        if (transferable.isDataFlavorSupported(DataFlavor.stringFlavor)) {
-            try {
-                val text = transferable.getTransferData(DataFlavor.stringFlavor) as? String
-                if (text != null && text.isNotBlank()) {
-                    return text
-                }
-            } catch (e: SecurityException) {
-                logger.warn(e) { "[ACP] readClipboardOnEdt: stringFlavor access denied (SecurityException)" }
-            } catch (_: Exception) { }
-        }
-
-        // 2. Try javaFileListFlavor (files from OS file manager) — only return
-        //    actual image files here; non-image files are intentionally ignored.
-        //    Non-image files should be attached via the "Attach" button (which
-        //    runs the full copy-into-allowed-dir + MIME detection path). The
-        //    clipboard path is for images and text only.
-        if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
-            @Suppress("UNCHECKED_CAST")
-            val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
-            if (files != null && files.isNotEmpty()) {
-                val imageExts = setOf("png", "jpg", "jpeg", "gif", "bmp", "svg", "webp")
-                val imageFiles = files.filter { f ->
-                    f.extension.lowercase() in imageExts
-                }
-                if (imageFiles.isNotEmpty()) {
-                    return imageFiles
-                }
-            }
-        }
-
-        // 3. Try imageFlavor (screenshot, copied image from image editor) —
-        //    last priority since screenshots typically don't also have text.
-        if (transferable.isDataFlavorSupported(DataFlavor.imageFlavor)) {
-            val image = transferable.getTransferData(DataFlavor.imageFlavor) as? java.awt.Image
-            if (image != null) {
-                return image
-            }
-        }
-
-    } catch (e: SecurityException) {
-        logger.warn(e) { "[ACP] readClipboardOnEdt: clipboard access denied (SecurityException)" }
-    } catch (e: Exception) {
-        logger.debug(e) { "[ACP] readClipboardOnEdt: clipboard access failed" }
-    }
-    return null
-}
-
-/**
- * Converts a java.awt.Image to a BufferedImage.
- */
-private fun java.awt.Image.toBufferedImage(): BufferedImage {
-    if (this is BufferedImage) return this
-    val width = getWidth(null)
-    val height = getHeight(null)
-    if (width <= 0 || height <= 0) return BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB)
-    val bufferedImage = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
-    val graphics = bufferedImage.createGraphics()
-    try {
-        graphics.drawImage(this, 0, 0, null)
-    } finally {
-        graphics.dispose()
-    }
-    return bufferedImage
-}
+suspend fun readClipboardContent(project: com.intellij.openapi.project.Project? = null): ClipboardResult? =
+    ClipboardReader.readClipboardContent(project)
 
 /**
  * ModifierNodeElement that attaches a [DragAndDropTarget] to the modifier chain.
@@ -298,17 +144,28 @@ private class DropTargetElement(
         name = "dragAndDropTarget"
     }
 
+    // equals()/hashCode() compare ONLY the `target` (not `shouldStartDragAndDrop`).
+    //
+    // Rationale: `shouldStartDragAndDrop` is a fresh lambda created on every
+    // DropTargetElement construction. Lambda references use identity equality
+    // (Object.equals), so two equivalent-but-distinct lambda instances are never
+    // equal — including `shouldStartDragAndDrop` in equals() would make the
+    // ModifierNodeElement appear to change on every recomposition, triggering
+    // unnecessary update()/create() cycles.
+    //
+    // The `target` is constructed via `remember(onAttachFile, onImagePasted)`
+    // (see line ~279), so its identity changes appropriately when the callbacks
+    // change. `shouldStartDragAndDrop` is a derived property of `target` (it
+    // delegates to the target's `onDrop`/acceptance logic), so comparing `target`
+    // alone is sufficient — when the target changes, the element changes; when
+    // the target is stable, the element is stable (no spurious updates).
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is DropTargetElement) return false
-        return target === other.target && shouldStartDragAndDrop == other.shouldStartDragAndDrop
+        return target === other.target
     }
 
-    override fun hashCode(): Int {
-        var result = target.hashCode()
-        result = 31 * result + shouldStartDragAndDrop.hashCode()
-        return result
-    }
+    override fun hashCode(): Int = target.hashCode()
 }
 
 @OptIn(ExperimentalJewelApi::class, ExperimentalComposeUiApi::class)
@@ -339,6 +196,10 @@ fun InputArea(
     onRecentFileClick: (RecentFile) -> Unit = {},
     onSlashCommand: (SlashCommand) -> Unit = {},
     commands: List<SlashCommand> = emptyList(),
+    // @ mention file autocomplete
+    mentionFiles: List<RecentFile> = emptyList(),
+    onMentionSearch: (String) -> Unit = {},
+    onMentionFileSelected: (RecentFile) -> Unit = {},
     todos: List<TodoItem> = emptyList(),
     commandHistory: List<CommandHistoryEntry> = emptyList(),
     onLoadHistoryEntry: (CommandHistoryEntry) -> Unit = {},
@@ -348,6 +209,8 @@ fun InputArea(
     isFollowEnabled: Boolean = false,                // NEW
     onDisconnect: () -> Unit = {},                   // NEW
     onToggleFollow: () -> Unit = {},                 // NEW
+    isBraveModeEnabled: Boolean = false,               // NEW: brave mode state
+    onToggleBraveMode: () -> Unit = {},               // NEW: brave mode toggle
     placeholderText: String = "Type a message...",
     ) {
     val textState = remember { TextFieldState() }
@@ -376,6 +239,28 @@ fun InputArea(
         if (slashQuery.startsWith(cmd.name, ignoreCase = true) && slashQuery.length > cmd.name.length) {
             slashQuery.substring(cmd.name.length).trim()
         } else ""
+
+    // @ mention palette state: shown when the user types "@" followed by a file query.
+    // The @ can appear anywhere in the text (not just at the start like slash commands).
+    // We detect the last "@" and extract the query text between it and the cursor/next space.
+    var showMentionPalette by remember { mutableStateOf(false) }
+    var mentionSelectedIndex by remember { mutableStateOf(0) }
+    var mentionQuery by remember { mutableStateOf("") }
+    var mentionStartIndex by remember { mutableStateOf(-1) } // text offset of the "@" char
+
+    // Filter mention files by the current query — open files first, then others
+    val filteredMentionFiles = remember(mentionQuery, mentionFiles) {
+        if (mentionQuery.isBlank()) {
+            mentionFiles.take(20)
+        } else {
+            mentionFiles.filter {
+                it.name.contains(mentionQuery, ignoreCase = true) ||
+                it.path.contains(mentionQuery, ignoreCase = true)
+            }.take(20)
+        }
+    }
+
+    LaunchedEffect(filteredMentionFiles.size) { mentionSelectedIndex = 0 }
 
     // Command history navigation state
     var historyIndex by remember { mutableStateOf(-1) }  // -1 = not navigating, 0 = newest, 1 = next older...
@@ -424,24 +309,36 @@ fun InputArea(
                                 // Reject non-file URI schemes (e.g. http://, ftp://) to
                                 // prevent attaching arbitrary remote resources. Only
                                 // local file:// URIs are allowed for drag-and-drop.
-                                if (!uri.startsWith("file:")) {
-                                    logger.warn { "[ACP] Drag-and-drop: rejecting non-file URI scheme: ${uri.take(50)}" }
+                                val parsed = try { java.net.URI(uri) } catch (e: java.net.URISyntaxException) {
+                                    logger.warn { "[ACP] Drag-and-drop: malformed URI: ${uri.take(50)}" }
+                                    null
+                                }
+                                if (parsed == null) {
+                                    null
+                                } else if (parsed.scheme?.lowercase() != "file") {
+                                    logger.warn { "[ACP] Drag-and-drop: rejecting non-file URI scheme: ${parsed.scheme}" }
                                     null
                                 } else {
-                                    val file = java.io.File(java.net.URI(uri))
+                                    val file = java.io.File(parsed)
                                     // Validate path is within project or allowed attachment dirs
                                     val canonicalPath = file.canonicalPath
-                                    val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }
-                                    val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
-                                    val isInsideProject = projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator)
-                                    val isInsideAttachments = (projectBase != null && canonicalPath.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
-                                        (userHome != null && canonicalPath.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))
-                                    if (!isInsideProject && !isInsideAttachments) {
+                                    val projectBase = project?.basePath?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
+                                    val userHome = System.getProperty("user.home")?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
+                                    if (!com.opencode.acp.chat.util.AttachmentPathValidator.isAllowed(canonicalPath, projectBase, userHome)) {
                                         // toAttachedFile will copy it into the allowed dir; if copy fails,
                                         // the service guard will catch it. Log for visibility.
                                         logger.debug { "[ACP] Drag-and-drop: file outside allowed dirs, will attempt copy: ${file.name}" }
                                     }
-                                    file.toAttachedFile(project)
+                                    // Post-condition: verify the returned AttachedFile.path is within
+                                    // allowed dirs after toAttachedFile (which copies external files in).
+                                    // This guards against a copy failure silently returning the raw external
+                                    // path, which would bypass the attachment security boundary.
+                                    val attached = file.toAttachedFile(project)
+                                    val isAllowed = attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
+                                    if (isAllowed) attached else {
+                                        logger.warn { "[ACP] Drag-and-drop: attached file path outside allowed dirs after copy: ${attached?.path}" }
+                                        null
+                                    }
                                 }
                             } catch (e: Exception) {
                                 logger.warn(e) { "[ACP] Drag-and-drop: failed to process file URI: ${uri.take(50)}" }
@@ -499,10 +396,41 @@ fun InputArea(
                         @Suppress("UNCHECKED_CAST")
                         val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
                         var anyAttached = false
+                        // Canonicalize the base paths once before the loop. Wrap in
+                        // try-catch so a canonicalization failure (e.g., network drive
+                        // disconnected, invalid chars on Windows) falls back to the
+                        // non-canonical path instead of aborting ALL file attachments.
+                        // Matches the pattern in OpenCodeService.kt:115-128.
+                        val projectBase = project?.basePath?.let { basePath ->
+                            try {
+                                java.io.File(basePath).canonicalPath.trimEnd(java.io.File.separatorChar)
+                            } catch (e: Exception) {
+                                logger.warn(e) { "[ACP] Drag-and-drop AWT fallback: project base canonicalization failed, using raw path" }
+                                basePath.trimEnd(java.io.File.separatorChar)
+                            }
+                        }
+                        val userHome = System.getProperty("user.home")?.let { home ->
+                            try {
+                                java.io.File(home).canonicalPath.trimEnd(java.io.File.separatorChar)
+                            } catch (e: Exception) {
+                                logger.warn(e) { "[ACP] Drag-and-drop AWT fallback: user.home canonicalization failed, using raw path" }
+                                home.trimEnd(java.io.File.separatorChar)
+                            }
+                        }
                         files?.forEach { file ->
                             try {
-                                onAttachFile(file.toAttachedFile(project))
-                                anyAttached = true
+                                val attached = file.toAttachedFile(project)
+                                // Post-condition: verify the returned AttachedFile.path is within
+                                // allowed dirs after toAttachedFile (which copies external files in).
+                                // This guards against a copy failure silently returning the raw external
+                                // path, which would bypass the attachment security boundary.
+                                val isAllowed = attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
+                                if (isAllowed) {
+                                    onAttachFile(attached)
+                                    anyAttached = true
+                                } else {
+                                    logger.warn { "[ACP] Drag-and-drop AWT fallback: attached file path outside allowed dirs after copy: ${attached?.path}" }
+                                }
                             } catch (e: Exception) {
                                 logger.warn(e) { "[ACP] Drag-and-drop AWT fallback: file attach failed" }
                             }
@@ -551,6 +479,36 @@ fun InputArea(
             }
     }
 
+    // Watch text changes to detect "@" mention triggers.
+    // The "@" can appear anywhere in the text. We find the last "@" before the
+    // cursor and extract the query between it and the next whitespace or cursor.
+    // The palette is dismissed if:
+    //   - there's no "@" in the text
+    //   - the text after "@" contains whitespace (user typed a space, ending the mention)
+    //   - the slash palette is active (slash commands take priority)
+    LaunchedEffect(Unit) {
+        androidx.compose.runtime.snapshotFlow { textState.text.toString() }
+            .collect { text ->
+                if (showSlashPalette) {
+                    showMentionPalette = false
+                    return@collect
+                }
+                val cursorPos = textState.selection.start
+                val result = detectMentionTrigger(text, cursorPos)
+                if (result.active) {
+                    showMentionPalette = true
+                    mentionQuery = result.query
+                    mentionStartIndex = result.startIndex
+                    // Trigger search for the query
+                    onMentionSearch(result.query)
+                } else {
+                    showMentionPalette = false
+                    mentionQuery = ""
+                    mentionStartIndex = -1
+                }
+            }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -583,6 +541,44 @@ fun InputArea(
                             onSlashCommand(command.copy(args = args))
                         },
                         onDismiss = { showSlashPalette = false },
+                    )
+                }
+            }
+        }
+
+        // @ mention palette — shown above the input when the user types "@query"
+        if (showMentionPalette && !showSlashPalette) {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.BottomStart
+            ) {
+                Popup(
+                    alignment = Alignment.BottomStart,
+                    offset = IntOffset(0, -4),
+                    properties = PopupProperties(
+                        focusable = false,
+                        dismissOnBackPress = true,
+                        dismissOnClickOutside = true,
+                    ),
+                    onDismissRequest = { showMentionPalette = false },
+                ) {
+                    MentionPalette(
+                        filtered = filteredMentionFiles,
+                        selectedIndex = mentionSelectedIndex,
+                        onSelectedIndexChange = { mentionSelectedIndex = it },
+                        onFileSelected = { file ->
+                            // Replace the "@query" text with "@filename" and attach the file
+                            val text = textState.text.toString()
+                            val endIdx = textState.selection.start.coerceIn(0, text.length)
+                            if (mentionStartIndex >= 0 && endIdx > mentionStartIndex) {
+                                textState.edit {
+                                    replace(mentionStartIndex, endIdx, "@${file.name}")
+                                }
+                            }
+                            showMentionPalette = false
+                            onMentionFileSelected(file)
+                        },
+                        onDismiss = { showMentionPalette = false },
                     )
                 }
             }
@@ -854,46 +850,83 @@ fun InputArea(
                                 .fillMaxSize()
                                 .focusRequester(focusRequester)
                                 .onPreviewKeyEvent { event ->
-                                    if (event.type == KeyEventType.KeyDown) {
-                                        when {
-                                            // Up arrow — navigate slash palette selection (older)
-                                            event.key == Key.DirectionUp && !event.isShiftPressed && showSlashPalette && filtered.isNotEmpty() -> {
-                                                selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
-                                                true
-                                            }
-                                            // Down arrow — navigate slash palette selection (newer)
-                                            event.key == Key.DirectionDown && !event.isShiftPressed && showSlashPalette && filtered.isNotEmpty() -> {
-                                                selectedIndex = (selectedIndex + 1).coerceAtMost(filtered.lastIndex)
-                                                true
-                                            }
-                                            // Up arrow — navigate command history (older).
-                                            // By design: matches documented shell-history behavior —
-                                            // Up recalls older entries, Down recalls newer, Escape
-                                            // restores the draft. See AGENTS.md "Input Command History".
-                                            event.key == Key.DirectionUp && !event.isShiftPressed && !showSlashPalette && commandHistory.isNotEmpty() -> {
-                                                saveDraftIfNeeded(attachedFiles)
-                                                val newIndex = if (historyIndex < 0) 0 else (historyIndex + 1).coerceAtMost(commandHistory.size - 1)
-                                                if (newIndex != historyIndex || historyIndex < 0) {
-                                                    loadHistoryEntry(newIndex)
+                                    // Build the immutable state snapshot for the pure reducer.
+                                    // The reducer decides the action; the executor below applies
+                                    // it to the real TextFieldState and Compose state.
+                                    val currentTextStr = textState.text.toString()
+                                    val trimmedText = currentTextStr.trim()
+                                    val hasMatchingSlashCommand = trimmedText.startsWith("/") &&
+                                        !trimmedText.startsWith("//") &&
+                                        run {
+                                            val firstWord = trimmedText.substring(1).substringBefore(" ")
+                                            commands.any { it.name.equals(firstWord, ignoreCase = true) }
+                                        }
+                                    val state = InputKeyboardState(
+                                        text = currentTextStr,
+                                        cursorPos = textState.selection.start.coerceIn(0, currentTextStr.length),
+                                        showSlashPalette = showSlashPalette,
+                                        showMentionPalette = showMentionPalette,
+                                        showAttachMenu = showAttachMenu,
+                                        filteredSlashSize = filtered.size,
+                                        filteredMentionSize = filteredMentionFiles.size,
+                                        slashSelectedIndex = selectedIndex,
+                                        mentionSelectedIndex = mentionSelectedIndex,
+                                        historyIndex = historyIndex,
+                                        inHistoryMode = inHistoryMode,
+                                        commandHistorySize = commandHistory.size,
+                                        hasMatchingSlashCommand = hasMatchingSlashCommand,
+                                    )
+                                    val action = InputKeyboardHandler.handleKeyEvent(event, state)
+                                    // Executor: apply the action to the real Compose state.
+                                    // Preserves the exact behavior of the original inline handler.
+                                    when (action) {
+                                        is InputKeyboardAction.SelectSlashIndex -> {
+                                            selectedIndex = action.index
+                                            true
+                                        }
+                                        is InputKeyboardAction.SelectMentionIndex -> {
+                                            mentionSelectedIndex = action.index
+                                            true
+                                        }
+                                        InputKeyboardAction.SelectMentionFile -> {
+                                            val file = filteredMentionFiles.getOrNull(mentionSelectedIndex)
+                                                ?: filteredMentionFiles.firstOrNull()
+                                            if (file != null) {
+                                                val text = textState.text.toString()
+                                                val endIdx = textState.selection.start.coerceIn(0, text.length)
+                                                if (mentionStartIndex >= 0 && endIdx > mentionStartIndex) {
+                                                    textState.edit {
+                                                        replace(mentionStartIndex, endIdx, "@${file.name}")
+                                                    }
                                                 }
-                                                true
+                                                showMentionPalette = false
+                                                onMentionFileSelected(file)
                                             }
-                                            // Down arrow — navigate command history (newer) or restore draft
-                                            event.key == Key.DirectionDown && !event.isShiftPressed && !showSlashPalette && inHistoryMode -> {
-                                                val newIndex = historyIndex - 1
-                                                if (newIndex < 0) {
-                                                    // Restore draft
-                                                    textState.edit { replace(0, length, draftText) }
-                                                    historyIndex = -1
-                                                    inHistoryMode = false
-                                                    onLoadHistoryEntry(CommandHistoryEntry(draftText, draftFiles))
-                                                } else {
-                                                    loadHistoryEntry(newIndex)
-                                                }
-                                                true
+                                            true
+                                        }
+                                        InputKeyboardAction.DismissMention -> {
+                                            showMentionPalette = false
+                                            true
+                                        }
+                                        is InputKeyboardAction.NavigateHistory -> {
+                                            saveDraftIfNeeded(attachedFiles)
+                                            val newIndex = if (historyIndex < 0) 0
+                                                else (historyIndex + action.delta).coerceAtMost(commandHistory.size - 1)
+                                            if (newIndex != historyIndex || historyIndex < 0) {
+                                                loadHistoryEntry(newIndex)
                                             }
-                                            // Enter with slash palette: execute selected command
-                                            event.key == Key.Enter && !event.isShiftPressed && showSlashPalette -> {
+                                            true
+                                        }
+                                        InputKeyboardAction.RestoreDraft -> {
+                                            textState.edit { replace(0, length, draftText) }
+                                            historyIndex = -1
+                                            inHistoryMode = false
+                                            onLoadHistoryEntry(CommandHistoryEntry(draftText, draftFiles))
+                                            true
+                                        }
+                                        InputKeyboardAction.ExecuteSlashCommand -> {
+                                            if (showSlashPalette) {
+                                                // Palette-visible path: execute the selected command.
                                                 val cmd = filtered.getOrNull(selectedIndex) ?: filtered.firstOrNull()
                                                 if (cmd != null) {
                                                     val args = extractArgs(cmd)
@@ -901,92 +934,66 @@ fun InputArea(
                                                     textState.edit { replace(0, length, "") }
                                                     onSlashCommand(cmd.copy(args = args))
                                                 }
-                                                true
-                                            }
-                                            event.key == Key.Enter && !event.isShiftPressed -> {
+                                            } else {
+                                                // Slash interception path: text starts with "/" and the
+                                                // first word matches a known command. Execute it with
+                                                // trailing args instead of sending to the server.
                                                 val text = textState.text.toString().trim()
-                                                // Escape mechanism: "//" prefix strips one "/" and sends
-                                                // the rest as literal text (lets the user send text that
-                                                // starts with "/" without triggering a slash command).
-                                                if (text.startsWith("//")) {
-                                                    val sendText = text.substring(1)
-                                                    if (sendText.isNotEmpty()) {
-                                                        onSend(sendText, attachedFiles)
-                                                        textState.edit { replace(0, length, "") }
-                                                    }
+                                                val firstWord = text.substring(1).substringBefore(" ")
+                                                val matchedCmd = commands.filter { it.name.equals(firstWord, ignoreCase = true) }
+                                                    .firstOrNull()
+                                                if (matchedCmd != null) {
+                                                    val args = if (text.length > firstWord.length + 1) {
+                                                        text.substring(firstWord.length + 1).trim()
+                                                    } else ""
+                                                    logger.debug { "[ACP] Slash command intercepted: /${matchedCmd.name} args='$args'" }
                                                     showSlashPalette = false
                                                     inHistoryMode = false
                                                     historyIndex = -1
-                                                    true
-                                                } else {
-                                                    // Slash command interception: even if the palette isn't
-                                                    // visible (e.g. text was pasted, or exceeded the old
-                                                    // length cap), check if the text starts with "/" and the
-                                                    // first word matches a known command. If so, execute it
-                                                    // with trailing args instead of sending to the server.
-                                                    val slashCmd = if (text.startsWith("/")) {
-                                                        val firstWord = text.substring(1).substringBefore(" ")
-                                                        commands.filter { it.name.equals(firstWord, ignoreCase = true) }
-                                                            .firstOrNull()?.let { cmd ->
-                                                                val args = if (text.length > firstWord.length + 1) {
-                                                                    text.substring(firstWord.length + 1).trim()
-                                                                } else ""
-                                                                cmd.copy(args = args)
-                                                            }
-                                                    } else null
-                                                    if (slashCmd != null) {
-                                                        logger.debug { "[ACP] Slash command intercepted: /${slashCmd.name} args='${slashCmd.args}'" }
-                                                        showSlashPalette = false
-                                                        inHistoryMode = false
-                                                        historyIndex = -1
-                                                        textState.edit { replace(0, length, "") }
-                                                        onSlashCommand(slashCmd)
-                                                        true
-                                                    } else {
-                                                        if (text.isNotEmpty()) {
-                                                            onSend(text, attachedFiles)
-                                                            textState.edit { replace(0, length, "") }
-                                                        }
-                                                        showSlashPalette = false
-                                                        inHistoryMode = false
-                                                        historyIndex = -1
-                                                        true
-                                                    }
+                                                    textState.edit { replace(0, length, "") }
+                                                    onSlashCommand(matchedCmd.copy(args = args))
                                                 }
                                             }
-                                            event.key == Key.Enter && event.isShiftPressed -> {
-                                                // Explicitly insert newline — CMP BasicTextField
-                                                // doesn't always handle this via pass-through
-                                                val pos = textState.selection.start
-                                                textState.edit { replace(pos, pos, "\n") }
-                                                showSlashPalette = false
-                                                true
-                                            }
-                                            event.key == Key.Escape -> {
-                                                if (showSlashPalette) {
-                                                    showSlashPalette = false
-                                                    true
-                                                } else if (showAttachMenu) {
-                                                    showAttachMenu = false
-                                                    true
-                                                } else if (inHistoryMode) {
-                                                    // Cancel history navigation and restore draft.
-                                                    // Draft files are snapshotted once on entering
-                                                    // history mode (saveDraftIfNeeded), so restoring
-                                                    // here returns the original pre-navigation input.
-                                                    textState.edit { replace(0, length, draftText) }
-                                                    onLoadHistoryEntry(CommandHistoryEntry(draftText, draftFiles))
-                                                    inHistoryMode = false
-                                                    historyIndex = -1
-                                                    true
-                                                } else {
-                                                    onCancel()
-                                                    true
-                                                }
-                                            }
-                                            else -> false
+                                            true
                                         }
-                                    } else false
+                                        InputKeyboardAction.Send -> {
+                                            val text = textState.text.toString().trim()
+                                            // Escape mechanism: "//" prefix strips one "/" and sends
+                                            // the rest as literal text (lets the user send text that
+                                            // starts with "/" without triggering a slash command).
+                                            val sendText = if (text.startsWith("//")) text.substring(1) else text
+                                            if (sendText.isNotEmpty()) {
+                                                onSend(sendText, attachedFiles)
+                                                textState.edit { replace(0, length, "") }
+                                            }
+                                            showSlashPalette = false
+                                            inHistoryMode = false
+                                            historyIndex = -1
+                                            true
+                                        }
+                                        InputKeyboardAction.InsertNewline -> {
+                                            // Explicitly insert newline — CMP BasicTextField
+                                            // doesn't always handle this via pass-through
+                                            val pos = textState.selection.start
+                                            textState.edit { replace(pos, pos, "\n") }
+                                            showSlashPalette = false
+                                            showMentionPalette = false
+                                            true
+                                        }
+                                        InputKeyboardAction.Cancel -> {
+                                            onCancel()
+                                            true
+                                        }
+                                        InputKeyboardAction.DismissSlashPalette -> {
+                                            showSlashPalette = false
+                                            true
+                                        }
+                                        InputKeyboardAction.DismissAttachMenu -> {
+                                            showAttachMenu = false
+                                            true
+                                        }
+                                        InputKeyboardAction.None -> false
+                                    }
                                 },
                             enabled = enabled,
                             cursorBrush = SolidColor(ChatTheme.colors.component.inputCursor),
@@ -1181,9 +1188,21 @@ fun InputArea(
             Spacer(modifier = Modifier.weight(1f))
 
             // NEW: Follow checkbox — always visible (local setting)
-            FollowAgentCheckbox(
+            CheckboxChip(
+                label = "Follow Agent",
+                tooltip = "When enabled, the editor follows the agent's tool calls — opens files and scrolls to active lines",
                 enabled = isFollowEnabled,
                 onToggle = onToggleFollow,
+                color = ChatTheme.colors.accent.blue,
+            )
+
+            // NEW: Brave Mode checkbox — auto-approve all permission prompts
+            CheckboxChip(
+                label = "Brave Mode",
+                tooltip = "When enabled, all tool permission prompts are auto-approved without asking. Explicit deny rules are still enforced.",
+                enabled = isBraveModeEnabled,
+                onToggle = onToggleBraveMode,
+                color = Color(0xFFE8A030),
             )
 
             // NEW: Separator + disconnect (only when connected or reconnecting)
@@ -1261,101 +1280,4 @@ private fun DisconnectButton(isReconnecting: Boolean, onClick: () -> Unit) {
     }
 }
 
-/**
- * Follow agent checkbox — always visible (local setting, not connection-dependent).
- * When checked, the editor follows the agent's tool calls (opens files and scrolls).
- * Font matches SelectorChip for visual consistency with other selector-row controls.
- */
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun FollowAgentCheckbox(enabled: Boolean, onToggle: () -> Unit) {
-    TooltipArea(
-        tooltip = {
-            Box(
-                modifier = Modifier
-                    .background(ChatTheme.colors.component.tooltipBg, RoundedCornerShape(4.dp))
-                    .border(1.dp, ChatTheme.colors.component.tooltipBorder, RoundedCornerShape(4.dp))
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
-            ) {
-                Text(
-                    "When enabled, the editor follows the agent's tool calls — opens files and scrolls to active lines",
-                    color = ChatTheme.colors.component.tooltipText,
-                    fontSize = ChatTheme.fonts.selectorChip,
-                )
-            }
-        },
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .clip(ChatTheme.shapes.chipCornerRadius)
-                .clickable(enabled = true) { onToggle() }
-                .padding(horizontal = 10.dp, vertical = 5.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(14.dp)
-                    .clip(RoundedCornerShape(3.dp))
-                    .background(
-                        if (enabled) ChatTheme.colors.accent.blue
-                        else Color.Transparent
-                    )
-                    .border(
-                        width = 1.dp,
-                        color = if (enabled) ChatTheme.colors.accent.blue
-                                else ChatTheme.colors.component.inputText.copy(alpha = 0.5f),
-                        shape = RoundedCornerShape(3.dp),
-                    ),
-                contentAlignment = Alignment.Center,
-            ) {
-                if (enabled) {
-                    Text(
-                        text = "\u2713",
-                        fontSize = 10.sp,
-                        color = ChatTheme.colors.text.inverse,
-                    )
-                }
-            }
-            Spacer(modifier = Modifier.width(4.dp))
-            Text(
-                text = "Follow Agent",
-                fontSize = ChatTheme.fonts.selectorChip,
-                color = ChatTheme.colors.component.inputText,
-            )
-        }
-    }
-}
 
-/**
- * Converts a java.io.File into an AttachedFile by reading its MIME type from the filename.
- * No bytes are read — the file content is referenced by path on the wire.
- *
- * If [sourceFile] lives outside the allowed attachment directories (project base,
- * `<project>/.opencode/attachments/`, `<user.home>/.opencode/attachments/`), it is
- * copied into `<project>/.opencode/attachments/` first so the security guard in
- * `OpenCodeService.sendMessageInternal()` doesn't silently drop it. The attachment
- * chip shows the copied path. If the copy fails, the original path is used and the
- * service guard will log/skip it.
- */
-private fun java.io.File.toAttachedFile(project: com.intellij.openapi.project.Project? = null): AttachedFile {
-    val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(name)
-    val copied = if (project != null) {
-        com.opencode.acp.util.copyExternalAttachmentToAllowedDir(this, project)
-    } else null
-    val effectivePath = if (copied != null) {
-        copied.absolutePath
-    } else {
-        // Copy failed — check if source is within allowed dirs
-        val canonicalSource = canonicalPath
-        val projectBase = project?.basePath?.let { java.io.File(it).canonicalPath }
-        val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
-        val isInsideProject = projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator)
-        val isInsideAttachments = (projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
-            (userHome != null && canonicalSource.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))
-        if (!isInsideProject && !isInsideAttachments) {
-            logger.warn { "[ACP] toAttachedFile: file outside allowed dirs and copy failed: $name ($absolutePath)" }
-        }
-        canonicalSource
-    }
-    return AttachedFile(name = name, path = effectivePath, mime = mime)
-}

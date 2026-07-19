@@ -45,7 +45,7 @@ class OpenCodeMcpConfigurable : Configurable {
     override fun getDisplayName(): String = "MCP"
 
     override fun createComponent(): JComponent {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         val mcpPanel = OpenCodeMcpPanel()
         mcpPanel.setState(settings)
         panel = mcpPanel
@@ -57,7 +57,7 @@ class OpenCodeMcpConfigurable : Configurable {
 
         // Wire retry button
         mcpPanel.mcpRetryButton.addActionListener {
-            triggerMcpReinitialize(OpenCodeSettingsState.getInstance())
+            triggerMcpReinitialize()
         }
 
         // Wire discover tools button
@@ -69,12 +69,12 @@ class OpenCodeMcpConfigurable : Configurable {
     }
 
     override fun isModified(): Boolean {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         return panel?.isModified(settings) ?: false
     }
 
     override fun apply() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         // Save old permissions before applyTo overwrites them
         val oldPermissionsJson = settings.toolPermissions
         panel?.applyTo(settings)
@@ -109,7 +109,7 @@ class OpenCodeMcpConfigurable : Configurable {
             settings.additionalMcpServers != prevAdditionalMcpServers
 
         if (mcpChanged) {
-            triggerMcpReinitialize(settings)
+            triggerMcpReinitialize()
             // Inform the user that a restart may be needed for full effect
             com.opencode.acp.chat.OpenCodeNotifications.showRestartWarning(
                 "OpenCode MCP settings changed. The OpenCode server is being re-initialized; " +
@@ -122,7 +122,7 @@ class OpenCodeMcpConfigurable : Configurable {
     }
 
     override fun reset() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
         panel?.setState(settings)
         prevEnableIntellijMcp = settings.enableIntellijMcp
         prevMcpServerUrl = settings.mcpServerUrl
@@ -132,7 +132,7 @@ class OpenCodeMcpConfigurable : Configurable {
     /**
      * Trigger MCP re-initialization on the active project's OpenCodeService.
      */
-    private fun triggerMcpReinitialize(settings: OpenCodeSettingsState) {
+    private fun triggerMcpReinitialize() {
         val project = getActiveProject()
         if (project == null) {
             logger.warn { "[ACP] MCP settings changed but no open project found" }
@@ -156,7 +156,8 @@ class OpenCodeMcpConfigurable : Configurable {
      * tools can't be discovered because the server is down.
      */
     private fun discoverTools() {
-        val settings = OpenCodeSettingsState.getInstance()
+        val settings = OpenCodeMcpSettingsState.getInstance()
+        val generalSettings = OpenCodeSettingsState.getInstance()
         val p = this.panel ?: return
         if (p.isDiscovering) return
 
@@ -208,13 +209,15 @@ class OpenCodeMcpConfigurable : Configurable {
                     }
                 }
 
-                val baseUrl = "http://127.0.0.1:${service.connectionManager.port}"
+                val baseUrl = "http://${service.connectionManager.host}:${service.connectionManager.port}"
                 val mcpUrls = service.mcpManager?.getServerUrls() ?: emptyMap()
                 val mcpServerCount = mcpUrls.size
                 val tools = registry.discoverAll(baseUrl, mcpUrls)
 
-                // Merge persisted permissions after discovery
-                val persisted = parsePersistedToolPermissions(settings.toolPermissions)
+                // Merge persisted permissions after discovery.
+                // parsePersistedToolPermissions applies fail-closed (all tools → ASK)
+                // if the persisted JSON is corrupted.
+                val persisted = parsePersistedToolPermissions(settings.toolPermissions, registry)
                 if (persisted.isNotEmpty()) {
                     registry.loadEnabledAndPermissions(persisted.mapValues { (_, pair) ->
                         val (enabled, permissionStr) = pair
@@ -242,7 +245,7 @@ class OpenCodeMcpConfigurable : Configurable {
                     settings.discoveredToolsJson = panelRef.generateDiscoveredToolsJson()
                     if (allTools.isEmpty()) {
                         panelRef.showToolPermissionsStatus(
-                            "No tools found. Ensure the OpenCode server is running on port ${settings.port}.", false)
+                            "No tools found. Ensure the OpenCode server is running on port ${generalSettings.port}.", false)
                     } else if (mcpServerCount == 0 && settings.enableIntellijMcp) {
                         // MCP is enabled but no MCP servers connected — warn the user
                         panelRef.showToolPermissionsStatus(
@@ -281,8 +284,17 @@ class OpenCodeMcpConfigurable : Configurable {
 
     /**
      * Parse persisted tool permissions JSON into a map.
+     *
+     * On parse failure, applies FAIL-CLOSED behavior: returns a map that sets
+     * every discovered tool to (enabled=true, permission="ask") instead of an
+     * empty map (which would leave all tools at their discovery default of ALLOW).
+     * This prevents a corrupted settings file from silently auto-approving all
+     * tools. A user-visible notification is also surfaced.
      */
-    private fun parsePersistedToolPermissions(perms: String): Map<String, Pair<Boolean, String>> {
+    private fun parsePersistedToolPermissions(
+        perms: String,
+        registry: com.opencode.acp.mcp.ToolRegistry? = null
+    ): Map<String, Pair<Boolean, String>> {
         if (perms.isBlank()) return emptyMap()
         return try {
             val obj = Json.parseToJsonElement(perms).jsonObject
@@ -293,11 +305,22 @@ class OpenCodeMcpConfigurable : Configurable {
                 toolName to Pair(enabled, permission)
             }
         } catch (e: Exception) {
-            logger.warn(e) { "[ACP] Failed to parse persisted tool permissions — reverting to defaults" }
+            // FAIL-CLOSED: set all discovered tools to ASK.
+            logger.error(e) { "[ACP] Corrupted tool permissions JSON — failing closed (all tools → ASK)" }
             com.opencode.acp.chat.OpenCodeNotifications.showRestartWarning(
-                "Tool permissions data was corrupted and has been reset to defaults."
+                "[ACP] Tool permissions settings file is corrupted. All tools have been set to ASK for safety. Please re-save your tool permissions in Settings → Tools → Sigil → MCP."
             )
-            emptyMap()
+            val allDiscovered = registry?.tools?.values ?: emptyList()
+            if (allDiscovered.isEmpty()) {
+                emptyMap()
+            } else {
+                val failClosed = mutableMapOf<String, Pair<Boolean, String>>()
+                for (tool in allDiscovered) {
+                    failClosed[tool.id] = Pair(true, "ask")
+                    failClosed[tool.name] = Pair(true, "ask")
+                }
+                failClosed.toMap()
+            }
         }
     }
 

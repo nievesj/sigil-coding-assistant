@@ -1,6 +1,6 @@
 package com.opencode.acp.chat.model
 
-import com.opencode.acp.chat.ui.compose.ParsedTable
+import com.opencode.acp.chat.markdown.ParsedTable
 
 /**
  * A typed, display-ready segment of message content.
@@ -19,6 +19,38 @@ sealed interface MessagePart {
 
     /** Part ID from the server. Null when not yet known (e.g. during initial segmentation). */
     val partId: String?
+
+    /**
+     * Estimated character count of this part's text content, used for context
+     * breakdown token estimation (TDD §4.2.5 rich domain model).
+     *
+     * Returns the length of the primary text-bearing field for each part type:
+     * - [Text] → [Text.content] length
+     * - [Code] → [Code.content] length
+     * - [Table] → [Table.rawMarkdown] length
+     * - [Thinking] → [Thinking.content] length
+     * - All other parts → 0 (non-text parts don't contribute to char-based token estimation)
+     *
+     * This encapsulates the estimation logic previously duplicated in
+     * `ContextBreakdown.estimateMessageChars()` and `estimateAssistantTextChars()`.
+     */
+    val estimatedCharCount: Long
+        get() = when (this) {
+            is Text -> content.length.toLong()
+            is Code -> content.length.toLong()
+            is Table -> rawMarkdown.length.toLong()
+            is Thinking -> content.length.toLong()
+            is ToolCall -> 0L
+            is FileChange -> 0L
+            is Error -> 0L
+            is Patch -> 0L
+            is AssistantFile -> 0L
+            is Image -> 0L
+            is Agent -> 0L
+            is StepFinish -> 0L
+            is Retry -> 0L
+            is Compaction -> 0L
+        }
 
     /** Markdown text content. Rendered via Jewel's Markdown composable.
      *  The processor has already segmented and healed this text.

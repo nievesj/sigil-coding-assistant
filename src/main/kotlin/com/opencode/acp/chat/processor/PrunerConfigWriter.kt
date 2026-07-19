@@ -1,7 +1,7 @@
 package com.opencode.acp.chat.processor
 
 import com.opencode.acp.chat.model.ChatConstants
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeContextSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -9,8 +9,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.nio.file.Files
-import java.nio.file.Path
-import java.nio.file.StandardCopyOption
 
 private val logger = KotlinLogging.logger {}
 
@@ -27,44 +25,37 @@ private val logger = KotlinLogging.logger {}
  *
  * Mirrors the [com.opencode.acp.mcp.McpConfigWriter] atomic-write pattern (temp
  * file + rename).
+ *
+ * @param projectBasePath The project root directory (where `.opencode/` lives).
+ *        Injected via constructor for testability — see TDD §4.2.4.
  */
-object PrunerConfigWriter {
+class PrunerConfigWriter(private val projectBasePath: java.nio.file.Path) {
 
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
 
     /**
      * Writes the pruner config file from the given settings.
      *
-     * @param projectBasePath The project root directory (where `.opencode/` lives).
      * @param settings The current settings state.
      * @return true if written successfully, false on error.
      */
-    fun writeConfig(projectBasePath: String, settings: OpenCodeSettingsState): Boolean {
+    fun writeConfig(settings: OpenCodeContextSettingsState): Boolean {
         return try {
-            val opencodeDir = Path.of(projectBasePath, ".opencode")
+            val opencodeDir = projectBasePath.resolve(".opencode")
+            // NOTE: createDirectories throws on read-only filesystems (e.g. CI
+            // sandboxes, containerized mounts). The error is logged at ERROR
+            // level, which may alarm users in read-only environments even though
+            // the pruner is non-essential. Consider downgrading to WARN.
             Files.createDirectories(opencodeDir)
 
             val configFile = opencodeDir.resolve(ChatConstants.PRUNER_CONFIG_FILENAME)
             val config = buildConfigObject(settings)
-
-            // Write atomically via temp file + rename. ATOMIC_MOVE may not be
-            // supported on all filesystems (e.g., Windows NTFS cross-volume).
-            // Fall back to non-atomic move if ATOMIC_MOVE fails.
-            val tempFile = Files.createTempFile(opencodeDir, "sigil-pruner.", ".tmp")
-            try {
-                Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), config))
-                try {
-                    Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-                } catch (_: java.nio.file.FileSystemException) {
-                    // ATOMIC_MOVE not supported — fall back to non-atomic move
-                    Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING)
-                }
+            val content = json.encodeToString(JsonObject.serializer(), config)
+            val written = com.opencode.acp.chat.util.AtomicFileWriter.writeAtomically(configFile, content)
+            if (written) {
                 logger.info { "[ACP] PrunerConfigWriter: wrote config to $configFile" }
-                true
-            } catch (e: Exception) {
-                try { Files.deleteIfExists(tempFile) } catch (_: Exception) {}
-                throw e
             }
+            written
         } catch (e: Exception) {
             logger.error(e) { "[ACP] PrunerConfigWriter: failed to write config" }
             false
@@ -74,12 +65,11 @@ object PrunerConfigWriter {
     /**
      * Removes the config file. Called when the pruner is disabled in settings.
      *
-     * @param projectBasePath The project root directory.
      * @return true if removed (or was already absent), false on error.
      */
-    fun clearConfig(projectBasePath: String): Boolean {
+    fun clearConfig(): Boolean {
         return try {
-            val configFile = Path.of(projectBasePath, ".opencode", ChatConstants.PRUNER_CONFIG_FILENAME)
+            val configFile = projectBasePath.resolve(".opencode").resolve(ChatConstants.PRUNER_CONFIG_FILENAME)
             if (Files.exists(configFile)) {
                 Files.delete(configFile)
                 logger.info { "[ACP] PrunerConfigWriter: removed config file" }
@@ -121,7 +111,7 @@ object PrunerConfigWriter {
      * }
      * ```
      */
-    private fun buildConfigObject(settings: OpenCodeSettingsState): JsonObject {
+    private fun buildConfigObject(settings: OpenCodeContextSettingsState): JsonObject {
         return buildJsonObject {
             put("enabled", JsonPrimitive(settings.enableContextPruner))
             put("pluginApiVersion", JsonPrimitive(ChatConstants.PRUNER_API_VERSION))
@@ -135,6 +125,9 @@ object PrunerConfigWriter {
             put("compress", buildJsonObject {
                 put("enabled", JsonPrimitive(settings.prunerCompressEnabled))
                 put("mode", JsonPrimitive(settings.prunerCompressMode))
+                // MAINTENANCE: This list is hardcoded. When new protected tools are added to
+                // the OpenCode server, update this list manually. Consider making this configurable
+                // via settings or reading from ToolRegistry at write time.
                 put("protectedTools", kotlinx.serialization.json.buildJsonArray {
                     listOf("task", "skill", "todowrite", "todoread", "write", "edit").forEach {
                         add(JsonPrimitive(it))

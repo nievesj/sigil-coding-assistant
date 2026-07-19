@@ -1,15 +1,14 @@
 package com.opencode.acp.adapter
 
 import com.agentclientprotocol.model.ContentBlock
-import com.opencode.acp.UnsupportedContentException
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.assertThrows
 
 class ContentMapperTest {
     private val mapper = ContentMapper()
-    
+
     @Test
     fun `text content block maps to OpenCodePart Text`() {
         val block = ContentBlock.Text(text = "Hello world")
@@ -17,19 +16,19 @@ class ContentMapperTest {
         assertTrue(result is OpenCodePart.Text)
         assertEquals("Hello world", (result as OpenCodePart.Text).text)
     }
-    
+
     @Test
-    fun `image content block throws UnsupportedContentException`() {
+    fun `image content block returns null`() {
         val block = ContentBlock.Image(data = "base64data", mimeType = "image/png")
-        assertThrows<UnsupportedContentException> { mapper.toOpenCodePart(block) }
+        assertNull(mapper.toOpenCodePart(block))
     }
-    
+
     @Test
-    fun `audio content block throws UnsupportedContentException`() {
+    fun `audio content block returns null`() {
         val block = ContentBlock.Audio(data = "base64data", mimeType = "audio/wav")
-        assertThrows<UnsupportedContentException> { mapper.toOpenCodePart(block) }
+        assertNull(mapper.toOpenCodePart(block))
     }
-    
+
     @Test
     fun `OpenCodePart Text maps back to ContentBlock Text`() {
         val part = OpenCodePart.Text(text = "Hello")
@@ -37,7 +36,7 @@ class ContentMapperTest {
         assertTrue(result is ContentBlock.Text)
         assertEquals("Hello", (result as ContentBlock.Text).text)
     }
-    
+
     @Test
     fun `toOpenCodeParts filters unsupported types`() {
         val blocks = listOf(
@@ -48,7 +47,7 @@ class ContentMapperTest {
         assertEquals(1, result.size)
         assertTrue(result[0] is OpenCodePart.Text)
     }
-    
+
     @Test
     fun `toContentBlocks converts all parts`() {
         val parts = listOf(

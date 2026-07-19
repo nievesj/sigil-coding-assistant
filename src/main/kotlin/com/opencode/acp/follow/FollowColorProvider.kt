@@ -1,7 +1,7 @@
 ﻿package com.opencode.acp.follow
 
 import com.agentclientprotocol.model.ToolKind
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
@@ -22,7 +22,7 @@ object FollowColorProvider {
     data class ColorConfig(
         val defaultColorHex: String,
         val inlayLabel: String?,
-        val settingsReader: (OpenCodeSettingsState) -> String,
+        val settingsReader: (OpenCodeFollowSettingsState) -> String,
     )
 
     private val colorConfigs: Map<ToolKind, ColorConfig?> = mapOf(
@@ -72,7 +72,7 @@ object FollowColorProvider {
 
     fun getColor(kind: ToolKind): java.awt.Color? {
         val config = colorConfigs[kind] ?: return null
-        val hex = config.settingsReader(OpenCodeSettingsState.getInstance())
+        val hex = config.settingsReader(OpenCodeFollowSettingsState.getInstance())
         // parseColorOrDefault returns null on bad input (which we treat as
         // "color disabled" — caller skips the highlight). The persisted
         // default hex is always valid; the only way to get here with bad

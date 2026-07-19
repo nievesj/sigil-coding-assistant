@@ -1,11 +1,6 @@
 package com.opencode.acp.mcp
 
-import com.opencode.acp.chat.model.ChatConstants
 import io.github.oshai.kotlinlogging.KotlinLogging
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
-import java.net.HttpURLConnection
 import java.net.URI
 
 private val logger = KotlinLogging.logger {}
@@ -28,11 +23,8 @@ private val logger = KotlinLogging.logger {}
  * without reading the body.
  */
 class McpServerDiscovery(
-    @Suppress("UNUSED_PARAMETER") httpClient: io.ktor.client.HttpClient
+    private val serverVerifier: ServerVerifier = HttpServerVerifier(),
 ) {
-    companion object {
-        private const val VERIFY_TIMEOUT_MS = ChatConstants.MCP_VERIFY_TIMEOUT_MS
-    }
 
     /**
      * Resolve a single McpServerConfig to a verified McpServerInfo.
@@ -88,41 +80,7 @@ class McpServerDiscovery(
      * A connection refused means the port is wrong.
      */
     private suspend fun verifyMcpServer(info: McpServerInfo): Boolean {
-        return withTimeoutOrNull(VERIFY_TIMEOUT_MS) {
-            // Run blocking HttpURLConnection on Dispatchers.IO so the blocked thread
-            // is an IO thread, not a Default thread. The blocking responseCode call
-            // does not respect coroutine cancellation — withContext ensures the
-            // blocked thread comes from the IO pool (which is designed for blocking).
-            withContext(Dispatchers.IO) {
-                try {
-                    val conn = URI(info.url).toURL().openConnection() as HttpURLConnection
-                    conn.connectTimeout = VERIFY_TIMEOUT_MS.toInt()
-                    conn.readTimeout = VERIFY_TIMEOUT_MS.toInt()
-                    conn.setRequestProperty("Accept", "text/event-stream")
-                    conn.setRequestProperty("Cache-Control", "no-cache")
-                    conn.doInput = true
-                    try {
-                        val status = conn.responseCode
-                        val contentType = conn.contentType ?: ""
-                        val success = status == 200 && contentType.contains("text/event-stream", ignoreCase = true)
-                        if (success) {
-                            logger.info { "[ACP] McpServerDiscovery: verified MCP server at ${info.url} (status $status, $contentType)" }
-                        } else {
-                            logger.warn { "[ACP] McpServerDiscovery: MCP server at ${info.url} returned status $status, content-type '$contentType'" }
-                        }
-                        success
-                    } finally {
-                        conn.disconnect()
-                    }
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] McpServerDiscovery: failed to connect to MCP server at ${info.url}" }
-                    false
-                }
-            }
-        } ?: run {
-            logger.warn { "[ACP] McpServerDiscovery: verification timed out after ${VERIFY_TIMEOUT_MS}ms for ${info.url}" }
-            false
-        }
+        return serverVerifier.verify(info.url)
     }
 
     /**
@@ -133,9 +91,13 @@ class McpServerDiscovery(
         if (!url.startsWith("http://") && !url.startsWith("https://")) return null
         return try {
             val parsed = URI(url).toURL()
+            if (parsed.host != "localhost" && parsed.host != "127.0.0.1") {
+                logger.debug { "[ACP] McpServerDiscovery: MCP server URL host '${parsed.host}' is not localhost — user-initiated SSRF risk" }
+            }
             val port = parsed.port.takeIf { it > 0 } ?: parsed.defaultPort
             McpServerInfo(name = name, port = port, url = url, source = source)
         } catch (e: Exception) {
+            logger.debug(e) { "[ACP] McpServerDiscovery: URL parse failed for '$url'" }
             null
         }
     }

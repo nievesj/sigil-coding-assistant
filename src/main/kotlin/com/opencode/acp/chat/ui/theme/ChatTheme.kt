@@ -214,9 +214,8 @@ private fun rememberChatThemeData(): ChatThemeData {
                 other = textMuted,
             ),
             component = ChatThemeData.ComponentColors(
-                // Sidebar shimmer — accent colors, safe as hardcoded (used as icon tints)
+                // Sidebar session indicator colors — used as icon tints by ConnectionSplashScreen
                 sidebarShimmerCreating = Color(0xFFFFC107),
-                sidebarShimmerStreaming = Color(0xFF4CAF50),
                 // Splash screen — accent status colors, safe as hardcoded (icons on dark splash bg)
                 splashConnected = Color(0xFF4CAF50),
                 splashError = Color(0xFFF44336),
@@ -571,7 +570,6 @@ private fun rememberChatThemeData(): ChatThemeData {
         animations = ChatThemeData.Animations(
             glowPulseMs = 2500,
             contextPulseMs = 800,
-            shimmerSweepMs = 1500,
             chipHoverMs = 150,
             thinkingIndicatorDelayMs = 300L,
         ),

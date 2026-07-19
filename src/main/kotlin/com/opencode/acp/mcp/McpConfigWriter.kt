@@ -1,7 +1,7 @@
 package com.opencode.acp.mcp
 
 import com.opencode.acp.chat.model.ChatConstants
-import com.opencode.acp.config.settings.OpenCodeSettingsState
+import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -17,6 +17,7 @@ import kotlinx.serialization.json.put
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 private val logger = KotlinLogging.logger {}
@@ -37,11 +38,21 @@ private val logger = KotlinLogging.logger {}
  */
 class McpConfigWriter(
     private val projectBasePath: Path,
-    private val settings: OpenCodeSettingsState
+    private val settings: OpenCodeMcpSettingsState
 ) {
 
-    /** Serializes all writeConfig calls to prevent concurrent read-modify-write races. */
-    private val writeLock = java.util.concurrent.locks.ReentrantLock()
+    /** Serializes all writeConfig calls to prevent concurrent read-modify-write races.
+     *  Uses a file-level lock shared across all McpConfigWriter instances targeting
+     *  the same project path, preventing cross-instance write races. */
+    private val writeLock: ReentrantLock = projectLocks.computeIfAbsent(
+        projectBasePath.toAbsolutePath().toString()
+    ) { ReentrantLock() }
+
+    companion object {
+        /** File-level locks keyed by canonical project path — prevents concurrent writes
+         *  from multiple McpConfigWriter instances targeting the same project. */
+        private val projectLocks = java.util.concurrent.ConcurrentHashMap<String, ReentrantLock>()
+    }
 
     /**
      * Read-modify-write the opencode.json config file atomically.
@@ -480,6 +491,9 @@ class McpConfigWriter(
      */
     private fun isValidConfigKey(key: String): Boolean {
         if (key.isBlank()) return false
+        // Reject keys starting with '$' (JSONPath/reserved prefix) to avoid
+        // conflicts with $schema and other reserved JSON keys.
+        if (key.startsWith("$")) return false
         // Reject excessively long keys from untrusted SSE data
         if (key.length > 128) return false
         // Reject path separators and traversal sequences

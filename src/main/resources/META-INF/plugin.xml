@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<idea-plugin require-restart="true">
+<idea-plugin require-restart="false">
     <id>com.sigil.plugin</id>
     <idea-version since-build="261"/>
     <name>Sigil - Coding Assistant</name>
@@ -103,7 +103,7 @@
             factoryClass="com.opencode.acp.chat.ChatToolWindowFactory"/>
 
         <notificationGroup id="Sigil"
-                           displayType="BALLOON"
+                           displayType="NONE"
                            isLogByDefault="true"/>
 
         <statusBarWidgetFactory id="OpenCodeMCP"

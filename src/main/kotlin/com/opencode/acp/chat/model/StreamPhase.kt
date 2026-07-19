@@ -6,7 +6,7 @@ package com.opencode.acp.chat.model
  * Replaces the boolean _isStreaming with an explicit state machine that
  * distinguishes "message dispatched, awaiting first token" (SENDING) from
  * "LLM actively generating tokens" (STREAMING). Both phases show identical
- * UI indicators (glow, stop button, pulse, shimmer).
+ * UI indicators (glow, stop button, pulse, spinner).
  *
  * Transitions:
  *   IDLE → SENDING      (sendMessage() called, before suspend)

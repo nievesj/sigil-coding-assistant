@@ -20,7 +20,7 @@ import kotlinx.coroutines.isActive
  * composition stalls). By driving the animation from a coroutine with [withFrameNanos] + a
  * time gate, we cap the effective frame rate (configurable via Settings → Tools → Sigil,
  * default 30fps), halving the GPU flush frequency while keeping the animation visually
- * identical for slow effects (glow sweep, context pulse, session shimmer).
+ * identical for slow effects (glow sweep, context pulse, session spinner).
  *
  * The returned [State] must be read inside a draw scope (`drawBehind {}` or `Canvas`) to
  * avoid recomposition on every tick — only the draw phase re-executes.
@@ -56,6 +56,8 @@ fun rememberThrottledInfiniteAnimation(
 
     LaunchedEffect(active, initialValue, targetValue, durationMillis, repeatMode, targetFps) {
         if (!active) {
+            // Reset to initialValue when the animation is stopped so the next
+            // activation starts from the beginning rather than mid-animation.
             state.floatValue = initialValue
             return@LaunchedEffect
         }

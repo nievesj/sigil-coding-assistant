@@ -23,15 +23,24 @@ import java.util.concurrent.atomic.AtomicLong
  * When the IDE is not focused, [requestWindowAttention] plays a system beep
  * to alert the user without forcibly stealing focus.
  */
-object OpenCodeNotifications {
+object OpenCodeNotifications : NotificationService {
 
     private const val GROUP_ID = "Sigil"
 
     /** Minimum interval (ms) between response-complete notifications. */
     private const val RESPONSE_NOTIFY_MIN_INTERVAL_MS = 5_000L
 
+    /** Minimum interval (ms) between permission-needed notifications.
+     *  Prevents balloon stacking from rapid subtask permission requests. */
+    private const val PERMISSION_NOTIFY_MIN_INTERVAL_MS = 10_000L
+
+    /** Minimum interval (ms) between question-asked notifications. */
+    private const val QUESTION_NOTIFY_MIN_INTERVAL_MS = 10_000L
+
     /** Atomic dedup counter — prevents TOCTOU race on rapid SSE events. */
     private val lastResponseNotifyTimeMs = AtomicLong(0L)
+    private val lastPermissionNotifyTimeMs = AtomicLong(0L)
+    private val lastQuestionNotifyTimeMs = AtomicLong(0L)
 
     /**
      * Escape untrusted strings for safe display in IntelliJ Notification content.
@@ -54,7 +63,7 @@ object OpenCodeNotifications {
      * Deduped: skips if a response-complete notification was shown within the last
      * [RESPONSE_NOTIFY_MIN_INTERVAL_MS] to avoid balloon stacking from rapid responses.
      */
-    fun notifyResponseComplete(project: Project) {
+    override fun notifyResponseComplete(project: Project) {
         if (isIdeWindowFocused(project)) return
 
         val now = System.currentTimeMillis()
@@ -83,8 +92,16 @@ object OpenCodeNotifications {
     /**
      * Notify the user that the LLM is asking a question that requires input.
      * Always fires — this blocks the conversation and needs user action.
+     *
+     * Deduped: skips if a question-asked notification was shown within the last
+     * [QUESTION_NOTIFY_MIN_INTERVAL_MS] to prevent balloon stacking.
      */
-    fun notifyQuestionAsked(project: Project) {
+    override fun notifyQuestionAsked(project: Project) {
+        val now = System.currentTimeMillis()
+        val last = lastQuestionNotifyTimeMs.get()
+        if (now - last < QUESTION_NOTIFY_MIN_INTERVAL_MS) return
+        if (!lastQuestionNotifyTimeMs.compareAndSet(last, now)) return
+
         if (!isIdeWindowFocused(project)) {
             requestWindowAttention(project)
         } else {
@@ -111,8 +128,17 @@ object OpenCodeNotifications {
     /**
      * Notify the user that the LLM is requesting permission for a tool.
      * Always fires — this blocks the conversation and needs user action.
+     *
+     * Deduped: skips if a permission-needed notification was shown within the last
+     * [PERMISSION_NOTIFY_MIN_INTERVAL_MS] to prevent balloon stacking from rapid
+     * subtask permission requests.
      */
-    fun notifyPermissionNeeded(project: Project) {
+    override fun notifyPermissionNeeded(project: Project) {
+        val now = System.currentTimeMillis()
+        val last = lastPermissionNotifyTimeMs.get()
+        if (now - last < PERMISSION_NOTIFY_MIN_INTERVAL_MS) return
+        if (!lastPermissionNotifyTimeMs.compareAndSet(last, now)) return
+
         if (!isIdeWindowFocused(project)) {
             requestWindowAttention(project)
         } else {
@@ -138,8 +164,8 @@ object OpenCodeNotifications {
      * Notify the user that a permission prompt timed out.
      * Provides visual feedback instead of silently dismissing the prompt.
      */
-    fun notifyPermissionTimedOut(project: Project, toolName: String) {
-        val displayToolName = htmlEscape(toolName.take(100))
+    override fun notifyPermissionTimedOut(project: Project, toolName: String) {
+        val displayToolName = htmlEscape(toolName).take(200)
         ApplicationManager.getApplication().invokeLater {
             Notification(
                 GROUP_ID,
@@ -158,7 +184,7 @@ object OpenCodeNotifications {
      * Notify the user that a permission was processed by the server despite a network error.
      * This happens when the POST fails locally but the server still received and processed the response.
      */
-    fun notifyPermissionProcessedDespiteError(project: Project, sessionId: String) {
+    override fun notifyPermissionProcessedDespiteError(project: Project, sessionId: String) {
         ApplicationManager.getApplication().invokeLater {
             Notification(
                 GROUP_ID,
@@ -178,19 +204,29 @@ object OpenCodeNotifications {
      * Used when MCP settings change and the OpenCode server is being re-initialized,
      * to inform the user that a restart may be needed for full effect.
      */
-    fun showRestartWarning(message: String) {
+    override fun showRestartWarning(message: String) {
+        // NOTE: Uses first open project — may not be the project that triggered the
+        // restart warning if multiple projects are open. Acceptable for now since the
+        // notification is informational only. Future: pass Project as a parameter.
         val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
             ?: run {
                 io.github.oshai.kotlinlogging.KotlinLogging.logger {}
                     .warn { "[ACP] Cannot show restart warning: no open project" }
                 return
             }
-        Notification(
-            GROUP_ID,
-            "Restart Needed",
-            message,
-            NotificationType.WARNING
-        ).notify(project)
+        // Escape the message to prevent HTML injection (CWE-79) in case a future
+        // caller passes dynamic/untrusted content. Current callers pass hardcoded strings.
+        val escapedMessage = htmlEscape(message)
+        // Post notification on EDT — Notification.notify() requires the Event Dispatch Thread.
+        // This method may be called from coroutine background threads (reinitializeMcpFromSettings).
+        ApplicationManager.getApplication().invokeLater {
+            Notification(
+                GROUP_ID,
+                "Restart Needed",
+                escapedMessage,
+                NotificationType.WARNING
+            ).notify(project)
+        }
     }
 
     /** Check if the IDE project frame is currently focused. */

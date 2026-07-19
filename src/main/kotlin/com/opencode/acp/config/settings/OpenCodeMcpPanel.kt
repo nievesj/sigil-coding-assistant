@@ -250,7 +250,7 @@ class OpenCodeMcpPanel {
         }
     }
 
-    fun setState(settings: OpenCodeSettingsState) {
+    fun setState(settings: OpenCodeMcpSettingsState) {
         enableIntellijMcpCheckbox.isSelected = settings.enableIntellijMcp
         mcpServerUrlField.text = settings.mcpServerUrl
         additionalMcpServersField.text = settings.additionalMcpServers
@@ -264,7 +264,7 @@ class OpenCodeMcpPanel {
         updateToolCountLabel()
     }
 
-    fun applyTo(settings: OpenCodeSettingsState) {
+    fun applyTo(settings: OpenCodeMcpSettingsState) {
         val additionalJson = additionalMcpServersField.text.trim()
         // Validate additionalMcpServers separately — a validation failure should only
         // skip that field, not block the entire apply (which would silently lose the
@@ -310,7 +310,7 @@ class OpenCodeMcpPanel {
         }
     }
 
-    fun isModified(settings: OpenCodeSettingsState): Boolean {
+    fun isModified(settings: OpenCodeMcpSettingsState): Boolean {
         return enableIntellijMcpCheckbox.isSelected != settings.enableIntellijMcp ||
                 mcpServerUrlField.text.trim() != settings.mcpServerUrl ||
                 additionalMcpServersField.text.trim() != settings.additionalMcpServers ||

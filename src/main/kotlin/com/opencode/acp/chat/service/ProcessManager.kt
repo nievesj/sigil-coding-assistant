@@ -95,6 +95,8 @@ class ProcessManager(private val scope: CoroutineScope) {
         }
 
         val settings = OpenCodeSettingsState.getInstance().state
+        val mcpSettings = com.opencode.acp.config.settings.OpenCodeMcpSettingsState.getInstance()
+        val contextSettings = com.opencode.acp.config.settings.OpenCodeContextSettingsState.getInstance()
         host = AcpDefaults.DEFAULT_OPENCODE_HOST
         val configuredPort = settings.port
 
@@ -118,28 +120,32 @@ class ProcessManager(private val scope: CoroutineScope) {
         // Write MCP config to .opencode/opencode.json BEFORE launching the binary.
         // OpenCode reads opencode.json on startup, so MCP servers must be in the
         // config file before the process starts.
-        if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
-            val configWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), settings)
+        if (mcpSettings.enableIntellijMcp || mcpSettings.additionalMcpServers.isNotBlank()) {
+            val configWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), mcpSettings)
             configWriter.write()
         } else {
             // Clear plugin-managed entries when MCP is disabled
-            val configWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), settings)
+            val configWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), mcpSettings)
             configWriter.clearAllEntries()
         }
 
         // Extract sigil-pruner.ts and write pruner config BEFORE launching the binary.
         // The OpenCode server loads plugins from .opencode/plugins/ on startup and
         // the TS plugin reads .opencode/sigil-pruner.json on load.
-        if (settings.enableContextPruner) {
-            val extracted = PrunerResourceExtractor.extractPlugin(projectBasePath)
+        if (contextSettings.enableContextPruner) {
+            val prunerExtractor = PrunerResourceExtractor(java.nio.file.Path.of(projectBasePath))
+            val extracted = prunerExtractor.extractPlugin()
             if (!extracted) {
                 logger.warn { "[ACP] ProcessManager.initialize: failed to extract sigil-pruner.ts — pruning unavailable" }
             }
-            PrunerConfigWriter.writeConfig(projectBasePath, settings)
+            val prunerConfigWriter = PrunerConfigWriter(java.nio.file.Path.of(projectBasePath))
+            prunerConfigWriter.writeConfig(contextSettings)
         } else {
             // Clean up pruner files when disabled
-            PrunerResourceExtractor.removePlugin(projectBasePath)
-            PrunerConfigWriter.clearConfig(projectBasePath)
+            val prunerExtractor = PrunerResourceExtractor(java.nio.file.Path.of(projectBasePath))
+            prunerExtractor.removePlugin()
+            val prunerConfigWriter = PrunerConfigWriter(java.nio.file.Path.of(projectBasePath))
+            prunerConfigWriter.clearConfig()
         }
 
         // Launch our own binary on the chosen port
@@ -227,7 +233,7 @@ class ProcessManager(private val scope: CoroutineScope) {
                 port = retryPort
                 // Close the old client and create a new one with the new base URL.
                 // OpenCodeClient.baseUrl is immutable, so we must recreate the client.
-                try { opencodeClient.close() } catch (_: Exception) { }
+                try { opencodeClient.shutdown() } catch (_: Exception) { }
                 val retryClient = OpenCodeClient(
                     baseUrl = "http://$host:$port",
                     authToken = authToken
@@ -288,6 +294,10 @@ class ProcessManager(private val scope: CoroutineScope) {
             }
 
             logger.info { "Launching: ${binaryFile.canonicalPath} serve --hostname $host --port $port (cwd=$projectBasePath)" }
+            // SECURITY INVARIANT: host is hardcoded to 127.0.0.1 (AcpDefaults.DEFAULT_OPENCODE_HOST)
+            // and must NOT be made user-configurable without sanitization. ProcessBuilder uses
+            // exec-style argument arrays (no shell), so this is safe against shell injection,
+            // but a user-controlled host could still target unintended network endpoints.
             val pb = ProcessBuilder(binaryPath, "serve", "--hostname", host, "--port", port.toString())
                 .directory(java.io.File(projectBasePath))
                 .redirectErrorStream(true)
@@ -304,6 +314,10 @@ class ProcessManager(private val scope: CoroutineScope) {
 
             // Drain stdout/stderr to a buffer so we can report it if the process dies
             outputBuffer.setLength(0)
+            // NOTE: This drain thread reads stdout only. It relies on redirectErrorStream(true)
+            // (set above) which merges stderr into stdout. If redirectErrorStream is ever
+            // removed, a separate stderr drain thread must be added to prevent pipe buffer
+            // deadlock.
             Thread({
                 try {
                     proc.inputStream.bufferedReader().use { reader ->
@@ -439,7 +453,7 @@ class ProcessManager(private val scope: CoroutineScope) {
                 if (taskkill.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
                     val exitCode = taskkill.exitValue()
                     if (exitCode != 0) {
-                        val stderr = try { taskkill.inputStream.bufferedReader().readText().take(200) } catch (_: Exception) { "" }
+                        val stderr = try { taskkill.errorStream.bufferedReader().readText().take(200) } catch (_: Exception) { "" }
                         logger.warn { "[ACP] taskkill exited with code $exitCode for PID $pid — stderr: $stderr" }
                         // Still fall through to destroyForcibly as a fallback
                         process.destroyForcibly()
@@ -478,7 +492,7 @@ class ProcessManager(private val scope: CoroutineScope) {
         _connectionState.value = ConnectionState.DISCONNECTED
         if (client != null) {
             Thread({
-                try { client.close() } catch (_: Exception) { }
+                try { client.shutdown() } catch (_: Exception) { }
             }, "opencode-client-close").apply { isDaemon = true; start() }
         }
         // Do NOT kill the process — it may still be healthy. initialize() will

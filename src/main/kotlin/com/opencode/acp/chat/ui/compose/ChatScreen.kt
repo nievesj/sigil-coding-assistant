@@ -64,157 +64,6 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/**
- * Computes recent files: currently open editors first, then recently closed files.
- */
-private fun computeRecentFiles(project: Project): List<RecentFile> {
-    val openFiles = FileEditorManager.getInstance(project).openFiles
-        .filter { it.isValid && !it.isDirectory }
-        .map { RecentFile(name = it.name, path = it.path) }
-
-    val openPaths = openFiles.map { it.path }.toSet()
-
-    // NOTE: EditorHistoryManager is an internal `impl` package API and may change
-    // or be removed on platform upgrades. Wrap in try/catch so the plugin degrades
-    // gracefully (returns empty list for closed files) instead of crashing.
-    val closedFiles = try {
-        com.intellij.openapi.fileEditor.impl.EditorHistoryManager.getInstance(project).fileList
-            .filter { it.isValid && !it.isDirectory && it.path !in openPaths }
-            .takeLast(15)
-            .map { RecentFile(name = it.name, path = it.path) }
-    } catch (e: NoClassDefFoundError) {
-        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] EditorHistoryManager unavailable (NoClassDefFoundError)" }
-        emptyList()
-    } catch (e: LinkageError) {
-        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] EditorHistoryManager unavailable (LinkageError)" }
-        emptyList()
-    } catch (e: Exception) {
-        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] EditorHistoryManager unavailable (Exception)" }
-        emptyList()
-    }
-
-    return openFiles + closedFiles
-}
-
-/**
- * Searches project files by name using IntelliJ's FilenameIndex.
- * First tries exact match, then falls back to iterating project scopes for partial matches.
- */
-fun searchProjectFiles(project: Project, query: String, maxResults: Int = 20): List<RecentFile> {
-    if (query.isBlank()) return emptyList()
-    val results = mutableListOf<RecentFile>()
-    val seen = mutableSetOf<String>()
-
-    // Exact filename match first
-    com.intellij.psi.search.FilenameIndex.getVirtualFilesByName(query, com.intellij.psi.search.GlobalSearchScope.projectScope(project))
-        .filter { it.isValid && !it.isDirectory }
-        .take(maxResults)
-        .forEach { vf ->
-            if (vf.path !in seen) {
-                seen.add(vf.path)
-                results.add(RecentFile(name = vf.name, path = vf.path))
-            }
-        }
-
-    // If we have enough results, return early
-    if (results.size >= maxResults) return results.take(maxResults)
-
-    // Local file system for VFS operations
-    val localFileSystem = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
-    // Fall back to project base path for partial match traversal
-    val basePath = project.basePath ?: return results
-    val baseDir = localFileSystem.findFileByPath(basePath) ?: return results
-
-    // Bounded recursive traversal: depth limit prevents deep recursion on
-    // huge directory trees, and maxNodes caps total nodes (directories + files)
-    // inspected to avoid holding the read lock for too long on large projects.
-    val maxDepth = 10
-    val maxNodes = 5000
-    var visited = 0
-
-    fun searchDir(dir: VirtualFile, depth: Int) {
-        if (results.size >= maxResults || depth > maxDepth || visited >= maxNodes) return
-        visited++
-        // Check for cancellation periodically to allow write actions to interrupt
-        // the read action. Without this, holding the read lock for 5000 nodes
-        // can starve write actions (file saves, project config changes).
-        if (visited % 500 == 0) {
-            // ProgressManager.checkCanceled() throws ProcessCanceledException
-            // which must be rethrown, not swallowed.
-            com.intellij.openapi.progress.ProgressManager.checkCanceled()
-        }
-        val children = dir.children ?: return
-        for (child in children) {
-            if (results.size >= maxResults || visited >= maxNodes) return
-            // Check for cancellation periodically within large directories
-            if (visited % 500 == 0) {
-                com.intellij.openapi.progress.ProgressManager.checkCanceled()
-            }
-            if (child.isDirectory && !isSymLink(child)) {
-                // Skip hidden and build directories; don't follow symlinks (path traversal / cycles)
-                if (!child.name.startsWith(".") && child.name !in setOf("build", "node_modules", ".git", "out", "target", ".idea", "__pycache__", ".gradle", "dist", ".next", ".venv")) {
-                    // NOTE: This skip set is hardcoded. Non-standard build directories (bin, obj,
-                    // .build) won't be skipped. Consider making configurable or using .gitignore.
-                    searchDir(child, depth + 1)
-                }
-            } else if (child.isValid && !isSymLink(child)) {
-                visited++
-                val nameLower = child.name.lowercase()
-                if (nameLower.contains(query.lowercase()) && child.path !in seen) {
-                    // Reject symlinks that escape the project base path.
-                    // On canonicalization failure, reject the file — a path that can't be
-                    // canonicalized is untrusted (broken symlink, restricted path, or a
-                    // symlink that resolves outside the project). Falling back to the raw
-                    // path would bypass the boundary check via symlinks.
-                    // Canonicalization is a filesystem stat call — deferred to only matched files
-                    // to minimize I/O. For 5000 nodes with 100 matches, this is 100 stat calls.
-                    val canonicalChild = try { java.io.File(child.path).canonicalPath } catch (_: Exception) { continue }
-                    val canonicalBase = try { java.io.File(basePath).canonicalPath } catch (_: Exception) { basePath }
-                    // On Windows, paths are case-insensitive — normalize for comparison
-                    val compareChild = if (System.getProperty("os.name").lowercase().contains("win")) canonicalChild.lowercase() else canonicalChild
-                    val compareBase = if (System.getProperty("os.name").lowercase().contains("win")) canonicalBase.lowercase() else canonicalBase
-                    if (compareChild.startsWith(compareBase + java.io.File.separator) || compareChild == compareBase) {
-                        seen.add(child.path)
-                        results.add(RecentFile(name = child.name, path = child.path))
-                    }
-                }
-            }
-        }
-    }
-
-    // If exact match didn't find enough, do partial search
-    if (results.size < maxResults) {
-        searchDir(baseDir, 0)
-    }
-
-    return results.take(maxResults)
-}
-
-/**
- * Returns true if [file] is a symlink. Uses `java.nio.file.Files.isSymbolicLink`
- * on the local path so it works against the public [VirtualFile] API (the
- * `isSymlink()` method is only on the internal `VirtualFileSystemEntry` impl).
- * Non-local VFS schemes (jar://, http://, etc.) cannot be symlinks.
- */
-private fun isSymLink(file: VirtualFile): Boolean {
-    if (file.fileSystem !is com.intellij.openapi.vfs.LocalFileSystem) return false
-    return try {
-        java.nio.file.Files.isSymbolicLink(java.io.File(file.path).toPath())
-    } catch (_: java.nio.file.InvalidPathException) {
-        // Path has invalid characters — fail closed: treat as symlink so the caller
-        // skips it. A path that can't be resolved is untrusted.
-        true
-    } catch (_: SecurityException) {
-        // Security manager denied access — fail closed: treat as symlink so the
-        // caller skips it rather than following a path it can't inspect.
-        true
-    } catch (_: java.io.IOException) {
-        // I/O error checking symlink — fail closed: treat as symlink so the
-        // caller skips it rather than risk following a broken/restricted path.
-        true
-    }
-}
-
 @Composable
 fun
         ChatScreen(
@@ -244,6 +93,7 @@ fun
     val commandHistory by viewModel.commandHistory.collectAsState()
     val queuedMessages by viewModel.queuedMessages.collectAsState()
     val followAgentEnabled by viewModel.followAgentEnabled.collectAsState()
+    val braveModeEnabled by viewModel.braveModeEnabled.collectAsState()
     val selectedSidebarTab by viewModel.selectedSidebarTab.collectAsState()
 
     // Local (non-server) slash commands — always shown first
@@ -279,7 +129,7 @@ fun
         // executeSynchronously() which wraps in a non-cancellable runReadAction
         // that blocks write actions (settings dialog, plugin updater).
         val initial = withContext(Dispatchers.IO) {
-            readAction { computeRecentFiles(project) }
+            readAction { ProjectFileSearch.computeRecentFiles(project) }
         }
         withContext(Dispatchers.Main) {
             recentFiles.clear()
@@ -306,7 +156,7 @@ fun
                 refreshJob = scope.launch {
                     kotlinx.coroutines.delay(100) // debounce — coalesce rapid events
                     val updated = withContext(Dispatchers.IO) {
-                        readAction { computeRecentFiles(project) }
+                        readAction { ProjectFileSearch.computeRecentFiles(project) }
                     }
                     withContext(Dispatchers.Main) {
                         recentFiles.clear()
@@ -334,7 +184,7 @@ fun
         viewModel.pasteImageSignal.collectLatest {
             when (val result = readClipboardContent(project)) {
                 is ClipboardResult.FileResult -> {
-                    attachedFiles.add(result.file)
+                    result.files.forEach { attachedFiles.add(it) }
                 }
                 is ClipboardResult.TextResult -> {
                     viewModel.requestTextPaste(result.text)
@@ -351,7 +201,7 @@ fun
         val chooser = FileChooserFactory.getInstance().createFileChooser(descriptor, project, null)
         val files = chooser.choose(project)
         files.forEach { file ->
-            addFileAttachment(file, attachedFiles, project)
+            FileAttachmentService.addFileAttachment(file, project)?.let { attachedFiles.add(it) }
         }
     }
 
@@ -366,36 +216,48 @@ fun
         val chooser = FileChooserFactory.getInstance().createFileChooser(descriptor, project, null)
         val files = chooser.choose(project)
         files.forEach { file ->
-            addFileAttachment(file, attachedFiles, project, requireImage = true)
+            FileAttachmentService.addFileAttachment(file, project, requireImage = true)?.let { attachedFiles.add(it) }
         }
     }
 
     // Recent file click — attach a recent file.
-    // NOTE: No re-validation of recentFile.path here — the path came from
-    // FileEditorManager/EditorHistoryManager (trusted VFS sources) and
-    // addFileAttachment() copies external files into the allowed dir. The
-    // service guard in OpenCodeService.sendMessageInternal() is the final
-    // authority and catches any invalid/out-of-bound paths. Defense-in-depth.
+    // NOTE: recentFile.path came from FileEditorManager/EditorHistoryManager (trusted VFS
+    // sources), but EditorHistoryManager may contain stale entries from previously-opened
+    // projects. Defense-in-depth: validate the canonical path is within the current project
+    // (or allowed attachment dirs) before attempting the copy. addFileAttachment() copies
+    // external files into the allowed dir, and the service guard in
+    // OpenCodeService.sendMessageInternal() is the final authority and catches any invalid
+    // paths. If the path is outside the project and not in an attachments dir, skip it.
     val onRecentFileClick: (RecentFile) -> Unit = { recentFile ->
-        val vfs = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
-        var vf = vfs.findFileByPath(recentFile.path)
-        if (vf == null) {
-            // Fallback for non-local paths. If the path is already a VFS URL
-            // (e.g. jar://, http://), resolve it directly; otherwise treat it
-            // as a local filesystem path.
-            vf = if (recentFile.path.startsWith("file://")) {
-                com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(recentFile.path)
-            } else if (recentFile.path.contains("://") && !recentFile.path.startsWith("file://")) {
-                // Reject non-file URL schemes (jar://, http://, etc.) — only file:// is valid for attachments
-                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] onRecentFileClick: rejecting non-file URL scheme: ${recentFile.path.take(50)}" }
-                null
-            } else {
-                com.intellij.openapi.vfs.LocalFileSystem.getInstance()
-                    .findFileByIoFile(java.io.File(recentFile.path))
+        // Re-validate the path is within the current project or allowed attachment dirs.
+        // Stale EditorHistoryManager entries from other projects could point outside.
+        val canonicalRecent = com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(recentFile.path)
+        val projectBase = project.basePath?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
+        val userHome = System.getProperty("user.home")?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
+        val isAllowed = canonicalRecent != null && com.opencode.acp.chat.util.AttachmentPathValidator.isAllowed(canonicalRecent, projectBase, userHome)
+        if (!isAllowed) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] onRecentFileClick: rejecting recent file outside allowed dirs: ${recentFile.path}" }
+        } else {
+            val vfs = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+            var vf = vfs.findFileByPath(recentFile.path)
+            if (vf == null) {
+                // Fallback for non-local paths. If the path is already a VFS URL
+                // (e.g. jar://, http://), resolve it directly; otherwise treat it
+                // as a local filesystem path.
+                vf = if (recentFile.path.startsWith("file://")) {
+                    com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(recentFile.path)
+                } else if (recentFile.path.contains("://") && !recentFile.path.startsWith("file://")) {
+                    // Reject non-file URL schemes (jar://, http://, etc.) — only file:// is valid for attachments
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] onRecentFileClick: rejecting non-file URL scheme: ${recentFile.path.take(50)}" }
+                    null
+                } else {
+                    com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+                        .findFileByIoFile(java.io.File(recentFile.path))
+                }
             }
-        }
-        if (vf != null) {
-            addFileAttachment(vf, attachedFiles, project)
+            if (vf != null) {
+                FileAttachmentService.addFileAttachment(vf, project)?.let { attachedFiles.add(it) }
+            }
         }
     }
 
@@ -415,8 +277,17 @@ fun
         } else {
             searchJob = scope.launch {
                 try {
+                    // Pass currently-open file paths so search results can mark
+                    // open files with isOpen=true for prioritized display.
+                    val openPaths = withContext(Dispatchers.IO) {
+                        readAction {
+                            FileEditorManager.getInstance(project).openFiles
+                                .filter { it.isValid && !it.isDirectory }
+                                .map { it.path }.toSet()
+                        }
+                    }
                     val results = withContext(Dispatchers.IO) {
-                        readAction { searchProjectFiles(project, query) }
+                        readAction { ProjectFileSearch.searchProjectFiles(project, query, openPaths = openPaths) }
                     }
                     searchResults.clear()
                     searchResults.addAll(results)
@@ -430,6 +301,81 @@ fun
                 } catch (e: Exception) {
                     io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] File search failed" }
                 }
+            }
+        }
+    }
+
+    // @ mention search results — separate from the attach menu search to allow
+    // independent query state. Uses the same searchProjectFiles() but with a
+    // dedicated result list and debounce job.
+    val mentionSearchResults = remember { mutableStateListOf<RecentFile>() }
+    var mentionSearchJob by remember { mutableStateOf<Job?>(null) }
+    val onMentionSearch: (String) -> Unit = { query ->
+        mentionSearchJob?.cancel()
+        if (query.isBlank()) {
+            // Empty query: show open files + recent files (same as attach menu default)
+            mentionSearchResults.clear()
+            mentionSearchResults.addAll(recentFiles)
+            mentionSearchJob = null
+        } else {
+            mentionSearchJob = scope.launch {
+                try {
+                    val openPaths = withContext(Dispatchers.IO) {
+                        readAction {
+                            FileEditorManager.getInstance(project).openFiles
+                                .filter { it.isValid && !it.isDirectory }
+                                .map { it.path }.toSet()
+                        }
+                    }
+                    val results = withContext(Dispatchers.IO) {
+                        readAction { ProjectFileSearch.searchProjectFiles(project, query, openPaths = openPaths) }
+                    }
+                    // Merge: open files from recentFiles that match the query first,
+                    // then search results. This ensures open editor files are always
+                    // prioritized in the @ mention autocomplete.
+                    val openMatching = recentFiles.filter { it.isOpen &&
+                        (it.name.contains(query, ignoreCase = true) || it.path.contains(query, ignoreCase = true)) }
+                    val merged = (openMatching + results).distinctBy { it.path }
+                    mentionSearchResults.clear()
+                    mentionSearchResults.addAll(merged.take(30))
+                } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
+                    throw e
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] Mention search failed" }
+                }
+            }
+        }
+    }
+
+    // @ mention file selected — attach the file to the current message.
+    // The @filename text is already inserted by InputArea; this callback handles
+    // the file attachment side (same flow as clicking a file in the attach menu).
+    val onMentionFileSelected: (RecentFile) -> Unit = { recentFile ->
+        // Re-validate the path is within the current project or allowed attachment dirs.
+        // Stale EditorHistoryManager entries from other projects could be selected via @-mention.
+        val canonicalRecent = com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(recentFile.path)
+        val projectBase = project.basePath?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
+        val userHome = System.getProperty("user.home")?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
+        val isAllowed = canonicalRecent != null && com.opencode.acp.chat.util.AttachmentPathValidator.isAllowed(canonicalRecent, projectBase, userHome)
+        if (!isAllowed) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] onMentionFileSelected: rejecting mention file outside allowed dirs: ${recentFile.path}" }
+        } else {
+            val vfs = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+            var vf = vfs.findFileByPath(recentFile.path)
+            if (vf == null) {
+                vf = if (recentFile.path.startsWith("file://")) {
+                    com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(recentFile.path)
+                } else if (recentFile.path.contains("://") && !recentFile.path.startsWith("file://")) {
+                    null
+                } else {
+                    com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+                        .findFileByIoFile(java.io.File(recentFile.path))
+                }
+            }
+            if (vf != null) {
+                FileAttachmentService.addFileAttachment(vf, project)?.let { attachedFiles.add(it) }
             }
         }
     }
@@ -674,6 +620,10 @@ fun
                     }
                 },
                 commands = allSlashCommands,
+                // @ mention file autocomplete
+                mentionFiles = mentionSearchResults,
+                onMentionSearch = onMentionSearch,
+                onMentionFileSelected = onMentionFileSelected,
                 todos = todoItems,
                 commandHistory = commandHistory,
                 onLoadHistoryEntry = { entry ->
@@ -702,6 +652,8 @@ fun
                     }
                 },
                 onToggleFollow = { viewModel.toggleFollowAgent() },
+                isBraveModeEnabled = braveModeEnabled,
+                onToggleBraveMode = { viewModel.toggleBraveMode() },
                 placeholderText = if (isActiveSessionChild) "Sub-task sessions cannot be prompted" else "Type a message...",
             )
             }
@@ -753,69 +705,5 @@ fun
                 onDismiss = { showClearAllDialog = false },
             )
         }
-    }
-}
-
-/**
- * Reads a VirtualFile into an AttachedFile and adds it to the list.
- *
- * If the file lives outside the allowed attachment directories (project base,
- * `<project>/.opencode/attachments/`, `<user.home>/.opencode/attachments/`), it is
- * copied into `<project>/.opencode/attachments/` first so the security guard in
- * `OpenCodeService.sendMessageInternal()` doesn't silently drop it. The attachment
- * chip shows the copied path.
- */
-private fun addFileAttachment(
-    file: VirtualFile,
-    attachedFiles: MutableList<AttachedFile>,
-    project: Project,
-    requireImage: Boolean = false
-) {
-    try {
-        if (requireImage) {
-            val ext = file.extension?.lowercase() ?: ""
-            if (ext !in setOf("png", "jpg", "jpeg", "gif", "bmp", "svg", "webp")) {
-                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] addFileAttachment: rejecting non-image file from image dialog: ${file.name} (.$ext)" }
-                return
-            }
-        }
-        val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(file.name)
-        // VirtualFile.path is already an absolute filesystem path for local files.
-        val sourceFile = java.io.File(file.path)
-        val effectivePath = if (sourceFile.isAbsolute && sourceFile.exists()) {
-            // Copy external files (Desktop, Documents, iCloud Drive, ...) into the
-            // project's .opencode/attachments/ dir so they pass the service guard.
-            // If the copy fails, fall back to the original path and let the guard
-            // log/skip it — never silently drop here.
-            com.opencode.acp.util.copyExternalAttachmentToAllowedDir(sourceFile, project)
-                ?.takeIf { it.absolutePath != sourceFile.absolutePath }
-                ?.let { copied ->
-                    // Preserve the original display name; use the copied file's path.
-                    // NOTE: Display name uses the original file.name, but the path points to the
-                    // copied file. If a collision occurred, the actual filename on disk may differ
-                    // (e.g., "file (1).txt"). This is a known minor UX issue — the display name
-                    // is more useful to the user than the collision-resolved name.
-                    AttachedFile(name = file.name, path = copied.absolutePath, mime = mime)
-                } ?: run {
-                    // Copy failed — check if source is outside allowed dirs
-                    val canonicalSource = sourceFile.canonicalPath
-                    val projectBase = project.basePath?.let { java.io.File(it).canonicalPath }
-                    val userHome = System.getProperty("user.home")?.let { java.io.File(it).canonicalPath }
-                    val isInsideProject = projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator)
-                    val isInsideAttachments = (projectBase != null && canonicalSource.startsWith(projectBase + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator)) ||
-                        (userHome != null && canonicalSource.startsWith(userHome + java.io.File.separator + ".opencode" + java.io.File.separator + "attachments" + java.io.File.separator))
-                    if (!isInsideProject && !isInsideAttachments) {
-                        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] addFileAttachment: rejecting file outside allowed dirs: ${file.name} (${sourceFile.path})" }
-                        return
-                    }
-                    AttachedFile(name = file.name, path = canonicalSource, mime = mime)
-                }
-        } else {
-            AttachedFile(name = file.name, path = file.path, mime = mime)
-        }
-        attachedFiles.add(effectivePath)
-    } catch (e: Exception) {
-        // Skip files that can't be read (e.g., deleted between picker and confirm)
-        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug(e) { "[ACP] addFileAttachment: failed to attach ${file.name}" }
     }
 }
