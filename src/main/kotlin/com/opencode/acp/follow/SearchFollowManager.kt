@@ -10,6 +10,7 @@ import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
 import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
+import java.io.File
 
 /**
  * Project-level service that opens IntelliJ's native "Find in Files" tool window
@@ -37,8 +38,7 @@ class SearchFollowManager(private val project: Project) : Disposable {
     }
 
     /** Timestamp of the last search follow (epoch millis). Cross-thread visible. */
-    @Volatile
-    private var lastSearchMs: Long = 0
+    private val lastSearchMs = java.util.concurrent.atomic.AtomicLong(0)
 
     /**
      * Main entry point: called by SessionState when the agent executes a search tool.
@@ -63,14 +63,14 @@ class SearchFollowManager(private val project: Project) : Disposable {
     ) {
         // ── Pre-condition checks ──────────────────────────────────────
         if (!OpenCodeFollowSettingsState.getInstance().followAgentEnabled) return
-        if (!OpenCodeFollowSettingsState.getInstance().followSearchesInFindWindow) return
         if (project.isDisposed) return
         if (pattern.isNullOrBlank()) return
 
         // ── Throttle ──────────────────────────────────────────────────
         val now = System.currentTimeMillis()
-        if (now - lastSearchMs < FOLLOW_SEARCH_COOLDOWN_MS) return
-        lastSearchMs = now
+        val last = lastSearchMs.get()
+        if (now - last < FOLLOW_SEARCH_COOLDOWN_MS) return
+        if (!lastSearchMs.compareAndSet(last, now)) return
 
         // ── Regex safety check ─────────────────────────────────────────
         // Reject patterns likely to cause catastrophic backtracking (ReDoS).
@@ -133,23 +133,59 @@ class SearchFollowManager(private val project: Project) : Disposable {
                 if (canonicalSearch != null && canonicalBase != null) {
                     val searchNorm = canonicalSearch.replace('\\', '/')
                     val baseNorm = canonicalBase.replace('\\', '/')
-                    if (!searchNorm.startsWith("$baseNorm/") && searchNorm != baseNorm) {
+                    val isWindows = System.getProperty("os.name").lowercase().contains("win")
+                    val prefixMatches = if (isWindows) {
+                        searchNorm.equals(baseNorm, ignoreCase = true) ||
+                            searchNorm.startsWith("$baseNorm/", ignoreCase = true)
+                    } else {
+                        searchNorm == baseNorm || searchNorm.startsWith("$baseNorm/")
+                    }
+                    if (!prefixMatches) {
                         logger.warn { "[ACP] Follow Agent: searchPath outside project blocked: $searchPath" }
                         isProjectScope = true
                     } else {
+                        // The canonical path is the authoritative traversal check (above).
+                        // However, FindInProjectManager's directoryName is matched against
+                        // VFS paths, which on Windows may be registered under the symlink
+                        // form (not the canonical form). If the non-canonical absolute path
+                        // also passes the prefix check, prefer it for directoryName since
+                        // VFS likely registered the symlink form. Fall back to the canonical
+                        // path only if the non-canonical form fails the prefix check.
+                        val absNormPath = try {
+                            java.io.File(searchPath).let { f ->
+                                if (f.isAbsolute) f.path
+                                else java.io.File(projectBase, searchPath).path
+                            }
+                        } catch (_: Exception) { null }
+                        val directoryForVfs = if (absNormPath != null) {
+                            val absNormNormalized = absNormPath.replace('\\', '/').replace('/', File.separatorChar).replace('\\', '/')
+                            val absNormSlash = absNormPath.replace('\\', '/')
+                            val absNormSafe = if (isWindows) {
+                                absNormSlash.equals(baseNorm, ignoreCase = true) ||
+                                    absNormSlash.startsWith("$baseNorm/", ignoreCase = true)
+                            } else {
+                                absNormSlash == baseNorm || absNormSlash.startsWith("$baseNorm/")
+                            }
+                            if (absNormSafe) absNormPath else canonicalSearch
+                        } else {
+                            canonicalSearch
+                        }
                         isProjectScope = false
-                        directoryName = searchPath
+                        directoryName = directoryForVfs
                         isWithSubdirectories = true
                     }
                 } else {
-                    isProjectScope = false
-                    directoryName = searchPath
-                    isWithSubdirectories = true
+                    // Canonicalization failed — default to project scope for safety.
+                    // Using the raw searchPath would bypass the path traversal check.
+                    logger.warn { "[ACP] Follow Agent: canonicalization failed for searchPath=$searchPath, defaulting to project scope" }
+                    isProjectScope = true
                 }
             } else {
-                isProjectScope = false
-                directoryName = searchPath
-                isWithSubdirectories = true
+                // No project base path (rare — default/Light project). Default to project
+                // scope for safety — using the raw searchPath would bypass the path
+                // traversal check since there's no base to compare against.
+                logger.warn { "[ACP] Follow Agent: project.basePath is null, defaulting to project scope for searchPath=$searchPath" }
+                isProjectScope = true
             }
         } else {
             isProjectScope = true
@@ -157,7 +193,18 @@ class SearchFollowManager(private val project: Project) : Disposable {
 
         // File filter: e.g. "*.kt", "*.{kt,java}" — passed through as-is.
         if (!includeGlob.isNullOrBlank()) {
-            fileFilter = includeGlob
+            val cappedGlob = if (includeGlob.length > 256) includeGlob.take(256) else includeGlob
+            // Reject globs that could escape the search directory via '..' path segments.
+            // fileFilter is scoped to the search directory, but '..' could cause
+            // unexpected scope expansion on some FindInProjectManager implementations.
+            // Match '..' only as a path segment (not any two consecutive dots, which
+            // would reject legitimate patterns like `file..bak` or `*.[a..z]`).
+            val traversalSegmentRegex = Regex("""(^|[/\\])\.\.([/\\]|$)""")
+            if (traversalSegmentRegex.containsMatchIn(cappedGlob)) {
+                logger.warn { "[ACP] Follow Agent: rejecting includeGlob with '..' traversal segment: $cappedGlob" }
+            } else {
+                fileFilter = cappedGlob
+            }
         }
     }
 
@@ -175,8 +222,17 @@ class SearchFollowManager(private val project: Project) : Disposable {
         includeGlob: String? = null,
         isRegex: Boolean = false,
     ) {
+        if (!OpenCodeFollowSettingsState.getInstance().followAgentEnabled) return
         if (project.isDisposed) return
         if (pattern.isBlank()) return
+
+        // ── Regex safety check ─────────────────────────────────────────
+        // Reject patterns likely to cause catastrophic backtracking (ReDoS).
+        // The pattern still originates from untrusted SSE tool input.
+        if (isRegex && !isRegexSafe(pattern)) {
+            logger.warn { "[ACP] Follow Agent: rejecting potentially unsafe regex pattern on reopen (ReDoS risk): '$pattern'" }
+            return
+        }
 
         ApplicationManager.getApplication().invokeLater({
             if (project.isDisposed) return@invokeLater
@@ -196,29 +252,68 @@ class SearchFollowManager(private val project: Project) : Disposable {
      * Heuristic check for regex patterns that could cause catastrophic backtracking (ReDoS).
      *
      * WARNING: This is a BEST-EFFORT heuristic, NOT a complete ReDoS defense. It may miss
-     * patterns with nested groups, character class quantifiers, or other backtracking vectors.
-     * FindInProjectManager does not impose a search timeout by default. For complete protection,
-     * consider adding a max-result-count or time-limit guard on the Find in Files call.
+     * some backtracking vectors. FindInProjectManager does not impose a search timeout by
+     * default. For complete protection, consider adding a max-result-count or time-limit
+     * guard on the Find in Files call.
      *
      * Rejects:
-     * - Patterns longer than 200 characters (unnecessary complexity for search)
-     * - Patterns with nested quantifiers (e.g., `(a+)+`, `(a*)*`, `(a{1,3})+`)
+     * - Patterns longer than 100 characters (legitimate search patterns are rarely longer;
+     *   the lower cap reduces the surface area for adversarial patterns)
+     * - Patterns with nested parentheses depth > 2 (walks the pattern char-by-char
+     *   tracking paren depth — classic ReDoS vectors like `(a(b+))+` or `((a+)(b*))+`
+     *   are rejected)
+     * - Patterns with nested quantifiers (e.g., `(a+)+`, `(a*)*`, `(a{1,3})+`,
+     *   `(a{2,})+`). A quantifier is `+`, `*`, `?`, or `{n}`, `{n,}`, `{n,m}`.
      *
      * This is a best-effort heuristic — it may reject some safe patterns and allow
      * some unsafe ones. The goal is to block the most common ReDoS vectors without
      * requiring a full regex complexity analyzer.
      */
     private fun isRegexSafe(pattern: String): Boolean {
-        if (pattern.length > 200) return false
-        // Detect nested quantifiers: a quantifier (+, *, ?, {n,m}) immediately
-        // following a group that ends with a quantifier. This is the classic
-        // ReDoS pattern: (a+)+, (a*)*, (a?)+, etc.
-        val nestedQuantifierRegex = Regex("""\([^)]*[+*?][^)]*\)[+*?]""")
+        if (pattern.length > 100) return false
+        // Reject patterns with nested parentheses deeper than 2.
+        // Walks the pattern char-by-char tracking paren depth; if depth exceeds 2
+        // at any point, the pattern is rejected. This catches classic nested-group
+        // ReDoS vectors like `(a(b+))+` that the regex-based nested-quantifier
+        // check below cannot detect (its `[^)]*` cannot match nested parens).
+        if (!isParenNestingSafe(pattern, maxDepth = 2)) return false
+        // Detect nested quantifiers: a quantifier (+, *, ?, {n}, {n,}, {n,m})
+        // immediately following a group that contains a quantifier. This is the
+        // classic ReDoS pattern: (a+)+, (a*)*, (a?)+, (a{1,3})+, (a{2,})+, etc.
+        val quantifier = """[+*?]|\{\d+(,\d*)?\}"""
+        val nestedQuantifierRegex = Regex("""\([^)]*(?:$quantifier)[^)]*\)(?:$quantifier)""")
         if (nestedQuantifierRegex.containsMatchIn(pattern)) return false
-        // Also check for quantifiers on groups containing alternation with quantifiers
-        val alternationQuantifierRegex = Regex("""\([^)]*[+*?][^)]*[|][^)]*[+*?][^)]*\)[+*?]""")
-        if (alternationQuantifierRegex.containsMatchIn(pattern)) return false
         return true
+    }
+
+    /**
+     * Walks [pattern] char-by-char tracking parenthesis nesting depth.
+     * Returns false if depth ever exceeds [maxDepth] (i.e., goes to maxDepth + 1).
+     * Also returns false if parentheses are unbalanced.
+     */
+    private fun isParenNestingSafe(pattern: String, maxDepth: Int): Boolean {
+        var depth = 0
+        var maxSeen = 0
+        var escaped = false
+        for (c in pattern) {
+            if (escaped) {
+                escaped = false
+                continue
+            }
+            when (c) {
+                '\\' -> escaped = true
+                '(' -> {
+                    depth++
+                    if (depth > maxSeen) maxSeen = depth
+                    if (depth > maxDepth) return false
+                }
+                ')' -> {
+                    depth--
+                    if (depth < 0) return false
+                }
+            }
+        }
+        return depth == 0
     }
 
     // ── Disposable ────────────────────────────────────────────────────

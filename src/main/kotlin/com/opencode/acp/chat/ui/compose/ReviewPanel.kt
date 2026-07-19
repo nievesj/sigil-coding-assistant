@@ -89,6 +89,14 @@ import org.jetbrains.jewel.ui.icon.IconKey
 // ── Review Panel (sidebar tab content) ───────────────────────────────────────
 
 /**
+ * One-time notification flag for [openDiffForPath] — set the first time a
+ * `NoClassDefFoundError` prevents the diff viewer from opening, so the user
+ * gets a single warning dialog instead of silent failure (or per-click spam).
+ */
+@Volatile
+private var diffOpenFailedNotified: Boolean = false
+
+/**
  * Main composable for the Review tab.
  *
  * ARCHITECTURE NOTE: The change listener and StateFlow are unified in a single
@@ -129,8 +137,10 @@ fun ReviewPanel(
             override fun prepareChange(events: List<VFileEvent>): AsyncFileListener.ChangeApplier? {
                 // Emit on any non-transactional file event (skip .git internal, build dirs, etc.)
                 // NOTE: `.review/` writes are intentionally NOT filtered out — the review panel
-                // should refresh when the LLM agent writes review JSON. There is no feedback loop
-                // because the refresh only READS files (it never writes to `.review/`).
+                // should refresh when the LLM agent writes review JSON. There IS a benign feedback
+                // path: VFS write → refreshSignal → produceState → gitService.getChangedFiles()
+                // (read-only VCS query). It does not write to `.review/`, so there is no infinite
+                // loop. If getChangedFiles() ever writes a cache file, this could become a problem.
                 val relevant = events.any { ev ->
                     val path = ev.file?.path?.replace('\\', '/') ?: return@any false
                     !path.contains("/.git/") &&
@@ -156,60 +166,53 @@ fun ReviewPanel(
 
     // Listen to ViewModel's file change signal for immediate refresh when tool calls modify files.
     // This bypasses ChangeListManager's internal polling delay.
-    if (fileChangeSignal != null) {
-        LaunchedEffect(Unit) {
-            fileChangeSignal.collect {
-                refreshSignal.update { it + 1 }
-            }
+    LaunchedEffect(fileChangeSignal) {
+        fileChangeSignal?.collect {
+            refreshSignal.update { it + 1 }
         }
     }
 
     // Collect comment changes from ReviewCommentManager
     val commentIndex by commentChangeSignal.collectAsState(ReviewIndex())
 
-    // Build CommentCounts from the review index
-    val commentCounts = remember(commentIndex) {
-        val counts = commentIndex.commentsByFile
-            .mapValues { (_, comments) -> comments.count { it.status == ReviewStatus.OPEN } }
-            .filterValues { it > 0 }
-        CommentCounts(counts)
-    }
-
-    // Build open-comments-per-file map for direct navigation + child rows.
-    // Sorted by startLine so the first entry is the topmost comment.
-    val openCommentsByFile = remember(commentIndex) {
-        commentIndex.commentsByFile
-            .mapValues { (_, comments) ->
-                comments.filter { it.status == ReviewStatus.OPEN }
-                    .sortedBy { it.startLine }
-            }
-            .filterValues { it.isNotEmpty() }
-    }
-
     // Debounce the refresh signal (300ms — responsive but prevents rapid-fire during bulk ops)
     val debouncedRefresh by refreshSignal
         .debounce(300)
         .collectAsState(initial = 0L)
 
-    // Re-compute when debouncedRefresh OR commentCounts changes
-    val refreshKey = remember(debouncedRefresh, commentCounts) {
-        "$debouncedRefresh-${commentCounts.totalOpen}-${commentCounts.countsByFile.size}"
-    }
-
     // Fetch data on background thread inside read action, update state on EDT.
     // Uses Mutex to prevent concurrent refreshes — only one refresh runs at a time.
     // Catch Exception to avoid swallowing OutOfMemoryError and other serious JVM errors.
+    //
+    // Key on `commentIndex` directly (not a stringified refreshKey) so the produceState
+    // block restarts whenever the comment index changes. The maps are derived INSIDE
+    // the block from `commentIndex`, eliminating the fragile outer-scope capture that
+    // could go stale if the remember keys for the maps were ever changed.
     val state by produceState<ReviewState>(
         initialValue = ReviewState.Loading,
-        key1 = refreshKey
+        key1 = debouncedRefresh,
+        key2 = commentIndex
     ) {
+        // Derive CommentCounts and open-comments-per-file from the current
+        // commentIndex inside the produceState block — self-contained capture.
+        val counts = CommentCounts(
+            commentIndex.commentsByFile
+                .mapValues { (_, comments) -> comments.count { it.status == ReviewStatus.OPEN } }
+                .filterValues { it > 0 }
+        )
+        val openComments = commentIndex.commentsByFile
+            .mapValues { (_, comments) ->
+                comments.filter { it.status == ReviewStatus.OPEN }
+                    .sortedBy { it.startLine }
+            }
+            .filterValues { it.isNotEmpty() }
         try {
             refreshMutex.withLock {
                 value = withContext(Dispatchers.IO) {
                     readAction {
                     val files = gitService.getChangedFiles()
                     if (files.isEmpty()) ReviewState.Empty
-                    else ReviewState.Loaded(files, commentCounts, openCommentsByFile)
+                    else ReviewState.Loaded(files, counts, openComments)
                     }
                 }
             }
@@ -240,7 +243,7 @@ fun ReviewPanel(
             is ReviewState.Error -> ReviewErrorContent(
                 message = s.message,
                 retryable = s.retryable,
-                onRetry = { refreshSignal.value = refreshSignal.value + 1 },
+                onRetry = { refreshSignal.update { it + 1 } },
                 modifier = Modifier.fillMaxSize()
             )
             is ReviewState.Loaded -> ReviewFileListContent(
@@ -535,12 +538,12 @@ private fun ReviewCommentChildRow(
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0x1AFFFFFF))
+                        .background(ChatTheme.colors.component.hoverBg.copy(alpha = 0.1f))
                         .clickable { repliesExpanded = !repliesExpanded }
                         .padding(horizontal = 5.dp, vertical = 1.dp)
                 ) {
                     Text(
-                        text = "${comment.replies.size} reply(ies)",
+                        text = "${comment.replies.size} ${if (comment.replies.size == 1) "reply" else "replies"}",
                         fontSize = ChatTheme.fonts.reviewStatusLabel,
                         color = ChatTheme.colors.text.secondary,
                     )
@@ -741,23 +744,53 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
                 } ?: ""
 
                 val factory = DiffContentFactory.getInstance()
+                val beforeRevisionLabel = readAction { change.beforeRevision?.revisionNumber?.asString() } ?: "Base"
+                val afterRevisionLabel = readAction { change.afterRevision?.revisionNumber?.asString() } ?: "Working"
                 val request = SimpleDiffRequest(
                     fileName,
                     factory.create(project, beforeContent, fileType),
                     factory.create(project, afterContent, fileType),
-                    change.beforeRevision?.revisionNumber?.asString() ?: "Base",
-                    change.afterRevision?.revisionNumber?.asString() ?: "Working"
+                    beforeRevisionLabel,
+                    afterRevisionLabel
                 )
                 // Stash the relative source path so ReviewCommentDiffExtension
                 // can recover it and apply review-comment highlights to the
                 // diff viewer's after-side editor (TDD §4.3 — NOT via
                 // ContentDiffRequest.contentTitles, which are display labels).
-                if (request is SimpleDiffRequest) {
-                    request.putUserData(ReviewCommentDiffExtension.REVIEW_PATH_KEY, filePath)
-                }
+                request.putUserData(ReviewCommentDiffExtension.REVIEW_PATH_KEY, filePath)
                 // DiffManager.showDiff must run on EDT.
                 ApplicationManager.getApplication().invokeLater {
-                    DiffManager.getInstance().showDiff(project, request, DiffDialogHints.DEFAULT)
+                    try {
+                        DiffManager.getInstance().showDiff(project, request, DiffDialogHints.DEFAULT)
+                    } catch (e: NoClassDefFoundError) {
+                        // Missing optional dependency — indicates a broken plugin installation.
+                        // Log at ERROR level so the user is aware of the configuration issue.
+                        // NOTE: We intentionally do NOT show a user-visible notification here.
+                        // NoClassDefFoundError on a diff-viewer open is a per-attempt failure —
+                        // surfacing a notification on every failed diff open would be intrusive.
+                        // The error-level log entry is sufficient for diagnosis via idea.log.
+                        //
+                        // Deliberate design decision (not an oversight): swallowing
+                        // NoClassDefFoundError here is intentional. NoClassDefFoundError is a
+                        // JVM-level error indicating a missing class (broken plugin install,
+                        // optional dependency absent), but it is recoverable — the rest of the
+                        // plugin continues to work. Re-throwing would surface an IDE error
+                        // dialog on every failed diff open, which is intrusive for a per-attempt
+                        // failure. The error-level log is the diagnostic trail; users diagnosing
+                        // a non-opening diff viewer can grep idea.log for [ACP] NoClassDefFoundError.
+                        com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
+                            .error("[ACP] Failed to open diff viewer for $filePath — missing dependency", e)
+                        // One-time user-visible warning so the failure isn't completely silent.
+                        // `invokeLater` already puts us on EDT, so `Messages.showWarningDialog` is safe here.
+                        if (!diffOpenFailedNotified) {
+                            diffOpenFailedNotified = true
+                            com.intellij.openapi.ui.Messages.showWarningDialog(
+                                project,
+                                "The diff viewer could not be opened (missing dependency: ${e.message}). See idea.log for details.",
+                                "Diff Viewer Unavailable"
+                            )
+                        }
+                    }
                 }
             } else if (virtualFile != null) {
                 // Change was committed/reverted — open file directly
@@ -774,36 +807,11 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
             throw e
         } catch (e: StackOverflowError) {
             throw e
-        } catch (e: NoClassDefFoundError) {
-            // Missing optional dependency — indicates a broken plugin installation.
-            // Log at ERROR level so the user is aware of the configuration issue.
-            // NOTE: We intentionally do NOT show a user-visible notification here.
-            // NoClassDefFoundError on a diff-viewer open is a per-attempt failure —
-            // surfacing a notification on every failed diff open would be intrusive.
-            // The error-level log entry is sufficient for diagnosis via idea.log.
-            //
-            // Deliberate design decision (not an oversight): swallowing
-            // NoClassDefFoundError here is intentional. NoClassDefFoundError is a
-            // JVM-level error indicating a missing class (broken plugin install,
-            // optional dependency absent), but it is recoverable — the rest of the
-            // plugin continues to work. Re-throwing would surface an IDE error
-            // dialog on every failed diff open, which is intrusive for a per-attempt
-            // failure. The error-level log is the diagnostic trail; users diagnosing
-            // a non-opening diff viewer can grep idea.log for [ACP] NoClassDefFoundError.
-            com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
-                .error("[ACP] Failed to open diff viewer for $filePath — missing dependency: ${e.message}")
         } catch (e: Exception) {
             // Log for diagnostics — silently swallowing makes diff-open failures invisible.
             com.intellij.openapi.diagnostic.Logger.getInstance("ACP")
                 .warn("[ACP] Failed to open diff viewer for $filePath: ${e.message}")
         }
-    }
-}
-
-/** Opens an untracked file in the editor. Uses VirtualFile directly (already stored in ChangedFile). */
-private fun openUntrackedFile(project: Project, virtualFile: com.intellij.openapi.vfs.VirtualFile) {
-    ApplicationManager.getApplication().invokeLater {
-        FileEditorManager.getInstance(project).openFile(virtualFile, true)
     }
 }
 

@@ -2,6 +2,8 @@ package com.opencode.acp.adapter
 
 import com.agentclientprotocol.model.ToolKind
 import io.kotest.matchers.shouldBe
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
@@ -27,8 +29,12 @@ class ToolMapperTest {
         "edit, EDIT",
         "apply_patch, EDIT",
         "write, EDIT",
+        "remove, DELETE",
+        "delete, DELETE",
+        "move, MOVE",
+        "rename, MOVE",
         "read, READ",
-        "list, READ",
+        "list, OTHER",
         "lsp, READ",
         "grep, SEARCH",
         "glob, SEARCH",
@@ -59,7 +65,7 @@ class ToolMapperTest {
         ToolMapper.toAcpKind(toolName) shouldBe expected
     }
 
-    @ParameterizedTest(name = "empty or blank ''{0}'' maps to OTHER")
+    @ParameterizedTest(name = "unknown or edge-case ''{0}'' maps to OTHER")
     @ValueSource(strings = ["", "   ", "totally_unknown_tool_xyz", "12345"])
     fun `toAcpKind maps unknown and edge-case names to OTHER`(toolName: String) {
         ToolMapper.toAcpKind(toolName) shouldBe ToolKind.OTHER
@@ -77,6 +83,8 @@ class ToolMapperTest {
         assertTrue(mappings.containsKey(ToolKind.FETCH))
         assertTrue(mappings.containsKey(ToolKind.THINK))
         assertTrue(mappings.containsKey(ToolKind.OTHER))
+        assertTrue(mappings.containsKey(ToolKind.DELETE))
+        assertTrue(mappings.containsKey(ToolKind.MOVE))
     }
 
     @Test
@@ -92,9 +100,9 @@ class ToolMapperTest {
     }
 
     @Test
-    fun `allMappings READ contains read list and lsp`() {
+    fun `allMappings READ contains read and lsp`() {
         val read = ToolMapper.allMappings()[ToolKind.READ]!!
-        read shouldBe listOf("read", "list", "lsp")
+        read shouldBe listOf("read", "lsp")
     }
 
     @Test
@@ -119,5 +127,164 @@ class ToolMapperTest {
     fun `allMappings OTHER contains skill todowrite task and external_directory`() {
         val other = ToolMapper.allMappings()[ToolKind.OTHER]!!
         other shouldBe listOf("skill", "todowrite", "task", "external_directory")
+    }
+
+    @Test
+    fun `allMappings DELETE contains remove and delete`() {
+        val delete = ToolMapper.allMappings()[ToolKind.DELETE]!!
+        delete shouldBe listOf("remove", "delete")
+    }
+
+    @Test
+    fun `allMappings MOVE contains move and rename`() {
+        val move = ToolMapper.allMappings()[ToolKind.MOVE]!!
+        move shouldBe listOf("move", "rename")
+    }
+
+    // ── detectKindFromInput ───────────────────────────────────────────────
+
+    @ParameterizedTest(name = "detectKindFromInput {0} -> {1}")
+    @CsvSource(
+        "command, EXECUTE",
+        "file_path, READ",
+        "filePath, READ",
+        "path, READ",
+        "pattern, SEARCH",
+        "query, SEARCH",
+    )
+    fun `detectKindFromInput maps single-key inputs to expected kinds`(key: String, expectedKind: String) {
+        val input = JsonObject(mapOf(key to JsonPrimitive("value")))
+        val expected = ToolKind.valueOf(expectedKind)
+        ToolMapper.detectKindFromInput(input) shouldBe expected
+    }
+
+    @Test
+    fun `detectKindFromInput returns OTHER for null and empty`() {
+        ToolMapper.detectKindFromInput(null) shouldBe ToolKind.OTHER
+        ToolMapper.detectKindFromInput(JsonObject(emptyMap())) shouldBe ToolKind.OTHER
+    }
+
+    @Test
+    fun `detectKindFromInput returns EDIT for file_path with old_string and new_string`() {
+        val input = JsonObject(mapOf(
+            "file_path" to JsonPrimitive("foo.kt"),
+            "old_string" to JsonPrimitive("a"),
+            "new_string" to JsonPrimitive("b"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.EDIT
+    }
+
+    @Test
+    fun `detectKindFromInput returns SEARCH for pattern with path (not READ)`() {
+        // Regression test: previously misclassified as READ because `path` matched the READ branch first.
+        val input = JsonObject(mapOf(
+            "pattern" to JsonPrimitive("foo"),
+            "path" to JsonPrimitive("/some/dir"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.SEARCH
+    }
+
+    @Test
+    fun `detectKindFromInput returns SEARCH for query with path`() {
+        val input = JsonObject(mapOf(
+            "query" to JsonPrimitive("foo"),
+            "path" to JsonPrimitive("/some/dir"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.SEARCH
+    }
+
+    @Test
+    fun `detectKindFromInput returns SEARCH for glob with path`() {
+        // Glob tool: directory in 'path', file pattern in 'glob'.
+        val input = JsonObject(mapOf(
+            "path" to JsonPrimitive("/some/dir"),
+            "glob" to JsonPrimitive("*.kt"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.SEARCH
+    }
+
+    @Test
+    fun `detectKindFromInput returns SEARCH for include with path`() {
+        val input = JsonObject(mapOf(
+            "path" to JsonPrimitive("/some/dir"),
+            "include" to JsonPrimitive("*.kt"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.SEARCH
+    }
+
+    @Test
+    fun `detectKindFromInput returns SEARCH for glob only`() {
+        val input = JsonObject(mapOf("glob" to JsonPrimitive("*.kt")))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.SEARCH
+    }
+
+    @Test
+    fun `detectKindFromInput returns READ for path only without glob`() {
+        // path-only without glob/include is still READ (could be a file read).
+        val input = JsonObject(mapOf("path" to JsonPrimitive("/some/file.kt")))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.READ
+    }
+
+    @Test
+    fun `detectKindFromInput returns EXECUTE when command and file_path both present`() {
+        // Ambiguous: EXECUTE wins per the when-branch order.
+        val input = JsonObject(mapOf(
+            "command" to JsonPrimitive("ls"),
+            "file_path" to JsonPrimitive("/some/dir"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.EXECUTE
+    }
+
+    @Test
+    fun `detectKindFromInput returns SEARCH for path with content when pattern also present`() {
+        // A search tool that uses 'content' for the search text (not file content)
+        // should be classified as SEARCH if pattern/query is present, not EDIT.
+        val input = JsonObject(mapOf(
+            "path" to JsonPrimitive("/some/dir"),
+            "content" to JsonPrimitive("search text"),
+            "pattern" to JsonPrimitive("foo"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.SEARCH
+    }
+
+    @Test
+    fun `detectKindFromInput returns EDIT for path with content and no search keys`() {
+        // path + content without pattern/query/glob/include is EDIT (file write).
+        val input = JsonObject(mapOf(
+            "path" to JsonPrimitive("/some/file.kt"),
+            "content" to JsonPrimitive("new file content"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.EDIT
+    }
+
+    @Test
+    fun `detectKindFromInput returns EXECUTE when command and pattern both present`() {
+        // EXECUTE wins per the when-branch order — command is checked first.
+        // This test locks in the priority so a future reordering doesn't silently change it.
+        val input = JsonObject(mapOf(
+            "command" to JsonPrimitive("grep -r foo ."),
+            "pattern" to JsonPrimitive("foo"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.EXECUTE
+    }
+
+    @Test
+    fun `detectKindFromInput returns EXECUTE when command and glob both present`() {
+        // EXECUTE wins per the when-branch order — command is checked first.
+        val input = JsonObject(mapOf(
+            "command" to JsonPrimitive("ls"),
+            "glob" to JsonPrimitive("*.kt"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.EXECUTE
+    }
+
+    @Test
+    fun `detectKindFromInput returns SEARCH when file_path and pattern both present`() {
+        // SEARCH wins per the when-branch order — pattern is checked before READ.
+        val input = JsonObject(mapOf(
+            "file_path" to JsonPrimitive("foo.kt"),
+            "pattern" to JsonPrimitive("bar"),
+        ))
+        ToolMapper.detectKindFromInput(input) shouldBe ToolKind.SEARCH
     }
 }

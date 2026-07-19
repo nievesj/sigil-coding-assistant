@@ -9,6 +9,7 @@ import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextField
 import com.intellij.ui.JBColor
 import com.intellij.util.ui.FormBuilder
+import com.opencode.acp.follow.parseColorOrDefault
 import java.awt.event.ActionListener
 import javax.swing.JButton
 import javax.swing.JComboBox
@@ -72,7 +73,7 @@ class OpenCodeSettingsPanel {
 
     val inlineCodeColorButton: JButton = JButton("\u25BC").apply {
         addActionListener(ActionListener {
-            val currentColor = parseColor(inlineCodeColorField.text)
+            val currentColor = parseColorOrDefault(inlineCodeColorField.text) ?: java.awt.Color(60, 60, 60)
             val chooser = javax.swing.JColorChooser(currentColor)
             val result = javax.swing.JOptionPane.showConfirmDialog(
                 panel,
@@ -155,7 +156,7 @@ class OpenCodeSettingsPanel {
 
     val listNumberColorButton: JButton = JButton("\u25BC").apply {
         addActionListener(ActionListener {
-            val currentColor = parseColor(listNumberColorField.text)
+            val currentColor = parseColorOrDefault(listNumberColorField.text) ?: java.awt.Color(60, 60, 60)
             val chooser = javax.swing.JColorChooser(currentColor)
             val result = javax.swing.JOptionPane.showConfirmDialog(
                 panel,
@@ -248,7 +249,7 @@ class OpenCodeSettingsPanel {
         val port = portField.text.trim().toIntOrNull()
         if (port != null && port !in 1024..65535) invalidFields.add("Server port (must be 1024-65535)")
         if (invalidFields.isNotEmpty()) {
-            showStatus("Invalid values in: ${invalidFields.joinToString(", ")} — using defaults", false)
+            showStatus("Invalid values in: ${invalidFields.joinToString(", ")} — coerced to valid range or reset to default", false)
             // Reset invalid fields to their coerced values so the UI matches what will be applied.
             // Without this, the invalid text remains in the field and isModified() produces
             // confusing results on the next check.
@@ -271,15 +272,21 @@ class OpenCodeSettingsPanel {
             } else {
                 if (System.getProperty("os.name").lowercase().contains("win")) {
                     // On Windows, canExecute() is unreliable (always true for readable files).
-                    // Check the file extension instead.
+                    // Check the file extension instead. Block the save for clearly non-executable
+                    // files (extension not in the recognized list AND file exists) — only warn
+                    // was insufficient because ProcessManager would fail with a confusing error.
                     val ext = file.extension.lowercase()
-                    if (ext !in listOf("exe", "bat", "cmd", "ps1", "com", "vbs")) {
-                        showStatus("Warning: '$binPath' may not be an executable (expected .exe, .bat, .cmd, .ps1, .com, or .vbs)", false)
+                    if (ext !in listOf("exe", "bat", "cmd", "ps1", "com", "vbs", "msi", "scr", "cpl")) {
+                        showStatus("Error: '$binPath' does not have a recognized executable extension " +
+                            "(expected .exe, .bat, .cmd, .ps1, .com, .vbs, .msi, .scr, or .cpl). " +
+                            "Binary path not updated.", false)
+                        // Block the save — don't set settings.binaryPath for non-executable files
+                    } else {
+                        settings.binaryPath = binPath
                     }
-                    settings.binaryPath = binPath
                 } else if (!file.canExecute()) {
-                    showStatus("Warning: '$binPath' may not be executable", false)
-                    settings.binaryPath = binPath
+                    showStatus("Error: '$binPath' is not executable. Binary path not updated.", false)
+                    // Block the save on non-Windows too
                 } else {
                     settings.binaryPath = binPath
                 }
@@ -310,11 +317,12 @@ class OpenCodeSettingsPanel {
     fun isModified(settings: OpenCodeSettingsState): Boolean {
         val expandedKinds = ToolKind.entries.filter { toolKindCheckboxes.getValue(it).isSelected }.map { it.name }.toSet()
         val currentExpandedKinds = settings.expandedToolKinds.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
-        // For numeric fields: a non-parseable value is always "modified" so that
-        // Apply is enabled and applyTo can coerce/reset it.
+        // For numeric fields: a non-parseable value (including empty) is always "modified"
+        // so that Apply is enabled and applyTo can coerce/reset it. Treating empty as
+        // modified lets the user clear a field and have Apply reset it to the default.
         fun isNumericModified(field: JBTextField, current: Int, default: Int): Boolean {
             val parsed = field.text.trim().toIntOrNull()
-            return if (parsed != null) parsed != current else field.text.trim().isNotEmpty()
+            return if (parsed != null) parsed != current else true  // empty or non-parseable = modified
         }
         return binaryPathField.text.trim() != settings.binaryPath ||
                 isNumericModified(portField, settings.port, 4096) ||
@@ -345,24 +353,14 @@ class OpenCodeSettingsPanel {
     }
 
     companion object {
-        private val panelLogger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
-
+        // Inline code and list number colors are RGB only (no alpha) — the Follow Agent
+        // color fields (OpenCodeFollowConfigurable) accept 8-char hex with alpha, but
+        // these two fields use a stricter 6-char validator. Copying an 8-char hex from
+        // a Follow Agent field to here will be silently rejected (falls back to previous value).
         private val HEX_COLOR_REGEX = Regex("^#[0-9A-Fa-f]{6}$")
 
-        /** Validate hex color format. Returns [fallback] if invalid. */
+        /** Validate hex color format (6-char RGB only, no alpha). Returns [fallback] if invalid. */
         private fun validateHexColor(value: String, fallback: String): String =
             if (value.matches(HEX_COLOR_REGEX)) value else fallback
-
-        private fun parseColor(hex: String): java.awt.Color {
-            if (hex.isBlank()) return java.awt.Color(60, 60, 60)
-            val clean = hex.removePrefix("#")
-            if (clean.length != 6) return java.awt.Color(60, 60, 60)
-            return try {
-                java.awt.Color(clean.toInt(16))
-            } catch (e: NumberFormatException) {
-                panelLogger.debug(e) { "[ACP] Failed to parse hex color: $hex" }
-                java.awt.Color(60, 60, 60)
-            }
-        }
     }
 }

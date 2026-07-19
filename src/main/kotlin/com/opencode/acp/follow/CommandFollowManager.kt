@@ -72,7 +72,7 @@ class CommandFollowManager(private val project: Project) : Disposable {
     private val consoles = ConcurrentHashMap<String, ConsoleState>()
 
     /** Throttle state — last time a command console was opened. */
-    @Volatile private var lastCommandMs: Long = 0
+    private val lastCommandMs = java.util.concurrent.atomic.AtomicLong(0)
 
     // ── Entry points ──────────────────────────────────────────────────
 
@@ -103,7 +103,6 @@ class CommandFollowManager(private val project: Project) : Disposable {
         // Guard: feature must be enabled
         val settings = OpenCodeFollowSettingsState.getInstance()
         if (!settings.followAgentEnabled) return
-        if (!settings.followCommandsInConsole) return
 
         // Guard: project alive
         if (project.isDisposed) return
@@ -113,8 +112,9 @@ class CommandFollowManager(private val project: Project) : Disposable {
 
         // Throttle: skip if too soon since last console opened
         val now = System.currentTimeMillis()
-        if (now - lastCommandMs < COMMAND_COOLDOWN_MS) return
-        lastCommandMs = now
+        val last = lastCommandMs.get()
+        if (now - last < COMMAND_COOLDOWN_MS) return
+        if (!lastCommandMs.compareAndSet(last, now)) return
 
         ApplicationManager.getApplication().invokeLater({
             if (project.isDisposed) return@invokeLater
@@ -146,25 +146,31 @@ class CommandFollowManager(private val project: Project) : Disposable {
     ) {
         if (project.isDisposed) return
 
-        val state = consoles[toolCallId] ?: return
+        // Early bail if unknown — but re-check inside EDT for the actual print
+        // since the console may be evicted between this background read and EDT.
+        if (!consoles.containsKey(toolCallId)) return
 
-        // Parse output text: extract "text" field from each JSON object and concatenate
-        val text = output
-            ?.mapNotNull { obj -> obj["text"]?.jsonPrimitive?.contentOrNull }
-            ?.joinToString("")
-            ?: return
-
-        if (text.isEmpty()) return
-
+        // Note: text parsing is deferred to the EDT callback below. Doing the
+        // parse on the background thread would waste work (e.g. large find/grep
+        // outputs) if the console was evicted between this check and EDT.
         ApplicationManager.getApplication().invokeLater({
             if (project.isDisposed) return@invokeLater
             try {
+                // Re-check inside EDT — the console may have been evicted/disposed
+                // between the background read and this EDT execution.
+                val current = consoles[toolCallId] ?: return@invokeLater
+                // Parse output text on EDT: extract "text" field from each JSON
+                // object and concatenate. Skipped if the console was evicted.
+                val text = output
+                    ?.mapNotNull { obj -> obj["text"]?.jsonPrimitive?.contentOrNull }
+                    ?.joinToString("")
+                if (text.isNullOrEmpty()) return@invokeLater
                 val contentType = if (isError) {
                     ConsoleViewContentType.ERROR_OUTPUT
                 } else {
                     ConsoleViewContentType.NORMAL_OUTPUT
                 }
-                state.consoleView.print(text, contentType)
+                current.consoleView.print(text, contentType)
             } catch (e: Exception) {
                 logger.error(e) { "[ACP] Follow Agent: error printing output for $toolCallId" }
             }
@@ -226,14 +232,15 @@ class CommandFollowManager(private val project: Project) : Disposable {
         val builder = TextConsoleBuilderFactory.getInstance().createBuilder(project)
         val consoleView = builder.console
 
-        // Register console as child disposable of the project
-        Disposer.register(project, consoleView)
+        // Lifecycle is managed manually via disposeConsole() — do NOT register with
+        // Disposer.register(project, ...) because that would cause a double-dispose
+        // when dispose() calls disposeConsole() AND the project disposes its children.
 
         // Print header
         printHeader(consoleView, agentName, modelName, workdir, command)
 
         // Build the toolbar: close button
-        val descriptor = createDescriptor(project, command, consoleView)
+        val descriptor = createDescriptor(project, toolCallId, command, consoleView)
 
         // Show in Run tool window under the "Run" executor
         val executor = DefaultRunExecutor.getRunExecutorInstance()
@@ -251,7 +258,8 @@ class CommandFollowManager(private val project: Project) : Disposable {
         // Evict oldest if over limit
         evictOldestIfNeeded()
 
-        logger.info { "[ACP] Follow Agent: command console opened for $toolCallId" }
+        val logCommand = if (command.length > 200) command.take(197) + "..." else command
+        logger.info { "[ACP] Follow Agent: command console opened for $toolCallId (cmd=$logCommand)" }
     }
 
     /**
@@ -283,7 +291,8 @@ class CommandFollowManager(private val project: Project) : Disposable {
             consoleView.print("Working directory: $workdir\n", ConsoleViewContentType.SYSTEM_OUTPUT)
         }
 
-        consoleView.print("$ $command\n", ConsoleViewContentType.USER_INPUT)
+        val headerCommand = if (command.length > 500) command.take(497) + "..." else command
+        consoleView.print("$ $headerCommand\n", ConsoleViewContentType.USER_INPUT)
         consoleView.print("─".repeat(60) + "\n", ConsoleViewContentType.SYSTEM_OUTPUT)
     }
 
@@ -295,6 +304,7 @@ class CommandFollowManager(private val project: Project) : Disposable {
      */
     private fun createDescriptor(
         project: Project,
+        toolCallId: String,
         command: String,
         consoleView: ConsoleView,
     ): RunContentDescriptor {
@@ -315,15 +325,21 @@ class CommandFollowManager(private val project: Project) : Disposable {
         val actionGroup = DefaultActionGroup()
 
         // We need the descriptor to construct CloseAction, but the descriptor
-        // wraps the panel that contains the close button. Use a var holder
-        // that the action reads at click-time (always initialized by then).
-        var descriptorRef: RunContentDescriptor? = null
+        // wraps the panel that contains the close button. Use a single-element
+        // array as a mutable reference holder that the action reads at click-time
+        // (always initialized by then). The array makes the mutable capture
+        // explicit, in contrast to a bare `var` captured by a closure.
+        val descriptorRef = arrayOfNulls<RunContentDescriptor>(1)
         actionGroup.add(object : com.intellij.openapi.actionSystem.AnAction(
             "Close", "Close this console tab", AllIcons.Actions.Close
         ) {
             override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent) {
-                val d = descriptorRef ?: return
+                val d = descriptorRef[0] ?: return
                 RunContentManager.getInstance(project).removeRunContent(executor, d)
+                // Sync the consoles map — without this, the map retains stale
+                // entries for user-closed tabs, causing evictOldestIfNeeded to
+                // try evicting already-closed tabs.
+                disposeConsole(toolCallId)
             }
         })
 
@@ -345,7 +361,7 @@ class CommandFollowManager(private val project: Project) : Disposable {
         ) {
             override fun isContentReuseProhibited(): Boolean = true
         }
-        descriptorRef = descriptor
+        descriptorRef[0] = descriptor
 
         return descriptor
     }
@@ -354,22 +370,27 @@ class CommandFollowManager(private val project: Project) : Disposable {
      * Evict the oldest console tab if the map exceeds [MAX_CONSOLE_TABS].
      * Disposes the console view and removes it from the Run tool window.
      *
-     * NOTE: This is a best-effort check-then-act — between reading `consoles.size`
-     * and calling `disposeConsole`, another thread could add or remove entries.
-     * The worst case is briefly having MAX_CONSOLE_TABS + 1 consoles, which
-     * self-corrects on the next eviction. This is acceptable for a UI convenience
-     * feature (the exact tab count is not a correctness invariant).
+     * The size check and eviction are wrapped in `synchronized(consoles)` to
+     * prevent two concurrent callers from picking the same oldest entry and
+     * both calling disposeConsole (the second would no-op via the atomic
+     * `consoles.remove`, but the synchronization avoids the wasted work and
+     * makes the size check consistent). The race is otherwise benign — the
+     * worst case without synchronization is briefly having
+     * MAX_CONSOLE_TABS + 1 consoles, which self-corrects on the next
+     * eviction — but the synchronized block keeps the count invariant tight.
      */
     private fun evictOldestIfNeeded() {
-        if (consoles.size <= MAX_CONSOLE_TABS) return
+        synchronized(consoles) {
+            if (consoles.size <= MAX_CONSOLE_TABS) return
 
-        // Find the oldest entry by createdAtMs
-        val oldest = consoles.entries
-            .minByOrNull { it.value.createdAtMs }
-            ?: return
+            // Find the oldest entry by createdAtMs
+            val oldest = consoles.entries
+                .minByOrNull { it.value.createdAtMs }
+                ?: return
 
-        logger.info { "[ACP] Follow Agent: evicting oldest console tab (toolCallId=${oldest.key})" }
-        disposeConsole(oldest.key)
+            logger.info { "[ACP] Follow Agent: evicting oldest console tab (toolCallId=${oldest.key})" }
+            disposeConsole(oldest.key)
+        }
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────
@@ -380,12 +401,27 @@ class CommandFollowManager(private val project: Project) : Disposable {
      * @param toolCallId The tool call identifier to remove.
      */
     fun disposeConsole(toolCallId: String) {
+        // remove() is atomic — if a concurrent CloseAction already removed this entry,
+        // we get null and return. This prevents double-dispose of the console view.
         val state = consoles.remove(toolCallId) ?: return
-        try {
-            val executor = DefaultRunExecutor.getRunExecutorInstance()
-            RunContentManager.getInstance(project).removeRunContent(executor, state.descriptor)
-        } catch (e: Exception) {
-            logger.debug(e) { "[ACP] Follow Agent: error removing run content for $toolCallId" }
+        // RunContentManager.removeRunContent must be called on EDT. When invoked
+        // from the CloseAction or evictOldestIfNeeded we're already on EDT; when
+        // invoked from dispose() (project closing) we may be on a non-EDT thread,
+        // so dispatch to EDT in that case. Disposer.dispose is safe from any thread
+        // and stays inline.
+        val app = ApplicationManager.getApplication()
+        val removeRunContent: () -> Unit = {
+            try {
+                val executor = DefaultRunExecutor.getRunExecutorInstance()
+                RunContentManager.getInstance(project).removeRunContent(executor, state.descriptor)
+            } catch (e: Exception) {
+                logger.debug(e) { "[ACP] Follow Agent: error removing run content for $toolCallId" }
+            }
+        }
+        if (app.isDispatchThread) {
+            removeRunContent()
+        } else {
+            app.invokeLater(removeRunContent, ModalityState.nonModal())
         }
         try {
             Disposer.dispose(state.consoleView)

@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -94,14 +95,11 @@ fun ModelPickerPanel(
     val grouped = remember(models, searchQuery, favoritesVersion) {
         buildModelGroups(models, settings, searchQuery)
     }
-    // Sync favoritesList whenever grouped.favorites changes (initial load, search
-    // filter, star toggle). Live swaps update favoritesList directly in onDragDelta
-    // for synchronous refresh (LaunchedEffect would lag by a frame and race with
-    // the next onDrag callback).
-    LaunchedEffect(grouped.favorites) {
-        favoritesList = grouped.favorites
+    // Cleanup stale favorites as a side effect when models change (kept out of
+    // the remember block above so buildModelGroups stays pure).
+    LaunchedEffect(models) {
+        settings.cleanupStaleFavorites(models)
     }
-
     // ── Drag-to-reorder state ──────────────────────────────────────────────
     // draggedIndex: index within grouped.favorites of the item being dragged (null when idle)
     // dragOffsetPx: accumulated vertical drag offset in pixels (used for live swap detection)
@@ -111,6 +109,23 @@ fun ModelPickerPanel(
     var dragOffsetPx by remember { mutableStateOf(0f) }
     var rowHeightPx by remember { mutableStateOf(32f * density.density) }
     val listState = rememberLazyListState()
+    // Sync favoritesList from grouped on every recomposition. Synchronous
+    // (not LaunchedEffect) so live swaps in onDragDelta are never overwritten
+    // by a stale grouped.favorites emission that lagged behind a settings write.
+    // Gate the write on idle (no active drag) so the live swap performed in
+    // onDragDelta is preserved during dragging; when drag ends (draggedIndex
+    // becomes null) the next recomposition syncs favoritesList back to
+    // grouped.favorites.
+    //
+    // Wrapped in SideEffect to move the state write out of the composition
+    // phase (Compose contract: composition should be side-effect-free). SideEffect
+    // runs after every successful composition, before the frame is committed.
+    SideEffect {
+        if (draggedIndex == null) {
+            favoritesList = grouped.favorites
+        }
+    }
+
 
     /** Called on each drag delta. Swaps the dragged item with its neighbor when
      *  the offset crosses a full row height past the current position. Only one
@@ -120,11 +135,10 @@ fun ModelPickerPanel(
      *  After a swap, favoritesList is updated synchronously so the next onDrag
      *  callback sees the new order immediately (no LaunchedEffect frame lag).
      *
-     *  SIDE EFFECT: Each swap calls settings.reorderFavoriteModel(), which writes
-     *  to the application-level OpenCodeSettingsState. PersistentStateComponent
-     *  doesn't write to disk on every field change (it flushes periodically), so
-     *  rapid drags don't cause excessive I/O — but the settings are mutated
-     *  immediately in memory. */
+     *  NOTE: Settings are NOT written here — per-swap writes to the
+     *  application-level PersistentStateComponent during an active pointer
+     *  gesture cause unnecessary settings churn (listener callbacks, potential
+     *  recompositions). The final order is persisted once in [endDrag]. */
     fun onDragDelta(deltaY: Float) {
         dragOffsetPx += deltaY
         val idx = draggedIndex ?: return
@@ -132,36 +146,22 @@ fun ModelPickerPanel(
         if (favs.isEmpty()) return
         // Swap up: offset is negative beyond one row height
         if (dragOffsetPx <= -rowHeightPx && idx > 0) {
-            val fromKey = "${favs[idx].providerID}/${favs[idx].modelID}"
-            val toKey = "${favs[idx - 1].providerID}/${favs[idx - 1].modelID}"
-            val fromPersisted = settings.favoriteModels.indexOf(fromKey)
-            val toPersisted = settings.favoriteModels.indexOf(toKey)
-            if (fromPersisted >= 0 && toPersisted >= 0) {
-                settings.reorderFavoriteModel(fromPersisted, toPersisted)
-                // Synchronously update the visible list so the next onDrag sees
-                // the new order. grouped will catch up on recomposition.
-                favoritesList = favs.toMutableList().apply {
-                    val tmp = this[idx]; this[idx] = this[idx - 1]; this[idx - 1] = tmp
-                }
-                favoritesVersion++
+            // Synchronously update the visible list so the next onDrag sees
+            // the new order. Settings persistence is deferred to endDrag().
+            favoritesList = favs.toMutableList().apply {
+                val tmp = this[idx]; this[idx] = this[idx - 1]; this[idx - 1] = tmp
             }
+            favoritesVersion++
             draggedIndex = idx - 1
             dragOffsetPx += rowHeightPx
             return
         }
         // Swap down: offset is positive beyond one row height
         if (dragOffsetPx >= rowHeightPx && idx < favs.size - 1) {
-            val fromKey = "${favs[idx].providerID}/${favs[idx].modelID}"
-            val toKey = "${favs[idx + 1].providerID}/${favs[idx + 1].modelID}"
-            val fromPersisted = settings.favoriteModels.indexOf(fromKey)
-            val toPersisted = settings.favoriteModels.indexOf(toKey)
-            if (fromPersisted >= 0 && toPersisted >= 0) {
-                settings.reorderFavoriteModel(fromPersisted, toPersisted)
-                favoritesList = favs.toMutableList().apply {
-                    val tmp = this[idx]; this[idx] = this[idx + 1]; this[idx + 1] = tmp
-                }
-                favoritesVersion++
+            favoritesList = favs.toMutableList().apply {
+                val tmp = this[idx]; this[idx] = this[idx + 1]; this[idx + 1] = tmp
             }
+            favoritesVersion++
             draggedIndex = idx + 1
             dragOffsetPx -= rowHeightPx
             return
@@ -174,6 +174,10 @@ fun ModelPickerPanel(
     }
 
     fun endDrag() {
+        // Persist the final favorites order to settings (single write on drag end).
+        val favs = favoritesList
+        val newOrder = favs.map { "${it.providerID}/${it.modelID}" }
+        settings.setFavoriteModelsOrder(newOrder)
         draggedIndex = null
         dragOffsetPx = 0f
     }
@@ -183,17 +187,32 @@ fun ModelPickerPanel(
         dragOffsetPx = 0f
     }
 
-    // Collapsible section state — providers collapsed by default when favorites exist
+    // Collapsible section state — providers collapsed by default when favorites exist.
+    // Persisted across model list updates: the remember has no key, so the map
+    // survives recomposition. New providers are seeded via LaunchedEffect below
+    // (NOT via getOrPut during composition — that would be a state write during
+    // the composition phase, violating the Compose contract).
     var favoritesExpanded by remember { mutableStateOf(true) }
     val providerExpanded = remember {
-        mutableStateOf(
-            grouped.providers.keys.associateWith { grouped.favorites.isEmpty() }.toMutableMap()
-        )
+        mutableStateOf(emptyMap<String, Boolean>().toMutableMap())
+    }
+    // Seed initial + new providers when the provider set changes. New providers
+    // default to expanded=true when there are no favorites, collapsed=false otherwise.
+    LaunchedEffect(grouped.providers.keys, grouped.favorites.isEmpty()) {
+        val defaults = grouped.favorites.isEmpty()
+        val newEntries = grouped.providers.keys.filter { it !in providerExpanded.value }
+        if (newEntries.isNotEmpty()) {
+            providerExpanded.value = providerExpanded.value.toMutableMap().apply {
+                newEntries.forEach { put(it, defaults) }
+            }
+        }
     }
 
     // Auto-focus search field
     LaunchedEffect(Unit) {
-        try { searchFocusRequester.requestFocus() } catch (_: Exception) {}
+        try { searchFocusRequester.requestFocus() } catch (e: Exception) {
+            dragLogger.debug(e) { "[ACP] Failed to focus search field" }
+        }
     }
 
     Column(
@@ -286,7 +305,7 @@ fun ModelPickerPanel(
 
             // Provider sections
             grouped.providers.forEach { (providerName, providerModels) ->
-                val isExpanded = providerExpanded.value.getOrPut(providerName) { true }
+                val isExpanded = providerExpanded.value[providerName] ?: true
                 item(key = "header_$providerName") {
                     SectionHeader(
                         title = providerName.uppercase(),
@@ -475,7 +494,7 @@ private fun ModelRow(
             Text(
                 text = model.modelID,
                 fontSize = ChatTheme.fonts.pickerModelName,
-                color = if (isSelected) Color.White else ChatTheme.colors.text.secondary,
+                color = if (isSelected) ChatTheme.colors.text.inverse else ChatTheme.colors.text.secondary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
@@ -594,8 +613,6 @@ private fun buildModelGroups(
 ): ModelGroups {
     if (models.isEmpty()) return ModelGroups(emptyList(), emptyMap())
 
-    settings.cleanupStaleFavorites(models)
-
     val filtered = if (searchQuery.isBlank()) models
     else models.filter { model ->
         model.modelID.contains(searchQuery, ignoreCase = true) ||
@@ -614,7 +631,10 @@ private fun buildModelGroups(
     val nonFavorites = filtered.filter { !settings.isFavoriteModel(it.providerID, it.modelID) }
 
     val providers = nonFavorites
-        .groupBy { it.displayName.substringBefore(" / ").trim() }
+        .groupBy {
+            val dn = it.displayName.substringBefore(" / ").trim()
+            if (dn.isEmpty() || dn == it.displayName) it.providerID.uppercase() else dn
+        }
         .toSortedMap(compareBy { it })
 
     return ModelGroups(favorites, providers)
@@ -645,12 +665,11 @@ private fun hasVisionCapability(model: ProviderModel): Boolean {
         id.startsWith("gpt-4o") ||
         id.startsWith("gpt-4.1") ||
         id.contains("gemini") ||
-        id.contains("claude-3") ||
+        id.contains("claude-3-opus") ||
+        id.contains("claude-3-sonnet") ||
         id.contains("claude-4") ||
         id.contains("qwen2.5-vl") ||
         id.contains("qwen-vl") ||
-        id.contains("kimi-k2.6") ||
-        id.contains("kimi-k2") ||
         name.contains("vision")
 }
 

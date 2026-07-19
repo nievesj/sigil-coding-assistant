@@ -386,11 +386,18 @@ private fun SessionList(
             initialized.value = true
             return@LaunchedEffect
         }
+        // Capture the OLD child map and update previousChildMap FIRST so that
+        // cancellation of this LaunchedEffect (when childSessionMap or
+        // streamingSessionIds changes mid-loop) cannot leave previousChildMap
+        // stale. The next launch reads the already-updated value, avoiding a
+        // TOCTOU race where a cancelled emission skips the trailing write.
+        val prevMap = previousChildMap.value
+        previousChildMap.value = childSessionMap
         val newChildParents = mutableSetOf<String>()
         childSessionMap.forEach { (parentId, children) ->
             val visibleChildren = children.filter { it.id !in hiddenChildIds }
             if (visibleChildren.isNotEmpty()) {
-                val prev = previousChildMap.value[parentId].orEmpty()
+                val prev = prevMap[parentId].orEmpty()
                 val prevVisible = prev.filter { it.id !in hiddenChildIds }
                 // Only expand when genuinely new children appeared (size grew)
                 if (visibleChildren.size > prevVisible.size) {
@@ -410,7 +417,6 @@ private fun SessionList(
                 expandedIds[parentId] = true
             }
         }
-        previousChildMap.value = childSessionMap
     }
 
     // Compute the capped set of child session IDs allowed to show a spinner.
@@ -422,10 +428,13 @@ private fun SessionList(
     val streamingChildIds = remember(streamingSessionIds, sessions, hiddenChildIds) {
         val childIds = sessions.filter { it.parentID != null && it.id !in hiddenChildIds }.map { it.id }.toSet()
         val streamingChildren = streamingSessionIds.filter { it in childIds }
+        // Precompute a session-by-id map so the sort comparator is O(1) lookup
+        // instead of O(m) linear scan per streaming child (avoids O(n*m)).
+        val sessionById = sessions.associateBy { it.id }
         // Prioritize by recency (updatedAt desc) so the most recently active
         // streaming children get spinners first when the cap is hit.
         streamingChildren
-            .sortedByDescending { id -> sessions.find { it.id == id }?.updatedAt ?: 0L }
+            .sortedByDescending { id -> sessionById[id]?.updatedAt ?: 0L }
             .take(com.opencode.acp.chat.model.ChatConstants.MAX_VISIBLE_CHILD_SPINNERS)
             .toSet()
     }
@@ -437,6 +446,7 @@ private fun SessionList(
     // For typical session trees (depth 2-3) this is effectively O(n). Deep subagent
     // chains (depth 10+) would degrade — if that becomes common, precompute a
     // parent-index map for O(1) ancestor lookup.
+    // Review note: O(n*depth) is acceptable for current usage (depth 2-3). If deep subagent chains (depth 10+) become common, precompute a depth→first-index map for O(1) ancestor lookup. No fix needed now.
     //
     // Use expandedIds.toMap() as the remember key. Map equality is structural
     // (compares entries, not identity), so remember recomputes only when the
@@ -695,7 +705,13 @@ private fun SessionRow(
                         modifier = Modifier.weight(1f),
                     )
                     // Archive button — shown for all sessions (including children and orphans)
-                    val archiveHoverBg = retrieveColorOrUnspecified("Component.errorFocusColor").copy(alpha = 0.12f)
+                    // Guard against unresolved theme key: retrieveColorOrUnspecified returns
+                    // Color.Unspecified when the key is missing, and .copy(alpha=...) on
+                    // Unspecified produces a near-transparent black smudge. Fall back to
+                    // ChatTheme.colors.text.error (a red-ish error color) before applying alpha.
+                    val errorColor = retrieveColorOrUnspecified("Component.errorFocusColor")
+                        .takeIf { it != Color.Unspecified } ?: ChatTheme.colors.text.error
+                    val archiveHoverBg = errorColor.copy(alpha = 0.12f)
                     Box(
                         modifier = Modifier
                             .size(24.dp)
@@ -711,7 +727,7 @@ private fun SessionRow(
                             tint = if (isHovered) {
                                 retrieveColorOrUnspecified("Component.errorFocusColor")
                             } else {
-                                retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.45f)
+                                (retrieveColorOrUnspecified("Panel.foreground").takeIf { it != Color.Unspecified } ?: ChatTheme.colors.component.inputText).copy(alpha = 0.45f)
                             },
                         )
                     }
@@ -795,7 +811,7 @@ private fun SessionRow(
  * The throttle FPS is configurable via Settings → Tools → Sigil → "Animation FPS".
  */
 @Composable
-private fun SessionSpinner(modifier: Modifier = Modifier, tint: Color = Color.Gray, active: Boolean = true) {
+private fun SessionSpinner(modifier: Modifier = Modifier, tint: Color = ChatTheme.colors.text.muted, active: Boolean = true) {
     val rotationState = rememberThrottledInfiniteAnimation(
         active = active,
         initialValue = 0f,
@@ -930,7 +946,7 @@ private fun SessionListFooter(
         Text(
             text = statusText,
             fontSize = 11.sp,
-            color = retrieveColorOrUnspecified("Panel.foreground").copy(alpha = 0.6f),
+            color = (retrieveColorOrUnspecified("Panel.foreground").takeIf { it != Color.Unspecified } ?: ChatTheme.colors.component.inputText).copy(alpha = 0.6f),
             modifier = Modifier.padding(bottom = 4.dp),
         )
 

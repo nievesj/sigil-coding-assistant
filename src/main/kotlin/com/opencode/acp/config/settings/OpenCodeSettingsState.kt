@@ -240,21 +240,6 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      */
     @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followAgentEnabled"))
     var followAgentEnabled: Boolean = false
-    /**
-     * When Follow Agent is enabled, also show agent-executed commands in a read-only
-     * console in the Run tool window. Default true — if the user opted into Follow Agent,
-     * they want to see command output too.
-     */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followCommandsInConsole"))
-    var followCommandsInConsole: Boolean = true
-
-    /**
-     * When Follow Agent is enabled, also open IntelliJ's native Find in Files when the
-     * agent performs a search. Default true — gives the user an interactive result set
-     * they can navigate, filter, and group.
-     */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followSearchesInFindWindow"))
-    var followSearchesInFindWindow: Boolean = true
     /** Highlight color for READ tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
     @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followReadColor"))
     var followReadColor: String = "#5078C888"
@@ -337,11 +322,12 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     @Suppress("DEPRECATION") // migrated fields retained for one release cycle
     private fun forwardToFollowSettings(state: OpenCodeSettingsState): Boolean {
         return try {
-            OpenCodeFollowSettingsState.getInstance().loadState(
+            // Use migrateFromLegacy (NOT loadState) so braveModeEnabled is preserved
+            // on the singleton. loadState would copy the fresh default (false) from
+            // the constructed state and silently disable Brave Mode on every restart.
+            OpenCodeFollowSettingsState.getInstance().migrateFromLegacy(
                 OpenCodeFollowSettingsState().apply {
                     followAgentEnabled = state.followAgentEnabled
-                    followCommandsInConsole = state.followCommandsInConsole
-                    followSearchesInFindWindow = state.followSearchesInFindWindow
                     followReadColor = state.followReadColor
                     followEditColor = state.followEditColor
                     followSearchColor = state.followSearchColor
@@ -412,7 +398,16 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         @Suppress("DEPRECATION")
         responseTimeoutSeconds = when {
             state.responseTimeoutSeconds != 300 -> state.responseTimeoutSeconds.coerceAtLeast(60)
-            state.sseSocketTimeoutSeconds != 60 -> state.sseSocketTimeoutSeconds.coerceAtLeast(60)
+            state.sseSocketTimeoutSeconds != 60 -> {
+                // Ambiguous case: responseTimeoutSeconds is at default (300) but sseSocketTimeoutSeconds
+                // was customized. Using the legacy value. Log a warning so the user can correct if needed.
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
+                    "[ACP] Migration: responseTimeoutSeconds was at default (300), using legacy sseSocketTimeoutSeconds=${state.sseSocketTimeoutSeconds} " +
+                    "(coerced to ${state.sseSocketTimeoutSeconds.coerceAtLeast(60)}). " +
+                    "If you explicitly set responseTimeoutSeconds to 300, please re-set it in Settings."
+                }
+                state.sseSocketTimeoutSeconds.coerceAtLeast(60)
+            }
             else -> 300
         }
         // NOTE: If the user explicitly set responseTimeoutSeconds to 300 (the default)
@@ -423,6 +418,9 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         toolStuckTimeoutSeconds = state.toolStuckTimeoutSeconds.coerceIn(60, 3600)
         // Clear deprecated field after migration to prevent it from being
         // re-persisted to XML on every IDE restart (reduces settings churn).
+        // NOTE: This is a one-way migration — downgrading to an older plugin version
+        // that still reads sseSocketTimeoutSeconds would get 0 (no timeout) instead of
+        // the original value. Downgrade is not supported after this migration.
         @Suppress("DEPRECATION")
         sseSocketTimeoutSeconds = 0
         autoConnect = state.autoConnect
@@ -450,7 +448,19 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
                 val parsed = kotlinx.serialization.json.Json.parseToJsonElement(state.additionalMcpServers)
                 // Validate structure: must be a JSON array (not an object or primitive)
                 if (parsed is kotlinx.serialization.json.JsonArray) {
-                    state.additionalMcpServers
+                    // Validate each element has required keys: name and url
+                    val allValid = parsed.all { element ->
+                        element is kotlinx.serialization.json.JsonObject &&
+                            element.containsKey("name") && element.containsKey("url")
+                    }
+                    if (allValid) {
+                        state.additionalMcpServers
+                    } else {
+                        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
+                            "[ACP] Invalid additionalMcpServers entry: each element must have 'name' and 'url' keys — clearing"
+                        }
+                        ""
+                    }
                 } else {
                     io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] Invalid additionalMcpServers in settings: expected JSON array, got ${parsed::class.simpleName} — clearing" }
                     ""
@@ -463,18 +473,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         toolPermissions = state.toolPermissions
         savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
         discoveredToolsJson = state.discoveredToolsJson
-        followAgentEnabled = state.followAgentEnabled
-        followCommandsInConsole = state.followCommandsInConsole
-        followReadColor = state.followReadColor
-        followEditColor = state.followEditColor
-        followSearchColor = state.followSearchColor
-        followExecuteColor = state.followExecuteColor
-        followDeleteColor = state.followDeleteColor
-        followMoveColor = state.followMoveColor
-        followFetchColor = state.followFetchColor
-        followOtherColor = state.followOtherColor
-        followSearchesInFindWindow = state.followSearchesInFindWindow
-        showDisconnectConfirmation = state.showDisconnectConfirmation
+       showDisconnectConfirmation = state.showDisconnectConfirmation
         // Context & Compaction settings (with clamping for corrupt/out-of-range values)
         truncateToolOutput = state.truncateToolOutput
         toolOutputCharLimit = state.toolOutputCharLimit.coerceIn(10_000, 200_000)
@@ -507,21 +506,127 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         // their own persistence and the old fields are stale — re-forwarding would
         // overwrite user edits made via the new configurables (data loss bug).
         // Per-class migration: only re-attempt the class that failed, not all three.
-        // This prevents overwriting user edits made via the new configurables between
-        // restarts when only one class's forwarding failed.
-        if (!state.mcpSettingsMigrated) {
-            state.mcpSettingsMigrated = forwardToMcpSettings(state)
+        //
+        // ROBUSTNESS: Also gate on the aggregate settingsMigratedToChildClasses flag,
+        // which IS persisted reliably. The per-class flags were added later but XStream
+        // does not always persist them — they default to false on load, causing the
+        // forwarder to re-run on every restart and overwrite the child state with stale
+        // legacy defaults. If the aggregate flag is true, ALL per-class forwards are
+        // skipped regardless of the per-class flag state.
+        //
+        // KNOWN LIMITATION: If the aggregate flag was never set (because one class's
+        // forwarding failed on the first run), the per-class flags are the only defense.
+        // Since XStream may not persist them reliably, there is a small window where
+        // forwarding re-runs and overwrites user edits. This is accepted as a one-time
+        // migration risk — once all three classes succeed once, the aggregate flag
+        // prevents all future re-forwarding.
+        val diskMarkers = readMigrationMarkers()
+        val aggregateMigrated = state.settingsMigratedToChildClasses
+        if (!state.mcpSettingsMigrated && !aggregateMigrated && "mcp" !in diskMarkers) {
+            mcpSettingsMigrated = forwardToMcpSettings(state)
+            if (mcpSettingsMigrated) writeMigrationMarker("mcp")
+        } else {
+            mcpSettingsMigrated = true
         }
-        if (!state.followSettingsMigrated) {
-            state.followSettingsMigrated = forwardToFollowSettings(state)
+        // Clear deprecated MCP fields after successful migration to prevent
+        // re-persistence to opencode-settings.xml. Same pattern as the Follow
+        // Agent field clearing below (L552-570). The values now live in
+        // OpenCodeMcpSettingsState. Only clear if forwarding SUCCEEDED — if it
+        // failed (mcpSettingsMigrated is false), keep the legacy values so they
+        // can be re-forwarded on the next restart.
+        if (mcpSettingsMigrated) {
+            @Suppress("DEPRECATION")
+            enableIntellijMcp = false
+            @Suppress("DEPRECATION")
+            mcpServerUrl = ""
+            @Suppress("DEPRECATION")
+            additionalMcpServers = ""
+            @Suppress("DEPRECATION")
+            toolPermissions = ""
+            @Suppress("DEPRECATION")
+            savedToolPermissionsBeforeDisable = ""
+            @Suppress("DEPRECATION")
+            discoveredToolsJson = ""
         }
-        if (!state.contextSettingsMigrated) {
-            state.contextSettingsMigrated = forwardToContextSettings(state)
+        if (!state.followSettingsMigrated && !aggregateMigrated && "follow" !in diskMarkers) {
+            followSettingsMigrated = forwardToFollowSettings(state)
+            if (followSettingsMigrated) writeMigrationMarker("follow")
+        } else {
+            followSettingsMigrated = true
+        }
+        if (!state.contextSettingsMigrated && !aggregateMigrated && "context" !in diskMarkers) {
+            contextSettingsMigrated = forwardToContextSettings(state)
+            if (contextSettingsMigrated) writeMigrationMarker("context")
+        } else {
+            contextSettingsMigrated = true
         }
         // Set the aggregate flag for backward compatibility (old code checks this).
-        settingsMigratedToChildClasses = state.mcpSettingsMigrated && state.followSettingsMigrated && state.contextSettingsMigrated
+        settingsMigratedToChildClasses = mcpSettingsMigrated && followSettingsMigrated && contextSettingsMigrated
+         // Clear deprecated Follow Agent fields after migration to prevent re-persistence
+         // to opencode-settings.xml. Same pattern as sseSocketTimeoutSeconds (line 410).
+         // The values now live in OpenCodeFollowSettingsState.
+        // NOTE: The legacy values were forwarded via the `state` parameter above
+        // (forwardToFollowSettings reads from `state`, not from `this`), so clearing
+        // `this` here does not lose data — it only prevents the deprecated fields from
+        // being re-persisted to XML on the next state flush.
+        // Only clear deprecated Follow Agent fields if forwarding SUCCEEDED.
+        // If forwarding failed (followSettingsMigrated is false), we must keep
+        // the legacy values so they can be re-forwarded on the next restart.
+        // Clearing them on failure would permanently lose the user's settings
+        // because getState() returns `this` and the cleared values would be persisted.
+        if (followSettingsMigrated) {
+            @Suppress("DEPRECATION")
+            followAgentEnabled = false
+            @Suppress("DEPRECATION")
+            followReadColor = ""
+            @Suppress("DEPRECATION")
+            followEditColor = ""
+            @Suppress("DEPRECATION")
+            followSearchColor = ""
+            @Suppress("DEPRECATION")
+            followExecuteColor = ""
+            @Suppress("DEPRECATION")
+            followDeleteColor = ""
+            @Suppress("DEPRECATION")
+            followMoveColor = ""
+            @Suppress("DEPRECATION")
+            followFetchColor = ""
+            @Suppress("DEPRECATION")
+            followOtherColor = ""
+        }
         if (!settingsMigratedToChildClasses) {
             io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] One or more settings forwardings failed; per-class flags set — failed classes will retry on next restart" }
+        }
+    }
+
+    /**
+     * Plain-text migration marker file — does NOT depend on XStream serialization,
+     * so it persists reliably even when XStream drops the per-class boolean flags.
+     * Located in the IDE config dir (same as opencode-settings.xml).
+     */
+    private fun migrationMarkerFile(): java.io.File {
+        val configDir = java.io.File(System.getProperty("idea.config.path", System.getProperty("user.home") + "/.intellij"))
+        return java.io.File(configDir, "opencode-migration-markers.txt")
+    }
+
+    private fun readMigrationMarkers(): Set<String> {
+        val file = migrationMarkerFile()
+        if (!file.exists()) return emptySet()
+        return try {
+            file.readLines().filter { it.isNotBlank() }.toSet()
+        } catch (_: Exception) { emptySet() }
+    }
+
+    private fun writeMigrationMarker(className: String) {
+        try {
+            val file = migrationMarkerFile()
+            file.parentFile?.mkdirs()
+            val existing = readMigrationMarkers()
+            if (className !in existing) {
+                file.writeText((existing + className).joinToString("\n"))
+            }
+        } catch (e: Exception) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] Failed to write migration marker for $className" }
         }
     }
 
@@ -578,5 +683,25 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         val fromIndex = favoriteModels.indexOf(key)
         if (fromIndex < 0) return
         reorderFavoriteModel(fromIndex, toIndex)
+    }
+
+    /**
+     * Replace [favoriteModels] with the given order, preserving only entries that
+     * are already in [favoriteModels] (i.e. reorder, not replace). Entries in
+     * [newOrder] that are not currently favorites are dropped; current favorites
+     * not present in [newOrder] retain their relative position at the end.
+     *
+     * Used by the model picker drag-to-reorder path to persist the final order
+     * in a single write on drag end (instead of per-swap writes during drag).
+     */
+    fun setFavoriteModelsOrder(newOrder: List<String>) {
+        val current = favoriteModels.toSet()
+        val reordered = newOrder.filter { it in current }
+        // Append any current favorites missing from newOrder (preserves them).
+        val missing = favoriteModels.filter { it !in reordered }
+        val result = java.util.ArrayList<String>(reordered.size + missing.size)
+        result.addAll(reordered)
+        result.addAll(missing)
+        favoriteModels = result
     }
 }

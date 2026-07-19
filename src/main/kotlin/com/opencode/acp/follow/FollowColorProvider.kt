@@ -18,6 +18,8 @@ import kotlinx.serialization.json.jsonPrimitive
  */
 object FollowColorProvider {
 
+    private val logger = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+
     /** Configuration for a single ToolKind's follow-agent behavior. */
     data class ColorConfig(
         val defaultColorHex: String,
@@ -70,14 +72,27 @@ object FollowColorProvider {
         ),
     )
 
+    /**
+     * Cache of parsed color per ToolKind, keyed by the hex string last seen.
+     * Avoids re-parsing the same hex on every call (hot path during streaming).
+     * Invalidated automatically when the hex string changes in settings.
+     */
+    private val colorCache = java.util.concurrent.ConcurrentHashMap<ToolKind, Pair<String, java.awt.Color?>>()
+
     fun getColor(kind: ToolKind): java.awt.Color? {
         val config = colorConfigs[kind] ?: return null
         val hex = config.settingsReader(OpenCodeFollowSettingsState.getInstance())
+        // Cache hit: same hex as last time → reuse parsed color.
+        colorCache[kind]?.let { (cachedHex, cachedColor) ->
+            if (cachedHex == hex) return cachedColor
+        }
         // parseColorOrDefault returns null on bad input (which we treat as
         // "color disabled" — caller skips the highlight). The persisted
         // default hex is always valid; the only way to get here with bad
         // input is a user typo in the settings panel.
-        return parseColorOrDefault(hex)
+        val color = parseColorOrDefault(hex)
+        colorCache[kind] = hex to color
+        return color
     }
 
     fun getInlayLabel(kind: ToolKind): String? {
@@ -110,56 +125,79 @@ object FollowColorProvider {
             else -> return getInlayLabel(kind) ?: ""
         }
 
-        // Build context suffix from input
-        val context = when (kind) {
-            ToolKind.READ, ToolKind.EDIT -> {
-                val path = input?.getString("filePath")
-                    ?: input?.getString("file_path")
-                    ?: input?.getString("path")
-                val fileName = path?.substringAfterLast('/')?.substringAfterLast('\\')
-                val startLine = input?.get("startLine")?.jsonPrimitive?.intOrNull
-                val endLine = input?.get("endLine")?.jsonPrimitive?.intOrNull
-                // For edits, compute delta
-                val delta = if (kind == ToolKind.EDIT) computeEditDelta(input) else null
-                buildString {
-                    if (fileName != null) append(fileName)
-                    if (startLine != null && endLine != null && startLine > 0) {
-                        append(" L$startLine-$endLine")
-                    }
-                    if (delta != null) append(" $delta")
-                }.takeIf { it.isNotEmpty() }
-            }
-            ToolKind.SEARCH -> {
-                val query = input?.getString("pattern") ?: input?.getString("query")
-                query?.let { "\"${it.take(40)}\"" }
-            }
-            ToolKind.EXECUTE -> {
-                val command = input?.getString("command")?.take(40)
-                command?.let { "`$it`" }
-            }
-            else -> null
-        }
+       // Build context suffix from input
+       val context = when (kind) {
+           ToolKind.READ, ToolKind.EDIT -> {
+               val path = input?.getString("file_path")
+                   ?: input?.getString("filePath")
+                   ?: input?.getString("path")
+               val fileName = path?.substringAfterLast('/')?.substringAfterLast('\\')
+                // Read line range using the same keys as FollowAgentDispatcher.extractLineRange:
+                // start_line/end_line (snake_case) or offset+limit (read tool).
+                // Match FollowAgentDispatcher.extractLineRange key priority: offset first, then start_line
+                val startLine = input?.get("offset")?.jsonPrimitive?.intOrNull?.let { it + 1 }
+                    ?: input?.get("start_line")?.jsonPrimitive?.intOrNull?.let { if (it == 0) 1 else it }
+                    ?: input?.get("startLine")?.jsonPrimitive?.intOrNull?.let { if (it == 0) 1 else it }
+                val endLine = (input?.get("offset")?.jsonPrimitive?.intOrNull?.let { offset ->
+                    val limit = input?.get("limit")?.jsonPrimitive?.intOrNull ?: 0
+                    if (limit > 0) (offset + 1) + limit - 1 else null
+                }) ?: input?.get("end_line")?.jsonPrimitive?.intOrNull?.let { if (it == 0) 1 else it }
+                    ?: input?.get("endLine")?.jsonPrimitive?.intOrNull?.let { if (it == 0) 1 else it }
+               // For edits, compute delta
+               val delta = if (kind == ToolKind.EDIT) computeEditDelta(input) else null
+               buildString {
+                   if (fileName != null) append(fileName)
+                   if (startLine != null && endLine != null && startLine > 0) {
+                       append(" L$startLine-$endLine")
+                   }
+                   if (delta != null) append(" $delta")
+               }.takeIf { it.isNotEmpty() }
+           }
+           ToolKind.SEARCH -> {
+               val query = input?.getString("pattern") ?: input?.getString("query")
+               query?.let { "\"${it.take(40)}\"" }
+           }
+           ToolKind.EXECUTE -> {
+               val command = input?.getString("command")?.take(40)
+               command?.let { "`$it`" }
+           }
+           else -> null
+       }
 
-        // Build duration suffix
-        val duration = if (startTimeMs != null && kind != ToolKind.EXECUTE) {
-            val elapsed = (currentTimeMs - startTimeMs) / 1000.0
-            if (elapsed >= 0.1) "(%.1fs)".format(elapsed) else null
-        } else null
+       // Extract a reason/description from the tool input when the agent
+       // provided one. The OpenCode protocol only includes `description` for
+       // EXECUTE tools, but some agents/tools include it for READ/EDIT too.
+       // When present, it is shown as a quoted suffix after the context.
+       val reason = input?.getString("description")?.takeIf { it.isNotBlank() }
 
-        // Compose: "Agent · Action" or "Agent · Action context" or "Agent · Action (0.3s)"
-        val who = agentName ?: "Agent"
-        val model = modelName?.let { " · $it" } ?: ""
-        return buildString {
-            append(who)
-            append(model)
-            append(" · ")
-            append(action)
-            if (context != null) append(" $context")
-            if (duration != null) append(" $duration")
-        }
+       // Build duration suffix
+       // EXECUTE duration is omitted here because long-running commands are shown
+       // in the Run console with their own completion footer (see CommandFollowManager).
+       // The inlay label is transient (5s) and would show a misleading 0.0s for
+       // commands that are still running.
+       val duration = if (startTimeMs != null && kind != ToolKind.EXECUTE) {
+           val elapsed = (currentTimeMs - startTimeMs) / 1000.0
+           if (elapsed >= 0.1) "(%.1fs)".format(elapsed) else null
+       } else null
+
+       // Compose: "Agent · Action" or "Agent · Action context" or "Agent · Action (0.3s)"
+       val who = agentName ?: "Agent"
+       val model = modelName?.let { " · $it" } ?: ""
+       return buildString {
+           append(who)
+           append(model)
+           append(" · ")
+           append(action)
+           if (context != null) append(" $context")
+           if (reason != null) append(" — \"${reason.take(80)}\"")
+           if (duration != null) append(" $duration")
+       }
     }
 
-    /** Extract edit delta string like "(+12 -3 lines)" from tool input. */
+    /** Extract edit delta string like "(+12 -3 lines)" from tool input.
+     *  Uses multiset counting to handle duplicate lines correctly: a set-difference
+     *  would treat 3 identical lines as 1, miscounting additions/deletions when
+     *  the same line appears multiple times in old or new content. */
     private fun computeEditDelta(input: JsonObject?): String? {
         if (input == null) return null
         val oldString = input.getString("oldString")
@@ -168,10 +206,8 @@ object FollowColorProvider {
         val newString = input.getString("newString")
             ?: input.getString("new_string")
             ?: input.getString("new")
-        return if (oldString != null && newString != null) {
-            val additions = newString.lines().size
-            val deletions = oldString.lines().size
-            "(+${additions} -${deletions} lines)"
+        return if (oldString != null || newString != null) {
+            LineDeltaUtils.formatDelta(oldString, newString)
         } else {
             val content = input.getString("content")
             if (content != null) "(+${content.lines().size} lines)" else null
@@ -181,7 +217,8 @@ object FollowColorProvider {
     private fun JsonObject.getString(key: String): String? {
         return try {
             this[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            logger.debug(e) { "[ACP] FollowColorProvider: failed to read string for key '$key'" }
             null
         }
     }
@@ -205,10 +242,8 @@ object FollowColorProvider {
  * crash. This is the only failure mode the user can trigger by typing in the
  * settings panel.
  *
- * Alpha handling: 6-digit hex defaults to 0x55 (≈33% opacity) so that ad-hoc
- * 6-digit values render correctly. 8-digit hex uses the explicit alpha from
- * the string. The persisted defaults are all 8-digit with explicit alpha
- * (e.g. `#5078C855`); 0x55 was chosen because it matches the convention.
+ * Alpha handling: 6-digit hex defaults to 0xFF (fully opaque). 8-digit hex uses
+ * the explicit alpha from the string.
  */
 internal fun parseColorOrDefault(hex: String?): java.awt.Color? {
     if (hex.isNullOrBlank()) return null
@@ -218,14 +253,9 @@ internal fun parseColorOrDefault(hex: String?): java.awt.Color? {
         val r = h.substring(0, 2).toInt(16)
         val g = h.substring(2, 4).toInt(16)
         val b = h.substring(4, 6).toInt(16)
-        val a = if (h.length >= 8) h.substring(6, 8).toInt(16) else 0x55
+        val a = if (h.length >= 8) h.substring(6, 8).toInt(16) else 0xFF
         java.awt.Color(r, g, b, a)
     } catch (_: NumberFormatException) {
         null
     }
 }
-
-/** Backwards-compatible alias — kept because older callers used the throwing name. */
-internal fun parseColor(hex: String): java.awt.Color =
-    parseColorOrDefault(hex)
-        ?: throw IllegalArgumentException("Invalid hex color: $hex")

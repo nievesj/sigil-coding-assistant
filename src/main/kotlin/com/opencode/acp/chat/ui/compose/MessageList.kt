@@ -290,7 +290,7 @@ fun MessageList(
     // 3. Streaming growth (messages.size unchanged, content grew in-place):
     //    instant scrollToItem (no animation — the content growth IS the motion;
     //    animating creates a feedback loop where the animation fights content growth)
-    LaunchedEffect(scrollRequest) {
+    LaunchedEffect(scrollRequest, messages.size, queuedMessages.size) {
         if (!autoScrollEnabled) return@LaunchedEffect
         val totalItems = messages.size + queuedMessages.size + if (queuedMessages.isNotEmpty() && messages.isNotEmpty()) 1 else 0
         if (totalItems <= 0) return@LaunchedEffect
@@ -455,7 +455,7 @@ fun MessageList(
         // Bright when scrolled up (actionable), dimmed when already at bottom.
         if (messages.isNotEmpty()) {
             val buttonBg = if (isAtBottom) ChatTheme.colors.text.muted.copy(alpha = 0.3f) else ChatTheme.colors.accent.blue
-            val iconTint = if (isAtBottom) ChatTheme.colors.text.muted.copy(alpha = 0.6f) else Color.White
+            val iconTint = if (isAtBottom) ChatTheme.colors.text.muted.copy(alpha = 0.6f) else ChatTheme.colors.text.inverse
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
@@ -534,12 +534,14 @@ fun UserMessage(message: ChatMessage, onImagePreview: ((String) -> Unit)? = null
                         LaunchedEffect(file.path) {
                             // decodeFileToBitmap already returns null for missing/unreadable/corrupt
                             // files (see ImageUtils.kt), but wrap in try-catch as a defense-in-depth
-                            // measure so a pathological failure (e.g., Error from the image decoder)
+                            // measure so a pathological failure (e.g., Exception from the image decoder)
                             // can never crash the composition. file.path may point to a deleted or
                             // moved file when reconstructed from command history — graceful null is
                             // the correct behavior; the image simply won't render.
+                            // NOTE: catch Exception (not Throwable) per AGENTS.md policy — do not
+                            // swallow OutOfMemoryError / StackOverflowError; let Error propagate.
                             bitmap = withContext(Dispatchers.IO) {
-                                try { decodeFileToBitmap(file.path) } catch (_: Throwable) { null }
+                                try { decodeFileToBitmap(file.path) } catch (_: Exception) { null }
                             }
                         }
                         bitmap?.let { bm ->
@@ -605,7 +607,12 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
      // order projects were opened in the IDE, which may vary across sessions/restarts.
      val currentProject = project ?: remember {
          com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+             ?.takeIf { !it.isDisposed }
      }
+     // NOTE: settings.state is a plain snapshot, not a State<T>. Color changes in
+     // Settings → Tools → Sigil will not propagate to already-rendered messages
+     // until an unrelated recomposition occurs. This is acceptable for color
+     // settings (rarely changed; a session switch or new message forces a refresh).
      val settings = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().state
      val defaultGreen = ChatTheme.colors.accent.green
      val inlineCodeColor = parseColorOrDefault(settings.inlineCodeColor, defaultGreen)
@@ -653,7 +660,7 @@ fun AssistantMessage(message: ChatMessage, project: Project? = null, getStreamin
      }
      val markdownProcessor = remember { MarkdownProcessor() }
      val codeHighlighter = remember(currentProject) {
-         currentProject?.let {
+         currentProject?.takeIf { !it.isDisposed }?.let {
              try { org.jetbrains.jewel.bridge.code.highlighting.CodeHighlighterFactory.getInstance(it).createHighlighter() }
              catch (_: Exception) { NoOpCodeHighlighter }
          } ?: NoOpCodeHighlighter
@@ -982,6 +989,10 @@ private fun FileChangeCard(
             // could emit filePath = "../../etc/passwd". Validate that the resolved
             // canonical path stays within the project basePath before resolving via
             // LocalFileSystem — prevents opening arbitrary system files in the editor.
+            // NOTE: The real protection here is path-join semantics —
+            // "$basePath/${change.filePath}" always produces a path under basePath, so
+            // absolute paths in change.filePath become relative subpaths. The
+            // startsWith check is a defense-in-depth backstop.
             try {
                 val absPath = "$basePath/${change.filePath}".replace('/', java.io.File.separatorChar)
                 val canonicalBase = java.io.File(basePath).canonicalPath
@@ -1187,26 +1198,59 @@ private fun openUrlSafely(url: String, project: Project? = null) {
                 logger.warn { "[ACP] Blocked URL with no host from markdown: ${trimmed.take(100)}" }
                 return
             }
-            // String-based internal-host detection — avoids DNS resolution (SSRF vector
-            // that leaks the user's IP to attacker-controlled DNS servers). Catches
-            // common loopback/link-local representations. Unknown hosts are allowed
-            // (they're external; BrowserUtil opens them in the system browser).
-            val isInternal = host == "127.0.0.1" ||
-                host == "localhost" ||
-                host == "::1" ||
-                host == "0.0.0.0" ||
-                host.startsWith("127.") ||
-                host.startsWith("169.254.") ||
-                host.startsWith("0:0:0:0:0:0:0:") ||  // ::1 variants
-                host.startsWith("::ffff:127.")  // IPv4-mapped IPv6 loopback
-            if (isInternal) {
-                // Allow only if it matches the configured OpenCode server port.
+            // String-based internal-host detection — fast path that catches common
+            // loopback/link-local/private representations without DNS resolution.
+            // Lowercased to catch mixed-case variants (e.g. LOCALHOST).
+            val hostLower = host.lowercase()
+            // Gate IP-range prefix checks on the host being a pure IPv4 address
+            // (four dot-separated numeric octets). Without this, public DNS names
+            // like "172.16.0.1.evil.com" or "10.prod.mycompany.com" would be
+            // falsely flagged as internal, blocking legitimate links.
+            val isPureIpv4 = hostLower.matches(Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+$"))
+            val isInternal = hostLower == "127.0.0.1" || hostLower == "localhost" || hostLower == "localhost." ||
+                hostLower == "::1" || hostLower == "0.0.0.0" ||
+                (isPureIpv4 && (
+                    hostLower.startsWith("127.") || hostLower.startsWith("169.254.") ||
+                    hostLower.startsWith("10.") || hostLower.startsWith("192.168.") ||
+                    (hostLower.startsWith("172.") && hostLower.substringAfter("172.").let { seg ->
+                        seg.isNotEmpty() && seg.substringBefore(".").toIntOrNull()?.let { it in 16..31 } == true
+                    })
+                )) ||
+                hostLower.startsWith("0:0:0:0:0:0:0:") || hostLower.startsWith("::ffff:127.") ||
+                hostLower.startsWith("::ffff:")
+            // Fallback: resolve host to catch hex/decimal/octal IP encodings and IPv6
+            // loopback variants that bypass the string-prefix checks above. The
+            // resolution is acceptable here because BrowserUtil will resolve the same
+            // host anyway — no additional DNS leak beyond what the browser would do.
+            //
+            // KNOWN LIMITATION (best-effort SSRF mitigation, not a complete defense):
+            // - DNS rebinding TOCTOU: InetAddress.getByName resolves at check time,
+            //   but BrowserUtil.open may resolve again to a DIFFERENT IP. An attacker
+            //   controlling DNS could return a public IP during the check and 127.0.0.1
+            //   when the browser resolves it. This is partially mitigated by the
+            //   string-based fast path above, but for hosts that bypass the string
+            //   check (e.g., decimal-encoded IPs that Java doesn't parse as IPs),
+            //   the rebinding window is real.
+            // - Coverage: does not check isMCSiteLocal() (deprecated 239.x ranges).
+            //   Cloud-metadata endpoints (169.254.169.254) are covered by both the
+            //   string path (startsWith("169.254.")) and the DNS path
+            //   (isLinkLocalAddress()).
+            // LLM-generated markdown links are treated as untrusted but not sandboxed.
+            val isInternalResolved = !isInternal && try {
+                val addr = java.net.InetAddress.getByName(host)
+                addr.isLoopbackAddress() || addr.isSiteLocalAddress() ||
+                    addr.isLinkLocalAddress() || addr.isAnyLocalAddress()
+            } catch (_: Exception) { false }
+            if (isInternal || isInternalResolved == true) {
+                // Allow only if it matches the configured OpenCode server port AND the
+                // path is a safe read-only endpoint (/doc OpenAPI spec, or root).
                 // Compare the port numerically (not via string prefix) to avoid
                 // bypasses like http://127.0.0.1:40960/ matching :4096.
                 val serverPort = com.opencode.acp.config.settings.OpenCodeSettingsState.getInstance().port
                 val parsedPort = parsed.port
                 val portMatches = parsedPort != -1 && parsedPort == serverPort
-                if (!portMatches) {
+                val pathIsSafe = parsed.path == "/doc" || parsed.path == "/" || parsed.path.isEmpty()
+                if (!portMatches || !pathIsSafe) {
                     logger.warn { "[ACP] Blocked internal URL from markdown: ${trimmed.take(100)}" }
                     return
                 }
@@ -1234,6 +1278,10 @@ private fun openFileReference(url: String, project: Project?) {
     }
     if (project == null) {
         logger.warn { "[ACP] Cannot open file reference without project context: ${ref.path}" }
+        return
+    }
+    if (ref.path.isBlank()) {
+        logger.warn { "[ACP] Cannot open file reference — path is blank: ${url.take(100)}" }
         return
     }
     // Defense-in-depth: validate the resolved path is within the project boundary
@@ -1356,7 +1404,7 @@ private fun QueuedMessageBubble(
                     if (file.mime.startsWith("image/")) {
                         var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
                         LaunchedEffect(file.path) {
-                            bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
+                            bitmap = withContext(Dispatchers.IO) { try { decodeFileToBitmap(file.path) } catch (_: Exception) { null } }
                         }
                         bitmap?.let { bm ->
                             Box(
