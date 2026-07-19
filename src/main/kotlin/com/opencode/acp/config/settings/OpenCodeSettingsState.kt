@@ -402,7 +402,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
                 // Ambiguous case: responseTimeoutSeconds is at default (300) but sseSocketTimeoutSeconds
                 // was customized. Using the legacy value. Log a warning so the user can correct if needed.
                 io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
-                    "[ACP] Migration: responseTimeoutSeconds was at default (300), using legacy sseSocketTimeoutSeconds=${state.sseSocketTimeoutSeconds}. " +
+                    "[ACP] Migration: responseTimeoutSeconds was at default (300), using legacy sseSocketTimeoutSeconds=${state.sseSocketTimeoutSeconds} " +
+                    "(coerced to ${state.sseSocketTimeoutSeconds.coerceAtLeast(60)}). " +
                     "If you explicitly set responseTimeoutSeconds to 300, please re-set it in Settings."
                 }
                 state.sseSocketTimeoutSeconds.coerceAtLeast(60)
@@ -519,22 +520,46 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         // forwarding re-runs and overwrites user edits. This is accepted as a one-time
         // migration risk — once all three classes succeed once, the aggregate flag
         // prevents all future re-forwarding.
+        val diskMarkers = readMigrationMarkers()
         val aggregateMigrated = state.settingsMigratedToChildClasses
-       if (!state.mcpSettingsMigrated && !aggregateMigrated) {
-           mcpSettingsMigrated = forwardToMcpSettings(state)
-       } else {
-           mcpSettingsMigrated = state.mcpSettingsMigrated
-       }
-       if (!state.followSettingsMigrated && !aggregateMigrated) {
-           followSettingsMigrated = forwardToFollowSettings(state)
-       } else {
-           followSettingsMigrated = state.followSettingsMigrated
-       }
-       if (!state.contextSettingsMigrated && !aggregateMigrated) {
-           contextSettingsMigrated = forwardToContextSettings(state)
-       } else {
-           contextSettingsMigrated = state.contextSettingsMigrated
-       }
+        if (!state.mcpSettingsMigrated && !aggregateMigrated && "mcp" !in diskMarkers) {
+            mcpSettingsMigrated = forwardToMcpSettings(state)
+            if (mcpSettingsMigrated) writeMigrationMarker("mcp")
+        } else {
+            mcpSettingsMigrated = true
+        }
+        // Clear deprecated MCP fields after successful migration to prevent
+        // re-persistence to opencode-settings.xml. Same pattern as the Follow
+        // Agent field clearing below (L552-570). The values now live in
+        // OpenCodeMcpSettingsState. Only clear if forwarding SUCCEEDED — if it
+        // failed (mcpSettingsMigrated is false), keep the legacy values so they
+        // can be re-forwarded on the next restart.
+        if (mcpSettingsMigrated) {
+            @Suppress("DEPRECATION")
+            enableIntellijMcp = false
+            @Suppress("DEPRECATION")
+            mcpServerUrl = ""
+            @Suppress("DEPRECATION")
+            additionalMcpServers = ""
+            @Suppress("DEPRECATION")
+            toolPermissions = ""
+            @Suppress("DEPRECATION")
+            savedToolPermissionsBeforeDisable = ""
+            @Suppress("DEPRECATION")
+            discoveredToolsJson = ""
+        }
+        if (!state.followSettingsMigrated && !aggregateMigrated && "follow" !in diskMarkers) {
+            followSettingsMigrated = forwardToFollowSettings(state)
+            if (followSettingsMigrated) writeMigrationMarker("follow")
+        } else {
+            followSettingsMigrated = true
+        }
+        if (!state.contextSettingsMigrated && !aggregateMigrated && "context" !in diskMarkers) {
+            contextSettingsMigrated = forwardToContextSettings(state)
+            if (contextSettingsMigrated) writeMigrationMarker("context")
+        } else {
+            contextSettingsMigrated = true
+        }
         // Set the aggregate flag for backward compatibility (old code checks this).
         settingsMigratedToChildClasses = mcpSettingsMigrated && followSettingsMigrated && contextSettingsMigrated
          // Clear deprecated Follow Agent fields after migration to prevent re-persistence
@@ -571,6 +596,37 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         }
         if (!settingsMigratedToChildClasses) {
             io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] One or more settings forwardings failed; per-class flags set — failed classes will retry on next restart" }
+        }
+    }
+
+    /**
+     * Plain-text migration marker file — does NOT depend on XStream serialization,
+     * so it persists reliably even when XStream drops the per-class boolean flags.
+     * Located in the IDE config dir (same as opencode-settings.xml).
+     */
+    private fun migrationMarkerFile(): java.io.File {
+        val configDir = java.io.File(System.getProperty("idea.config.path", System.getProperty("user.home") + "/.intellij"))
+        return java.io.File(configDir, "opencode-migration-markers.txt")
+    }
+
+    private fun readMigrationMarkers(): Set<String> {
+        val file = migrationMarkerFile()
+        if (!file.exists()) return emptySet()
+        return try {
+            file.readLines().filter { it.isNotBlank() }.toSet()
+        } catch (_: Exception) { emptySet() }
+    }
+
+    private fun writeMigrationMarker(className: String) {
+        try {
+            val file = migrationMarkerFile()
+            file.parentFile?.mkdirs()
+            val existing = readMigrationMarkers()
+            if (className !in existing) {
+                file.writeText((existing + className).joinToString("\n"))
+            }
+        } catch (e: Exception) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] Failed to write migration marker for $className" }
         }
     }
 
@@ -627,5 +683,25 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         val fromIndex = favoriteModels.indexOf(key)
         if (fromIndex < 0) return
         reorderFavoriteModel(fromIndex, toIndex)
+    }
+
+    /**
+     * Replace [favoriteModels] with the given order, preserving only entries that
+     * are already in [favoriteModels] (i.e. reorder, not replace). Entries in
+     * [newOrder] that are not currently favorites are dropped; current favorites
+     * not present in [newOrder] retain their relative position at the end.
+     *
+     * Used by the model picker drag-to-reorder path to persist the final order
+     * in a single write on drag end (instead of per-swap writes during drag).
+     */
+    fun setFavoriteModelsOrder(newOrder: List<String>) {
+        val current = favoriteModels.toSet()
+        val reordered = newOrder.filter { it in current }
+        // Append any current favorites missing from newOrder (preserves them).
+        val missing = favoriteModels.filter { it !in reordered }
+        val result = java.util.ArrayList<String>(reordered.size + missing.size)
+        result.addAll(reordered)
+        result.addAll(missing)
+        favoriteModels = result
     }
 }

@@ -320,19 +320,13 @@ fun InputArea(
                                     null
                                 } else {
                                     val file = java.io.File(parsed)
-                                    // Validate path is within project or allowed attachment dirs
-                                    val canonicalPath = file.canonicalPath
+                                    // toAttachedFile copies external files into the allowed attachment dir.
+                                    // Post-condition: verify the returned AttachedFile.path is within
+                                    // allowed dirs after the copy. This guards against a copy failure
+                                    // silently returning the raw external path, which would bypass the
+                                    // attachment security boundary.
                                     val projectBase = project?.basePath?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
                                     val userHome = System.getProperty("user.home")?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
-                                    if (!com.opencode.acp.chat.util.AttachmentPathValidator.isAllowed(canonicalPath, projectBase, userHome)) {
-                                        // toAttachedFile will copy it into the allowed dir; if copy fails,
-                                        // the service guard will catch it. Log for visibility.
-                                        logger.debug { "[ACP] Drag-and-drop: file outside allowed dirs, will attempt copy: ${file.name}" }
-                                    }
-                                    // Post-condition: verify the returned AttachedFile.path is within
-                                    // allowed dirs after toAttachedFile (which copies external files in).
-                                    // This guards against a copy failure silently returning the raw external
-                                    // path, which would bypass the attachment security boundary.
                                     val attached = file.toAttachedFile(project)
                                     val isAllowed = attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
                                     if (isAllowed) attached else {
@@ -352,14 +346,10 @@ fun InputArea(
                         }
                     }
                     is DragData.Image -> {
-                        try {
-                            // DragData.Image.readImage() returns Painter (CMP 1.10),
-                            // so we fall through to the AWT transferable approach below.
-                            // Drag through to else branch for AWT image extraction.
-                            null
-                        } catch (_: Exception) {
-                            null
-                        }
+                        // DragData.Image.readImage() returns Painter (CMP 1.10), which we can't
+                        // convert to an AttachedFile. Fall through to the AWT transferable
+                        // fallback below, which handles image drops via DataFlavor.imageFlavor.
+                        null
                     }
                 }
 
@@ -451,16 +441,16 @@ fun InputArea(
     }
 
     // Collect text paste signals and insert into text field.
-    // The cursor position is read inside the collector, which runs on the
-    // Compose thread — so there is no stale read of the selection state.
+    // The cursor position is read INSIDE the edit block so the read and write
+    // are atomic within the edit — two rapid pastes in the same frame cannot
+    // interleave and insert at stale cursors.
     if (pasteTextSignal != null) {
         LaunchedEffect(pasteTextSignal) {
             pasteTextSignal.collect { text ->
-                val cursorPos = textState.selection.start
                 textState.edit {
+                    val cursorPos = selection.start
                     replace(cursorPos, cursorPos, text)
                 }
-
             }
         }
     }
@@ -737,7 +727,7 @@ fun InputArea(
                                 // Image thumbnail with click-to-preview
                                 var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
                                 LaunchedEffect(file.path) {
-                                    bitmap = withContext(Dispatchers.IO) { decodeFileToBitmap(file.path) }
+                                    bitmap = withContext(Dispatchers.IO) { try { decodeFileToBitmap(file.path) } catch (_: Exception) { null } }
                                 }
                                 Box(
                                     modifier = Modifier
@@ -965,10 +955,10 @@ fun InputArea(
                                             if (sendText.isNotEmpty()) {
                                                 onSend(sendText, attachedFiles)
                                                 textState.edit { replace(0, length, "") }
+                                                showSlashPalette = false
+                                                inHistoryMode = false
+                                                historyIndex = -1
                                             }
-                                            showSlashPalette = false
-                                            inHistoryMode = false
-                                            historyIndex = -1
                                             true
                                         }
                                         InputKeyboardAction.InsertNewline -> {
@@ -1202,7 +1192,7 @@ fun InputArea(
                 tooltip = "When enabled, all tool permission prompts are auto-approved without asking. Explicit deny rules are still enforced.",
                 enabled = isBraveModeEnabled,
                 onToggle = onToggleBraveMode,
-                color = Color(0xFFE8A030),
+                color = ChatTheme.colors.accent.yellow,
             )
 
             // NEW: Separator + disconnect (only when connected or reconnecting)

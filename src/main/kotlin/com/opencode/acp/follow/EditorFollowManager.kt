@@ -15,6 +15,8 @@ import com.intellij.openapi.fileEditor.TextEditor
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.psi.search.FilenameIndex
+import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
@@ -30,10 +32,10 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
-import java.io.File
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicReference
 
@@ -52,7 +54,7 @@ class EditorFollowManager(private val project: Project) : Disposable {
 
     private val logger = KotlinLogging.logger {}
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.EDT)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     companion object {
         const val FOLLOW_FILE_COOLDOWN_MS = 2_000L
@@ -60,6 +62,7 @@ class EditorFollowManager(private val project: Project) : Disposable {
         const val PROJECT_VIEW_COOLDOWN_MS = 5_000L
 
         private val LINE_HEADER_REGEX = Regex("""^Line (\d+):""")
+        private val SINGLE_LINE_MATCH_REGEX = Regex("""^(.+):(\d+):.*$""")
 
         fun getInstance(project: Project): EditorFollowManager =
             project.service<EditorFollowManager>()
@@ -82,12 +85,15 @@ class EditorFollowManager(private val project: Project) : Disposable {
     private var pendingJob: kotlinx.coroutines.Job?
         get() = pendingJobRef.get()
         set(value) {
-            // Cancel any existing job, then atomically set the new one.
-            // Uses a CAS loop to handle concurrent setters — only one wins.
+            // CAS first, then cancel the old value only after a successful CAS.
+            // This avoids cancelling a job that another writer just set and wants
+            // to keep (the cancel-before-CAS ordering was fragile under contention).
             while (true) {
                 val existing = pendingJobRef.get()
-                existing?.cancel()
-                if (pendingJobRef.compareAndSet(existing, value)) return
+                if (pendingJobRef.compareAndSet(existing, value)) {
+                    existing?.cancel()
+                    return
+                }
             }
         }
 
@@ -138,21 +144,22 @@ class EditorFollowManager(private val project: Project) : Disposable {
      * Entry point for ToolResult events (search tools — line numbers in results).
      * Thread-safe: can be called from any thread.
      */
-   fun followToolResult(
-       project: Project,
-       toolCallId: String,
-       output: List<JsonObject>?,
-       kind: ToolKind,
-       agentName: String? = null,
-       modelName: String? = null,
-       input: JsonObject? = null,
-   ) {
-       if (!isFollowEnabled()) return
-       if (kind != ToolKind.SEARCH) return
-       val color = FollowColorProvider.getColor(kind) ?: return
-       val label = FollowColorProvider.composeInlayLabel(
-           kind, agentName, modelName, input, null
-       ).ifBlank { return }
+    fun followToolResult(
+        project: Project,
+        toolCallId: String,
+        output: List<JsonObject>?,
+        kind: ToolKind,
+        agentName: String? = null,
+        modelName: String? = null,
+        input: JsonObject? = null,
+    ) {
+        if (!isFollowEnabled()) return
+        if (kind != ToolKind.SEARCH) return
+        val color = FollowColorProvider.getColor(kind) ?: return
+        val label = FollowColorProvider.composeInlayLabel(
+            kind, agentName, modelName, input, null
+        )
+        if (label.isBlank()) return
 
         // Parse first match from tool output text.
         // OpenCode grep format: two lines per match:
@@ -181,7 +188,7 @@ class EditorFollowManager(private val project: Project) : Disposable {
             // Checked FIRST so that a Format B line ending with ':' (e.g. a path
             // with no line number but a trailing colon) is not misparsed as the
             // start of a Format A two-line block.
-            val singleMatch = Regex("""^(.+):(\d+):.*$""").find(pathLine)
+            val singleMatch = SINGLE_LINE_MATCH_REGEX.find(pathLine)
             if (singleMatch != null) {
                 val fp = singleMatch.groupValues[1]
                 val ln = singleMatch.groupValues[2].toIntOrNull()
@@ -215,19 +222,28 @@ class EditorFollowManager(private val project: Project) : Disposable {
             return
         }
 
-        // Navigate to the first candidate. The throttle is global (not per-candidate),
-        // so if it fails for the first candidate it would fail for all — we queue the
-        // first candidate and return. resolveVirtualFile will reject candidates outside
-        // the project; if the first candidate is rejected, the navigation silently no-ops.
-        // Note: we do NOT iterate to later candidates because navigateOnEdt is async
-        // (EDT) and we can't synchronously check if the file resolved.
-        candidates.firstOrNull()?.let { (filePath, line) ->
-            if (!throttleCheck()) {
-                pendingFollowRef.set(PendingFollow(filePath, line, line, kind))
-                schedulePendingFollow()
-                return
+        // Resolve candidates synchronously (resolveVirtualFile is cheap for direct
+        // paths — only the FilenameIndex fallback does I/O, and only on miss) and
+        // navigate to the first one that resolves inside the project. Previously
+        // only the first candidate was tried; if it resolved outside the project
+        // (e.g. an absolute path from a different project), later valid candidates
+        // were silently ignored.
+        scope.launch(Dispatchers.IO) {
+            for ((filePath, line) in candidates) {
+                val vf = resolveVirtualFile(project, filePath) ?: continue
+                val navigated = withContext(Dispatchers.EDT) {
+                    if (project.isDisposed) return@withContext false
+                    if (!throttleCheck()) {
+                        pendingFollowRef.set(PendingFollow(filePath, line, line, kind, agentName, modelName, input, null))
+                        schedulePendingFollow()
+                        return@withContext false
+                    }
+                    navigateToResolvedFile(project, vf, line, line, color, label, focus = false, filePathForLog = filePath)
+                    true
+                }
+                if (navigated) return@launch
             }
-            navigateOnEdt(project, filePath, line, line, color, label, focus = false)
+            logger.debug { "[ACP] Follow Agent: no candidate resolved to a project file" }
         }
     }
 
@@ -236,26 +252,32 @@ class EditorFollowManager(private val project: Project) : Disposable {
      * Used by ToolPill click-to-open (focus=true) vs auto-follow (focus=false).
      */
     fun openFileAtLine(project: Project, filePath: String, line: Int, focus: Boolean) {
-        ApplicationManager.getApplication().invokeLater({
-            try {
-                val vf = resolveVirtualFile(project, filePath) ?: return@invokeLater
-                if (line > 0) {
-                    OpenFileDescriptor(project, vf, line - 1, 0).navigate(focus)
-                } else {
-                    FileEditorManager.getInstance(project).openFile(vf, focus)
+        scope.launch(Dispatchers.IO) {
+            val vf = resolveVirtualFile(project, filePath) ?: return@launch
+            withContext(Dispatchers.EDT) {
+                try {
+                    if (line > 0) {
+                        OpenFileDescriptor(project, vf, line - 1, 0).navigate(focus)
+                    } else {
+                        FileEditorManager.getInstance(project).openFile(vf, focus)
+                    }
+                } catch (e: Exception) {
+                    logger.error(e) { "[ACP] Follow Agent: error opening $filePath" }
                 }
-            } catch (e: Exception) {
-                logger.error(e) { "[ACP] Follow Agent: error opening $filePath" }
             }
-        }, ModalityState.nonModal())
+        }
     }
 
     /**
      * Resolve file path to VirtualFile.
      * Uses findFileByPath() first (VFS snapshot, no I/O).
      * Falls back to refreshAndFindFileByPath() for externally-created files.
+     *
+     * Marked `suspend` so callers can run it on Dispatchers.IO: the direct VFS
+     * lookup is cheap, but the FilenameIndex fallback does filesystem I/O
+     * (canonicalization) that must not block the EDT.
      */
-    fun resolveVirtualFile(project: Project, filePath: String): VirtualFile? {
+    suspend fun resolveVirtualFile(project: Project, filePath: String): VirtualFile? {
         val basePath = project.basePath ?: return null
         val absPath = if (Path.of(filePath).isAbsolute) {
             filePath
@@ -268,7 +290,7 @@ class EditorFollowManager(private val project: Project) : Disposable {
         val canonicalAbs = try { java.io.File(absPath).canonicalPath } catch (_: Exception) { return null }
         val baseNormalized = canonicalBase.replace('\\', '/')
         val absNormalized = canonicalAbs.replace('\\', '/')
-        if (!absNormalized.startsWith("$baseNormalized/") && absNormalized != baseNormalized) {
+        if (!absNormalized.startsWith("$baseNormalized/")) {
             logger.warn { "[ACP] Follow Agent: path traversal blocked: $filePath resolves outside project" }
             return null
         }
@@ -279,9 +301,72 @@ class EditorFollowManager(private val project: Project) : Disposable {
         // appear inside the project while canonicalizing outside). If the canonical
         // VFS lookup fails, fall back to refreshAndFindFileByPath on the canonical
         // path only.
-        val canonicalNorm = canonicalAbs.replace('/', File.separatorChar)
-        return vfs.findFileByPath(canonicalNorm)
-            ?: vfs.refreshAndFindFileByPath(canonicalNorm)
+        //
+        // LocalFileSystem.findFileByPath contractually expects forward-slash-
+        // separated paths on all platforms (the VFS is platform-independent).
+        // On Windows, passing a backslash path would fail the direct lookup,
+        // forcing the slower refreshAndFindFileByPath and then the FilenameIndex
+        // fallback on every call — a silent performance regression.
+        val canonicalFwdSlash = canonicalAbs.replace('\\', '/')
+        val direct = vfs.findFileByPath(canonicalFwdSlash)
+            ?: vfs.refreshAndFindFileByPath(canonicalFwdSlash)
+        if (direct != null) return direct
+
+        // Fallback: search the project file index by filename. LLMs frequently emit
+        // bare filenames (Foo.kt:42) or partial paths (src/Foo.kt) that don't match
+        // the actual project location. FilenameIndex scans the VFS snapshot.
+        return resolveViaFilenameIndex(project, filePath, baseNormalized)
+    }
+
+    /**
+     * Fallback resolver: use FilenameIndex to find files by name when the direct
+     * path lookup fails. Filters results to valid non-directory files inside the
+     * project basePath (re-uses the CWE-22 traversal guard). Prefers matches whose
+     * path ends with the original relative path (suffix match, case-insensitive on
+     * Windows); otherwise picks the shortest-path match (heuristic: closest to the
+     * project root). FilenameIndex requires a read action.
+     *
+     * The FilenameIndex lookup + canonicalization runs on Dispatchers.IO inside a
+     * read action — canonicalization does filesystem I/O that must not block EDT.
+     */
+    private suspend fun resolveViaFilenameIndex(
+        project: Project,
+        filePath: String,
+        baseNormalized: String,
+    ): VirtualFile? {
+        // Pure-logic extraction (unit-tested in FileRefMatchingTest).
+        val fileName = FileRefMatching.extractFileName(filePath) ?: return null
+        val relForSuffix = FileRefMatching.extractRelativePath(filePath) ?: return null
+
+        val matches = withContext(Dispatchers.IO) {
+            ApplicationManager.getApplication().runReadAction<List<VirtualFile>> {
+                FilenameIndex.getVirtualFilesByName(fileName, GlobalSearchScope.projectScope(project))
+                    .filter { it.isValid && !it.isDirectory }
+                    .filter { vf ->
+                        // Re-apply CWE-22 traversal guard on index results too.
+                        val canon = try { java.io.File(vf.path).canonicalPath } catch (_: Exception) { return@filter false }
+                        val canonNorm = canon.replace('\\', '/')
+                        canonNorm == baseNormalized || canonNorm.startsWith("$baseNormalized/")
+                    }
+            }
+        }
+
+        if (matches.isEmpty()) return null
+
+        logger.debug {
+            "[ACP] Follow Agent: direct path lookup failed for $filePath, found ${matches.size} index matches: " +
+                matches.joinToString(",") { it.path }
+        }
+
+        // Pure-logic selection (unit-tested in FileRefMatchingTest): prefer a
+        // case-insensitive suffix match (handles partial paths like "src/Foo.kt"
+        // matching ".../src/Foo.kt" or bare "Foo.kt" matching any "Foo.kt" in the
+        // project). Falls back to shortest path (closest to root, less likely to
+        // be a generated/test variant). FilenameIndex order is stable but not
+        // meaningful for our purposes.
+        val selectedPath = FileRefMatching.selectBestMatch(matches.map { it.path }, relForSuffix)
+            ?: return null
+        return matches.firstOrNull { it.path == selectedPath }
     }
 
     // ── Throttle ────────────────────────────────────────────────────────
@@ -294,6 +379,7 @@ class EditorFollowManager(private val project: Project) : Disposable {
     }
 
     private fun schedulePendingFollow() {
+        val expectedLast = lastFollowFileMs.get()
         pendingJob = scope.launch {
             delay(FOLLOW_FILE_COOLDOWN_MS)
             // Explicit cancellation/dispose check for clarity — the pendingFollowRef
@@ -306,7 +392,15 @@ class EditorFollowManager(private val project: Project) : Disposable {
             val label = FollowColorProvider.composeInlayLabel(
                 pending.kind, pending.agentName, pending.modelName, pending.input, pending.startTimeMs
             )
-            lastFollowFileMs.set(System.currentTimeMillis())
+            // CAS: only claim the slot if no other call claimed it during our delay.
+            // If a non-throttled followToolCall ran while we were waiting, its timestamp
+            // differs from expectedLast and the CAS fails — skip navigation since the
+            // newer call already navigated.
+            val now = System.currentTimeMillis()
+            if (!lastFollowFileMs.compareAndSet(expectedLast, now)) {
+                logger.debug { "[ACP] Follow Agent: pending follow superseded by a newer call — skipping" }
+                return@launch
+            }
             navigateOnEdt(project, pending.filePath, pending.startLine, pending.endLine, color, label, focus = false)
         }
     }
@@ -318,40 +412,62 @@ class EditorFollowManager(private val project: Project) : Disposable {
         startLine: Int, endLine: Int,
         color: java.awt.Color, label: String, focus: Boolean
     ) {
+        // Resolve on Dispatchers.IO (FilenameIndex fallback does filesystem I/O),
+        // then hop to EDT for the editor navigation. invokeLater + nonModal
+        // ensures the EDT hop happens outside any modal dialog context.
         ApplicationManager.getApplication().invokeLater({
             if (project.isDisposed) return@invokeLater
-            try {
+            scope.launch(Dispatchers.IO) {
                 val vf = resolveVirtualFile(project, filePath) ?: run {
                     logger.warn { "[ACP] Follow Agent: file not found: $filePath" }
-                    return@invokeLater
+                    return@launch
                 }
-
-                val fem = FileEditorManager.getInstance(project)
-                val hasLineRange = startLine > 0 && endLine > 0
-
-                if (hasLineRange) {
-                    val midLine = (startLine + endLine) / 2
-                    OpenFileDescriptor(project, vf, midLine - 1, 0).navigate(focus)
-                    scrollAndHighlight(fem, vf, startLine, endLine, midLine, color, label)
-                } else {
-                    // No line numbers in the tool input (e.g. edit/write/apply_patch).
-                    // Just open the file at the top — do NOT navigate to line 0 via
-                    // OpenFileDescriptor(line=0) because that scrolls the editor and
-                    // moves the caret to a meaningless position. Then add the inlay
-                    // label at the top of the file so the user sees "Agent is editing".
-                    fem.openFile(vf, focus)
-                    addInlayOnly(fem, vf, color, label)
+                withContext(Dispatchers.EDT) {
+                    if (project.isDisposed) return@withContext
+                    navigateToResolvedFile(project, vf, startLine, endLine, color, label, focus, filePath)
                 }
-
-                selectInProjectView(project, vf)
-                logger.info { "[ACP] Follow Agent: opened $filePath" }
-
-                // Balloon notifications intentionally omitted — the inlay label
-                // and project-view selection are sufficient visual cues.
-            } catch (e: Exception) {
-                logger.error(e) { "[ACP] Follow Agent: error navigating to $filePath" }
             }
         }, ModalityState.nonModal())
+    }
+
+    /**
+     * Editor-navigation helper that takes a pre-resolved [VirtualFile] instead
+     * of a path string. Extracted from [navigateOnEdt] so callers that have
+     * already resolved the file (e.g. the candidate-iteration path in
+     * [followToolResult]) can avoid re-resolving on EDT. Must be called on EDT.
+     */
+    private fun navigateToResolvedFile(
+        project: Project, vf: VirtualFile,
+        startLine: Int, endLine: Int,
+        color: java.awt.Color, label: String, focus: Boolean,
+        filePathForLog: String,
+    ) {
+        try {
+            val fem = FileEditorManager.getInstance(project)
+            val hasLineRange = startLine > 0 && endLine > 0
+
+            if (hasLineRange) {
+                val midLine = (startLine + endLine) / 2
+                OpenFileDescriptor(project, vf, midLine - 1, 0).navigate(focus)
+                scrollAndHighlight(fem, vf, startLine, endLine, midLine, color, label)
+            } else {
+                // No line numbers in the tool input (e.g. edit/write/apply_patch).
+                // Just open the file at the top — do NOT navigate to line 0 via
+                // OpenFileDescriptor(line=0) because that scrolls the editor and
+                // moves the caret to a meaningless position. Then add the inlay
+                // label at the top of the file so the user sees "Agent is editing".
+                fem.openFile(vf, focus)
+                addInlayOnly(fem, vf, color, label)
+            }
+
+            selectInProjectView(project, vf)
+            logger.info { "[ACP] Follow Agent: opened $filePathForLog" }
+
+            // Balloon notifications intentionally omitted — the inlay label
+            // and project-view selection are sufficient visual cues.
+        } catch (e: Exception) {
+            logger.error(e) { "[ACP] Follow Agent: error navigating to $filePathForLog" }
+        }
     }
 
     /**
@@ -382,13 +498,16 @@ class EditorFollowManager(private val project: Project) : Disposable {
         editor.scrollingModel.scrollToCaret(ScrollType.MAKE_VISIBLE)
         scope.launch {
             delay(HIGHLIGHT_DURATION_MS)
-            // Wrap the entire disposal (including the isValid check, which can
-            // itself throw if the inlay model is disposed) in runCatching so we
-            // never propagate exceptions from a disposed editor.
-            runCatching {
-                if (inlay?.isValid == true) inlay.dispose()
-            }.onFailure { e ->
-                logger.debug(e) { "[ACP] Follow Agent: inlay already disposed" }
+            withContext(Dispatchers.EDT) {
+                if (project.isDisposed) return@withContext
+                // Wrap the entire disposal (including the isValid check, which can
+                // itself throw if the inlay model is disposed) in runCatching so we
+                // never propagate exceptions from a disposed editor.
+                runCatching {
+                    if (inlay?.isValid == true) inlay.dispose()
+                }.onFailure { e ->
+                    logger.debug(e) { "[ACP] Follow Agent: inlay already disposed" }
+                }
             }
         }
     }
@@ -457,11 +576,14 @@ class EditorFollowManager(private val project: Project) : Disposable {
         )
         scope.launch {
             delay(HIGHLIGHT_DURATION_MS)
-            // Wrap the entire removal (including any disposed-editor internal
-            // access) in runCatching — removeHighlight may touch disposed editor
-            // internals if the editor was closed before the delay elapsed.
-            runCatching { EditorHighlightSupport.removeHighlight(handle) }
-                .onFailure { e -> logger.debug(e) { "[ACP] Follow Agent: highlight already disposed" } }
+            withContext(Dispatchers.EDT) {
+                if (project.isDisposed) return@withContext
+                // Wrap the entire removal (including any disposed-editor internal
+                // access) in runCatching — removeHighlight may touch disposed editor
+                // internals if the editor was closed before the delay elapsed.
+                runCatching { EditorHighlightSupport.removeHighlight(handle) }
+                    .onFailure { e -> logger.debug(e) { "[ACP] Follow Agent: highlight already disposed" } }
+            }
         }
     }
 

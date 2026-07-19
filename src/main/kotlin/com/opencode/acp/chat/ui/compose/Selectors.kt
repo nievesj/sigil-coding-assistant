@@ -105,17 +105,22 @@ fun ThinkingSelector(
     val availableEfforts = remember(variants) {
         val matched = variants.mapNotNull { variantName ->
             ThinkingEffort.entries.find { it.variant == variantName }
-        }.sortedBy { it.ordinal }
+        }.filter { it != ThinkingEffort.DEFAULT }
+            .distinctBy { it }
+            .sortedBy { it.ordinal }
         listOf(ThinkingEffort.DEFAULT) + matched
     }
+
+    val hasMultipleEfforts = availableEfforts.size > 1
 
     Box {
         SelectorChip(
             text = displayText,
-            onClick = { showPopup = !showPopup },
+            enabled = hasMultipleEfforts,
+            onClick = if (hasMultipleEfforts) ({ showPopup = !showPopup }) else null,
         )
 
-        if (showPopup) {
+        if (showPopup && hasMultipleEfforts) {
             Popup(
                 alignment = Alignment.TopStart,
                 offset = IntOffset(0, -4),
@@ -228,6 +233,17 @@ private fun SimplePickerPanel(
     items: List<PickerItem>,
     onDismiss: () -> Unit,
 ) {
+    // Defensive dedup by key — LazyColumn items(key=...) throws on duplicate keys.
+    // Log when duplicates are detected so the data-integrity issue is visible.
+    val dedupedItems = remember(items) {
+        if (items.size != items.distinctBy { it.key }.size) {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
+                "[ACP] Duplicate picker item keys detected — ${items.size - items.distinctBy { it.key }.size} item(s) dropped. Keys: ${items.map { it.key }.groupingBy { it }.eachCount().filter { it.value > 1 }.keys}"
+            }
+        }
+        items.distinctBy { it.key }
+    }
+
     Column(
         modifier = Modifier
             .widthIn(min = 140.dp, max = 240.dp)
@@ -250,10 +266,10 @@ private fun SimplePickerPanel(
                 .heightIn(min = 0.dp),
         ) {
             items(
-                count = items.size,
-                key = { items[it].key },
+                count = dedupedItems.size,
+                key = { dedupedItems[it].key },
             ) { index ->
-                val item = items[index]
+                val item = dedupedItems[index]
                 PickerItemRow(
                     label = item.label,
                     isSelected = item.isSelected,
@@ -293,7 +309,7 @@ private fun PickerItemRow(
         Text(
             text = label,
             fontSize = ChatTheme.fonts.selectorItem,
-            color = if (isSelected) Color.White else ChatTheme.colors.text.secondary,
+            color = if (isSelected) ChatTheme.colors.text.inverse else ChatTheme.colors.text.secondary,
             maxLines = 1,
             modifier = Modifier.weight(1f),
         )
