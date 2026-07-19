@@ -309,7 +309,22 @@ class EditorFollowManager(private val project: Project) : Disposable {
         // fallback on every call — a silent performance regression.
         val canonicalFwdSlash = canonicalAbs.replace('\\', '/')
         val direct = vfs.findFileByPath(canonicalFwdSlash)
-            ?: vfs.refreshAndFindFileByPath(canonicalFwdSlash)
+            ?: withContext(Dispatchers.EDT) {
+                // refreshAndFindFileByPath internally acquires a write action.
+                // On a background thread (Dispatchers.IO), the write action's
+                // beforeWriteActionStart callback fires on that thread, where
+                // DaemonListeners.stopDaemon → TrafficLightRenderer.getErrorCounts
+                // → CodeInsightContextManagerImpl.getPreferredContext tries to read
+                // editor context without a read action — causing
+                // "RuntimeExceptionWithAttachments: Read access is allowed from
+                // inside read-action only". Running on EDT gives implicit read
+                // access in write-intent mode. Same platform bug as the
+                // asyncRefresh case documented in ChatViewModel.kt:897-909.
+                // This only fires when findFileByPath returns null (file not yet
+                // in VFS — the fallback for externally-created files), so the
+                // EDT cost is minimal.
+                vfs.refreshAndFindFileByPath(canonicalFwdSlash)
+            }
         if (direct != null) return direct
 
         // Fallback: search the project file index by filename. LLMs frequently emit
