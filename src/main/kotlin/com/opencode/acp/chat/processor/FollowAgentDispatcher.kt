@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -87,13 +88,18 @@ internal class FollowAgentDispatcher(
         // For the duplicate path: only re-fire if the duplicate carries real input
         // that the primary didn't have.
         val shouldFireFollow = if (isDuplicate) {
-            input != null && input.isNotEmpty() &&
-                (existingPill?.input == null || existingPill.input.isEmpty())
+            // Fire follow on duplicate only if the duplicate carries input that the primary didn't have.
+            // Check whether the primary's input yielded a valid file path — if it did, the primary already
+            // triggered navigation; if not, the duplicate's input is "new" information.
+            input != null && input.isNotEmpty() && run {
+                val primaryInput = existingPill?.input
+                primaryInput == null || primaryInput.isEmpty() || extractFilePath(primaryInput) == null
+            }
         } else {
             input != null
         }
 
-        if (shouldFireFollow) {
+        if (shouldFireFollow && effectiveKind in setOf(ToolKind.READ, ToolKind.EDIT, ToolKind.DELETE, ToolKind.MOVE)) {
             val followFilePath = input?.let { extractFilePath(it) }
             if (followFilePath != null) {
                 val (startLine, endLine) = extractLineRange(input)
@@ -108,7 +114,7 @@ internal class FollowAgentDispatcher(
                         input = input,
                         startTimeMs = startTimeMs,
                     )
-                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (${if (isDuplicate) "duplicate-ToolUse" else "ToolUse"} path)" } }
+                }.onFailure { logger.warn(it) { "[ACP] Follow Agent: failed (${if (isDuplicate) "duplicate-ToolUse" else "ToolUse"} path)" } }
             }
         }
 
@@ -134,7 +140,7 @@ internal class FollowAgentDispatcher(
                         agentName = toolCallState.activeAgentName,
                         modelName = turnLifecycleState.modelID,
                     )
-                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: command console skipped (${if (isDuplicate) "duplicate path" else "primary"})" } }
+                }.onFailure { logger.warn(it) { "[ACP] Follow Agent: command console failed (${if (isDuplicate) "duplicate path" else "primary"})" } }
             }
         }
 
@@ -151,6 +157,27 @@ internal class FollowAgentDispatcher(
                 input["include"]?.jsonPrimitive?.contentOrNull
                     ?: input["glob"]?.jsonPrimitive?.contentOrNull
             } catch (_: Exception) { null }
+            // booleanOrNull handles both boolean primitives (JsonPrimitive(true))
+            // and string primitives containing "true"/"false" — it parses the
+            // content string. This fixes the case where the SSE event sends a
+            // boolean JsonPrimitive instead of a string, which contentOrNull
+            // would silently return null for.
+            val isRegex = try {
+                // Check common key names for the regex flag. The OpenCode server
+                // uses 'pattern_regex' (verified), but some MCP tools may use
+                // alternative names. If none are present, default to false (literal search).
+                val patternRegex = input["pattern_regex"]?.jsonPrimitive?.booleanOrNull
+                val isRegexVal = input["is_regex"]?.jsonPrimitive?.booleanOrNull
+                val regexVal = input["regex"]?.jsonPrimitive?.booleanOrNull
+                // Log if multiple keys present with conflicting values
+                if (patternRegex != null && isRegexVal != null && patternRegex != isRegexVal) {
+                    logger.warn { "[ACP] Follow Agent: conflicting regex flags: pattern_regex=$patternRegex, is_regex=$isRegexVal" }
+                }
+                if ((patternRegex ?: isRegexVal) != null && regexVal != null && (patternRegex ?: isRegexVal) != regexVal) {
+                    logger.warn { "[ACP] Follow Agent: conflicting regex flags: regex=$regexVal differs from earlier value" }
+                }
+                patternRegex ?: isRegexVal ?: regexVal ?: false
+            } catch (_: Exception) { false }
             if (pattern != null) {
                 runCatching {
                     SearchFollowManager.getInstance(project).followSearch(
@@ -158,11 +185,11 @@ internal class FollowAgentDispatcher(
                         pattern = pattern,
                         searchPath = searchPath,
                         includeGlob = includeGlob,
-                        isRegex = false,
+                        isRegex = isRegex,
                         agentName = toolCallState.activeAgentName,
                         modelName = turnLifecycleState.modelID,
                     )
-                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: Find in Files skipped (${if (isDuplicate) "duplicate path" else "primary"})" } }
+                }.onFailure { logger.warn(it) { "[ACP] Follow Agent: Find in Files failed (${if (isDuplicate) "duplicate path" else "primary"})" } }
             }
         }
 
@@ -172,7 +199,24 @@ internal class FollowAgentDispatcher(
         if (!isDuplicate && toolKind == ToolKind.EDIT && input != null) {
             val filePath = extractFilePath(input)
             if (filePath != null) {
-                val fileName = java.io.File(filePath).name
+                // Normalize the path for storage — extractFilePath returns the raw path
+                // which may contain '..' sequences. Canonicalize against project base
+                // to produce a stable, normalized path for display and matching.
+                val normalizedPath = try {
+                    val base = project.basePath
+                    if (base != null) {
+                        val abs = if (java.nio.file.Path.of(filePath).isAbsolute) {
+                            filePath
+                        } else {
+                            java.nio.file.Path.of(base).resolve(filePath).normalize().toString()
+                        }
+                        // Canonicalize to resolve symlinks, matching EditorFollowManager's approach
+                        try {
+                            java.io.File(abs).canonicalPath
+                        } catch (_: Exception) { abs }
+                    } else filePath
+                } catch (_: Exception) { filePath }
+                val fileName = java.io.File(normalizedPath).name
                 val oldString = input["oldString"]?.jsonPrimitive?.contentOrNull
                     ?: input["old_string"]?.jsonPrimitive?.contentOrNull
                     ?: input["old"]?.jsonPrimitive?.contentOrNull
@@ -180,17 +224,15 @@ internal class FollowAgentDispatcher(
                     ?: input["new_string"]?.jsonPrimitive?.contentOrNull
                     ?: input["new"]?.jsonPrimitive?.contentOrNull
                 val content = input["content"]?.jsonPrimitive?.contentOrNull
-                val additions = when {
-                    oldString != null && newString != null -> newString.lines().size
-                    content != null -> content.lines().size
-                    else -> 0
-                }
-                val deletions = when {
-                    oldString != null && newString != null -> oldString.lines().size
-                    else -> 0
+                val (additions, deletions) = when {
+                    oldString != null && newString != null -> {
+                        com.opencode.acp.follow.LineDeltaUtils.computeLineDelta(oldString, newString)
+                    }
+                    content != null -> Pair(content.lines().size, 0)
+                    else -> Pair(0, 0)
                 }
                 val change = ChatFileChange(
-                    filePath = filePath,
+                    filePath = normalizedPath,
                     fileName = fileName,
                     additions = additions,
                     deletions = deletions
@@ -199,25 +241,25 @@ internal class FollowAgentDispatcher(
             }
         }
 
-        // -- Task tools � proactively cache the child session --
-        // For the duplicate path: only cache if the primary didn't already cache it
-        // (existingPill.metadata?.get("sessionId") == null but event.metadata has one).
-        if (isDuplicate) {
-            if (existingPill?.toolName == "task" && existingPill.metadata?.get("sessionId") == null && metadata?.get("sessionId") != null) {
-                val childId = try { metadata["sessionId"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
-                if (childId != null) {
-                    logger.info { "[ACP] Task tool (metadata update): proactively caching child session $childId" }
-                    scope.launch { sessionManager.ensureSessionCached(childId) }
-                }
+        // -- Task tools — proactively cache the child session --
+        // Consolidated: both primary and duplicate paths extract childId from metadata
+        // and launch ensureSessionCached. The duplicate path only fires if the primary
+        // didn't already cache it (existingPill.metadata has no sessionId).
+        val isTaskTool = if (isDuplicate) {
+            // Duplicate path: only fire if primary didn't already cache the child session.
+            // Distinguish "metadata is null" (primary had no metadata) from "metadata has no sessionId".
+            existingPill?.toolName == "task" && run {
+                val meta = existingPill.metadata
+                meta == null || !meta.containsKey("sessionId")
             }
         } else {
-            if (toolName == "task") {
-                logger.info { "[ACP] Task tool ToolUse: callID=$toolCallId, metadata=$metadata" }
-                val childId = try { metadata?.get("sessionId")?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
-                if (childId != null) {
-                    logger.info { "[ACP] Task tool: proactively caching child session $childId" }
-                    scope.launch { sessionManager.ensureSessionCached(childId) }
-                }
+            toolName == "task"
+        }
+        if (isTaskTool && metadata?.get("sessionId") != null) {
+            val childId = try { metadata["sessionId"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+            if (childId != null) {
+                logger.info { "[ACP] Task tool (${if (isDuplicate) "metadata update" else "ToolUse"}): proactively caching child session $childId" }
+                scope.launch { sessionManager.ensureSessionCached(childId) }
             }
         }
     }
@@ -250,12 +292,15 @@ internal class FollowAgentDispatcher(
     ) {
         if (!isOrphan) {
             // -- SEARCH tools � navigate to the first match result --
-            if (resolvedKind == ToolKind.SEARCH) {
-                runCatching {
-                    EditorFollowManager.getInstance(project).followToolResult(
-                        project, toolCallId, content, ToolKind.SEARCH
-                    )
-                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: skipped (ToolResult path)" } }
+           if (resolvedKind == ToolKind.SEARCH) {
+               runCatching {
+                   EditorFollowManager.getInstance(project).followToolResult(
+                       project, toolCallId, content, ToolKind.SEARCH,
+                       agentName = toolCallState.activeAgentName,
+                       modelName = turnLifecycleState.modelID,
+                       input = input,
+                   )
+                }.onFailure { logger.warn(it) { "[ACP] Follow Agent: failed (ToolResult path)" } }
             }
             // -- EXECUTE tools � print output into the Run console --
             if (resolvedKind == ToolKind.EXECUTE) {
@@ -271,7 +316,7 @@ internal class FollowAgentDispatcher(
                         toolCallId = toolCallId,
                         isError = isError,
                     )
-                }.onFailure { logger.debug(it) { "[ACP] Follow Agent: command result skipped" } }
+                }.onFailure { logger.warn(it) { "[ACP] Follow Agent: command result failed" } }
             }
         } else {
             // Orphan path � no prior ToolUse. Emit FileChanged for EDIT tools and
@@ -288,7 +333,7 @@ internal class FollowAgentDispatcher(
         }
     }
 
-    /** Extract and canonicalize file path from tool input JSON. */
+    /** Extract file path from tool input JSON (raw, not canonicalized). */
     fun extractFilePath(input: JsonObject): String? {
         for (key in listOf("file_path", "filePath", "path")) {
             val element = input[key] ?: continue
@@ -296,18 +341,14 @@ internal class FollowAgentDispatcher(
                 (element as? JsonPrimitive)?.content
             } catch (_: Exception) { null }
             if (!rawPath.isNullOrEmpty()) {
-                // Canonicalize to resolve ../ sequences and symlinks.
-                // Callers (sendMessageInternal, EditorFollowManager) rely on this
-                // for path traversal validation � returning raw paths bypasses
-                // their boundary checks.
-                // Return null on failure: a path that can't be canonicalized is
-                // untrusted (permissions, broken symlink, non-existent path).
-                // Callers already handle null gracefully (they skip the operation).
-                return try {
-                    java.io.File(rawPath).canonicalPath
-                } catch (_: Exception) {
-                    null
-                }
+                // Return the raw path — EditorFollowManager.resolveVirtualFile canonicalizes
+                // against project.basePath (the correct base for relative paths). Canonicalizing
+                // here would resolve relative paths against the JVM's user.dir, which is NOT
+                // guaranteed to match project.basePath, causing navigation failures and false-
+                // positive path-traversal blocks. Callers that need canonicalization for their
+                // own purposes (e.g. file-change extraction below) should canonicalize with
+                // project.basePath as the base.
+                return rawPath
             }
         }
         return null
@@ -318,16 +359,31 @@ internal class FollowAgentDispatcher(
      * Returns Pair(0, 0) when no line info is available (e.g. edit/write).
      *
      * Known field names:
-     * - `offset` (1-indexed start) + `limit` (max lines) ? read tool
-     * - `start_line` / `end_line` ? generic (not used by OpenCode's built-in tools)
+     * - `offset` (0-indexed start; converted to 1-indexed for display/navigation)
+     *   + `limit` (max lines) — read tool
+     * - `start_line` / `end_line` — generic (not used by OpenCode's built-in tools)
+     *
+     * Note: the returned startLine/endLine are 1-indexed throughout the follow logic.
+     *
+     * `start_line`/`end_line` are assumed to be 1-indexed. Some tools may send 0-indexed
+     * values (where 0 means "first line"); we handle this gracefully by treating 0 as
+     * line 1. A value of 0 with no other line info returns 0 (no navigation).
      */
     fun extractLineRange(input: JsonObject?): Pair<Int, Int> {
         if (input == null) return Pair(0, 0)
         val startLine = when {
-            input.containsKey("offset") ->
-                input["offset"]?.jsonPrimitive?.intOrNull ?: 0
+            input.containsKey("offset") -> {
+                // OpenCode's read tool uses 'offset' as a 0-indexed line offset.
+                // Convert to 1-indexed for display/navigation (OpenFileDescriptor uses 0-indexed,
+                // but our startLine is used as a 1-indexed value throughout the follow logic).
+                val raw = input["offset"]?.jsonPrimitive?.intOrNull ?: 0
+                raw + 1
+            }
             input.containsKey("start_line") ->
-                input["start_line"]?.jsonPrimitive?.intOrNull ?: 0
+                // start_line is 1-indexed; treat 0 as line 1 (some tools send 0-indexed)
+                input["start_line"]?.jsonPrimitive?.intOrNull?.let { if (it == 0) 1 else it } ?: 0
+            input.containsKey("startLine") ->
+                input["startLine"]?.jsonPrimitive?.intOrNull?.let { if (it == 0) 1 else it } ?: 0
             else -> 0
         }
         val endLine = when {
@@ -336,7 +392,9 @@ internal class FollowAgentDispatcher(
                 if (limit > 0) startLine + limit - 1 else 0
             }
             input.containsKey("end_line") ->
-                input["end_line"]?.jsonPrimitive?.intOrNull ?: 0
+                input["end_line"]?.jsonPrimitive?.intOrNull?.let { if (it == 0) 1 else it } ?: 0
+            input.containsKey("endLine") ->
+                input["endLine"]?.jsonPrimitive?.intOrNull?.let { if (it == 0) 1 else it } ?: 0
             else -> 0
         }
         return Pair(startLine, endLine)

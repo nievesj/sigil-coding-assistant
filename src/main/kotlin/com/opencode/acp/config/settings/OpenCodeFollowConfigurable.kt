@@ -24,17 +24,28 @@ class OpenCodeFollowConfigurable : Configurable {
 
     private var panel: JPanel? = null
     private var followEnabledCheckBox: JBCheckBox? = null
-    private var followCommandsInConsoleCheckBox: JBCheckBox? = null
-    private var followSearchesInFindWindowCheckBox: JBCheckBox? = null
-    private var braveModeCheckBox: JBCheckBox? = null
 
     /** Per-row model: holds the text field and remembers the ToolKind it edits. */
     private data class ColorRow(val kind: ToolKind, val textField: JBTextField)
     private val colorRows = mutableListOf<ColorRow>()
 
+    /**
+     * Flag set while apply() mutates field.text programmatically (to reset invalid hex
+     * fields to defaults). Disables the DocumentListener's updateColor callback during
+     * programmatic updates to avoid re-entrant listener firing.
+     */
+    private var applyingProgrammatically = false
+
     override fun getDisplayName(): String = "Follow Agent"
 
     override fun createComponent(): JComponent {
+        // Clear any rows from a previous createComponent call — the IDE may
+        // call createComponent multiple times without disposing the prior panel,
+        // which would otherwise accumulate duplicate ColorRow entries.
+        // Note: the old panel's text fields are orphaned (held by the IDE until
+        // disposed) but are no longer referenced by colorRows, so they won't
+        // receive apply()/reset() calls.
+        colorRows.clear()
         val settings = OpenCodeFollowSettingsState.getInstance()
 
         followEnabledCheckBox = JBCheckBox(
@@ -42,29 +53,10 @@ class OpenCodeFollowConfigurable : Configurable {
             settings.followAgentEnabled
         )
 
-        followCommandsInConsoleCheckBox = JBCheckBox(
-            "Show agent commands in Run console",
-            settings.followCommandsInConsole
-        )
-        followCommandsInConsoleCheckBox?.toolTipText = "When Follow Agent is on, display agent-executed commands and their output in a read-only Run console"
 
-        followSearchesInFindWindowCheckBox = JBCheckBox(
-            "Open Find in Files for agent searches",
-            settings.followSearchesInFindWindow
-        )
-        followSearchesInFindWindowCheckBox?.toolTipText = "When Follow Agent is on, open IntelliJ's native Find in Files when the agent searches"
-
-        braveModeCheckBox = JBCheckBox(
-            "Enable Brave Mode (auto-approve all permission prompts)",
-            settings.braveModeEnabled
-        )
-        braveModeCheckBox?.toolTipText = "When enabled, all tool permission prompts are auto-approved with ALLOW_ONCE without showing the UI dialog. Explicit deny rules in opencode.json are still enforced. Note: if the auto-approve POST fails (network error), the prompt will fall back to showing in the UI for manual approval."
 
         val builder = FormBuilder()
             .addComponent(followEnabledCheckBox!!)
-            .addComponent(followCommandsInConsoleCheckBox!!)
-            .addComponent(followSearchesInFindWindowCheckBox!!)
-            .addComponent(braveModeCheckBox!!)
             .addVerticalGap(8)
             .addSeparator()
             .addVerticalGap(4)
@@ -78,7 +70,7 @@ class OpenCodeFollowConfigurable : Configurable {
             val defaultHex = com.opencode.acp.follow.FollowColorProvider.getDefaultHex(kind) ?: continue
             val label = com.opencode.acp.follow.FollowColorProvider.getInlayLabel(kind) ?: continue
             val textField = JBTextField(settings.getFollowColor(kind), 10)
-            textField.toolTipText = "$label (default: $defaultHex). Format: #RRGGBB (alpha defaults to FF) or #RRGGBBAA where AA is alpha (00=transparent, FF=opaque)."
+            textField.toolTipText = "$label (default: $defaultHex). Format: #RRGGBB (alpha defaults to FF = fully opaque) or #RRGGBBAA where AA is alpha (00=transparent, FF=opaque). Note: defaults use 0x88 alpha (semi-transparent); entering 6-char hex makes the highlight fully opaque."
             // Mark the field invalid on bad input so the user gets immediate feedback.
             // We do not block apply() — the setter stores whatever the user types, but
             // FollowColorProvider.getColor() will fall back to "no highlight" on bad
@@ -99,38 +91,44 @@ class OpenCodeFollowConfigurable : Configurable {
     override fun isModified(): Boolean {
         val settings = OpenCodeFollowSettingsState.getInstance()
         if (followEnabledCheckBox?.isSelected != settings.followAgentEnabled) return true
-        if (followCommandsInConsoleCheckBox?.isSelected != settings.followCommandsInConsole) return true
-        if (followSearchesInFindWindowCheckBox?.isSelected != settings.followSearchesInFindWindow) return true
-        if (braveModeCheckBox?.isSelected != settings.braveModeEnabled) return true
         return colorRows.any { (kind, field) -> field.text.trim() != settings.getFollowColor(kind) }
     }
 
     override fun apply() {
         val settings = OpenCodeFollowSettingsState.getInstance()
         settings.followAgentEnabled = followEnabledCheckBox?.isSelected ?: false
-        settings.followCommandsInConsole = followCommandsInConsoleCheckBox?.isSelected ?: settings.followCommandsInConsole
-        settings.followSearchesInFindWindow = followSearchesInFindWindowCheckBox?.isSelected ?: settings.followSearchesInFindWindow
-        settings.braveModeEnabled = braveModeCheckBox?.isSelected ?: false
+        // Collect fields that need resetting to defaults (invalid hex).
+        // We defer the field.text mutation until after the loop to avoid
+        // re-entrant DocumentListener callbacks during iteration.
+        val fieldsToReset = mutableListOf<Pair<ColorRow, String>>()
         for ((kind, field) in colorRows) {
             val trimmed = field.text.trim()
             // Invalid hex values are silently reset to defaults here (no error dialog);
             // the user gets visual feedback via the pink background on the field itself.
             val hexToPersist = if (isValidHex(trimmed)) trimmed else {
                 val defaultHex = com.opencode.acp.follow.FollowColorProvider.getDefaultHex(kind) ?: trimmed
-                // Reset the field to the default so the UI shows the corrected value
-                field.text = defaultHex
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] Follow Agent: invalid hex '$trimmed' for $kind, resetting to default $defaultHex" }
+                fieldsToReset.add(ColorRow(kind, field) to defaultHex)
                 defaultHex
             }
             settings.setFollowColor(kind, hexToPersist)
+        }
+        // Now reset the invalid fields outside the iteration loop. Disable the
+        // DocumentListener during programmatic text updates to avoid re-entrant
+        // callbacks (updateColor would otherwise fire on each text mutation).
+        applyingProgrammatically = true
+        try {
+            for ((row, defaultHex) in fieldsToReset) {
+                row.textField.text = defaultHex
+            }
+        } finally {
+            applyingProgrammatically = false
         }
     }
 
     override fun reset() {
         val settings = OpenCodeFollowSettingsState.getInstance()
         followEnabledCheckBox?.isSelected = settings.followAgentEnabled
-        followCommandsInConsoleCheckBox?.isSelected = settings.followCommandsInConsole
-        followSearchesInFindWindowCheckBox?.isSelected = settings.followSearchesInFindWindow
-        braveModeCheckBox?.isSelected = settings.braveModeEnabled
         for ((kind, field) in colorRows) {
             field.text = settings.getFollowColor(kind)
         }
@@ -144,6 +142,7 @@ class OpenCodeFollowConfigurable : Configurable {
     }
 
     private fun updateColor(textField: JBTextField) {
+        if (applyingProgrammatically) return
         val text = textField.text.trim()
         textField.background = if (isValidHex(text)) null /* default background */
         else java.awt.Color(0xFFEEEE)  // light pink

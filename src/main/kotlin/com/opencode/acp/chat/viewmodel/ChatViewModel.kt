@@ -78,7 +78,12 @@ class ChatViewModel(
     // --- Permission/Selection state (delegated to PermissionViewModel) ---
     private val permissionViewModel = PermissionViewModel(
         scope, service, project,
-        braveModeProvider = { _braveModeEnabled.value },
+        // Read from the persisted settings (the single source of truth) so that
+        // Brave Mode is evaluated consistently with PermissionRelayHandler, which
+        // also reads from OpenCodeFollowSettingsState. The _braveModeEnabled
+        // StateFlow below is only for driving the InputArea checkbox UI state.
+        // The chat window checkbox is the sole UI for toggling Brave Mode.
+        braveModeProvider = { OpenCodeFollowSettingsState.getInstance().braveModeEnabled },
     )
     val permissionPrompt: StateFlow<PermissionPrompt?> = permissionViewModel.permissionPrompt
     val childPermissionPrompts: StateFlow<Map<String, List<ChildPermissionPrompt>>> = permissionViewModel.childPermissionPrompts
@@ -949,9 +954,27 @@ class ChatViewModel(
 
     fun toggleFollowAgent() {
         val newValue = !_followAgentEnabled.value
-        EditorFollowManager.getInstance(project).setFollowEnabled(newValue)
-        _followAgentEnabled.value = newValue
+        _followAgentEnabled.value = newValue  // Update StateFlow first
+        EditorFollowManager.getInstance(project).setFollowEnabled(newValue)  // Then persist
         logger.info { "[ACP] Follow agent toggled: $newValue" }
+    }
+
+    /**
+     * Re-sync Follow Agent and Brave Mode enabled state from persisted settings.
+     * Called when the tool window gains focus or settings change externally,
+     * so the chat UI toggle reflects the current settings value (not the
+     * value from when the ChatViewModel was constructed).
+     */
+    fun syncFollowAgentFromSettings() {
+        val followEnabled = EditorFollowManager.getInstance(project).isFollowEnabled()
+        if (_followAgentEnabled.value != followEnabled) {
+            _followAgentEnabled.value = followEnabled
+        }
+        val braveEnabled = OpenCodeFollowSettingsState.getInstance().braveModeEnabled
+        if (_braveModeEnabled.value != braveEnabled) {
+            _braveModeEnabled.value = braveEnabled
+            logger.info { "[ACP] Brave Mode synced from settings: $braveEnabled" }
+        }
     }
 
     // --- Brave Mode toggle ---
@@ -961,6 +984,21 @@ class ChatViewModel(
      *  the UI dialog. Explicit `deny` rules are still enforced server-side. */
     fun toggleBraveMode() {
         val newValue = !_braveModeEnabled.value
+        if (newValue) {
+            // Confirm before enabling — Brave Mode auto-approves ALL permission prompts
+            // without showing the UI dialog. This is a security-relevant decision.
+            val confirm = com.intellij.openapi.ui.Messages.showOkCancelDialog(
+                project,
+                "Brave Mode will auto-approve ALL tool permission prompts without showing the confirmation dialog.\n\n" +
+                    "Explicit 'deny' rules are still enforced server-side, but any tool without a deny rule " +
+                    "will run without asking.\n\nEnable Brave Mode?",
+                "Confirm Brave Mode",
+                com.intellij.openapi.ui.Messages.OK_BUTTON,
+                com.intellij.openapi.ui.Messages.CANCEL_BUTTON,
+                com.intellij.icons.AllIcons.General.Warning,
+            )
+            if (confirm != com.intellij.openapi.ui.Messages.OK) return
+        }
         OpenCodeFollowSettingsState.getInstance().braveModeEnabled = newValue
         _braveModeEnabled.value = newValue
         logger.info { "[ACP] Brave mode toggled: $newValue" }
@@ -981,7 +1019,7 @@ class ChatViewModel(
             service.parsePersistedToolPermissions(permsJson).mapValues { (_, pair) ->
                 Pair(pair.first, ToolPermission.fromActionString(pair.second))
             }
-        } catch (e: Exception) {
+        } catch (e: kotlinx.serialization.SerializationException) {
             // FAIL-CLOSED: corrupted permissions JSON → set all discovered tools to ASK
             // (safest interactive default) instead of leaving them at ALLOW. See
             // OpenCodeService.discoverToolsInBackground for the full rationale.
@@ -990,6 +1028,9 @@ class ChatViewModel(
             if (allDiscovered.isEmpty()) {
                 emptyMap()
             } else {
+                // Set both tool.id and tool.name to ASK — the registry may look up permissions
+                // by either key depending on the context (some tools are referenced by id, others
+                // by name). Setting both ensures fail-closed regardless of which key is used.
                 val failClosed = mutableMapOf<String, Pair<Boolean, ToolPermission>>()
                 for (tool in allDiscovered) {
                     failClosed[tool.id] = Pair(true, ToolPermission.ASK)
@@ -997,6 +1038,11 @@ class ChatViewModel(
                 }
                 failClosed.toMap()
             }
+        } catch (e: Exception) {
+            // Non-parse exceptions (NPE, ClassCastException, etc.) indicate a code bug,
+            // not corrupted JSON. Log and rethrow to surface the real issue.
+            logger.error(e) { "[ACP] Unexpected error parsing tool permissions (not a JSON error)" }
+            throw e
         }
     }
 

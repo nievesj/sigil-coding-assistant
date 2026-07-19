@@ -240,21 +240,6 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      */
     @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followAgentEnabled"))
     var followAgentEnabled: Boolean = false
-    /**
-     * When Follow Agent is enabled, also show agent-executed commands in a read-only
-     * console in the Run tool window. Default true — if the user opted into Follow Agent,
-     * they want to see command output too.
-     */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followCommandsInConsole"))
-    var followCommandsInConsole: Boolean = true
-
-    /**
-     * When Follow Agent is enabled, also open IntelliJ's native Find in Files when the
-     * agent performs a search. Default true — gives the user an interactive result set
-     * they can navigate, filter, and group.
-     */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followSearchesInFindWindow"))
-    var followSearchesInFindWindow: Boolean = true
     /** Highlight color for READ tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
     @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followReadColor"))
     var followReadColor: String = "#5078C888"
@@ -337,11 +322,12 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
     @Suppress("DEPRECATION") // migrated fields retained for one release cycle
     private fun forwardToFollowSettings(state: OpenCodeSettingsState): Boolean {
         return try {
-            OpenCodeFollowSettingsState.getInstance().loadState(
+            // Use migrateFromLegacy (NOT loadState) so braveModeEnabled is preserved
+            // on the singleton. loadState would copy the fresh default (false) from
+            // the constructed state and silently disable Brave Mode on every restart.
+            OpenCodeFollowSettingsState.getInstance().migrateFromLegacy(
                 OpenCodeFollowSettingsState().apply {
                     followAgentEnabled = state.followAgentEnabled
-                    followCommandsInConsole = state.followCommandsInConsole
-                    followSearchesInFindWindow = state.followSearchesInFindWindow
                     followReadColor = state.followReadColor
                     followEditColor = state.followEditColor
                     followSearchColor = state.followSearchColor
@@ -412,7 +398,15 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         @Suppress("DEPRECATION")
         responseTimeoutSeconds = when {
             state.responseTimeoutSeconds != 300 -> state.responseTimeoutSeconds.coerceAtLeast(60)
-            state.sseSocketTimeoutSeconds != 60 -> state.sseSocketTimeoutSeconds.coerceAtLeast(60)
+            state.sseSocketTimeoutSeconds != 60 -> {
+                // Ambiguous case: responseTimeoutSeconds is at default (300) but sseSocketTimeoutSeconds
+                // was customized. Using the legacy value. Log a warning so the user can correct if needed.
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
+                    "[ACP] Migration: responseTimeoutSeconds was at default (300), using legacy sseSocketTimeoutSeconds=${state.sseSocketTimeoutSeconds}. " +
+                    "If you explicitly set responseTimeoutSeconds to 300, please re-set it in Settings."
+                }
+                state.sseSocketTimeoutSeconds.coerceAtLeast(60)
+            }
             else -> 300
         }
         // NOTE: If the user explicitly set responseTimeoutSeconds to 300 (the default)
@@ -423,6 +417,9 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         toolStuckTimeoutSeconds = state.toolStuckTimeoutSeconds.coerceIn(60, 3600)
         // Clear deprecated field after migration to prevent it from being
         // re-persisted to XML on every IDE restart (reduces settings churn).
+        // NOTE: This is a one-way migration — downgrading to an older plugin version
+        // that still reads sseSocketTimeoutSeconds would get 0 (no timeout) instead of
+        // the original value. Downgrade is not supported after this migration.
         @Suppress("DEPRECATION")
         sseSocketTimeoutSeconds = 0
         autoConnect = state.autoConnect
@@ -450,7 +447,19 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
                 val parsed = kotlinx.serialization.json.Json.parseToJsonElement(state.additionalMcpServers)
                 // Validate structure: must be a JSON array (not an object or primitive)
                 if (parsed is kotlinx.serialization.json.JsonArray) {
-                    state.additionalMcpServers
+                    // Validate each element has required keys: name and url
+                    val allValid = parsed.all { element ->
+                        element is kotlinx.serialization.json.JsonObject &&
+                            element.containsKey("name") && element.containsKey("url")
+                    }
+                    if (allValid) {
+                        state.additionalMcpServers
+                    } else {
+                        io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
+                            "[ACP] Invalid additionalMcpServers entry: each element must have 'name' and 'url' keys — clearing"
+                        }
+                        ""
+                    }
                 } else {
                     io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] Invalid additionalMcpServers in settings: expected JSON array, got ${parsed::class.simpleName} — clearing" }
                     ""
@@ -463,18 +472,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         toolPermissions = state.toolPermissions
         savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
         discoveredToolsJson = state.discoveredToolsJson
-        followAgentEnabled = state.followAgentEnabled
-        followCommandsInConsole = state.followCommandsInConsole
-        followReadColor = state.followReadColor
-        followEditColor = state.followEditColor
-        followSearchColor = state.followSearchColor
-        followExecuteColor = state.followExecuteColor
-        followDeleteColor = state.followDeleteColor
-        followMoveColor = state.followMoveColor
-        followFetchColor = state.followFetchColor
-        followOtherColor = state.followOtherColor
-        followSearchesInFindWindow = state.followSearchesInFindWindow
-        showDisconnectConfirmation = state.showDisconnectConfirmation
+       showDisconnectConfirmation = state.showDisconnectConfirmation
         // Context & Compaction settings (with clamping for corrupt/out-of-range values)
         truncateToolOutput = state.truncateToolOutput
         toolOutputCharLimit = state.toolOutputCharLimit.coerceIn(10_000, 200_000)
@@ -507,19 +505,70 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         // their own persistence and the old fields are stale — re-forwarding would
         // overwrite user edits made via the new configurables (data loss bug).
         // Per-class migration: only re-attempt the class that failed, not all three.
-        // This prevents overwriting user edits made via the new configurables between
-        // restarts when only one class's forwarding failed.
-        if (!state.mcpSettingsMigrated) {
-            state.mcpSettingsMigrated = forwardToMcpSettings(state)
-        }
-        if (!state.followSettingsMigrated) {
-            state.followSettingsMigrated = forwardToFollowSettings(state)
-        }
-        if (!state.contextSettingsMigrated) {
-            state.contextSettingsMigrated = forwardToContextSettings(state)
-        }
+        //
+        // ROBUSTNESS: Also gate on the aggregate settingsMigratedToChildClasses flag,
+        // which IS persisted reliably. The per-class flags were added later but XStream
+        // does not always persist them — they default to false on load, causing the
+        // forwarder to re-run on every restart and overwrite the child state with stale
+        // legacy defaults. If the aggregate flag is true, ALL per-class forwards are
+        // skipped regardless of the per-class flag state.
+        //
+        // KNOWN LIMITATION: If the aggregate flag was never set (because one class's
+        // forwarding failed on the first run), the per-class flags are the only defense.
+        // Since XStream may not persist them reliably, there is a small window where
+        // forwarding re-runs and overwrites user edits. This is accepted as a one-time
+        // migration risk — once all three classes succeed once, the aggregate flag
+        // prevents all future re-forwarding.
+        val aggregateMigrated = state.settingsMigratedToChildClasses
+       if (!state.mcpSettingsMigrated && !aggregateMigrated) {
+           mcpSettingsMigrated = forwardToMcpSettings(state)
+       } else {
+           mcpSettingsMigrated = state.mcpSettingsMigrated
+       }
+       if (!state.followSettingsMigrated && !aggregateMigrated) {
+           followSettingsMigrated = forwardToFollowSettings(state)
+       } else {
+           followSettingsMigrated = state.followSettingsMigrated
+       }
+       if (!state.contextSettingsMigrated && !aggregateMigrated) {
+           contextSettingsMigrated = forwardToContextSettings(state)
+       } else {
+           contextSettingsMigrated = state.contextSettingsMigrated
+       }
         // Set the aggregate flag for backward compatibility (old code checks this).
-        settingsMigratedToChildClasses = state.mcpSettingsMigrated && state.followSettingsMigrated && state.contextSettingsMigrated
+        settingsMigratedToChildClasses = mcpSettingsMigrated && followSettingsMigrated && contextSettingsMigrated
+         // Clear deprecated Follow Agent fields after migration to prevent re-persistence
+         // to opencode-settings.xml. Same pattern as sseSocketTimeoutSeconds (line 410).
+         // The values now live in OpenCodeFollowSettingsState.
+        // NOTE: The legacy values were forwarded via the `state` parameter above
+        // (forwardToFollowSettings reads from `state`, not from `this`), so clearing
+        // `this` here does not lose data — it only prevents the deprecated fields from
+        // being re-persisted to XML on the next state flush.
+        // Only clear deprecated Follow Agent fields if forwarding SUCCEEDED.
+        // If forwarding failed (followSettingsMigrated is false), we must keep
+        // the legacy values so they can be re-forwarded on the next restart.
+        // Clearing them on failure would permanently lose the user's settings
+        // because getState() returns `this` and the cleared values would be persisted.
+        if (followSettingsMigrated) {
+            @Suppress("DEPRECATION")
+            followAgentEnabled = false
+            @Suppress("DEPRECATION")
+            followReadColor = ""
+            @Suppress("DEPRECATION")
+            followEditColor = ""
+            @Suppress("DEPRECATION")
+            followSearchColor = ""
+            @Suppress("DEPRECATION")
+            followExecuteColor = ""
+            @Suppress("DEPRECATION")
+            followDeleteColor = ""
+            @Suppress("DEPRECATION")
+            followMoveColor = ""
+            @Suppress("DEPRECATION")
+            followFetchColor = ""
+            @Suppress("DEPRECATION")
+            followOtherColor = ""
+        }
         if (!settingsMigratedToChildClasses) {
             io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] One or more settings forwardings failed; per-class flags set — failed classes will retry on next restart" }
         }

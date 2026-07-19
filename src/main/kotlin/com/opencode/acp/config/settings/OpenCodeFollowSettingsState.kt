@@ -31,19 +31,6 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
      * have not opted in.
      */
     var followAgentEnabled: Boolean = false
-    /**
-     * When Follow Agent is enabled, also show agent-executed commands in a read-only
-     * console in the Run tool window. Default true — if the user opted into Follow Agent,
-     * they want to see command output too.
-     */
-    var followCommandsInConsole: Boolean = true
-
-    /**
-     * When Follow Agent is enabled, also open IntelliJ's native Find in Files when the
-     * agent performs a search. Default true — gives the user an interactive result set
-     * they can navigate, filter, and group.
-     */
-    var followSearchesInFindWindow: Boolean = true
 
     /**
      * Whether Brave Mode (auto-approve all permission prompts) is enabled.
@@ -51,6 +38,16 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
      * showing the UI prompt, which is a security-relevant decision. The server
      * still enforces explicit `deny` rules before sending the permission SSE
      * event, so Brave Mode cannot override hard denials.
+     *
+     * **MISPLACEMENT WARNING**: This field lives in OpenCodeFollowSettingsState for
+     * historical reasons (XStream migration Phase A grouped it with Follow Agent).
+     * It is conceptually a PERMISSION setting, NOT a Follow Agent setting.
+     * Future refactoring should move it to a dedicated OpenCodePermissionSettingsState.
+     *
+     * **DO NOT add braveModeEnabled to migrateFromLegacy()** — that method deliberately
+     * excludes this field to avoid overwriting the user's Brave Mode setting with the
+     * default (false) from a freshly-constructed state. Adding it would silently disable
+     * Brave Mode on every restart.
      */
     var braveModeEnabled: Boolean = false
 
@@ -73,10 +70,31 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
 
     override fun getState(): OpenCodeFollowSettingsState = this
 
+    /**
+     * Load state from the XStream-loaded state object.
+     *
+     * **IMPORTANT**: This method copies ALL fields including braveModeEnabled.
+     * It should ONLY be called by the IntelliJ persistence framework (which loads
+     * from XML where braveModeEnabled is persisted). NEVER call this method with
+     * a freshly-constructed OpenCodeFollowSettingsState() — that would overwrite
+     * the user's Brave Mode setting with the default (false).
+     *
+     * For legacy migration from OpenCodeSettingsState, use [migrateFromLegacy]
+     * instead, which deliberately excludes braveModeEnabled.
+     */
     override fun loadState(state: OpenCodeFollowSettingsState) {
+        // Detect accidental calls with a freshly-constructed default state, which would
+        // silently disable Brave Mode. Log a warning — don't throw (the IntelliJ persistence
+        // framework calls this with a properly-loaded state).
+        if (!state.braveModeEnabled && state.followAgentEnabled == false &&
+            state.followReadColor == "#5078C888" && state.followEditColor == "#50A05088") {
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
+                "[ACP] OpenCodeFollowSettingsState.loadState called with a state that looks like a fresh default — " +
+                "this would silently disable Brave Mode. Use migrateFromLegacy() for legacy migration, " +
+                "not loadState(). If this is a legitimate reset, ignore this warning."
+            }
+        }
         followAgentEnabled = state.followAgentEnabled
-        followCommandsInConsole = state.followCommandsInConsole
-        followSearchesInFindWindow = state.followSearchesInFindWindow
         braveModeEnabled = state.braveModeEnabled
         followReadColor = state.followReadColor
         followEditColor = state.followEditColor
@@ -89,12 +107,36 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
     }
 
     /**
-     * Returns the persisted hex color for a [com.agentclientprotocol.model.ToolKind].
-     * THINK and SWITCH_MODE have no persisted color and fall back to OTHER.
+     * One-time legacy migration from [OpenCodeSettingsState].
      *
-     * Asymmetry with [setFollowColor]: get returns OTHER's color for THINK/SWITCH_MODE
-     * (read fallback), but set is a no-op for those kinds (no persistence). This is
-     * intentional — they have no dedicated UI color picker and inherit OTHER's color.
+     * Copies ONLY the migrated Follow Agent fields (followAgentEnabled + the 9
+     * follow*Color fields) from [state] into this singleton, leaving
+     * [braveModeEnabled] UNTOUCHED. This is critical because callers construct a
+     * fresh `OpenCodeFollowSettingsState()` (whose `braveModeEnabled` defaults to
+     * `false`) and would otherwise overwrite the user's Brave Mode setting on
+     * every restart — silently disabling auto-approve of permission prompts.
+     *
+     * Use [loadState] for the normal `PersistentStateComponent` flow (which
+     * copies all fields from a state object loaded by XStream). Use this method
+     * only when forwarding legacy fields from the parent [OpenCodeSettingsState].
+     */
+    fun migrateFromLegacy(state: OpenCodeFollowSettingsState) {
+        followAgentEnabled = state.followAgentEnabled
+        followReadColor = state.followReadColor
+        followEditColor = state.followEditColor
+        followSearchColor = state.followSearchColor
+        followExecuteColor = state.followExecuteColor
+        followDeleteColor = state.followDeleteColor
+        followMoveColor = state.followMoveColor
+        followFetchColor = state.followFetchColor
+        followOtherColor = state.followOtherColor
+    }
+
+    /**
+     * Returns the persisted hex color for a [com.agentclientprotocol.model.ToolKind].
+     * THINK and SWITCH_MODE have no dedicated color and fall back to OTHER.
+     * Symmetric with [setFollowColor] — both read and write fall back to
+     * followOtherColor for THINK/SWITCH_MODE.
      */
     fun getFollowColor(kind: com.agentclientprotocol.model.ToolKind): String = when (kind) {
         com.agentclientprotocol.model.ToolKind.READ -> followReadColor
@@ -111,7 +153,9 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
 
     /**
      * Persists the hex color for a [com.agentclientprotocol.model.ToolKind].
-     * THINK and SWITCH_MODE have no persisted color — no-op.
+     * THINK and SWITCH_MODE have no highlight (colorConfigs maps them to null), so
+     * persisting a color for them would be misleading — setFollowColor is a no-op
+     * for those kinds. OTHER writes to followOtherColor as before.
      */
     fun setFollowColor(kind: com.agentclientprotocol.model.ToolKind, hex: String) {
         when (kind) {
@@ -124,7 +168,13 @@ class OpenCodeFollowSettingsState : PersistentStateComponent<OpenCodeFollowSetti
             com.agentclientprotocol.model.ToolKind.FETCH -> followFetchColor = hex
             com.agentclientprotocol.model.ToolKind.OTHER -> followOtherColor = hex
             com.agentclientprotocol.model.ToolKind.THINK,
-            com.agentclientprotocol.model.ToolKind.SWITCH_MODE -> { /* no-op */ }
+            com.agentclientprotocol.model.ToolKind.SWITCH_MODE -> {
+                // THINK and SWITCH_MODE have no highlight (colorConfigs maps them to null).
+                // Persisting a color for them would be misleading — no-op.
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}.debug {
+                    "[ACP] setFollowColor: no-op for $kind (no highlight configured)"
+                }
+            }
         }
     }
 
