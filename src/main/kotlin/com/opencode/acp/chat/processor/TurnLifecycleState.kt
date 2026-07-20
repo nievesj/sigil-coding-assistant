@@ -38,12 +38,20 @@ class TurnLifecycleState {
      *  coroutine and read by emitStreamingCompleted from completeStreaming/abortStreaming
      *  which can run on recoverBackgroundSessions or the activity monitor coroutine. */
     @Volatile var streamingCompletedEmitted: Boolean = false
+    /** Set to true in abort/error paths to mark the turn as aborted. Checked by
+     *  SseEventPipeline to drop stale events that arrive after abort but before the
+     *  next ResetTurn clears it. Cleared by reset() on the next turn.
+     *  @Volatile because written by abort/error paths (which can run on the activity
+     *  monitor coroutine or recoverBackgroundSessions) and read by the event processing
+     *  coroutine in SseEventPipeline.process(). */
+    @Volatile var isAborted: Boolean = false
 
     /** Reset turn-lifecycle state for a new streaming turn. */
     fun reset() {
         activeMessageId = null
         activeServerMessageId = null
         errorMessage = null
+        lastUserText = null
         isStreaming = false
         modelID = null
         providerID = null
@@ -52,5 +60,6 @@ class TurnLifecycleState {
         lastActivityTimeMs = System.currentTimeMillis()
         streamingStartedEmitted = false
         streamingCompletedEmitted = false
+        isAborted = false
     }
 }

@@ -601,7 +601,6 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
             attachedFiles = files
         )
         sessionManager.addMessage(userMsg)
-        sessionManager.setLastUserText(text)
 
         client.resetReasoningTracking()
         val assistantMsgId = sessionManager.createAssistantMessage(
@@ -609,6 +608,11 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
             providerID = providerID,
             serverMessageId = null
         )
+        // Set lastUserText AFTER createAssistantMessage — createAssistantMessage sends a
+        // ResetTurn that calls resetTurnState() → reset(), which clears lastUserText.
+        // Setting it after ensures the echo-stripping logic has the correct user text
+        // when the first TextChunk/TextReplace arrives.
+        sessionManager.setLastUserText(text)
 
         val deferred = CompletableDeferred<Unit>()
         val activeSession = sessionManager.getActiveSession()

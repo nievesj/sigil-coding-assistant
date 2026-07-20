@@ -2,6 +2,7 @@ package com.opencode.acp.chat.processor
 
 import com.opencode.acp.SseEvent
 import com.opencode.acp.chat.model.MessagePart
+import com.opencode.acp.chat.model.MessageState
 import com.opencode.acp.chat.util.FakeFollowAgentDispatcher
 import io.kotest.assertions.withClue
 import io.kotest.matchers.shouldBe
@@ -9,6 +10,7 @@ import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.ints.shouldBeLessThan
 import io.kotest.matchers.ints.shouldBeGreaterThan
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
@@ -67,7 +69,13 @@ class SessionStateTest {
      * dispatcher's virtual time. We need a real-time sleep + poll to give the
      * Dispatchers.Default threads a chance to process the channel events.
      */
-    private suspend fun process(vararg events: SseEvent) {
+    private suspend fun process(
+        vararg events: SseEvent,
+        done: () -> Boolean = {
+            sessionState.textStreamingState.streamingText.value.isNotEmpty() ||
+                sessionState.textStreamingState.textBuffer.isNotEmpty()
+        },
+    ) {
         for (event in events) {
             sessionState.processEvent(event)
         }
@@ -80,18 +88,48 @@ class SessionStateTest {
         // the JVM scheduler to run Dispatchers.Default worker threads that
         // drain the event channel. We poll the streamingText StateFlow which
         // is updated after each text event is processed.
+       var attempts = 0
+       while (attempts < 100) {
+           Thread.sleep(20)
+           testScope.runCurrent()
+           if (done()) break
+           attempts++
+       }
+       // Fail loudly if the done predicate never returned true. Incomplete processing
+       // should not silently pass. This catches bugs where events are dropped or the
+       // event processing coroutine is stuck.
+       if (!done()) {
+           throw AssertionError("process() timed out after 2s waiting for event processing. streamingText='${sessionState.textStreamingState.streamingText.value}', textBufferLen=${sessionState.textStreamingState.textBuffer.length}")
+       }
+       // Final yield to let any remaining resegment complete
+        Thread.sleep(100)
+        testScope.runCurrent()
+    }
+
+    /**
+     * Feed events and poll until [done] returns true. More deterministic than [process]
+     * for multi-event tests where the legacy break-on-first-text condition fires too early.
+     */
+    private suspend fun processUntil(done: () -> Boolean, vararg events: SseEvent) {
+        for (event in events) {
+            sessionState.processEvent(event)
+        }
+        testScope.runCurrent()
+        testScope.advanceUntilIdle()
+        testScope.runCurrent()
         var attempts = 0
-        while (attempts < 50) {
+        while (attempts < 100) {
             Thread.sleep(20)
             testScope.runCurrent()
-            // Check if the event processing has produced output
-            if (sessionState.textStreamingState.streamingText.value.isNotEmpty() ||
-                sessionState.textStreamingState.textBuffer.isNotEmpty()) {
-                break
-            }
+            if (done()) break
             attempts++
         }
-        // Final yield to let any remaining resegment complete
+        // Fail loudly if the done predicate never returned true. Incomplete processing
+        // should not silently pass. This catches bugs where events are dropped or the
+        // event processing coroutine is stuck.
+        if (!done()) {
+            throw AssertionError("processUntil() timed out after 2s waiting for event processing")
+        }
         Thread.sleep(100)
         testScope.runCurrent()
     }
@@ -258,8 +296,11 @@ class SessionStateTest {
     @Test
     fun `user echo stripping works on first textReplace`() = testScope.runTest {
         val sid = "test_session"
-        sessionState.setLastUserText("User: ")
         sessionState.createAssistantMessage(null, null)
+        // Set lastUserText AFTER createAssistantMessage — the ResetTurn it sends
+        // calls resetTurnState() → reset() which clears lastUserText. Setting it
+        // after ensures it survives until the first TextReplace arrives.
+        sessionState.setLastUserText("User: ")
 
         process(SseEvent.TextReplace(sid, "User: Response", partId = "pt_1"))
 
@@ -268,6 +309,84 @@ class SessionStateTest {
         }
         withClue("userEchoStripped should be true") {
             sessionState.textStreamingState.userEchoStripped shouldBe true
+        }
+    }
+
+    // ── handleSessionError (interrupt-during-subtask fix) ──────────────────
+
+    @Test
+    fun `handleSessionError clears activeMessageId and sets isAborted`() = testScope.runTest {
+        val sid = "test_session"
+        sessionState.createAssistantMessage(null, null, fromEventProcessing = true)
+        // Simulate an active streaming turn with a server message ID
+        sessionState.turnLifecycleState.activeServerMessageId = "srv_1"
+        sessionState.turnLifecycleState.isStreaming = true
+        val deferred = CompletableDeferred<Unit>()
+        sessionState.responseDeferred = deferred
+
+        sessionState.handleSessionError(SseEvent.SessionError(sessionId = sid, errorMessage = "Aborted"))
+
+        withClue("activeMessageId should be cleared") {
+            sessionState.turnLifecycleState.activeMessageId shouldBe null
+        }
+        withClue("activeServerMessageId should be cleared") {
+            sessionState.turnLifecycleState.activeServerMessageId shouldBe null
+        }
+        withClue("isStreaming should be false") {
+            sessionState.turnLifecycleState.isStreaming shouldBe false
+        }
+        withClue("isAborted should be true") {
+            sessionState.turnLifecycleState.isAborted shouldBe true
+        }
+        withClue("responseDeferred should be completed (defensive backup)") {
+            deferred.isCompleted shouldBe true
+        }
+    }
+
+    @Test
+    fun `handleSessionError followed by stale ToolUse does not reprocess`() = testScope.runTest {
+        val sid = "test_session"
+        val msgId = sessionState.createAssistantMessage(null, null, fromEventProcessing = true)
+        sessionState.turnLifecycleState.activeServerMessageId = "srv_1"
+        sessionState.turnLifecycleState.isStreaming = true
+
+        val messagesBefore = sessionState.messages.first().size
+
+        sessionState.handleSessionError(SseEvent.SessionError(sessionId = sid, errorMessage = "Aborted"))
+
+        // Snapshot the parts count after the error
+        val partsAfterError = sessionState.messages.first()[msgId]?.parts?.size ?: 0
+
+       // Now feed a stale V1 ToolUse (messageId = null) through the pipeline.
+       // The isAborted guard in SseEventPipeline should drop it.
+       // The stale ToolUse is dropped by the isAborted guard, producing no observable
+       // state change (no new message, no new pill, no text output). We cannot poll
+       // for a state change because there is none. Instead, feed the event and wait
+       // a fixed time for the event processing coroutine to drain the channel. The
+       // 200ms sleep is generous for a single event on Dispatchers.Default.
+       sessionState.processEvent(SseEvent.ToolUse(sid, toolCallId = "tc_stale", toolName = "bash", messageId = null))
+       testScope.runCurrent()
+       testScope.advanceUntilIdle()
+       testScope.runCurrent()
+       Thread.sleep(200)
+       testScope.runCurrent()
+
+        // The aborted message's parts should be unchanged — the stale ToolUse was
+        // either dropped by the isAborted guard, or routed to a NEW auto-created
+        // message (when activeMessageId is null, a content event triggers auto-create
+        // which calls resetTurnState() clearing isAborted and starting a fresh turn).
+        // In both cases, the aborted message's parts must not gain the stale tool call.
+        val partsAfterStale = sessionState.messages.first()[msgId]?.parts?.size ?: 0
+        withClue("stale ToolUse after abort should not add parts to the aborted message") {
+            partsAfterStale shouldBe partsAfterError
+        }
+
+        // Additionally verify the isAborted guard specifically dropped the event
+        // (not routed to a new auto-created message). If a new message were created,
+        // the total message count would have increased.
+        val messagesAfter = sessionState.messages.first().size
+        withClue("isAborted guard should drop the stale ToolUse without creating a new message") {
+            messagesAfter shouldBe messagesBefore
         }
     }
 }
