@@ -46,15 +46,22 @@ class TurnLifecycleState {
      *  coroutine in SseEventPipeline.process(). */
     @Volatile var isAborted: Boolean = false
 
-    /** Reset turn-lifecycle state for a new streaming turn. */
-    fun reset() {
-        activeMessageId = null
-        activeServerMessageId = null
-        errorMessage = null
-        lastUserText = null
-        isStreaming = false
-        modelID = null
-        providerID = null
+   /** Reset turn-lifecycle state for a new streaming turn. */
+   fun reset() {
+       activeMessageId = null
+       activeServerMessageId = null
+       // NOTE: lastUserText is intentionally NOT cleared here. It is overwritten
+       // on each send by setLastUserText(). Clearing it would break echo stripping
+       // when the async ResetTurn (enqueued by createAssistantMessage) is processed
+       // AFTER setLastUserText runs on the sender's coroutine — the race window
+       // where reset() would null out lastUserText before the first TextReplace
+       // arrives. See SessionStateTest: `lastUserText survives resetTurnState so
+       // echo stripping works after async ResetTurn race`.
+       // DO NOT add `lastUserText = null` here without updating that test.
+       errorMessage = null
+       isStreaming = false
+       modelID = null
+       providerID = null
         pendingStopJob?.cancel()
         pendingStopJob = null
         lastActivityTimeMs = System.currentTimeMillis()

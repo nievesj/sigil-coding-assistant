@@ -205,9 +205,10 @@ class FileAttachmentServiceTest {
             val result = FileAttachmentService.addFileAttachment(file, project)
 
             result.shouldBeInstanceOf<AttachedFile>()
-            // Display name preserves the original; path points to the copied file.
+            // Display name uses the copied file's name (handles collision-resolved
+            // names like "foo-1.png"); path points to the copied file's canonical path.
             result.name shouldBe "external-doc.md"
-            result.path shouldBe copiedFile.absolutePath
+            result.path shouldBe copiedFile.canonicalPath
             result.mime shouldBe "text/markdown"
         } finally {
             outsideFile.delete()
@@ -215,6 +216,41 @@ class FileAttachmentServiceTest {
     }
 
     // ── Non-absolute / non-existent path ───────────────────────────────────────
+
+    // ── Collision handling ─────────────────────────────────────────────────────
+
+    @Test
+    fun `collision during copy uses collision-resolved filename for display name`() {
+        // When copyExternalAttachmentToAllowedDir copies a file and a name collision
+        // occurs, the on-disk filename is "foo-1.png" (not "foo.png"). The AttachedFile
+        // should use the collision-resolved name so the display name matches the path.
+        val outsideDir = tempDir.parent ?: tempDir
+        val outsideFile = java.io.File(outsideDir.toFile(), "image.png").apply { writeText("png") }
+        try {
+            val attachmentsDir = java.io.File(projectBaseFile, ".opencode/attachments").apply { mkdirs() }
+            // Simulate a collision-resolved copy: the copied file is named "image-1.png"
+            val copiedFile = java.io.File(attachmentsDir, "image-1.png").apply { writeText("png") }
+
+            val file = mockk<VirtualFile>()
+            every { file.name } returns "image.png"
+            every { file.extension } returns "png"
+            every { file.path } returns outsideFile.absolutePath
+
+            every {
+                copyExternalAttachmentToAllowedDir(any(), any())
+            } returns copiedFile
+
+            val result = FileAttachmentService.addFileAttachment(file, project)
+
+            result.shouldBeInstanceOf<AttachedFile>()
+            // Display name uses the collision-resolved name, not the original.
+            result.name shouldBe "image-1.png"
+            result.path shouldBe copiedFile.canonicalPath
+            result.mime shouldBe "image/png"
+        } finally {
+            outsideFile.delete()
+        }
+    }
 
     @Test
     fun `non-existent relative path returns null for defense in depth`() {

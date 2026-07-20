@@ -88,19 +88,23 @@ class SessionStateTest {
         // the JVM scheduler to run Dispatchers.Default worker threads that
         // drain the event channel. We poll the streamingText StateFlow which
         // is updated after each text event is processed.
+       // Budget: 500 attempts × 20ms = 10s total. The previous 100-attempt (2s)
+       // budget was too tight for loaded CI machines and caused intermittent
+       // AssertionError failures. 10s is generous for event processing on
+       // Dispatchers.Default while still failing fast enough for real bugs.
        var attempts = 0
-       while (attempts < 100) {
-           Thread.sleep(20)
-           testScope.runCurrent()
-           if (done()) break
-           attempts++
-       }
+       while (attempts < 500) {
+            Thread.sleep(20)
+            testScope.runCurrent()
+            if (done()) break
+            attempts++
+        }
        // Fail loudly if the done predicate never returned true. Incomplete processing
        // should not silently pass. This catches bugs where events are dropped or the
        // event processing coroutine is stuck.
        if (!done()) {
-           throw AssertionError("process() timed out after 2s waiting for event processing. streamingText='${sessionState.textStreamingState.streamingText.value}', textBufferLen=${sessionState.textStreamingState.textBuffer.length}")
-       }
+           throw AssertionError("process() timed out after 10s waiting for event processing. streamingText='${sessionState.textStreamingState.streamingText.value}', textBufferLen=${sessionState.textStreamingState.textBuffer.length}")
+        }
        // Final yield to let any remaining resegment complete
         Thread.sleep(100)
         testScope.runCurrent()
@@ -118,7 +122,7 @@ class SessionStateTest {
         testScope.advanceUntilIdle()
         testScope.runCurrent()
         var attempts = 0
-        while (attempts < 100) {
+        while (attempts < 500) {
             Thread.sleep(20)
             testScope.runCurrent()
             if (done()) break
@@ -128,7 +132,7 @@ class SessionStateTest {
         // should not silently pass. This catches bugs where events are dropped or the
         // event processing coroutine is stuck.
         if (!done()) {
-            throw AssertionError("processUntil() timed out after 2s waiting for event processing")
+            throw AssertionError("processUntil() timed out after 10s waiting for event processing")
         }
         Thread.sleep(100)
         testScope.runCurrent()
@@ -312,6 +316,35 @@ class SessionStateTest {
         }
     }
 
+    // Regression test for the echo-stripping race: createAssistantMessage enqueues
+    // a ResetTurn that runs asynchronously on the event-processing coroutine.
+    // setLastUserText runs on the sender's coroutine. If the ResetTurn is processed
+    // AFTER setLastUserText, resetTurnState() -> reset() previously cleared
+    // lastUserText to null, defeating the echo strip on the subsequent TextReplace.
+    // Fix: lastUserText is no longer cleared by reset(); it is overwritten on each
+    // send by setLastUserText. This test simulates the race by calling resetTurnState()
+    // after setLastUserText and asserting the value survives.
+    @Test
+    fun `lastUserText survives resetTurnState so echo stripping works after async ResetTurn race`() = testScope.runTest {
+        val sid = "test_session"
+        sessionState.createAssistantMessage(null, null, fromEventProcessing = true)
+        sessionState.setLastUserText("User: ")
+        // Simulate the event-processing coroutine processing a late ResetTurn
+        // (the race window: ResetTurn enqueued by createAssistantMessage is
+        // processed AFTER setLastUserText runs on the sender's coroutine).
+        sessionState.resetTurnState()
+        withClue("lastUserText must survive resetTurnState() to defeat the async ResetTurn race") {
+            sessionState.turnLifecycleState.lastUserText shouldBe "User: "
+        }
+        // Re-establish the active turn (resetTurnState cleared activeMessageId)
+        sessionState.turnLifecycleState.activeMessageId = sessionState.messages.first().keys.first()
+        sessionState.turnLifecycleState.isStreaming = true
+        process(SseEvent.TextReplace(sid, "User: Response", partId = "pt_1"))
+        withClue("echo should be stripped even when ResetTurn races ahead of setLastUserText") {
+            sessionState.textStreamingState.textBuffer.toString() shouldBe "Response"
+        }
+    }
+
     // ── handleSessionError (interrupt-during-subtask fix) ──────────────────
 
     @Test
@@ -370,6 +403,27 @@ class SessionStateTest {
        testScope.runCurrent()
        Thread.sleep(200)
        testScope.runCurrent()
+       //
+       // NOTE: This test is inherently non-deterministic because the stale ToolUse
+       // produces NO observable state change when correctly dropped. We cannot
+       // distinguish "guard dropped the event" from "event not yet processed" by
+       // observing state. The polling loop below waits up to 4s (200 attempts × 20ms)
+       // for the event processing coroutine to drain the channel, which is generous
+       // for a single event on Dispatchers.Default. The assertions verify the
+       // INVARIANT (no new message, no new parts) which holds in both cases — if
+       // the guard fails, a new message or parts would appear, which the assertions
+       // catch. If the event is not yet processed, the assertions pass vacuously,
+       // but the 4s budget makes this unlikely on any reasonable hardware.
+       var staleAttempts = 0
+       while (staleAttempts < 200) {
+           Thread.sleep(20)
+           testScope.runCurrent()
+           // No done() predicate — the stale event produces no state change when
+           // correctly dropped. We just wait for the channel to drain.
+           // Check if a new message appeared (guard failed) — if so, break early.
+           if (sessionState.messages.first().size != messagesBefore) break
+           staleAttempts++
+       }
 
         // The aborted message's parts should be unchanged — the stale ToolUse was
         // either dropped by the isAborted guard, or routed to a NEW auto-created

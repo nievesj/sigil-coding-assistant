@@ -59,6 +59,22 @@ object FileTypeIcons {
         put("json", PlatformIconKeys.FileTypes.Json)
         put("yaml", PlatformIconKeys.FileTypes.Yaml)
         put("yml", PlatformIconKeys.FileTypes.Yaml)
+        // Unity / game dev
+        put("prefab", PlatformIconKeys.FileTypes.Yaml)
+        put("asset", PlatformIconKeys.FileTypes.Yaml)
+        put("meta", PlatformIconKeys.FileTypes.Yaml)
+        put("unity", PlatformIconKeys.FileTypes.Yaml)
+        put("mat", PlatformIconKeys.FileTypes.Yaml)
+        put("controller", PlatformIconKeys.FileTypes.Yaml)
+        put("anim", PlatformIconKeys.FileTypes.Yaml)
+        put("cs", PlatformIconKeys.FileTypes.Java) // C# → use Java icon (closest match)
+        put("asmdef", PlatformIconKeys.FileTypes.Json)
+        put("asmref", PlatformIconKeys.FileTypes.Json)
+        put("shader", PlatformIconKeys.FileTypes.Text)
+        put("cginc", PlatformIconKeys.FileTypes.Text)
+        put("compute", PlatformIconKeys.FileTypes.Text)
+        put("hlsl", PlatformIconKeys.FileTypes.Text)
+        put("glsl", PlatformIconKeys.FileTypes.Text)
         put("md", PlatformIconKeys.FileTypes.Text)
         put("txt", PlatformIconKeys.FileTypes.Text)
         put("properties", PlatformIconKeys.FileTypes.Text)
@@ -105,6 +121,15 @@ object FileTypeIcons {
         put("json", PlatformIconKeys.FileTypes.Json)
         put("yaml", PlatformIconKeys.FileTypes.Yaml)
         put("yml", PlatformIconKeys.FileTypes.Yaml)
+        // Unity / game dev
+        put("csharp", PlatformIconKeys.FileTypes.Java)
+        put("cs", PlatformIconKeys.FileTypes.Java)
+        put("shader", PlatformIconKeys.FileTypes.Text)
+        put("hlsl", PlatformIconKeys.FileTypes.Text)
+        put("glsl", PlatformIconKeys.FileTypes.Text)
+        put("cginc", PlatformIconKeys.FileTypes.Text)
+        put("lua", PlatformIconKeys.FileTypes.Text)
+        put("dart", PlatformIconKeys.FileTypes.Text)
         put("python", PlatformIconKeys.Language.Python)
         put("py", PlatformIconKeys.Language.Python)
         put("ruby", PlatformIconKeys.Language.Ruby)
@@ -253,14 +278,21 @@ object FileTypeIcons {
      */
     internal fun resolveFileTypeIconFromPlatform(fileName: String): IconKey {
         // Guard against calls outside the IntelliJ application context (e.g., in
-        // pure unit tests or during early plugin initialization). FileTypeManager
-        // can throw AssertionError / NoClassDefFoundError when the application
-        // context is not initialized — Error is not a subclass of Exception, so
-        // the catch below would not intercept it. Checking ApplicationManager
-        // up front avoids the Error entirely and degrades cleanly to the default
-        // icon. The Exception catch remains as a fallback for misbehaving
-        // FileType extensions.
-        if (ApplicationManager.getApplication() == null) {
+        // pure unit tests or during early plugin initialization). On IntelliJ
+        // Platform 2026.1+, ApplicationManager.getApplication() throws
+        // IllegalStateException("Application is not initialized") when the
+        // application hasn't been created — it does NOT return null. We catch
+        // that here and degrade to the default icon. The broader
+        // catch (Exception) below remains as a fallback for misbehaving FileType
+        // extensions.
+        val app = try {
+            ApplicationManager.getApplication()
+        } catch (_: IllegalStateException) {
+            return PlatformIconKeys.FileTypes.Text
+        }
+        if (app == null) {
+            // Belt-and-suspenders: some older platform versions or test stubs
+            // may still return null. Kept for defensive compatibility.
             return PlatformIconKeys.FileTypes.Text
         }
         return try {

@@ -2,6 +2,8 @@ package com.opencode.acp.chat.ui.compose
 
 import com.intellij.openapi.project.Project
 import com.opencode.acp.chat.model.AttachedFile
+import com.opencode.acp.chat.util.AttachmentConstants
+import com.opencode.acp.chat.util.AttachmentPathValidator
 import com.opencode.acp.util.saveClipboardImageToDisk
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +46,17 @@ object ClipboardReader {
         // OleGetClipboard), freezing the entire IDE. The invokeLater path posts
         // the clipboard read as the next EDT event and times out after 5s if the
         // clipboard is locked, returning null instead of hanging.
+        //
+        // LIMITATION: The timeout protects the CALLER (returns null after 5s) but
+        // does NOT protect the EDT if readClipboardOnEdt() already started before
+        // the timeout fired. The `cancelled` flag check below only prevents the
+        // read from STARTING; it cannot abort an in-progress read. If the clipboard
+        // is locked and the read started just before the timeout, the EDT will
+        // still hang for the full locked-clipboard duration (potentially 5-9s).
+        // This is an accepted trade-off: the alternative (reading the clipboard on
+        // a background thread) violates AWT's requirement that clipboard access
+        // happens on the EDT. A future fix could use a watchdog that logs a
+        // warning if the EDT read exceeds a threshold, but cannot abort it.
         val clipResult: Any? = withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 val deferred = kotlinx.coroutines.CompletableDeferred<Any?>()
@@ -134,9 +147,37 @@ object ClipboardReader {
 
             val flavors = transferable.transferDataFlavors
 
-            // 1. Try stringFlavor / plain text FIRST — if the clipboard has text
-            //    content, it should be treated as text even if it also has an image
-            //    representation (many apps put both on the clipboard).
+            // 1. Try javaFileListFlavor (files from OS file manager) FIRST.
+            //    On macOS Finder (and some Windows configurations), copying image
+            //    files also places the file path on the clipboard as text/plain.
+            //    If we checked text first, the user's paste would produce a text
+            //    path string instead of an image attachment. Checking the file
+            //    list first ensures copied files are attached as files.
+            //    Only image files are returned here; non-image files are
+            //    intentionally ignored (attach them via the "Attach" button,
+            //    which runs the full copy-into-allowed-dir + MIME detection path).
+            if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                @Suppress("UNCHECKED_CAST")
+                val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
+                if (files != null && files.isNotEmpty()) {
+                    val imageFiles = files.filter { f ->
+                        f.extension.lowercase() in AttachmentConstants.IMAGE_EXTENSIONS
+                    }
+                    val nonImageCount = files.size - imageFiles.size
+                    if (nonImageCount > 0) {
+                        logger.info { "[ACP] readClipboardOnEdt: ignored $nonImageCount non-image file(s) from clipboard — attach via the Attach button" }
+                    }
+                    if (imageFiles.isNotEmpty()) {
+                        return imageFiles
+                    }
+                }
+            }
+
+            // 2. Try stringFlavor / plain text — if the clipboard has text content,
+            //    it should be treated as text even if it also has an image
+            //    representation (many apps put both on the clipboard). This runs
+            //    AFTER the file-list check so that copied files are attached as
+            //    files, not pasted as text paths.
             for (flavor in flavors) {
                 if (flavor.mimeType.startsWith("text/plain") && flavor.isRepresentationClassReader) {
                     try {
@@ -165,25 +206,6 @@ object ClipboardReader {
                     logger.warn(e) { "[ACP] readClipboardOnEdt: stringFlavor access denied (SecurityException)" }
                 } catch (e: Exception) {
                     logger.debug(e) { "[ACP] readClipboardOnEdt: string flavor read failed" }
-                }
-            }
-
-            // 2. Try javaFileListFlavor (files from OS file manager) — only return
-            //    actual image files here; non-image files are intentionally ignored.
-            //    Non-image files should be attached via the "Attach" button (which
-            //    runs the full copy-into-allowed-dir + MIME detection path). The
-            //    clipboard path is for images and text only.
-            if (transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
-                @Suppress("UNCHECKED_CAST")
-                val files = transferable.getTransferData(DataFlavor.javaFileListFlavor) as? List<java.io.File>
-                if (files != null && files.isNotEmpty()) {
-                    val imageExts = setOf("png", "jpg", "jpeg", "gif", "bmp", "svg", "webp")
-                    val imageFiles = files.filter { f ->
-                        f.extension.lowercase() in imageExts
-                    }
-                    if (imageFiles.isNotEmpty()) {
-                        return imageFiles
-                    }
                 }
             }
 
@@ -245,18 +267,25 @@ internal fun java.awt.Image.toBufferedImage(): BufferedImage {
  * path) and the drag-and-drop handlers in `InputArea`.
  */
 internal fun java.io.File.toAttachedFile(project: Project? = null): AttachedFile? {
-    val mime = com.opencode.acp.util.MimeTypes.guessFromFileName(name)
+    val mime = com.opencode.acp.util.MimeTypes.guessFromFile(this)
     val copied = if (project != null) {
         com.opencode.acp.util.copyExternalAttachmentToAllowedDir(this, project)
     } else null
     val effectivePath = if (copied != null) {
         copied.absolutePath
     } else {
-        // Copy failed — check if source is within allowed dirs
-        val canonicalSource = canonicalPath
-        val projectBase = project?.basePath?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
-        val userHome = System.getProperty("user.home")?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
-        if (!com.opencode.acp.chat.util.AttachmentPathValidator.isAllowed(canonicalSource, projectBase, userHome)) {
+        // Copy failed — check if source is within allowed dirs.
+        // Use canonicalizeOrReject (fail-closed) instead of raw canonicalPath,
+        // which throws IOException on broken symlinks / permission errors and
+        // would propagate out of mapNotNull, rejecting ALL files in the list.
+        val canonicalSource = AttachmentPathValidator.canonicalizeOrReject(path)
+            ?: run {
+                logger.warn { "[ACP] toAttachedFile: canonicalization failed — skipping: $name ($absolutePath)" }
+                return null
+            }
+        val projectBase = project?.basePath?.let { AttachmentPathValidator.canonicalizeOrReject(it) }
+        val userHome = System.getProperty("user.home")?.let { AttachmentPathValidator.canonicalizeOrReject(it) }
+        if (!AttachmentPathValidator.isAllowed(canonicalSource, projectBase, userHome)) {
             // Defense-in-depth: skip the file entirely instead of returning a path
             // outside allowed dirs. The server-side AttachmentValidator is the real
             // guard, but this prevents sending arbitrary paths (e.g., C:\Windows\System32\config\sam)
