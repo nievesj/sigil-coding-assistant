@@ -6,9 +6,12 @@ import com.opencode.acp.chat.model.MessageRole
 import com.opencode.acp.chat.model.MessageState
 import com.opencode.acp.chat.processor.MessageLifecycleManager.PendingTurnIdentity
 import io.github.oshai.kotlinlogging.KotlinLogging
+import io.kotest.assertions.withClue
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.TestScope
@@ -236,12 +239,34 @@ class MessageLifecycleManagerTest {
             serverMessageId = null,
             fromEventProcessing = false,
         )
-        // pendingTurnIdentity is @Volatile and may have been consumed by the event
-        // processing coroutine by the time we check. The meaningful invariant is that
-        // the message was added to the map despite the full channel. The pendingTurnIdentity
-        // is an internal optimization — testing its presence/absence is non-deterministic.
+        // pendingTurnIdentity should be stored as the fallback
+        manager.pendingTurnIdentity shouldNotBe null
+        val pending = manager.pendingTurnIdentity!!
+        pending.messageId shouldBe id
+        pending.modelID shouldBe "m"
+        pending.providerID shouldBe "p"
+
+        // Simulate the event processing coroutine applying pendingTurnIdentity:
+        // drain the channel, then apply the pending identity (mirrors SseEventPipeline.process).
+        // Drain all buffered ResetTurn events.
+        while (eventChannel.tryReceive().isSuccess) { /* drain */ }
+        // Apply the pending identity (the event processing coroutine does this at the
+        // start of processEventInternal when pendingTurnIdentity is non-null).
+        manager.pendingTurnIdentity = null
+        resetTurnStateCalled = true
+        turnLifecycleState.activeMessageId = pending.messageId
+        if (pending.serverMessageId != null) turnLifecycleState.activeServerMessageId = pending.serverMessageId
+        turnLifecycleState.modelID = pending.modelID
+        turnLifecycleState.providerID = pending.providerID
+        turnLifecycleState.isStreaming = true
+
         // The message should still be added to the map
         messages.value.containsKey(id) shouldBe true
+        // And the pending identity should have been applied to ctx
+        turnLifecycleState.activeMessageId shouldBe id
+        turnLifecycleState.isStreaming shouldBe true
+        turnLifecycleState.modelID shouldBe "m"
+        turnLifecycleState.providerID shouldBe "p"
     }
 
     // ── completeStreaming ─────────────────────────────────────────────────
@@ -314,13 +339,23 @@ class MessageLifecycleManagerTest {
             providerID = null,
             fromEventProcessing = true,
         )
-        // Verify that completeStreaming → emitStreamingCompleted uses the default
-        // naturalCompletion = true. We test this by checking the signal content
-        // via a dedicated StreamingLifecycleManager test (see StreamingLifecycleManagerTest).
-        // Here we verify the integration: completeStreaming finalizes the message
-        // and the streamingCompletedEmitted guard is set (signal was emitted).
+        // Collect the StreamingCompleted signal to verify naturalCompletion
+        val collected = mutableListOf<UiSignal>()
+        val collectJob = scope.launch(Dispatchers.Unconfined) {
+            signals.collect { collected.add(it) }
+        }
         manager.completeStreaming(id)
         advanceUntilIdle()
+        // Stop the collection
+        collectJob.cancel()
+        // Find the StreamingCompleted signal
+        val streamingCompleted = collected.filterIsInstance<UiSignal.StreamingCompleted>().firstOrNull()
+        withClue("StreamingCompleted should be emitted") {
+            streamingCompleted shouldNotBe null
+        }
+        withClue("naturalCompletion should be true for completeStreaming") {
+            streamingCompleted!!.naturalCompletion shouldBe true
+        }
         turnLifecycleState.streamingCompletedEmitted shouldBe true
         messages.value[id]!!.state shouldBe MessageState.Completed
     }
@@ -332,11 +367,20 @@ class MessageLifecycleManagerTest {
             providerID = null,
             fromEventProcessing = true,
         )
-        // Verify that abortStreaming → emitStreamingCompleted(naturalCompletion = false).
-        // The message should be Aborted (not Completed), and the signal should have been
-        // emitted (streamingCompletedEmitted guard is set).
+        val collected = mutableListOf<UiSignal>()
+        val collectJob = scope.launch(Dispatchers.Unconfined) {
+            signals.collect { collected.add(it) }
+        }
         manager.abortStreaming("User cancelled")
         advanceUntilIdle()
+        collectJob.cancel()
+        val streamingCompleted = collected.filterIsInstance<UiSignal.StreamingCompleted>().firstOrNull()
+        withClue("StreamingCompleted should be emitted") {
+            streamingCompleted shouldNotBe null
+        }
+        withClue("naturalCompletion should be false for abortStreaming") {
+            streamingCompleted!!.naturalCompletion shouldBe false
+        }
         turnLifecycleState.streamingCompletedEmitted shouldBe true
         messages.value[id]!!.state shouldBe MessageState.Aborted
     }
@@ -430,6 +474,69 @@ class MessageLifecycleManagerTest {
         val msg = messages.value[id]!!
         msg.isStreaming shouldBe false
         msg.state shouldBe MessageState.Aborted
+    }
+
+    // ── abort clears activeMessageId/activeServerMessageId and sets isAborted ──
+
+    @Test
+    fun `abortStreaming clears activeMessageId and activeServerMessageId and sets isAborted`() = runTest {
+        val id = manager.createAssistantMessage(
+            modelID = null,
+            providerID = null,
+            fromEventProcessing = true,
+        )
+        turnLifecycleState.activeServerMessageId = "srv_1"
+        turnLifecycleState.isStreaming = true
+        manager.abortStreaming("reason")
+        advanceUntilIdle()
+        turnLifecycleState.activeMessageId shouldBe null
+        turnLifecycleState.activeServerMessageId shouldBe null
+        turnLifecycleState.isStreaming shouldBe false
+        turnLifecycleState.isAborted shouldBe true
+        // streamingCompletedEmitted must NOT be cleared (idempotency guard)
+        turnLifecycleState.streamingCompletedEmitted shouldBe true
+        val msg = messages.value[id]!!
+        msg.state shouldBe MessageState.Aborted
+    }
+
+    @Test
+    fun `abortStreamingWithFallback clears activeMessageId and sets isAborted`() = runTest {
+        val id = manager.createAssistantMessage(
+            modelID = null,
+            providerID = null,
+            fromEventProcessing = true,
+        )
+        turnLifecycleState.activeServerMessageId = "srv_1"
+        turnLifecycleState.isStreaming = true
+        manager.abortStreamingWithFallback("reason", fallbackMessageId = "fallback_id")
+        advanceUntilIdle()
+        turnLifecycleState.activeMessageId shouldBe null
+        turnLifecycleState.activeServerMessageId shouldBe null
+        turnLifecycleState.isStreaming shouldBe false
+        turnLifecycleState.isAborted shouldBe true
+        turnLifecycleState.streamingCompletedEmitted shouldBe true
+        val msg = messages.value[id]!!
+        msg.state shouldBe MessageState.Aborted
+    }
+
+    @Test
+    fun `updateServerMessageId sets activeServerMessageId even when ctx not yet synced`() = runTest {
+        // Simulate the race: activeMessageId points to an old turn, activeServerMessageId is null
+        turnLifecycleState.activeMessageId = "old_msg"
+        turnLifecycleState.activeServerMessageId = null
+        // Add the new message to the map so update can find it
+        messages.value["new_msg"] = ChatMessage(
+            id = "new_msg",
+            role = MessageRole.ASSISTANT,
+            parts = linkedMapOf(),
+            isStreaming = true,
+            state = MessageState.Created,
+            timestamp = System.currentTimeMillis(),
+        )
+        manager.updateServerMessageId("new_msg", "srv_new")
+        // Closes the race window: activeServerMessageId is set even though ctx not synced
+        turnLifecycleState.activeServerMessageId shouldBe "srv_new"
+        messages.value["new_msg"]!!.serverMessageId shouldBe "srv_new"
     }
 
     // ── pendingTurnIdentity ───────────────────────────────────────────────

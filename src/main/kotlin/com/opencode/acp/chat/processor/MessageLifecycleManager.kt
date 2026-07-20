@@ -287,6 +287,7 @@ internal class MessageLifecycleManager(
         }
         streamingLifecycle.emitStreamingCompleted(msgId, naturalCompletion = false)
         signals.tryEmit(UiSignal.Error(msgId, reason))
+        abortTurnAndReset(msgId, reason)
     }
 
     /**
@@ -311,12 +312,6 @@ internal class MessageLifecycleManager(
         textStreaming.flushReveal()
         turnLifecycleState.errorMessage = reason
         turnLifecycleState.isStreaming = false
-        // Set activeMessageId so emitStreamingCompleted and UiSignal.Error reference the
-        // correct message. If ResetTurn hasn't fired yet, this prevents the ghost message.
-        // If ResetTurn fires later, resetTurnState() will clear this — no harm.
-        if (turnLifecycleState.activeMessageId == null) {
-            turnLifecycleState.activeMessageId = msgId
-        }
         messageMap.update(msgId) { msg ->
             val parts = LinkedHashMap(msg.parts)
             parts["error"] = MessagePart.Error(reason)
@@ -324,6 +319,38 @@ internal class MessageLifecycleManager(
         }
         streamingLifecycle.emitStreamingCompleted(msgId, naturalCompletion = false)
         signals.tryEmit(UiSignal.Error(msgId, reason))
+        abortTurnAndReset(msgId, reason)
+    }
+
+    /**
+     * Targeted clear of turn identity after an abort/error. Called by [abortStreaming]
+     * and [abortStreamingWithFallback] AFTER [emitStreamingCompleted] and [UiSignal.Error]
+     * emission (ordering matters — [emitStreamingCompleted] reads [toolCallState.pendingFileChanges]).
+     *
+     * Performs a TARGETED clear — NOT a full [resetTurnState]:
+     * - Clears [TurnLifecycleState.activeMessageId], [TurnLifecycleState.activeServerMessageId],
+     *   [TurnLifecycleState.isStreaming] (already set by callers, set again for clarity).
+     * - Sets [TurnLifecycleState.isAborted] = true so [SseEventPipeline] drops stale events
+     *   that arrive after abort but before the next [SseEvent.ResetTurn] clears it.
+     * - Cancels [TurnLifecycleState.pendingStopJob].
+     *
+     * Does NOT clear: [errorMessage] (UI may read it), [modelID]/[providerID] (next turn
+     * overwrites), [streamingStartedEmitted]/[streamingCompletedEmitted] (idempotency guards
+     * — clearing them risks double-emission). Does NOT clear [toolCallState] or
+     * [textStreamingState] — those are owned by their own managers and the [isAborted]
+     * flag in [SseEventPipeline] prevents new events from mutating them. They'll be
+     * cleared by [resetTurnState] on the next [createAssistantMessage].
+     *
+     * Caller MUST already hold [stateLock].
+     */
+    private fun abortTurnAndReset(msgId: String, reason: String) {
+        turnLifecycleState.activeMessageId = null
+        turnLifecycleState.activeServerMessageId = null
+        turnLifecycleState.isStreaming = false
+        turnLifecycleState.isAborted = true
+        turnLifecycleState.pendingStopJob?.cancel()
+        turnLifecycleState.pendingStopJob = null
+        logger.info { "[ACP] abortTurnAndReset: msg=$msgId reason=$reason — cleared activeMessageId/activeServerMessageId, set isAborted=true" }
     }
 
     /**
@@ -350,7 +377,34 @@ internal class MessageLifecycleManager(
                 logger.warn { "[ACP] updateServerMessageId: server ID mismatch — HTTP=$serverMessageId, SSE=${turnLifecycleState.activeServerMessageId}. Keeping SSE value." }
             }
         } else {
-            logger.info { "[ACP] updateServerMessageId: ctx not yet synced (msg=$messageId, activeMessageId=${turnLifecycleState.activeMessageId}) — message field updated, ctx will be set by ResetTurn or first SSE event" }
+            // ctx not yet synced — but still set activeServerMessageId if null so the
+            // routing check can filter stale events. This closes the window between
+            // createAssistantMessage (sends ResetTurn) and ResetTurn being processed.
+            // If activeServerMessageId is non-null AND differs from the new serverMessageId,
+            // it is a stale value from a previous turn (ResetTurn hasn't cleared it yet).
+            // Overwrite it with the new turn's serverId — otherwise the server-ID routing
+            // check in SseEventPipeline would skip events for the new turn (comparing the
+           // new event's serverId against the stale activeServerMessageId).
+           //
+           // ASSUMPTION: This overwrite assumes single-send-in-flight for the parent
+           // session (sendMutex serializes sends). A child-session auto-create racing
+           // with a parent send could theoretically cause two updateServerMessageId
+           // calls to race in this branch, with the second overwriting the first's
+           // activeServerMessageId. Impact is low: the auto-create path sets
+           // activeMessageId directly (fromEventProcessing=true), so the
+           // `messageId == activeMessageId` branch above is taken instead of this
+           // one. This branch only fires during the narrow window between
+           // createAssistantMessage (sends ResetTurn) and ResetTurn being processed,
+           // and only one send should be in flight during that window.
+           if (turnLifecycleState.activeServerMessageId == null) {
+                turnLifecycleState.activeServerMessageId = serverMessageId
+                logger.info { "[ACP] updateServerMessageId: ctx not yet synced but setting activeServerMessageId=$serverMessageId (msg=$messageId, activeMessageId=${turnLifecycleState.activeMessageId})" }
+            } else if (turnLifecycleState.activeServerMessageId != serverMessageId) {
+                logger.warn { "[ACP] updateServerMessageId: overwriting stale activeServerMessageId=${turnLifecycleState.activeServerMessageId} with $serverMessageId (msg=$messageId, activeMessageId=${turnLifecycleState.activeMessageId}) — ResetTurn hasn't cleared the previous turn's serverId yet" }
+                turnLifecycleState.activeServerMessageId = serverMessageId
+            } else {
+                logger.info { "[ACP] updateServerMessageId: ctx not yet synced (msg=$messageId, activeMessageId=${turnLifecycleState.activeMessageId}) — message field updated, ctx will be set by ResetTurn or first SSE event" }
+            }
         }
     }
 

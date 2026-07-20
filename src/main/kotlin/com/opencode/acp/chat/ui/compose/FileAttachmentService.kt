@@ -3,6 +3,7 @@ package com.opencode.acp.chat.ui.compose
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.opencode.acp.chat.model.AttachedFile
+import com.opencode.acp.chat.util.AttachmentConstants
 import com.opencode.acp.chat.util.AttachmentPathValidator
 import com.opencode.acp.util.MimeTypes
 import com.opencode.acp.util.copyExternalAttachmentToAllowedDir
@@ -31,7 +32,9 @@ private val logger = KotlinLogging.logger {}
  */
 object FileAttachmentService {
 
-    private val IMAGE_EXTENSIONS = setOf("png", "jpg", "jpeg", "gif", "bmp", "svg", "webp")
+    // Use the shared constant so the requireImage gate stays in sync with the
+    // clipboard file-list filter in ClipboardReader. See AttachmentConstants.
+    private val IMAGE_EXTENSIONS = AttachmentConstants.IMAGE_EXTENSIONS
 
     /**
      * Reads [file] into an [AttachedFile].
@@ -55,35 +58,43 @@ object FileAttachmentService {
                     return null
                 }
             }
-            val mime = MimeTypes.guessFromFileName(file.name)
             // VirtualFile.path is already an absolute filesystem path for local files.
             val sourceFile = java.io.File(file.path)
+            val mime = MimeTypes.guessFromFile(sourceFile)
             val effectivePath: AttachedFile? = if (sourceFile.isAbsolute && sourceFile.exists()) {
                 // Copy external files (Desktop, Documents, iCloud Drive, ...) into the
                 // project's .opencode/attachments/ dir so they pass the service guard.
-                // If the copy fails, fall back to the original path and let the guard
-                // log/skip it — never silently drop here.
-                copyExternalAttachmentToAllowedDir(sourceFile, project)
-                    ?.takeIf { it.absolutePath != sourceFile.absolutePath }
-                    ?.let { copied ->
-                        // Preserve the original display name; use the copied file's path.
-                        // NOTE: Display name uses the original file.name, but the path points to the
-                        // copied file. If a collision occurred, the actual filename on disk may differ
-                        // (e.g., "file (1).txt"). This is a known minor UX issue — the display name
-                        // is more useful to the user than the collision-resolved name.
-                        AttachedFile(name = file.name, path = copied.absolutePath, mime = mime)
-                    } ?: run {
-                        // Copy failed — check if source is outside allowed dirs
-                        val canonicalSource = AttachmentPathValidator.canonicalizeOrReject(sourceFile.path)
-                            ?: return null
-                        val projectBase = project.basePath?.let { AttachmentPathValidator.canonicalizeOrReject(it) }
-                        val userHome = System.getProperty("user.home")?.let { AttachmentPathValidator.canonicalizeOrReject(it) }
-                        if (!AttachmentPathValidator.isAllowed(canonicalSource, projectBase, userHome)) {
-                            logger.warn { "[ACP] addFileAttachment: rejecting file outside allowed dirs: ${file.name} (${sourceFile.path})" }
-                            return null
-                        }
-                        AttachedFile(name = file.name, path = canonicalSource, mime = mime)
+                // copyExternalAttachmentToAllowedDir returns the sourceFile unchanged
+                // when it's already inside an allowed dir — in that case, use the
+                // canonical path directly. If the copy fails (returns null), fall back
+                // to strict canonical validation (fail-closed).
+                val copied = copyExternalAttachmentToAllowedDir(sourceFile, project)
+                if (copied != null) {
+                    // Copy succeeded OR file was already inside allowed dirs.
+                    // Use the copied file's name (handles collision-resolved names
+                    // like "foo-1.png") and canonical path. If canonicalization
+                    // fails (broken symlink in path), fall back to absolutePath
+                    // rather than rejecting — copyExternalAttachmentToAllowedDir
+                    // already validated the file is in an allowed dir.
+                    val canonicalPath = AttachmentPathValidator.canonicalizeOrReject(copied.absolutePath)
+                        ?: copied.absolutePath
+                    AttachedFile(name = copied.name, path = canonicalPath, mime = mime)
+                } else {
+                    // Copy failed — check if source is outside allowed dirs using
+                    // the same fail-closed canonicalization as the service guard.
+                    // NOTE: The `return null` statements below use Kotlin's
+                    // non-local return — they exit addFileAttachment, NOT this
+                    // `else` block. Do NOT refactor without restructuring.
+                    val canonicalSource = AttachmentPathValidator.canonicalizeOrReject(sourceFile.path)
+                        ?: return null
+                    val projectBase = project.basePath?.let { AttachmentPathValidator.canonicalizeOrReject(it) }
+                    val userHome = System.getProperty("user.home")?.let { AttachmentPathValidator.canonicalizeOrReject(it) }
+                    if (!AttachmentPathValidator.isAllowed(canonicalSource, projectBase, userHome)) {
+                        logger.warn { "[ACP] addFileAttachment: rejecting file outside allowed dirs: ${file.name} (${sourceFile.path})" }
+                        return null
                     }
+                    AttachedFile(name = file.name, path = canonicalSource, mime = mime)
+                }
             } else {
                 // Defense-in-depth: reject non-absolute or non-existent files at
                 // attach time rather than passing an unvalidated raw path to the

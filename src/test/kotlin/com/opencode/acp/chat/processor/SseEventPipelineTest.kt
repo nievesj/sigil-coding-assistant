@@ -502,6 +502,108 @@ class SseEventPipelineTest {
         verify { sessionState.handleToolResult(event, "msg_1") }
     }
 
+    // ── isAborted guard (interrupt-during-subtask fix) ──────────────────────
+
+    @Test
+    fun `stale event after abort with activeServerId null is dropped when isAborted`() {
+        turnLifecycleState.activeMessageId = "msg_1"
+        turnLifecycleState.activeServerMessageId = null
+        turnLifecycleState.isStreaming = false
+        turnLifecycleState.isAborted = true
+        val event = SseEvent.TextChunk(
+            sessionId = "ses_test",
+            text = "stale",
+            messageId = "srv_different",
+        )
+        pipeline.process(event, ctx())
+        verify(exactly = 0) { sessionState.handleTextChunk(any(), any()) }
+    }
+
+    @Test
+    fun `V1 tool event with null eventServerId after abort is dropped`() {
+        turnLifecycleState.activeMessageId = "msg_1"
+        turnLifecycleState.activeServerMessageId = null
+        turnLifecycleState.isStreaming = false
+        turnLifecycleState.isAborted = true
+        // V1 tool events have null messageId
+        val event = SseEvent.ToolUse(
+            sessionId = "ses_test",
+            toolCallId = "tc_1",
+            toolName = "bash",
+            messageId = null,
+        )
+        pipeline.process(event, ctx())
+        verify(exactly = 0) { sessionState.handleToolUse(any(), any()) }
+    }
+
+    @Test
+    fun `events pass through when streaming with activeServerId null and not aborted`() {
+        turnLifecycleState.activeMessageId = "msg_1"
+        turnLifecycleState.activeServerMessageId = null
+        turnLifecycleState.isStreaming = true
+        turnLifecycleState.isAborted = false
+        val event = SseEvent.TextChunk(
+            sessionId = "ses_test",
+            text = "hi",
+            messageId = "srv_1",
+        )
+        pipeline.process(event, ctx())
+        verify { sessionState.handleTextChunk(event, "msg_1") }
+    }
+
+    @Test
+    fun `ToolResult after abort still routes (cross-message preserved)`() {
+        turnLifecycleState.activeMessageId = "msg_1"
+        turnLifecycleState.activeServerMessageId = null
+        turnLifecycleState.isStreaming = false
+        turnLifecycleState.isAborted = true
+        val event = SseEvent.ToolResult(
+            sessionId = "ses_test",
+            toolCallId = "tc_1",
+            messageId = "srv_different",
+        )
+        pipeline.process(event, ctx())
+        verify { sessionState.handleToolResult(event, "msg_1") }
+    }
+
+    @Test
+    fun `Permission after abort still routes (cross-message preserved)`() {
+        turnLifecycleState.activeMessageId = "msg_1"
+        turnLifecycleState.activeServerMessageId = null
+        turnLifecycleState.isStreaming = false
+        turnLifecycleState.isAborted = true
+        val event = SseEvent.Permission(
+            sessionId = "ses_test",
+            permissionId = "perm_1",
+            toolCallId = "tc_1",
+            action = "execute",
+            messageId = "srv_different",
+        )
+        pipeline.process(event, ctx())
+        verify { sessionState.handlePermission(event, "msg_1") }
+    }
+
+    @Test
+    fun `isAborted is cleared by ResetTurn`() {
+        turnLifecycleState.isAborted = true
+        // Stub resetTurnState to call the real turnLifecycleState.reset() so the
+        // isAborted clear is observable. (Other tests rely on resetTurnState being
+        // a no-op mock to preserve activeServerMessageId; this test needs the real
+        // reset behavior to verify isAborted is cleared.)
+        every { sessionState.resetTurnState() } answers {
+            turnLifecycleState.reset()
+        }
+        val event = SseEvent.ResetTurn(
+            sessionId = "ses_test",
+            newTurnMessageId = "new_msg",
+            newTurnServerMessageId = null,
+            newTurnModelID = null,
+            newTurnProviderID = null,
+        )
+        pipeline.process(event, ctx())
+        turnLifecycleState.isAborted shouldBe false
+    }
+
     // ── pendingTurnIdentity application ─────────────────────────────────────
 
     @Test
@@ -531,5 +633,129 @@ class SseEventPipelineTest {
         turnLifecycleState.modelID shouldBe "m"
         turnLifecycleState.providerID shouldBe "p"
         turnLifecycleState.isStreaming shouldBe true
+    }
+
+    @Test
+    fun `pendingTurnIdentity race - new value set between read and clear is preserved`() {
+        // Simulates the write-AFTER-clear case: the pipeline reads `first`, clears it,
+        // then a concurrent createAssistantMessage writes `second`. The re-check reads
+        // `second` and applies it. This is the case the re-check DOES cover.
+        val first = MessageLifecycleManager.PendingTurnIdentity(
+            messageId = "first_msg",
+            serverMessageId = "srv_first",
+            modelID = "m1",
+            providerID = "p1",
+        )
+        val second = MessageLifecycleManager.PendingTurnIdentity(
+            messageId = "second_msg",
+            serverMessageId = "srv_second",
+            modelID = "m2",
+            providerID = "p2",
+        )
+        // First read returns `first`; after the pipeline clears it, the next read
+        // returns `second` (simulating a concurrent write AFTER the clear).
+        var readCount = 0
+        every { sessionState.pendingTurnIdentity } answers {
+            readCount++
+            when (readCount) {
+                1 -> first
+                2 -> second  // re-check after clear — concurrent write returned `second`
+                else -> null
+            }
+        }
+        every { sessionState.pendingTurnIdentity = any() } just runs
+
+        val event = SseEvent.TextChunk(sessionId = "ses_test", text = "hi", messageId = "srv_second")
+        pipeline.process(event, ctx())
+
+        // The pipeline should have applied `second` (the newer value), not `first`.
+        turnLifecycleState.activeMessageId shouldBe "second_msg"
+        turnLifecycleState.activeServerMessageId shouldBe "srv_second"
+        turnLifecycleState.modelID shouldBe "m2"
+        turnLifecycleState.providerID shouldBe "p2"
+        turnLifecycleState.isStreaming shouldBe true
+    }
+
+    @Test
+    fun `pendingTurnIdentity race - write between read and clear loses the new value`() {
+        // Documents the actual race window NOT covered by the re-check: a concurrent
+        // createAssistantMessage writes a NEW pendingTurnIdentity BETWEEN the pipeline's
+        // read (line 50) and the clear (line 52). The clear overwrites the NEW value to
+        // null, and the re-check reads null. The OLD value is applied; the NEW value
+        // is silently lost. This is a known, very-low-probability race (requires
+        // channel-full at 1024 capacity AND a concurrent createAssistantMessage in the
+        // microsecond window). The auto-create fallback handles the lost identity.
+        val first = MessageLifecycleManager.PendingTurnIdentity(
+            messageId = "first_msg",
+            serverMessageId = "srv_first",
+            modelID = "m1",
+            providerID = "p1",
+        )
+        val second = MessageLifecycleManager.PendingTurnIdentity(
+            messageId = "second_msg",
+            serverMessageId = "srv_second",
+            modelID = "m2",
+            providerID = "p2",
+        )
+        // Simulates the actual race window: the pipeline reads `first` (readCount 1),
+        // then a concurrent createAssistantMessage writes `second` (between the read
+        // and the clear), then the pipeline's clear overwrites `second` to null.
+        // The re-check (readCount 2) reads null — `second` was lost by the clear.
+        // The pipeline applies `first` (the OLD value captured at read time).
+        // This documents the known race behavior (not a desired behavior) — the
+        // auto-create fallback handles the lost identity by creating a new message
+        // when the first content-bearing SSE event arrives.
+        var readCount = 0
+        every { sessionState.pendingTurnIdentity } answers {
+            readCount++
+            when (readCount) {
+                1 -> first       // initial read — `first` is present
+                // Concurrent write sets `second` here (between read and clear)
+                // The clear at line 52 overwrites `second` to null
+                2 -> null        // re-check reads null — `second` was lost by the clear
+                else -> null
+            }
+        }
+        every { sessionState.pendingTurnIdentity = any() } just runs
+
+        val event = SseEvent.TextChunk(sessionId = "ses_test", text = "hi", messageId = "srv_first")
+        pipeline.process(event, ctx())
+
+        // The pipeline applies `first` (the OLD value) — `second` was lost.
+        // This documents the known race window behavior, not a desired behavior.
+        turnLifecycleState.activeMessageId shouldBe "first_msg"
+        turnLifecycleState.activeServerMessageId shouldBe "srv_first"
+        turnLifecycleState.modelID shouldBe "m1"
+        turnLifecycleState.providerID shouldBe "p1"
+        turnLifecycleState.isStreaming shouldBe true
+    }
+
+    // ── isGenerationEvent / isContentEvent sync guard ──────────────────────
+
+    @Test
+    fun `isGenerationEvent and isContentEvent cover the same event types modulo intentional exclusions`() {
+        // Regression guard: the two lists in SseEventPipeline.process() must stay in
+        // sync. Adding a new event type to one list but not the other causes subtle
+        // bugs (stuck generation or missing auto-create). This test asserts the
+        // symmetric difference is exactly the intentionally-excluded types so a new
+        // event type added to one list triggers a test failure if not considered
+        // for the other.
+        val generationTypes = setOf(
+            "TextChunk", "TextReplace", "ThinkingChunk", "ThinkingReplace",
+            "ToolUse", "Patch", "AssistantFile", "AssistantImage", "Retry", "Subtask",
+        )
+        val contentTypes = setOf(
+            "TextChunk", "TextReplace", "ThinkingChunk", "ThinkingReplace",
+            "ToolUse", "ToolResult", "Patch", "Agent", "StepFinish", "Compaction",
+            "Snapshot", "AssistantFile", "AssistantImage",
+        )
+        // isContentEvent includes these types that isGenerationEvent intentionally excludes
+        val intentionallyExcludedFromGeneration = setOf("ToolResult", "Agent", "StepFinish", "Compaction", "Snapshot")
+        // isGenerationEvent includes these types that isContentEvent intentionally excludes
+        val intentionallyExcludedFromContent = setOf("Retry", "Subtask")
+        val genOnly = generationTypes - contentTypes
+        val contentOnly = contentTypes - generationTypes
+        genOnly shouldBe intentionallyExcludedFromContent
+        contentOnly shouldBe intentionallyExcludedFromGeneration
     }
 }

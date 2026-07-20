@@ -404,9 +404,15 @@ class SessionState(
         addSimplePart(msgId, "assistant_image_$key", MessagePart.Image(event.mime, event.url, event.filename))
     }
 
-    internal fun handleSessionError(event: SseEvent.SessionError) {
+    internal fun handleSessionError(event: SseEvent.SessionError) = stateLock.withLock {
+        // Bail out if a concurrent abortStreaming already finalized this turn —
+        // otherwise we'd overwrite its Aborted state with Failed(reason).
+        if (turnLifecycleState.isAborted) {
+            logger.info { "[ACP] handleSessionError: SKIP — turn already aborted by concurrent path" }
+            return@withLock
+        }
         if (turnLifecycleState.isStreaming && turnLifecycleState.activeMessageId != null) {
-            val msgId = turnLifecycleState.activeMessageId ?: return
+            val msgId = turnLifecycleState.activeMessageId ?: return@withLock
             textStreaming.freezeThinking()
             textStreaming.flushReveal()
             val reason = event.errorMessage ?: "Session error"
@@ -419,11 +425,33 @@ class SessionState(
             }
             _signals.tryEmit(UiSignal.Error(msgId, reason))
             emitStreamingCompleted(msgId, naturalCompletion = false)
+            // Defensive backup: complete responseDeferred directly in case the signal
+            // buffer is full and the StreamingCompleted emission above was dropped by
+            // tryEmit. CompletableDeferred.complete() is idempotent so this is safe.
+            responseDeferred?.complete(Unit)
+            responseDeferred = null
+            // Targeted clear: mark turn as aborted and clear identity so stale events
+            // are dropped by SseEventPipeline's isAborted guard. Do NOT call full
+            // resetTurnState() — that would clear streamingCompletedEmitted (risking
+            // double-emission) and toolCallState/textStreamingState (which the isAborted
+            // guard already protects). The next createAssistantMessage's ResetTurn will
+            // call full resetTurnState().
+            turnLifecycleState.activeMessageId = null
+            turnLifecycleState.activeServerMessageId = null
+            turnLifecycleState.isAborted = true
+            turnLifecycleState.pendingStopJob?.cancel()
+            turnLifecycleState.pendingStopJob = null
         }
         _signals.tryEmit(UiSignal.SessionError(sessionId, event.errorMessage))
     }
 
-    internal fun handleError(event: SseEvent.Error, msgId: String) {
+    internal fun handleError(event: SseEvent.Error, msgId: String) = stateLock.withLock {
+        // Bail out if a concurrent abortStreaming already finalized this turn —
+        // otherwise we'd overwrite its Aborted state with Failed(reason).
+        if (turnLifecycleState.isAborted) {
+            logger.info { "[ACP] handleError: SKIP — turn already aborted by concurrent path" }
+            return@withLock
+        }
         textStreaming.freezeThinking()
         turnLifecycleState.errorMessage = event.message
         turnLifecycleState.isStreaming = false
@@ -437,7 +465,16 @@ class SessionState(
     }
 
     internal fun handlePermission(event: SseEvent.Permission, msgId: String) {
-        val targetMsgId = toolCallState.toolCallIndex[event.toolCallId]
+        // Snapshot both index and pill reads together under stateLock to avoid a
+        // concurrent eviction removing the entry between the two reads (which
+        // would leave targetMsgId non-null but existingPill null, skipping the
+        // pill update while still mutating parts).
+        val targetMsgId: String?
+        val existingPill: ToolCallPill?
+        stateLock.withLock {
+            targetMsgId = toolCallState.toolCallIndex[event.toolCallId]
+            existingPill = toolCallState.toolCallPills[event.toolCallId]
+        }
         if (targetMsgId == null) {
             // The toolCallId is not in the index (likely evicted). We must NOT return early:
             // the server's Deferred promise for this tool call would hang indefinitely waiting
@@ -445,24 +482,31 @@ class SessionState(
             // require the message to exist) but still surface the permission prompt so the
             // user can approve/reject it and unblock the agent.
             logger.warn { "[ACP] Permission: toolCallId=${event.toolCallId} not in index (evicted?) — surfacing prompt without pill update to avoid dropping the server's permission request" }
-        } else {
-            toolCallState.toolPartStates[event.toolCallId] = PartState.Pending
-            val existingPill = toolCallState.toolCallPills[event.toolCallId]
-            if (existingPill != null) {
-                toolCallState.toolCallPills[event.toolCallId] = existingPill.copy(status = ToolCallStatus.PENDING)
-            }
-            messageMap.update(targetMsgId) { msg ->
-                val parts = LinkedHashMap(msg.parts)
-                val existing = parts[event.toolCallId]
-                if (existing is MessagePart.ToolCall) {
-                    parts[event.toolCallId] = existing.copy(
-                        pill = existing.pill.copy(status = ToolCallStatus.PENDING),
-                        state = PartState.Pending
-                    )
-                }
-                msg.copy(parts = parts, isStreaming = turnLifecycleState.isStreaming)
-            }
-        }
+       } else {
+           // Hold stateLock for the entire mutation block to keep locking
+           // discipline consistent. The snapshot read above was under lock;
+           // the writes below must also be under lock to prevent a concurrent
+           // eviction from clearing toolPartStates/toolCallPills between the
+           // snapshot read and these writes. messageMap.update re-acquires
+           // stateLock (ReentrantLock allows re-entry).
+           stateLock.withLock {
+               toolCallState.toolPartStates[event.toolCallId] = PartState.Pending
+               if (existingPill != null) {
+                   toolCallState.toolCallPills[event.toolCallId] = existingPill.copy(status = ToolCallStatus.PENDING)
+               }
+               messageMap.update(targetMsgId!!) { msg ->
+                   val parts = LinkedHashMap(msg.parts)
+                   val existing = parts[event.toolCallId]
+                   if (existing is MessagePart.ToolCall) {
+                       parts[event.toolCallId] = existing.copy(
+                           pill = existing.pill.copy(status = ToolCallStatus.PENDING),
+                           state = PartState.Pending
+                       )
+                   }
+                   msg.copy(parts = parts, isStreaming = turnLifecycleState.isStreaming)
+               }
+           }
+       }
         val realToolName = toolCallState.toolCallPills[event.toolCallId]?.toolName ?: event.action
         val prompt = PermissionPrompt(
             sessionId = sessionId,
@@ -521,10 +565,18 @@ class SessionState(
 
         if (serverMsgId != turnLifecycleState.activeServerMessageId && serverMsgId != turnLifecycleState.activeMessageId) {
             if (turnLifecycleState.activeServerMessageId == null && turnLifecycleState.activeMessageId != null && turnLifecycleState.isStreaming) {
-                logger.warn { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${turnLifecycleState.activeMessageId} (activeServerId was null, firstText=${textStreamingState.firstTextChunkReceived}, pills=${toolCallState.toolCallPills.size}) â€” content events prove this is the active message" }
-                turnLifecycleState.activeServerMessageId = serverMsgId
+                logger.warn { "[ACP] MessageFinalized: adopting serverMsgId=$serverMsgId for activeMsgId=${turnLifecycleState.activeMessageId} (activeServerId was null, firstText=${textStreamingState.firstTextChunkReceived}, pills=${toolCallState.toolCallPills.size}) — content events prove this is the active message" }
+                // Re-check null before writing: a concurrent updateServerMessageId
+                // (under stateLock) could have set activeServerMessageId between the
+                // check above and this write. Only write if still null to avoid
+                // overwriting the value set by updateServerMessageId.
+                if (turnLifecycleState.activeServerMessageId == null) {
+                    turnLifecycleState.activeServerMessageId = serverMsgId
+                } else {
+                    logger.info { "[ACP] MessageFinalized: activeServerMessageId set concurrently to ${turnLifecycleState.activeServerMessageId} — keeping it over $serverMsgId" }
+                }
             } else {
-                logger.debug { "[ACP] MessageFinalized for non-active message $serverMsgId â€” skipping (activeLocal=${turnLifecycleState.activeMessageId}, activeServer=${turnLifecycleState.activeServerMessageId})" }
+                logger.debug { "[ACP] MessageFinalized for non-active message $serverMsgId — skipping (activeLocal=${turnLifecycleState.activeMessageId}, activeServer=${turnLifecycleState.activeServerMessageId})" }
                 return
             }
         }

@@ -38,19 +38,35 @@ class TurnLifecycleState {
      *  coroutine and read by emitStreamingCompleted from completeStreaming/abortStreaming
      *  which can run on recoverBackgroundSessions or the activity monitor coroutine. */
     @Volatile var streamingCompletedEmitted: Boolean = false
+    /** Set to true in abort/error paths to mark the turn as aborted. Checked by
+     *  SseEventPipeline to drop stale events that arrive after abort but before the
+     *  next ResetTurn clears it. Cleared by reset() on the next turn.
+     *  @Volatile because written by abort/error paths (which can run on the activity
+     *  monitor coroutine or recoverBackgroundSessions) and read by the event processing
+     *  coroutine in SseEventPipeline.process(). */
+    @Volatile var isAborted: Boolean = false
 
-    /** Reset turn-lifecycle state for a new streaming turn. */
-    fun reset() {
-        activeMessageId = null
-        activeServerMessageId = null
-        errorMessage = null
-        isStreaming = false
-        modelID = null
-        providerID = null
+   /** Reset turn-lifecycle state for a new streaming turn. */
+   fun reset() {
+       activeMessageId = null
+       activeServerMessageId = null
+       // NOTE: lastUserText is intentionally NOT cleared here. It is overwritten
+       // on each send by setLastUserText(). Clearing it would break echo stripping
+       // when the async ResetTurn (enqueued by createAssistantMessage) is processed
+       // AFTER setLastUserText runs on the sender's coroutine — the race window
+       // where reset() would null out lastUserText before the first TextReplace
+       // arrives. See SessionStateTest: `lastUserText survives resetTurnState so
+       // echo stripping works after async ResetTurn race`.
+       // DO NOT add `lastUserText = null` here without updating that test.
+       errorMessage = null
+       isStreaming = false
+       modelID = null
+       providerID = null
         pendingStopJob?.cancel()
         pendingStopJob = null
         lastActivityTimeMs = System.currentTimeMillis()
         streamingStartedEmitted = false
         streamingCompletedEmitted = false
+        isAborted = false
     }
 }

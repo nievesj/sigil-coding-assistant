@@ -100,6 +100,42 @@ class MimeTypesTest {
         MimeTypes.guessFromFileName("config.yml") shouldBe "text/yaml"
     }
 
+    // ── Unity / game dev ──────────────────────────────────────────────────
+    @Test
+    fun `prefab maps to text-yaml`() {
+        MimeTypes.guessFromFileName("Player.prefab") shouldBe "text/yaml"
+    }
+
+    @Test
+    fun `asset maps to text-yaml`() {
+        MimeTypes.guessFromFileName("ProjectSettings.asset") shouldBe "text/yaml"
+    }
+
+    @Test
+    fun `meta maps to text-yaml`() {
+        MimeTypes.guessFromFileName("Main.cs.meta") shouldBe "text/yaml"
+    }
+
+    @Test
+    fun `unity scene maps to text-yaml`() {
+        MimeTypes.guessFromFileName("MainScene.unity") shouldBe "text/yaml"
+    }
+
+    @Test
+    fun `mat maps to text-yaml`() {
+        MimeTypes.guessFromFileName("Wood.mat") shouldBe "text/yaml"
+    }
+
+    @Test
+    fun `asmdef maps to text-json`() {
+        MimeTypes.guessFromFileName("Assembly-CSharp.asmdef") shouldBe "text/json"
+    }
+
+    @Test
+    fun `shader maps to text-x-c`() {
+        MimeTypes.guessFromFileName("Unlit.shader") shouldBe "text/x-c"
+    }
+
     @Test
     fun `toml maps to text-toml`() {
         MimeTypes.guessFromFileName("Cargo.toml") shouldBe "text/toml"
@@ -121,7 +157,20 @@ class MimeTypesTest {
         MimeTypes.guessFromFileName("notes.txt") shouldBe "text/plain"
     }
 
+    // ── Objective-C / Objective-C++ ─────────────────────────────────────────
+
+    @Test
+    fun `m maps to text-x-objective-c`() {
+        MimeTypes.guessFromFileName("AppDelegate.m") shouldBe "text/x-objective-c"
+    }
+
+    @Test
+    fun `mm maps to text-x-objective-c++`() {
+        MimeTypes.guessFromFileName("AppController.mm") shouldBe "text/x-objective-c++"
+    }
+
     // ── Shell / scripts ────────────────────────────────────────────────────
+
     @Test
     fun `sh maps to text-x-shellscript`() {
         MimeTypes.guessFromFileName("deploy.sh") shouldBe "text/x-shellscript"
@@ -187,13 +236,58 @@ class MimeTypesTest {
 
     @Test
     fun `no extension falls back to application-octet-stream`() {
-        // URLConnection.guessContentTypeFromName returns null for extensionless names.
-        MimeTypes.guessFromFileName("Makefile") shouldBe "application/octet-stream"
+        // Unknown extensionless names fall back to application/octet-stream.
+        // (Known extensionless names like Makefile/Dockerfile are handled by
+        // fullNameMap — see the full-name tests below.)
+        MimeTypes.guessFromFileName("unknownfile") shouldBe "application/octet-stream"
     }
 
     @Test
     fun `empty string falls back to application-octet-stream`() {
         MimeTypes.guessFromFileName("") shouldBe "application/octet-stream"
+    }
+
+    // ── Full-name lookup (extensionless / multi-dot dotfiles) ──────────────
+    @Test
+    fun `Makefile maps to text-x-makefile via fullNameMap`() {
+        MimeTypes.guessFromFileName("Makefile") shouldBe "text/x-makefile"
+    }
+
+    @Test
+    fun `Dockerfile maps to text-x-dockerfile via fullNameMap`() {
+        MimeTypes.guessFromFileName("Dockerfile") shouldBe "text/x-dockerfile"
+    }
+
+    @Test
+    fun `makefile is case-insensitive via fullNameMap`() {
+        MimeTypes.guessFromFileName("makefile") shouldBe "text/x-makefile"
+        MimeTypes.guessFromFileName("MAKEFILE") shouldBe "text/x-makefile"
+    }
+
+    @Test
+    fun `dockerfile is case-insensitive via fullNameMap`() {
+        MimeTypes.guessFromFileName("dockerfile") shouldBe "text/x-dockerfile"
+        MimeTypes.guessFromFileName("DOCKERFILE") shouldBe "text/x-dockerfile"
+    }
+
+    @Test
+    fun `env local maps to text-plain via fullNameMap`() {
+        MimeTypes.guessFromFileName(".env.local") shouldBe "text/plain"
+    }
+
+    @Test
+    fun `env development maps to text-plain via fullNameMap`() {
+        MimeTypes.guessFromFileName(".env.development") shouldBe "text/plain"
+    }
+
+    @Test
+    fun `env production maps to text-plain via fullNameMap`() {
+        MimeTypes.guessFromFileName(".env.production") shouldBe "text/plain"
+    }
+
+    @Test
+    fun `env local is case-insensitive via fullNameMap`() {
+        MimeTypes.guessFromFileName(".ENV.LOCAL") shouldBe "text/plain"
     }
 
     // ── Case-insensitivity & path handling ─────────────────────────────────

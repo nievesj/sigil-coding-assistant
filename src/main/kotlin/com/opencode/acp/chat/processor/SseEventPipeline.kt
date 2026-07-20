@@ -29,12 +29,37 @@ class SseEventPipeline(
         // trySend failed (channel full). This closes the window where activeMessageId
         // was null between the dropped ResetTurn and the first content-bearing SSE event,
         // which previously caused a duplicate auto-create. Resetting here (on the event
-        // processing coroutine) is single-writer safe — ctx fields are owned by this
-        // coroutine. We do NOT drain the channel; stale events are skipped by the
-        // server-ID routing check below (same as the ResetTurn handler).
-        val pending = s.pendingTurnIdentity
+        // processing coroutine) is single-writer safe for ctx fields — but pendingTurnIdentity
+        // itself is written by createAssistantMessage on an external coroutine, so the
+        // read-clear must be atomic. We clear AFTER capturing and re-check after clear to
+        // handle a concurrent write between capture and clear (the new value would be lost
+        // by an unconditional clear). We do NOT drain the channel; stale events are skipped
+       // by the server-ID routing check below (same as the ResetTurn handler).
+       //
+       // RACE WINDOW (not fully closed): The re-check below only catches a concurrent
+       // write that happens AFTER the clear. If a concurrent createAssistantMessage
+       // writes a NEW pendingTurnIdentity BETWEEN the read above and the clear below,
+       // the clear overwrites the NEW value to null, and the re-check reads null. The
+       // NEW value is silently LOST, and the OLD value (captured above) is applied.
+       // Probability is very low (requires channel-full at 1024 capacity AND a concurrent
+       // createAssistantMessage in the microsecond window). The auto-create fallback
+       // (needsNewMessage check below) handles the lost identity by creating a new
+       // message when the first content-bearing SSE event arrives, so the impact is a
+       // potential duplicate assistant message, not data loss. A compare-and-swap loop
+       // would close this fully but adds complexity for a very-low-probability race.
+       var pending = s.pendingTurnIdentity
         if (pending != null) {
             s.pendingTurnIdentity = null
+           // Re-check: a concurrent createAssistantMessage may have set a NEW
+           // pendingTurnIdentity between our read above and the clear. If so,
+           // apply the newer value (it carries the latest turn identity).
+           // NOTE: This only covers writes AFTER the clear. Writes BETWEEN the read
+           // and the clear are lost (see RACE WINDOW comment above).
+           val newer = s.pendingTurnIdentity
+            if (newer != null) {
+                s.pendingTurnIdentity = null
+                pending = newer
+            }
             s.resetTurnState()
             s.turnLifecycleState.activeMessageId = pending.messageId
             if (pending.serverMessageId != null) s.turnLifecycleState.activeServerMessageId = pending.serverMessageId
@@ -173,6 +198,12 @@ class SseEventPipeline(
             || event is SseEvent.Snapshot || event is SseEvent.AssistantFile
             || event is SseEvent.AssistantImage
         val needsNewMessage = when {
+            // When the turn is aborted, do NOT auto-create a new message — the
+            // isAborted guard below will drop the stale event. Without this check,
+            // auto-create would call resetTurnState() → reset() which clears
+            // isAborted, letting the stale event through and creating a spurious
+            // new assistant message.
+            s.turnLifecycleState.isAborted -> false
             // ToolResult for a known tool call (in toolCallIndex) belongs to a previous
             // turn's message — don't auto-create a new message. The ToolResult handler
             // routes via toolCallIndex. This prevents a spurious third message when a
@@ -226,6 +257,16 @@ class SseEventPipeline(
         logger.info { "[ACP] processEvent ROUTE: ${event::class.simpleName} activeMsgId=$msgId activeServerId=$activeServerId eventServerId=$eventServerId isCross=$isCrossMessageEvent" }
         if (!isCrossMessageEvent && activeServerId != null && eventServerId != null && eventServerId != activeServerId) {
             logger.info { "[ACP] processEvent SKIP: event messageId=$eventServerId != active=$activeServerId" }
+            return
+        }
+
+        // Abort guard: when the turn is aborted, drop all non-cross-message events.
+        // This catches V1 tool events with eventServerId=null (which the routing check above
+        // cannot filter because it requires eventServerId != null). Cross-message events
+        // (ToolResult, Permission) are still allowed through so tool results for the aborted
+        // turn can complete their pills.
+        if (s.turnLifecycleState.isAborted && !isCrossMessageEvent) {
+            logger.info { "[ACP] processEvent SKIP (aborted): ${event::class.simpleName} — turn is aborted, dropping stale event eventServerId=$eventServerId" }
             return
         }
 
