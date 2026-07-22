@@ -25,6 +25,11 @@ class PermissionManager(
      *  - startPermissionTimeout() / cancelPermissionTimeout() from ViewModel scope (Dispatchers.Default)
      *  - cancelPermissionTimeout() from dispose() on EDT */
     @Volatile private var permissionTimeoutJob: Job? = null
+    /** Serializes the cancel+launch sequence in [startPermissionTimeout] so two
+     *  concurrent calls cannot both leak an uncancelled job. Non-suspending lock
+     *  because [startPermissionTimeout] / [cancelPermissionTimeout] are called
+     *  from EDT and ViewModel scope (non-suspend). */
+    private val timeoutLock = Any()
 
     /** Respond to a permission prompt. Routes to the correct session by sessionId.
      *
@@ -52,22 +57,29 @@ class PermissionManager(
             logger.warn { "[ACP] Permission response dropped: client is null (server may not be connected)" }
             return
         }
-        // Update local state first — optimistic but reversible
-        when (response) {
-            PermissionResponse.REJECT_ONCE ->
-                sessionManager.setToolPartStateForSession(sessionId, toolCallId, PartState.Rejected)
-            PermissionResponse.ALLOW_ONCE,
-            PermissionResponse.ALLOW_ALWAYS ->
-                sessionManager.updateToolCallStatusForSession(sessionId, toolCallId, ToolCallStatus.IN_PROGRESS, null)
+        // Update local state first — optimistic but reversible.
+        // REJECT_ONCE is NOT updated optimistically — see below for the post-server-call
+        // update. This avoids diverging local and server state on POST failure.
+        if (response == PermissionResponse.ALLOW_ONCE || response == PermissionResponse.ALLOW_ALWAYS) {
+            sessionManager.updateToolCallStatusForSession(sessionId, toolCallId, ToolCallStatus.IN_PROGRESS, null)
         }
         try {
-            client.respondPermission(permissionId = permissionId, response = response.optionId)
+            client.respondPermission(permissionId = permissionId, sessionId = sessionId, response = response.optionId)
+            // REJECT_ONCE local state is updated AFTER the server call succeeds to avoid
+            // diverging local and server state on POST failure. If the server never received
+            // the rejection, the tool must NOT appear Rejected locally — otherwise the user
+            // sees a 'Rejected' pill while the server-side tool may still proceed. ALLOW_*
+            // remain optimistic because IN_PROGRESS is the natural next state and SSE
+            // reconciles quickly.
+            if (response == PermissionResponse.REJECT_ONCE) {
+                sessionManager.setToolPartStateForSession(sessionId, toolCallId, PartState.Rejected)
+            }
             // Config sync AFTER POST succeeds (not in parallel) — if the server rejects,
             // the config file should NOT say "allow".
             if (response == PermissionResponse.ALLOW_ALWAYS && toolName.isNotEmpty()) {
                 try {
                     mcpConfigWriterProvider()?.writeAlwaysAllowRule(agentName, toolName, patterns)
-                    logger.info { "[ACP] Always Allow synced to config: agent=$agentName, tool=$toolName, patterns=$patterns" }
+                    logger.debug { "[ACP] Always Allow synced to config: agent=$agentName, tool=$toolName, patterns=$patterns" }
                 } catch (e: Exception) {
                     logger.warn(e) { "[ACP] Failed to sync 'Always Allow' to config for $toolName" }
                     // Non-fatal — server already persists "always" internally
@@ -82,12 +94,14 @@ class PermissionManager(
             throw e
         } catch (e: Exception) {
             logger.warn(e) { "[ACP] Failed to respond to permission $permissionId: ${e.message}" }
-            // Do NOT roll back tool state on POST failure. The server may have processed
-            // the response despite the network error (TDD §4.2.4). Rolling back to PENDING
-            // would overwrite SSE-driven state that already moved the tool to IN_PROGRESS,
-            // making the tool appear stuck. The PermissionReplied handler (or timeout) is
-            // the sole authority on clearing tool state. The prompt stays visible for retry
-            // because the caller (ChatViewModel) catches the exception and keeps the prompt.
+            // Do NOT roll back ALLOW_* tool state on POST failure. The server may have
+            // processed the response despite the network error (TDD §4.2.4). Rolling
+            // back to PENDING would overwrite SSE-driven state that already moved the
+            // tool to IN_PROGRESS, making the tool appear stuck. REJECT_ONCE is not
+            // updated optimistically (see above), so there is nothing to roll back.
+            // The PermissionReplied handler (or timeout) is the sole authority on
+            // clearing tool state. The prompt stays visible for retry because the
+            // caller (ChatViewModel) catches the exception and keeps the prompt.
             throw e
         }
     }
@@ -151,20 +165,30 @@ class PermissionManager(
         toolName: String = "",
         onTimeout: () -> Unit,
     ) {
-        permissionTimeoutJob?.cancel()
-        if (timeoutSeconds <= 0) return
-        // Clamp BEFORE multiply: coerceAtMost(3600) bounds the value to <= 3600,
-        // so `clampedSeconds * 1000L` is at most 3,600,000 — no Int overflow possible.
-        val clampedSeconds = timeoutSeconds.coerceAtMost(3600) // Max 1 hour
-        permissionTimeoutJob = scope.launch {
-            delay(clampedSeconds * 1000L)
-            onTimeout()
+        synchronized(timeoutLock) {
+            permissionTimeoutJob?.cancel()
+            if (timeoutSeconds <= 0) return
+            // Clamp BEFORE multiply: coerceAtMost(3600) bounds the value to <= 3600,
+            // so `clampedSeconds * 1000L` is at most 3,600,000 — no Int overflow possible.
+            val clampedSeconds = timeoutSeconds.coerceAtMost(3600) // Max 1 hour
+            permissionTimeoutJob = scope.launch {
+                delay(clampedSeconds * 1000L)
+                try {
+                    onTimeout()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.error(e) { "[ACP] Permission timeout callback threw an exception" }
+                }
+            }
         }
     }
 
     fun cancelPermissionTimeout() {
-        permissionTimeoutJob?.cancel()
-        permissionTimeoutJob = null
+        synchronized(timeoutLock) {
+            permissionTimeoutJob?.cancel()
+            permissionTimeoutJob = null
+        }
     }
 
     fun dispose() {
