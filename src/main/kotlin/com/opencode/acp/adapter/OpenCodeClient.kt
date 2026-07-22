@@ -94,13 +94,20 @@ class OpenCodeClient(
      */
     @Volatile
     private var _mcpHttpClient: HttpClient? = null
+    private val mcpClientLock = Any()
     val mcpHttpClient: HttpClient
-        get() = _mcpHttpClient ?: HttpClient(Java) {
-            install(HttpTimeout) {
-                requestTimeoutMillis = 5_000   // 5s for MCP verification/tool fetch
-                connectTimeoutMillis = 3_000   // 3s TCP connection timeout
+        get() {
+            _mcpHttpClient?.let { return it }
+            synchronized(mcpClientLock) {
+                _mcpHttpClient?.let { return it }
+                return HttpClient(Java) {
+                    install(HttpTimeout) {
+                        requestTimeoutMillis = 5_000   // 5s for MCP verification/tool fetch
+                        connectTimeoutMillis = 3_000   // 3s TCP connection timeout
+                    }
+                }.also { _mcpHttpClient = it }
             }
-        }.also { _mcpHttpClient = it }
+        }
 
     // NOTE: Two separate Json instances are intentional — do NOT merge them.
     // 1. This instance-level Json has classDiscriminator = "type" for polymorphic deserialization
@@ -380,7 +387,14 @@ class OpenCodeClient(
             val response = httpClient.delete("$baseUrl/session/$sessionId/share") {
                 applyAuth()
             }
-            json.decodeFromString(response.bodyAsText())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                logger.error { "DELETE /session/$sessionId/share returned ${response.status}: ${body.take(500)}" }
+                error("DELETE /session/$sessionId/share failed with ${response.status}: ${body.take(200)}")
+            }
+            json.decodeFromString(body)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.warn(e) { "Failed to unshare session $sessionId" }
             throw e
@@ -458,7 +472,10 @@ class OpenCodeClient(
         val requestBody = json.encodeToString(
             SendMessageRequest(parts = parts, variant = variant, agent = agent, model = model)
         )
-        logger.info { "Sending message: ${requestBody.take(200)}" }
+        logger.debug { "Sending message: ${requestBody.take(200)}" }
+        // NOTE: requestBody contains user prompt text — downgraded to DEBUG to avoid
+        // leaking prompt content in default (INFO) logs. Aligns with the debugLog
+        // helper rationale at the top of this file.
         val startTime = System.currentTimeMillis()
         try {
             val response = httpClient.post("$baseUrl/session/$sessionId/message") {
@@ -609,22 +626,24 @@ class OpenCodeClient(
 
     /**
      * Responds to a permission request.
-     * POST /permission/{requestID}/reply
+     * POST /session/{sessionId}/permissions/{permissionID}
      */
     suspend fun respondPermission(
         permissionId: String,
+        sessionId: String,
         response: String
     ) {
         validatePathId(permissionId, "permissionId")
-        val response = httpClient.post("$baseUrl/permission/$permissionId/reply") {
+        validatePathId(sessionId, "sessionId")
+        val httpResponse = httpClient.post("$baseUrl/session/$sessionId/permissions/$permissionId") {
             applyAuth()
             contentType(ContentType.Application.Json)
             setBody(json.encodeToString(PermissionRequest(response = response)))
         }
-        if (!response.status.isSuccess()) {
-            val body = response.bodyAsText()
-            logger.error { "POST /permission/$permissionId/reply returned ${response.status}: ${body.take(500)}" }
-            error("POST /permission/$permissionId/reply failed with ${response.status}: ${body.take(200)}")
+        if (!httpResponse.status.isSuccess()) {
+            val body = httpResponse.bodyAsText()
+            logger.error { "POST /session/$sessionId/permissions/$permissionId returned ${httpResponse.status}: ${body.take(500)}" }
+            error("POST /session/$sessionId/permissions/$permissionId failed with ${httpResponse.status}: ${body.take(200)}")
         }
     }
 
@@ -691,6 +710,8 @@ class OpenCodeClient(
                         val data = event.data ?: return@collect
                         val jsonObj: JsonObject = try {
                             json.parseToJsonElement(data).jsonObject
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (_: Exception) {
                             return@collect
                         }
@@ -703,48 +724,64 @@ class OpenCodeClient(
                         // V2 SyncEvents use {id, seq, type: "session.next.text.delta.1", data: {sessionID, delta, ...}}
                         // V1 BusEvents use {type: "session.next.text.delta", properties: {sessionID, delta, ...}}
                         // Detect V2 by presence of "data" object (V2) vs "properties" object (V1)
-                        val v2Data = jsonObj["data"]?.jsonObject
-                        val props: JsonObject
-                        val eventType: String
+                        try {
+                            val v2Data = jsonObj["data"]?.jsonObject
+                            val props: JsonObject
+                            val eventType: String
 
-                        if (v2Data != null) {
-                            // V2 SyncEvent: payload is in "data", type has version suffix (e.g. ".1")
-                            props = v2Data
-                            // Strip version suffix: "session.next.text.delta.1" → "session.next.text.delta"
-                            eventType = rawEventType.replace(Regex("\\.\\d+$"), "")
-                        } else {
-                            // V1 BusEvent: payload is in "properties" (or flat at root)
-                            props = jsonObj["properties"]?.jsonObject ?: jsonObj
-                            eventType = rawEventType
-                        }
+                            if (v2Data != null) {
+                                // V2 SyncEvent: payload is in "data", type has version suffix (e.g. ".1")
+                                // Defensive: V2 events also carry "seq" and "aggregateID". If "data"
+                                // is present but "seq" is absent, this may be a V1 event with a "data"
+                                // field — log a warning to catch server format drift early.
+                                if (jsonObj["seq"] == null) {
+                                    logger.warn { "[ACP-SSE] V2 detection heuristic: 'data' present but 'seq' absent — possible V1 misdetection. rawType=$rawEventType, keys=${jsonObj.keys}" }
+                                }
+                                props = v2Data
+                                // Strip version suffix: "session.next.text.delta.1" → "session.next.text.delta"
+                                eventType = rawEventType.replace(VERSION_SUFFIX_REGEX, "")
+                            } else {
+                                // V1 BusEvent: payload is in "properties" (or flat at root)
+                                props = jsonObj["properties"]?.jsonObject ?: jsonObj
+                                eventType = rawEventType
+                            }
 
-                        // Extract sessionId from various possible locations
-                        val sessionId = when {
-                            props["sessionID"] != null -> props["sessionID"]?.jsonPrimitive?.contentOrNull
-                            props["sessionId"] != null -> props["sessionId"]?.jsonPrimitive?.contentOrNull
-                            jsonObj["sessionID"] != null -> jsonObj["sessionID"]?.jsonPrimitive?.contentOrNull
-                            jsonObj["sessionId"] != null -> jsonObj["sessionId"]?.jsonPrimitive?.contentOrNull
-                            else -> null
-                        }
+                            // Extract sessionId from various possible locations
+                            val sessionId = when {
+                                props["sessionID"] != null -> props["sessionID"]?.jsonPrimitive?.contentOrNull
+                                props["sessionId"] != null -> props["sessionId"]?.jsonPrimitive?.contentOrNull
+                                jsonObj["sessionID"] != null -> jsonObj["sessionID"]?.jsonPrimitive?.contentOrNull
+                                jsonObj["sessionId"] != null -> jsonObj["sessionId"]?.jsonPrimitive?.contentOrNull
+                                else -> null
+                            }
                         
-                        if (sessionId == null) {
-                            debugLog("SSE MISS: rawType=$rawEventType, type=$eventType, hasData=${v2Data != null}, hasProps=${jsonObj["properties"] != null}, keys=${jsonObj.keys}")
+                            if (sessionId == null) {
+                                debugLog("SSE MISS: rawType=$rawEventType, type=$eventType, hasData=${v2Data != null}, hasProps=${jsonObj["properties"] != null}, keys=${jsonObj.keys}")
+                                return@collect
+                            }
+
+                            debugLog("SSE IN: rawType=$rawEventType → eventType=$eventType, v2=${v2Data != null}, sid=$sessionId, pKeys=${props.keys}")
+
+                            val parsed = sseEventParser.parse(eventType, props, sessionId)
+                            if (parsed is SseEvent.Ignored) {
+                                logger.debug { "[ACP-SSE] IGNORED: type=$eventType, reason=${parsed.reason}" }
+                            } else {
+                                debugLog("SSE OK: ${parsed::class.simpleName}")
+                            }
+                            send(parsed)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            logger.warn(e) { "[ACP-SSE] Failed to process event rawType=$rawEventType, skipping" }
                             return@collect
                         }
-
-                        debugLog("SSE IN: rawType=$rawEventType → eventType=$eventType, v2=${v2Data != null}, sid=$sessionId, pKeys=${props.keys}")
-
-                        val parsed = sseEventParser.parse(eventType, props, sessionId)
-                    if (parsed is SseEvent.Ignored) {
-                        logger.debug { "[ACP-SSE] IGNORED: type=$eventType, reason=${parsed.reason}" }
-                    } else {
-                            debugLog("SSE OK: ${parsed::class.simpleName}")
-                        }
-                        send(parsed)
                     }
                     logger.info { "[ACP] SSE stream ended (connected at $connectTime)" }
                 }
             } catch (e: Exception) {
+                // CancellationException extends Exception — re-throw to preserve
+                // structured concurrency (matches healthCheck/postSuccess pattern).
+                if (e is CancellationException) throw e
                 logger.warn(e) { "[ACP] SSE connection closed with error" }
             }
         }
@@ -768,7 +805,10 @@ class OpenCodeClient(
      * by [OpenCodeService.dispose] → [ProcessManager.shutdown] → this method.
      */
     fun shutdown() {
-        _mcpHttpClient?.close()
+        synchronized(mcpClientLock) {
+            _mcpHttpClient?.close()
+            _mcpHttpClient = null
+        }
         httpClient.close()
     }
 
@@ -783,6 +823,10 @@ class OpenCodeClient(
         private const val SHORT_TIMEOUT_MS = 60_000L
         /** TCP connection timeout — applies to all profiles (cannot be overridden per-request). */
         private const val CONNECT_TIMEOUT_MS = 10_000L
+        /** Pre-compiled regex to strip V2 SyncEvent version suffix (e.g. ".1").
+         *  Hoisted out of the per-event collect lambda to avoid recompiling on
+         *  every SSE event. */
+        private val VERSION_SUFFIX_REGEX = Regex("\\.\\d+$")
 
         /**
          * Normalize a directory path for the `?directory=` query parameter.
