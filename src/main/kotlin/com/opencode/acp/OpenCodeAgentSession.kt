@@ -41,13 +41,25 @@ class OpenCodeAgentSession(
 ) : AgentSession {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
-    private val promptJob = CompletableDeferred<Job>()
+    // @Volatile: cancel() reads promptJob from a different coroutine than prompt().
+    // The reset+complete sequence in prompt() is NOT atomic — there is a brief window
+    // where cancel() may capture the old CompletableDeferred (not yet completed) or the
+    // new one (not yet completed). In both cases cancel() sees isCompleted=false and
+    // skips cancellation. This is acceptable: cancel() is best-effort, and the ACP
+    // consumer's flow collection is cancelled via the parent coroutine's job, not via
+    // promptJob. promptJob only provides a secondary cancellation path for the abort
+    // API. The race window is bounded by the synchronous lines 53-54 (no suspension).
+    @Volatile private var promptJob = CompletableDeferred<Job>()
 
     override suspend fun prompt(
         content: List<ContentBlock>,
         _meta: JsonElement?
     ): Flow<Event> = flow {
         val job = currentCoroutineContext()[Job] ?: error("No job in flow context")
+        // Reset promptJob for each prompt() call so cancel() tracks the CURRENT
+        // prompt's job, not a stale one from a previous (uncancelled) call.
+        // See the @Volatile comment above for the acceptable race window.
+        promptJob = CompletableDeferred<Job>()
         promptJob.complete(job)
 
         _meta?.let { handleMeta(it) }
@@ -68,6 +80,7 @@ class OpenCodeAgentSession(
                     "assistant" -> emit(Event.SessionUpdateEvent(
                         update = SessionUpdate.AgentMessageChunk(content = contentBlock)
                     ))
+                    else -> logger.warn { "[ACP] Unknown role during replay: ${msg.role} — message skipped" }
                 }
             }
             emit(Event.PromptResponseEvent(
@@ -201,6 +214,10 @@ class OpenCodeAgentSession(
                         logger.info { "Session compacted: ${sseEvent.sessionId}" }
                     }
 
+                    is SseEvent.SessionDeleted -> {
+                        logger.info { "Session deleted: ${sseEvent.sessionId}" }
+                    }
+
                     is SseEvent.MessageRemoved -> {
                         logger.debug { "Message removed: ${sseEvent.messageId}" }
                     }
@@ -306,10 +323,13 @@ class OpenCodeAgentSession(
             logger.warn(e) { "[ACP] Failed to abort session $openCodeSessionId" }
         }
         try {
+            // Capture the reference once to avoid TOCTOU: a concurrent prompt() could
+            // reassign promptJob between isCompleted and getCompleted().
+            val job = promptJob
             // Guard: getCompleted() throws IllegalStateException if prompt() was never
             // called (promptJob not yet completed). Only cancel if the job exists.
-            if (promptJob.isCompleted) {
-                promptJob.getCompleted().cancel()
+            if (job.isCompleted) {
+                job.getCompleted().cancel()
             } else {
                 logger.debug { "[ACP] cancel(): promptJob not yet completed (prompt() never called) — nothing to cancel" }
             }

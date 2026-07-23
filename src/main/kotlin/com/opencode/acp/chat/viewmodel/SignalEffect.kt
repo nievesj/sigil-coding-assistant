@@ -57,6 +57,9 @@ sealed interface SignalEffect {
     /** Refresh the active session's messages from the server (after compaction). */
     data class RefreshActiveSessionMessages(val sessionId: String) : SignalEffect
 
+    /** Handle a session deletion — clear messages if it was the active session, reload session list. */
+    data class HandleSessionDeleted(val sessionId: String) : SignalEffect
+
     /** Remove a session from the streaming-session spinner set. */
     data class RemoveStreamingSession(val sessionId: String) : SignalEffect
 

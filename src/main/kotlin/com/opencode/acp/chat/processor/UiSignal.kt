@@ -63,4 +63,7 @@ sealed interface UiSignal {
 
     /** Session compacted — server performed auto-compaction; local message cache may be stale. */
     data class SessionCompacted(val sessionId: String) : UiSignal
+
+    /** Session deleted — server removed the session; cache and sidebar must be pruned. */
+    data class SessionDeleted(val sessionId: String) : UiSignal
 }

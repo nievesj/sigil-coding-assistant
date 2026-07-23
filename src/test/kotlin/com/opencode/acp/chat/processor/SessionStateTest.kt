@@ -443,4 +443,137 @@ class SessionStateTest {
             messagesAfter shouldBe messagesBefore
         }
     }
+
+    // Regression test for the interrupt+steer race: a stale SessionError from the
+    // old (aborted) turn arrives AFTER the new turn's ResetTurn has been processed.
+    // ResetTurn clears isAborted, so the isAborted guard in handleSessionError no
+    // longer catches the stale error. Without the stale-event guard (comparing
+    // event.messageId against activeServerMessageId), the stale error would
+    // finalize the NEW turn's message as Failed, clear activeMessageId, and set
+    // isAborted=true — dropping all subsequent streaming events and leaving the
+    // send mutex held.
+    @Test
+    fun `stale SessionError after ResetTurn does not poison new turn`() = testScope.runTest {
+        val sid = "test_session"
+        // Establish the old turn (aborted by the user's steer).
+        sessionState.createAssistantMessage(null, null, fromEventProcessing = true)
+        val oldMsgId = sessionState.turnLifecycleState.activeMessageId
+        sessionState.turnLifecycleState.activeServerMessageId = "srv_old"
+        sessionState.turnLifecycleState.isStreaming = true
+
+        // Simulate the new turn's ResetTurn: resetTurnState() clears isAborted,
+        // then the new turn identity is applied.
+        sessionState.resetTurnState()
+        sessionState.turnLifecycleState.activeMessageId = "msg_new"
+        sessionState.turnLifecycleState.activeServerMessageId = "srv_new"
+        sessionState.turnLifecycleState.isStreaming = true
+        // isAborted was cleared by resetTurnState() — this is the crux of the race.
+
+        withClue("precondition: isAborted should be false after ResetTurn") {
+            sessionState.turnLifecycleState.isAborted shouldBe false
+        }
+
+        // Stale SessionError from the OLD turn arrives (carries old server msgId).
+        sessionState.handleSessionError(
+            SseEvent.SessionError(
+                sessionId = sid,
+                errorMessage = "Aborted",
+                messageId = "srv_old",
+            )
+        )
+
+        // The new turn's state must be intact.
+        withClue("activeMessageId should remain the new turn's id") {
+            sessionState.turnLifecycleState.activeMessageId shouldBe "msg_new"
+        }
+        withClue("activeServerMessageId should remain the new turn's server id") {
+            sessionState.turnLifecycleState.activeServerMessageId shouldBe "srv_new"
+        }
+        withClue("isStreaming should remain true") {
+            sessionState.turnLifecycleState.isStreaming shouldBe true
+        }
+        withClue("isAborted should remain false (stale error did not poison the turn)") {
+            sessionState.turnLifecycleState.isAborted shouldBe false
+        }
+        withClue("errorMessage should not be set by the stale error") {
+            sessionState.turnLifecycleState.errorMessage shouldBe null
+        }
+        // The old turn's message should not have been finalized as Failed.
+        withClue("old message should not have an error part from the stale SessionError") {
+            val oldMsg = sessionState.messages.first()[oldMsgId]
+            oldMsg?.parts?.values?.none { it is MessagePart.Error } shouldBe true
+        }
+    }
+
+    // Sanity check: a SessionError whose messageId MATCHES the active turn is
+    // still processed (the stale guard must not suppress legitimate errors).
+    @Test
+    fun `SessionError with matching messageId still finalizes the active turn`() = testScope.runTest {
+        val sid = "test_session"
+        sessionState.createAssistantMessage(null, null, fromEventProcessing = true)
+        val msgId = sessionState.turnLifecycleState.activeMessageId
+        sessionState.turnLifecycleState.activeServerMessageId = "srv_active"
+        sessionState.turnLifecycleState.isStreaming = true
+        val deferred = CompletableDeferred<Unit>()
+        sessionState.responseDeferred = deferred
+
+        sessionState.handleSessionError(
+            SseEvent.SessionError(
+                sessionId = sid,
+                errorMessage = "Real error",
+                messageId = "srv_active",
+            )
+        )
+
+        withClue("matching-messageId error should finalize the turn") {
+            sessionState.turnLifecycleState.activeMessageId shouldBe null
+        }
+        withClue("isStreaming should be false") {
+            sessionState.turnLifecycleState.isStreaming shouldBe false
+        }
+        withClue("isAborted should be true") {
+            sessionState.turnLifecycleState.isAborted shouldBe true
+        }
+        withClue("errorMessage should be set") {
+            sessionState.turnLifecycleState.errorMessage shouldBe "Real error"
+        }
+        withClue("responseDeferred should be completed") {
+            deferred.isCompleted shouldBe true
+        }
+        withClue("message should have an Error part") {
+            val msg = sessionState.messages.first()[msgId]
+            msg?.parts?.values?.any { it is MessagePart.Error } shouldBe true
+        }
+    }
+
+    // A SessionError with a null messageId (session-level error, no specific
+    // message) must still be processed — the stale guard only applies when both
+    // the event and the turn carry a server messageId.
+    @Test
+    fun `SessionError with null messageId still finalizes the active turn`() = testScope.runTest {
+        val sid = "test_session"
+        sessionState.createAssistantMessage(null, null, fromEventProcessing = true)
+        val msgId = sessionState.turnLifecycleState.activeMessageId
+        sessionState.turnLifecycleState.activeServerMessageId = "srv_active"
+        sessionState.turnLifecycleState.isStreaming = true
+
+        sessionState.handleSessionError(
+            SseEvent.SessionError(
+                sessionId = sid,
+                errorMessage = "Session-level error",
+                messageId = null,
+            )
+        )
+
+        withClue("null-messageId error should finalize the turn") {
+            sessionState.turnLifecycleState.activeMessageId shouldBe null
+        }
+        withClue("isAborted should be true") {
+            sessionState.turnLifecycleState.isAborted shouldBe true
+        }
+        withClue("message should have an Error part") {
+            val msg = sessionState.messages.first()[msgId]
+            msg?.parts?.values?.any { it is MessagePart.Error } shouldBe true
+        }
+    }
 }

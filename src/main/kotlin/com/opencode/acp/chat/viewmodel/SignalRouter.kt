@@ -115,6 +115,7 @@ class SignalRouter(
             is UiSignal.SessionIdle -> Unit
             is UiSignal.SessionError -> Unit
             is UiSignal.SessionCompacted -> Unit
+            is UiSignal.SessionDeleted -> Unit
             is UiSignal.ChildPermissionRequested -> Unit
             is UiSignal.PermissionReplied -> Unit
             is UiSignal.PermissionTimedOut -> {
@@ -143,6 +144,9 @@ class SignalRouter(
             is UiSignal.SessionCompacted -> {
                 _effects.emit(SignalEffect.RefreshActiveSessionMessages(signal.sessionId))
                 _effects.emit(SignalEffect.ComputeSessionContext(null))
+            }
+            is UiSignal.SessionDeleted -> {
+                _effects.emit(SignalEffect.HandleSessionDeleted(signal.sessionId))
             }
             is UiSignal.ChildPermissionRequested -> {
                 _effects.emit(SignalEffect.AddChildPermissionPrompt(signal.prompt))

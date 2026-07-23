@@ -244,6 +244,15 @@ class SignalRouterTest {
     }
 
     @Test
+    fun `SessionDeleted global emits HandleSessionDeleted`() = runRouterTest { effects, _, emitGlobal ->
+        emitGlobal(UiSignal.SessionDeleted("ses_1"))
+        advanceUntilIdle()
+        effects shouldBe listOf(
+            SignalEffect.HandleSessionDeleted("ses_1"),
+        )
+    }
+
+    @Test
     fun `ChildPermissionRequested global emits AddChildPermissionPrompt, NotifyPermissionNeeded`() = runRouterTest { effects, _, emitGlobal ->
         val prompt = makeChildPermissionPrompt()
         emitGlobal(UiSignal.ChildPermissionRequested(prompt))
@@ -280,6 +289,7 @@ class SignalRouterTest {
         emitSignal(UiSignal.SessionIdle("ses_1"))
         emitSignal(UiSignal.SessionError("ses_1", "boom"))
         emitSignal(UiSignal.SessionCompacted("ses_1"))
+        emitSignal(UiSignal.SessionDeleted("ses_1"))
         emitSignal(UiSignal.ChildPermissionRequested(makeChildPermissionPrompt()))
         emitSignal(UiSignal.PermissionReplied("perm_1", "allow", "ses_1"))
         emitSignal(UiSignal.PermissionTimedOut("perm_1", "ses_1", "bash"))

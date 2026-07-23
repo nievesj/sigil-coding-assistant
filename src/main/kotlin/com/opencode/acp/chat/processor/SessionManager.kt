@@ -272,7 +272,7 @@ class SessionManager(
     internal fun emitGlobalError(errorMessage: String) {
         // Use a synthetic session ID so the ViewModel's SessionError handler
         // can process it without matching a specific session.
-        _globalSignals.tryEmit(UiSignal.SessionError("__internal__", errorMessage))
+        _globalSignals.tryEmit(UiSignal.SessionError("__acp_internal_error__", errorMessage))
     }
 
     /** Emit a global signal (e.g., ChildPermissionRequested) to be collected by the ViewModel. */
@@ -559,6 +559,25 @@ class SessionManager(
             // plugin's lifetime.
             val currentSessionIds = items.map { it.id }.toSet()
             childSessionTracker.pruneDeleted(currentSessionIds)
+
+            // Prune sessions cache: remove cached SessionStates for sessions
+            // the server has deleted. This is defense-in-depth — the session.deleted
+            // SSE event handler also evicts, but loadSessions() catches deletions
+            // that occurred before the SSE subscription was established.
+            val cacheIdsToPrune = sessionsLock.withLock {
+                sessions.keys - currentSessionIds
+            }
+            if (cacheIdsToPrune.isNotEmpty()) {
+                val evictedStates = sessionsLock.withLock {
+                    cacheIdsToPrune.mapNotNull { id ->
+                        val removed = sessions.remove(id)
+                        sessionsSnapshot = sessions.values.toList()
+                        removed
+                    }
+                }
+                evictedStates.forEach { it.close() }
+                logger.info { "[ACP] loadSessions: pruned ${cacheIdsToPrune.size} stale session(s) from cache" }
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -826,6 +845,56 @@ class SessionManager(
                 if (event.sessionId == _activeSessionId.value) {
                     _globalSignals.tryEmit(UiSignal.SessionCompacted(event.sessionId))
                 }
+                return
+            }
+            is SseEvent.SessionDeleted -> {
+                val deletedId = event.sessionId
+                logger.info { "[ACP] Session deleted by server: $deletedId" }
+
+                // Evict from cache — close() outside lock (cancels coroutines, closes channels)
+                val evictedState = sessionsLock.withLock {
+                    val removed = sessions.remove(deletedId)
+                    sessionsSnapshot = sessions.values.toList()
+                    removed
+                }
+                evictedState?.close()
+
+                // Remove from streaming set if present
+                _streamingSessionIds.update { it - deletedId }
+
+               // If the deleted session was active, switch to another surviving session
+               if (_activeSessionId.value == deletedId) {
+                   val next = sessionsLock.withLock {
+                       sessions.entries
+                           .filter { it.key != deletedId }
+                           .maxByOrNull { it.value.lastAccessTime }
+                           ?.key
+                   }
+                    if (next != null) {
+                        // Launch switchSession in a separate coroutine to avoid blocking
+                        // SSE event processing for all sessions. switchSession acquires
+                        // switchMutex, which may be contended by a concurrent user-initiated
+                        // switch. Blocking here would stall the SSE collection coroutine.
+                        scope.launch {
+                            try {
+                                switchSession(next)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                logger.warn(e) { "[ACP] Failed to switch after session deletion of $deletedId" }
+                                _activeSessionId.value = null
+                            }
+                        }
+                    } else {
+                        _activeSessionId.value = null
+                    }
+                }
+
+                // Emit global signal so ViewModel can react (e.g., clear messages if active)
+                _globalSignals.tryEmit(UiSignal.SessionDeleted(deletedId))
+
+                // Refresh the sidebar session list from the server
+                scope.launch { loadSessions() }
                 return
             }
             is SseEvent.MessageRemoved -> {

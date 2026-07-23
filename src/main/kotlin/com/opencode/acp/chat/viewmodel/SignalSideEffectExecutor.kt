@@ -85,19 +85,38 @@ class SignalSideEffectExecutor(
         collectJob = null
     }
 
+    /**
+     * Run a side-effect block with standard error handling: re-throw CancellationException,
+     * log other exceptions as warnings. This ensures one failing side effect doesn't skip
+     * subsequent ones, and that coroutine cancellation propagates correctly.
+     *
+     * @param name Human-readable effect name for log messages. Include the triggering
+     *   context where helpful (e.g., "loadSessions [HandleSessionDeleted]") to distinguish
+     *   effects triggered by different signals.
+     */
+    private suspend fun runEffect(name: String, block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] side-effect '$name' failed" }
+        }
+    }
+
     /** Execute a single [SignalEffect]. Dispatches to the appropriate dependency. */
     private suspend fun executeEffect(effect: SignalEffect) {
         when (effect) {
-            is SignalEffect.SetStreamPhaseIdle -> {
+            is SignalEffect.SetStreamPhaseIdle -> runEffect("setStreamPhaseIdle") {
                 setStreamPhaseIdle()
             }
-            is SignalEffect.SetStreamPhaseIdleForSession -> {
+            is SignalEffect.SetStreamPhaseIdleForSession -> runEffect("setStreamPhaseIdleForSession") {
                 // sessionId-gating is handled at the ChatViewModel injection site
                 // (see ChatViewModel.setStreamPhaseIdleForSession) — the executor
                 // correctly passes sessionId through unchanged.
                 setStreamPhaseIdleForSession(effect.sessionId)
             }
-            is SignalEffect.NotifyResponseComplete -> {
+            is SignalEffect.NotifyResponseComplete -> runEffect("notifyResponseComplete") {
                 // Three gates (mirrors original ChatViewModel.kt:247-251):
                 //  1. naturalCompletion — already checked by SignalRouter
                 //     (only emits this effect when naturalCompletion=true).
@@ -112,98 +131,61 @@ class SignalSideEffectExecutor(
                     OpenCodeNotifications.notifyResponseComplete(project)
                 }
             }
-            is SignalEffect.NotifyPermissionNeeded -> {
+            is SignalEffect.NotifyPermissionNeeded -> runEffect("notifyPermissionNeeded") {
                 OpenCodeNotifications.notifyPermissionNeeded(project)
             }
-            is SignalEffect.NotifyQuestionAsked -> {
+            is SignalEffect.NotifyQuestionAsked -> runEffect("notifyQuestionAsked") {
                 OpenCodeNotifications.notifyQuestionAsked(project)
             }
-            is SignalEffect.ComputeSessionContext -> {
-                try {
-                    computeSessionContext()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] computeSessionContext failed after StreamingCompleted" }
-                }
+            is SignalEffect.ComputeSessionContext -> runEffect("computeSessionContext") {
+                computeSessionContext()
             }
-            is SignalEffect.FetchTodos -> {
-                try {
-                    fetchTodos()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] fetchTodos failed after StreamingCompleted" }
-                }
+            is SignalEffect.FetchTodos -> runEffect("fetchTodos") {
+                fetchTodos()
             }
-            is SignalEffect.LoadSessions -> {
-                try {
-                    service.loadSessions()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] loadSessions failed after StreamingCompleted" }
-                }
+            is SignalEffect.LoadSessions -> runEffect("loadSessions") {
+                service.loadSessions()
             }
-            is SignalEffect.DrainQueue -> {
-                try {
-                    messageQueueManager.drainQueue()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] drainQueue failed after StreamingCompleted" }
-                }
+            is SignalEffect.DrainQueue -> runEffect("drainQueue") {
+                messageQueueManager.drainQueue()
             }
-            is SignalEffect.RefreshReviewFiles -> {
-                try {
-                    refreshReviewFiles()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] refreshReviewFiles failed after StreamingCompleted" }
-                }
+            is SignalEffect.RefreshReviewFiles -> runEffect("refreshReviewFiles") {
+                refreshReviewFiles()
             }
-            is SignalEffect.RefreshActiveSessionMessages -> {
-                try {
-                    service.refreshActiveSessionMessages()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] refreshActiveSessionMessages failed after SessionCompacted" }
-                }
+            is SignalEffect.RefreshActiveSessionMessages -> runEffect("refreshActiveSessionMessages") {
+                service.refreshActiveSessionMessages()
             }
-            is SignalEffect.RemoveStreamingSession -> {
+            is SignalEffect.HandleSessionDeleted -> runEffect("loadSessions [HandleSessionDeleted]") {
+                // loadSessions() refreshes the sidebar; SessionManager.processEvent
+                // already evicted the cache and switched active session if needed.
+                service.loadSessions()
+            }
+            is SignalEffect.RemoveStreamingSession -> runEffect("removeStreamingSession") {
                 service.removeStreamingSession(effect.sessionId)
             }
-            is SignalEffect.StartPermissionTimeout -> {
+            is SignalEffect.StartPermissionTimeout -> runEffect("startPermissionTimeout") {
                 permissionViewModel.startPermissionTimeout()
             }
-            is SignalEffect.SetPermissionPrompt -> {
+            is SignalEffect.SetPermissionPrompt -> runEffect("setPermissionPrompt") {
                 permissionViewModel.setPermissionPrompt(effect.prompt)
             }
-            is SignalEffect.SetSelectionPrompt -> {
+            is SignalEffect.SetSelectionPrompt -> runEffect("setSelectionPrompt") {
                 permissionViewModel.setSelectionPrompt(effect.prompt)
             }
-            is SignalEffect.AddChildPermissionPrompt -> {
+            is SignalEffect.AddChildPermissionPrompt -> runEffect("addChildPermissionPrompt") {
                 permissionViewModel.addChildPermissionPrompt(effect.prompt)
             }
-            is SignalEffect.HandlePermissionReplied -> {
+            is SignalEffect.HandlePermissionReplied -> runEffect("handlePermissionReplied") {
                 permissionHandler.handlePermissionReplied(effect.permissionId, effect.reply, effect.sessionId)
             }
-            is SignalEffect.HandlePermissionTimedOut -> {
+            is SignalEffect.HandlePermissionTimedOut -> runEffect("handlePermissionTimedOut") {
                 permissionHandler.handlePermissionTimedOut(effect.permissionId, effect.sessionId, effect.toolName)
             }
-            is SignalEffect.EmitFileChangeSignal -> {
+            is SignalEffect.EmitFileChangeSignal -> runEffect("emitFileChangeSignal") {
                 emitFileChangeSignal()
             }
-            is SignalEffect.ComputeSessionContextLocal -> {
-                try {
-                    computeSessionContextLocal()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.warn(e) { "[ACP] computeSessionContextLocal failed after MessageUpdated" }
-                }
+            is SignalEffect.ComputeSessionContextLocal -> runEffect("computeSessionContextLocal") {
+                computeSessionContextLocal()
             }
         }
     }

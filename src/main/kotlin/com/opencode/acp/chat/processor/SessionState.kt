@@ -36,7 +36,7 @@ import kotlin.concurrent.withLock
  * Per-session state: message map, processor context, streaming lifecycle.
  * Each session gets its own [SessionState]. Switching sessions is a pointer swap.
  *
- * Thread safety: dual protection model â€”
+ * Thread safety: dual protection model —
  * - Event processing coroutine runs on Dispatchers.Default (serialization for processEvent
  *   is guaranteed by the Channel<BUFFERED> single-reader, NOT by dispatcher confinement)
  * - External callers (createAssistantMessage, addMessage, etc.) acquire stateLock
@@ -102,7 +102,7 @@ class SessionState(
     /** SSE event dispatch pipeline (extracted from processEventInternal). See TDD Â§4.2.2. */
     internal val sseEventPipeline = SseEventPipeline(logger)
 
-    /** Event channel â€” SSE events buffered for EDT processing.
+    /** Event channel — SSE events buffered for EDT processing.
      *  Declared before collaborators because [messageLifecycle] needs it. */
     private val eventChannel = Channel<SseEvent>(1024)
 
@@ -184,7 +184,7 @@ class SessionState(
     var lastAccessTime: Long = System.currentTimeMillis()
         private set
 
-    /** Signal forwarding job â€” forwards signals to global merged flow. */
+    /** Signal forwarding job — forwards signals to global merged flow. */
     private var signalForwardJob: Job? = null
 
     init {
@@ -202,7 +202,7 @@ class SessionState(
      *  Without the lock, the event processing coroutine could mutate these maps
      *  mid-snapshot, producing an inconsistent view (e.g., a tool appears
      *  InProgress in partStates but Completed in pills). The lock is ReentrantLock
-     *  and the read is O(n) â€” brief enough to not cause contention.
+     *  and the read is O(n) — brief enough to not cause contention.
      *
      *  Returns a Triple of:
      *   1. partStates values (List<PartState>)
@@ -243,7 +243,7 @@ class SessionState(
         try {
             eventChannel.send(event)
         } catch (_: ClosedSendChannelException) {
-            // Session was closed between the @Volatile check and the send â€” safe to drop
+            // Session was closed between the @Volatile check and the send — safe to drop
         }
     }
 
@@ -306,10 +306,10 @@ class SessionState(
     fun setLastUserText(text: String?) = messageLifecycle.setLastUserText(text)
 
     fun close() {
-        // Non-blocking close â€” never blocks EDT.
+        // Non-blocking close — never blocks EDT.
         // Set closed flag first to prevent new events from being processed.
-        // Cancel jobs (cooperative â€” they stop at next suspension point).
-        // Close channel (non-blocking â€” prevents new events from being enqueued).
+        // Cancel jobs (cooperative — they stop at next suspension point).
+        // Close channel (non-blocking — prevents new events from being enqueued).
         // Complete responseDeferred unconditionally (prevents sendMutex leak).
         stateLock.withLock {
             if (closed) return@withLock
@@ -338,7 +338,7 @@ class SessionState(
         // Use Dispatchers.Default (NOT EDT) for event processing.
         // SseEventPipeline.process() does CPU-intensive work (markdown parsing, JSON
         // manipulation, message map mutations) that blocks the UI thread when on EDT.
-        // StateFlow updates are thread-safe â€” Compose recomposes on EDT automatically.
+        // StateFlow updates are thread-safe — Compose recomposes on EDT automatically.
         // Serialization is guaranteed by the Channel<BUFFERED> (events processed one at a time).
         eventProcessingJob = scope.launch(Dispatchers.Default) {
             for (event in eventChannel) {
@@ -405,6 +405,31 @@ class SessionState(
     }
 
     internal fun handleSessionError(event: SseEvent.SessionError) = stateLock.withLock {
+        // Stale-event guard: if the SessionError carries a messageId that differs
+        // from the current turn's activeServerMessageId, it belongs to a previous
+        // turn that was aborted. The ResetTurn for the new turn already cleared
+        // isAborted, so the isAborted check below won't catch it. Skip it to
+        // prevent poisoning the new turn (which would drop all subsequent
+        // streaming events and leave the send mutex held).
+        val eventMsgId = event.messageId
+        if (eventMsgId != null &&
+            turnLifecycleState.activeServerMessageId != null &&
+            eventMsgId != turnLifecycleState.activeServerMessageId) {
+            logger.info { "[ACP] handleSessionError: SKIP — stale error for old turn (eventMsgId=$eventMsgId != activeServerId=${turnLifecycleState.activeServerMessageId})" }
+            return@withLock
+        }
+        // Edge case: if the event carries a messageId but the current turn's
+        // activeServerMessageId is still null (server ID not yet resolved via
+        // MessageFinalized/updateServerMessageId), we cannot confirm whether
+        // this error belongs to the current or a previous turn. Log a warning
+        // so the ambiguity is visible in logs. The error is still processed
+        // (below) because suppressing a legitimate error would be worse than
+        // processing a stale one — the isAborted guard provides a second line
+        // of defense if the turn was already aborted.
+        if (eventMsgId != null && turnLifecycleState.activeServerMessageId == null &&
+            turnLifecycleState.activeMessageId != null && turnLifecycleState.isStreaming) {
+            logger.warn { "[ACP] handleSessionError: cannot confirm staleness — eventMsgId=$eventMsgId but activeServerMessageId is null (activeMsgId=${turnLifecycleState.activeMessageId}, isStreaming=true). Processing error; may be stale." }
+        }
         // Bail out if a concurrent abortStreaming already finalized this turn —
         // otherwise we'd overwrite its Aborted state with Failed(reason).
         if (turnLifecycleState.isAborted) {
@@ -465,49 +490,49 @@ class SessionState(
     }
 
     internal fun handlePermission(event: SseEvent.Permission, msgId: String) {
-        // Snapshot both index and pill reads together under stateLock to avoid a
-        // concurrent eviction removing the entry between the two reads (which
-        // would leave targetMsgId non-null but existingPill null, skipping the
-        // pill update while still mutating parts).
+        // Combine the snapshot read and the writes into a SINGLE stateLock.withLock
+        // block. Previously the read (toolCallIndex/toolCallPills) and the writes
+        // (toolPartStates/toolCallPills/messageMap) were in two separate
+        // stateLock.withLock blocks, releasing the lock between read and write.
+        // That window allowed a concurrent eviction to corrupt state (e.g.,
+        // targetMsgId non-null at read time but evicted before the write).
         val targetMsgId: String?
-        val existingPill: ToolCallPill?
+        var realToolName: String = event.action  // default outside lock; captured inside lock
         stateLock.withLock {
             targetMsgId = toolCallState.toolCallIndex[event.toolCallId]
-            existingPill = toolCallState.toolCallPills[event.toolCallId]
+            if (targetMsgId == null) {
+                // The toolCallId is not in the index (likely evicted). We must NOT return early:
+                // the server's Deferred promise for this tool call would hang indefinitely waiting
+                // for a response that never comes. Instead, skip the pill/part updates (which
+                // require the message to exist) but still surface the permission prompt so the
+                // user can approve/reject it and unblock the agent.
+                logger.warn { "[ACP] Permission: toolCallId=${event.toolCallId} not in index (evicted?) — surfacing prompt without pill update to avoid dropping the server's permission request" }
+            } else {
+                val existingPill = toolCallState.toolCallPills[event.toolCallId]
+                // Capture realToolName INSIDE the lock to avoid a data race on the
+                // non-thread-safe LinkedHashMap (toolCallPills) — concurrent locked
+                // writes could otherwise race with this read outside the lock.
+                realToolName = existingPill?.toolName ?: event.action
+                toolCallState.toolPartStates[event.toolCallId] = PartState.Pending
+                if (existingPill != null) {
+                    toolCallState.toolCallPills[event.toolCallId] = existingPill.copy(status = ToolCallStatus.PENDING)
+                }
+                messageMap.update(targetMsgId) { msg ->
+                    val parts = LinkedHashMap(msg.parts)
+                    val existing = parts[event.toolCallId]
+                    if (existing is MessagePart.ToolCall) {
+                        parts[event.toolCallId] = existing.copy(
+                            pill = existing.pill.copy(status = ToolCallStatus.PENDING),
+                            state = PartState.Pending
+                        )
+                    }
+                    msg.copy(parts = parts, isStreaming = turnLifecycleState.isStreaming)
+                }
+            }
         }
-        if (targetMsgId == null) {
-            // The toolCallId is not in the index (likely evicted). We must NOT return early:
-            // the server's Deferred promise for this tool call would hang indefinitely waiting
-            // for a response that never comes. Instead, skip the pill/part updates (which
-            // require the message to exist) but still surface the permission prompt so the
-            // user can approve/reject it and unblock the agent.
-            logger.warn { "[ACP] Permission: toolCallId=${event.toolCallId} not in index (evicted?) — surfacing prompt without pill update to avoid dropping the server's permission request" }
-       } else {
-           // Hold stateLock for the entire mutation block to keep locking
-           // discipline consistent. The snapshot read above was under lock;
-           // the writes below must also be under lock to prevent a concurrent
-           // eviction from clearing toolPartStates/toolCallPills between the
-           // snapshot read and these writes. messageMap.update re-acquires
-           // stateLock (ReentrantLock allows re-entry).
-           stateLock.withLock {
-               toolCallState.toolPartStates[event.toolCallId] = PartState.Pending
-               if (existingPill != null) {
-                   toolCallState.toolCallPills[event.toolCallId] = existingPill.copy(status = ToolCallStatus.PENDING)
-               }
-               messageMap.update(targetMsgId!!) { msg ->
-                   val parts = LinkedHashMap(msg.parts)
-                   val existing = parts[event.toolCallId]
-                   if (existing is MessagePart.ToolCall) {
-                       parts[event.toolCallId] = existing.copy(
-                           pill = existing.pill.copy(status = ToolCallStatus.PENDING),
-                           state = PartState.Pending
-                       )
-                   }
-                   msg.copy(parts = parts, isStreaming = turnLifecycleState.isStreaming)
-               }
-           }
-       }
-        val realToolName = toolCallState.toolCallPills[event.toolCallId]?.toolName ?: event.action
+        // Prompt creation and signal emission stay OUTSIDE the lock:
+        // setPendingPermissionPrompt uses its own StateFlow. realToolName was
+        // captured inside the lock above, so it is safe to use here.
         val prompt = PermissionPrompt(
             sessionId = sessionId,
             permissionId = event.permissionId,
@@ -521,20 +546,32 @@ class SessionState(
     }
 
     internal fun handlePermissionReplied(event: SseEvent.PermissionReplied) {
-        val currentPermId = _pendingPermission.value?.permissionId
-        if (currentPermId == null || currentPermId == event.permissionId) {
-            setPendingPermission(false)
+        // Wrap the read-check-clear of _pendingPermission.value in stateLock.withLock
+        // to make it atomic. Previously the read, the setPendingPermission(false)
+        // clear, and the signal emission were unsynchronized, allowing a concurrent
+        // handlePermission to interleave and observe a stale permissionId.
+        val shouldEmitSignal: Boolean
+        stateLock.withLock {
+            val currentPermId = _pendingPermission.value?.permissionId
+            if (currentPermId == null || currentPermId == event.permissionId) {
+                setPendingPermission(false)
+            }
+           shouldEmitSignal = currentPermId == event.permissionId
+           if (!shouldEmitSignal && currentPermId == null) {
+               logger.debug { "[ACP] permission.replied for already-resolved permission: permissionId=${event.permissionId}, reply=${event.reply} — signal suppressed" }
+            } else if (!shouldEmitSignal) {
+               logger.warn { "[ACP] permission.replied for mismatched permission: eventPermissionId=${event.permissionId} != currentPermId=$currentPermId, reply=${event.reply} — signal suppressed (reply for a different permission than the pending one)" }
+            }
+            logger.info { "[ACP] permission.replied received: permissionId=${event.permissionId}, reply=${event.reply}, currentPermId=$currentPermId, cleared=${currentPermId == null || currentPermId == event.permissionId}" }
         }
-        if (currentPermId == event.permissionId) {
+        // Emit signal OUTSIDE the lock to reduce contention
+        if (shouldEmitSignal) {
             _signals.tryEmit(UiSignal.PermissionReplied(
                 permissionId = event.permissionId,
                 reply = event.reply,
                 sessionId = sessionId,
             ))
-        } else if (currentPermId == null) {
-            logger.debug { "[ACP] permission.replied for already-resolved permission: permissionId=${event.permissionId}, reply=${event.reply} â€” signal suppressed" }
         }
-        logger.info { "[ACP] permission.replied received: permissionId=${event.permissionId}, reply=${event.reply}, currentPermId=$currentPermId, cleared=${currentPermId == null || currentPermId == event.permissionId}" }
     }
 
     internal fun handleQuestionAsked(event: SseEvent.QuestionAsked) {
@@ -623,6 +660,11 @@ class SessionState(
             // started with the same characters as the user's input but in different case
             // (e.g., user "CSS is great" â†’ assistant "css is great for styling" had
             // "CSS is great" stripped, leaving " for styling").
+            // Limitation: echo stripping only checks the FIRST text chunk. If the server
+            // splits the user's echoed input across multiple SSE deltas (e.g., first
+            // chunk = "Hello " when user text = "Hello world"), startsWith returns false
+            // and the echo is NOT stripped. This is acceptable because the server
+            // typically echoes the full user text in a single delta.
             if (userText != null && text.startsWith(userText, ignoreCase = false)) {
                 textStreamingState.userEchoStripped = true
                 val chunk = text.substring(userText.length).trimStart()
@@ -857,7 +899,7 @@ class SessionState(
             )
             val targetMsgId = toolCallState.toolCallIndex[event.toolCallId]
             if (targetMsgId == null) {
-                logger.warn { "[ACP] ToolResult: toolCallId=${event.toolCallId} not in index (evicted?) â€” skipping to avoid misrouting to activeMessageId" }
+                logger.warn { "[ACP] ToolResult: toolCallId=${event.toolCallId} not in index (evicted?) — skipping to avoid misrouting to activeMessageId" }
                 return
             }
             messageMap.update(targetMsgId) { msg ->
@@ -879,7 +921,7 @@ class SessionState(
                 msg.copy(parts = parts, isStreaming = turnLifecycleState.isStreaming)
             }
         } else {
-            logger.warn { "[ACP] ToolResult without prior ToolUse for callID=${event.toolCallId} â€” deriving toolName from kind" }
+            logger.warn { "[ACP] ToolResult without prior ToolUse for callID=${event.toolCallId} — deriving toolName from kind" }
             val newInput = event.input
             val baseKind = ToolMapper.toAcpKind("tool")
             val resolvedKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(newInput) else baseKind
