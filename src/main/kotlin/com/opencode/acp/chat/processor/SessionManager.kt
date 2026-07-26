@@ -17,6 +17,7 @@ import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -47,6 +48,13 @@ class SessionManager(
     companion object {
         /** Maximum number of sessions to keep in memory. LRU eviction. */
         const val MAX_CACHED_SESSIONS = 10
+
+        /** Synthetic session ID used by [emitGlobalError] to surface background-coroutine
+         *  crashes to the UI. The ViewModel's SessionError handler treats this sentinel
+         *  specially: it unconditionally resets the stream phase to IDLE (a normal
+         *  SessionError only resets phase if the sessionId matches the active session).
+         *  This ensures a background crash never leaves the UI stuck in STREAMING. */
+        const val INTERNAL_ERROR_SESSION_ID = "__acp_internal_error__"
     }
 
     // ── Per-Session State ──
@@ -116,8 +124,11 @@ class SessionManager(
         }
         .shareIn(scope, SharingStarted.Eagerly, replay = 0)
 
-    /** Global signals for cross-session events (SessionCreated, etc.). */
-    private val _globalSignals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 16)
+    /** Global signals for cross-session events (SessionCreated, etc.).
+     *  Buffer capacity is 64 (increased from 16) to reduce the chance of dropping
+     *  crash-surfacing signals during burst events (e.g., rapid SessionCreated +
+     *  SessionError + SessionDeleted sequences). */
+    private val _globalSignals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 64)
     val globalSignals: SharedFlow<UiSignal> = _globalSignals.asSharedFlow()
 
     // ── Session List State (from old SessionManager) ──
@@ -272,7 +283,13 @@ class SessionManager(
     internal fun emitGlobalError(errorMessage: String) {
         // Use a synthetic session ID so the ViewModel's SessionError handler
         // can process it without matching a specific session.
-        _globalSignals.tryEmit(UiSignal.SessionError("__acp_internal_error__", errorMessage))
+        val emitted = _globalSignals.tryEmit(UiSignal.SessionError(INTERNAL_ERROR_SESSION_ID, errorMessage))
+        if (!emitted) {
+            // The global signals buffer (extraBufferCapacity=64) is full — the crash
+            // signal was dropped. This is the crash-surfacing mechanism itself failing
+            // silently, so log loudly as a last resort. The UI may stay stuck in STREAMING.
+            logger.error { "[ACP] emitGlobalError: global signals buffer full — crash signal DROPPED (errorMessage=$errorMessage). UI may stay stuck in STREAMING." }
+        }
     }
 
     /** Emit a global signal (e.g., ChildPermissionRequested) to be collected by the ViewModel. */
@@ -447,7 +464,7 @@ class SessionManager(
         }
         try {
             logger.info { "[ACP] SessionManager.loadSessions: fetching session list... (directory=$directory)" }
-            var sessionList: List<OpenCodeSession>
+            var sessionList: List<OpenCodeSession> = emptyList()
 
             try {
                 sessionList = c.listSessions(directory)
@@ -505,6 +522,12 @@ class SessionManager(
                                         java.io.File(dir).canonicalPath
                                     } catch (_: Exception) { return@filter false }
                                     canonicalDir == canonicalBase ||
+                                        // Note: canonicalPath collapses drive roots and symlinks,
+                                        // so this startsWith check is cross-OS safe. On Windows,
+                                        // canonicalBase already includes the drive letter (e.g.
+                                        // "C:\Projects\..."), and the separator suffix prevents
+                                        // prefix-only matches like "C:\Projects\Foo" matching
+                                        // "C:\Projects\FooBar".
                                         canonicalDir.startsWith(canonicalBase + java.io.File.separator)
                                 }
                             }
@@ -651,6 +674,25 @@ class SessionManager(
             }
         }
 
+        // Best-effort deferred reconciliation: if both loadSessions() attempts above
+        // failed, the parent→child map may be stale and orphaned children could remain
+        // undiscovered. Schedule a delayed retry so they eventually get picked up.
+        // If this also fails, the next SSE SessionCreated event or a manual refresh
+        // will catch up. Wrapped in try/catch — this is purely opportunistic.
+        if (!sessionsLoaded) {
+            scope.launch {
+                try {
+                    delay(2000)
+                    loadSessions()
+                    logger.info { "[ACP] archiveSession: deferred loadSessions() reconciliation succeeded" }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] archiveSession: deferred loadSessions() reconciliation also failed — will rely on SSE/manual refresh" }
+                }
+            }
+        }
+
         // If the active session was the target or any of its descendants,
         // switch to another surviving session (or clear active if none remain).
         // Wrapped in try/catch because switchSession() can throw (ensureSessionCached
@@ -666,7 +708,10 @@ class SessionManager(
                         .maxByOrNull { it.value.lastAccessTime }
                         ?.key
                 }
-                if (next != null && sessionsLock.withLock { sessions.containsKey(next) }) {
+                if (next != null) {
+                    // switchSession calls ensureSessionCached(next) which re-fetches if
+                    // the session was evicted between the lock release and the call —
+                    // no need for a redundant containsKey check under lock.
                     switchSession(next)
                 } else {
                     _activeSessionId.value = null
@@ -875,6 +920,17 @@ class SessionManager(
                         // SSE event processing for all sessions. switchSession acquires
                         // switchMutex, which may be contended by a concurrent user-initiated
                         // switch. Blocking here would stall the SSE collection coroutine.
+                        //
+                        // Nondeterminism note: the loadSessions() launch below (at the
+                        // "Refresh the sidebar session list" comment) runs concurrently
+                        // with this switchSession launch. There is no ordering guarantee
+                        // between them — loadSessions() may complete before or after
+                        // switchSession(). This is acceptable because switchSession's
+                        // failure path self-corrects by setting _activeSessionId = null
+                        // (see catch block below), and loadSessions() refreshes the
+                        // sidebar independently of the active-session switch. If
+                        // switchSession picks a session that loadSessions() subsequently
+                        // evicts, the next user action or SSE event will reconcile.
                         scope.launch {
                             try {
                                 switchSession(next)
@@ -915,25 +971,22 @@ class SessionManager(
                 // The child's session ID is NOT present in the Subtask event payload
                 // (OpenCodePart.Subtask has only prompt, description, agent, model).
                 //
-                // We CANNOT populate the childToParent reverse index from Subtask
-                // events because we don't know the child's session ID from this event.
-                // The reverse index is populated solely from loadSessions(), which
-                // has `parentID` on each SessionItem. The agent label is still
-                // captured from the Subtask event for display purposes.
+                // We CANNOT populate childToParent, knownChildSessionIds, or childAgentLabels
+                // from Subtask events because we don't know the child's session ID. Doing so
+                // would corrupt child-session tracking by marking the PARENT as a child
+                // (isActiveSessionChild → true for parent → input disabled; markChildSessionComplete
+                // → parent hidden from sidebar; eviction protection corrupted).
                 //
-                // When a child session needs permission before loadSessions() has
-                // populated the reverse index, the orphan-permission retry in
-                // OpenCodeService.startGlobalSignalCollection() triggers a
-                // loadSessions() to fetch the child's parentID and retry the relay.
-                val childSessionId = event.sessionId
-                val agent = event.agent
-                // Only capture the agent label — don't populate the reverse index
-                if (agent != null) {
-                    childSessionTracker.setChildAgentLabel(childSessionId, agent)
-                }
-                childSessionTracker.addKnownChild(childSessionId)
-                logger.info { "[ACP] Subtask event: parentSessionId=$childSessionId, agent=$agent — agent label captured, reverse index NOT populated (child session ID unknown from Subtask event)" }
-                // Still route to SessionState for existing ToolPill rendering behavior
+                // Child registration happens via:
+                //   - loadSessions() (has parentID + agent on each SessionItem)
+                //   - The child's own SSE events (which carry the child's sessionId)
+                //
+                // When a child session needs permission before loadSessions() has populated
+                // the reverse index, the orphan-permission retry in
+                // OpenCodeService.startGlobalSignalCollection() triggers a loadSessions()
+                // to fetch the child's parentID and retry the relay.
+                logger.info { "[ACP] Subtask event: parentSessionId=$sessionId — child registration deferred to loadSessions() (child session ID unknown from Subtask event)" }
+                // Route to the parent's SessionState for ToolPill rendering of the subtask part.
                 sessionsLock.withLock { sessions[sessionId] }?.let { state ->
                     state.processEvent(event)
                 }
@@ -1246,6 +1299,13 @@ class SessionManager(
             // scope.cancel() (called by the caller after this) will cancel all SessionState
             // coroutines; close() here handles the critical cleanup (closed flag, responseDeferred,
             // event channel, prompts) that scope.cancel() alone does NOT perform.
+            //
+            // The `sessions` map is intentionally NOT cleared in this branch — we cannot
+            // acquire the lock to clear it safely. The map entries (SessionState references)
+            // will be garbage-collected along with this SessionManager instance, which is
+            // short-lived (one per tool window). Since scope.cancel() (called by the caller)
+            // cancels all SessionState coroutines, the uncleared entries are inert and pose
+            // no leak risk — they're just stale references awaiting GC.
             logger.warn { "[ACP] SessionManager.close: lock held — using volatile snapshot for cleanup" }
             val snapshot = sessionsSnapshot
             snapshot.forEach { it.close() }

@@ -2,12 +2,16 @@ package com.opencode.acp.chat.viewmodel
 
 import com.opencode.acp.chat.OpenCodeNotifications
 import com.opencode.acp.chat.service.OpenCodeServiceApi
+import com.intellij.notification.Notification
+import com.intellij.notification.NotificationType
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Collects [SignalEffect] from [SignalRouter] and runs each with the
@@ -71,11 +75,45 @@ class SignalSideEffectExecutor(
     private var collectJob: kotlinx.coroutines.Job? = null
 
     /**
+     * Timeout for REST-calling side effects. Prevents a half-open TCP connection
+     * (server unresponsive but TCP alive) from freezing the entire signal pipeline
+     * indefinitely. Effects are processed sequentially, so one hung REST call would
+     * block ALL subsequent effect processing — blocking signal routing, which
+     * blocks SSE event handling. [withTimeoutOrNull] returns null on timeout,
+     * which is logged as a warning; the collect coroutine continues.
+     */
+    private val effectTimeoutMs: Long = 30_000L
+
+    /**
      * Start collecting [SignalEffect] from [effects] and executing each.
+     *
+     * Safe to call multiple times: any existing collect job is cancelled and joined
+     * before launching a new one. The join() ensures in-flight [executeEffect] calls
+     * complete before the new collector starts, preventing duplicate effect
+     * processing from overlapping old and new collectors.
+     *
+     * Backpressure: effects are processed sequentially. If a side effect blocks
+     * (e.g., loadSessions() on a slow HTTP response), subsequent effects queue in
+     * the SharedFlow buffer (capacity 256). If the buffer fills, the router's
+     * _effects.emit() suspends, back-pressuring the SSE event pipeline. This is
+     * intentional — ordered processing is required for the StreamingCompleted
+     * side-effect chain. REST-calling effects are wrapped in [withTimeoutOrNull]
+     * (see [effectTimeoutMs]) so a half-open TCP connection cannot block the
+     * pipeline indefinitely.
      */
     fun start(effects: Flow<SignalEffect>) {
-        collectJob = scope.launch {
-            effects.collect { effect -> executeEffect(effect) }
+        // Cancel+join any existing collect job before launching a new one.
+        // The join() ensures in-flight executeEffect calls complete before the
+        // new collector starts, preventing duplicate effect processing from
+        // overlapping old and new collectors. Runs in a scope.launch so the
+        // suspend join() is in a coroutine context and the relaunch happens
+        // after join completes.
+        scope.launch {
+            collectJob?.cancel()
+            collectJob?.join()
+            collectJob = scope.launch {
+                effects.collect { effect -> executeEffect(effect) }
+            }
         }
     }
 
@@ -93,14 +131,48 @@ class SignalSideEffectExecutor(
      * @param name Human-readable effect name for log messages. Include the triggering
      *   context where helpful (e.g., "loadSessions [HandleSessionDeleted]") to distinguish
      *   effects triggered by different signals.
+     * @param securityRelevant When true, the effect is security-relevant (e.g., permission
+     *   enforcement) and failures are logged at ERROR level instead of WARN. ERROR-level
+     *   logs are visible in idea.log under the default INFO log level, ensuring security
+     *   effect failures are not silently buried. A dedicated UI notification (balloon) for
+     *   security effect failures is NOT yet implemented — TODO: add a visible notification
+     *   via NotificationGroupManager so the user is alerted that permission enforcement may
+     *   be incomplete. For now, ERROR-level logging is the immediate improvement.
      */
-    private suspend fun runEffect(name: String, block: suspend () -> Unit) {
+    private suspend fun runEffect(name: String, securityRelevant: Boolean = false, block: suspend () -> Unit) {
         try {
             block()
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn(e) { "[ACP] side-effect '$name' failed" }
+            if (securityRelevant) {
+                logger.error(e) { "[ACP] SECURITY side-effect '$name' failed — permission enforcement may be incomplete" }
+                // Surface a user-visible notification so the user knows permission enforcement
+                // failed. Without this, the user believes a tool was denied/allowed/timed-out
+                // but the server never received the decision — the permission may remain
+                // pending indefinitely. Uses invokeLater because this may run on a coroutine
+                // background thread and Notification.notify() requires the EDT.
+                notifySecurityEffectFailure(name)
+            } else {
+                logger.warn(e) { "[ACP] side-effect '$name' failed" }
+            }
+        }
+    }
+
+    /** Show a balloon notification for a security-relevant effect failure. */
+    private fun notifySecurityEffectFailure(name: String) {
+        try {
+            ApplicationManager.getApplication().invokeLater {
+                Notification(
+                    "Sigil",
+                    "Sigil",
+                    "Permission enforcement failed for: $name. The server may not have received the decision. Check idea.log for details.",
+                    NotificationType.WARNING,
+                ).notify(project)
+            }
+        } catch (e: Exception) {
+            // Notification system may not be available (e.g., during disposal). Log and continue.
+            logger.warn(e) { "[ACP] Failed to show security effect failure notification for '$name'" }
         }
     }
 
@@ -108,7 +180,22 @@ class SignalSideEffectExecutor(
     private suspend fun executeEffect(effect: SignalEffect) {
         when (effect) {
             is SignalEffect.SetStreamPhaseIdle -> runEffect("setStreamPhaseIdle") {
+                // UNGATED — used by StreamingCompleted. The messageId is the message that
+                // just finished streaming, so the phase must reset to IDLE regardless of
+                // whether the user switched sessions between signal emission and effect
+                // execution. Without this, a session switch during the effect window would
+                // leave _streamPhase stuck at STREAMING (perpetual Stop button, no streaming).
                 setStreamPhaseIdle()
+            }
+            is SignalEffect.SetStreamPhaseIdleGated -> runEffect("setStreamPhaseIdleGated") {
+                // GATED on isActiveMessage — used by Error backstop. Only reset the active
+                // session's stream phase if the error was for a message in the active session.
+                // This prevents a background Error (messageId not in the active session) from
+                // forcing IDLE while the active session is legitimately streaming for a
+                // different message.
+                if (isActiveMessage(effect.messageId)) {
+                    setStreamPhaseIdle()
+                }
             }
             is SignalEffect.SetStreamPhaseIdleForSession -> runEffect("setStreamPhaseIdleForSession") {
                 // sessionId-gating is handled at the ChatViewModel injection site
@@ -138,13 +225,16 @@ class SignalSideEffectExecutor(
                 OpenCodeNotifications.notifyQuestionAsked(project)
             }
             is SignalEffect.ComputeSessionContext -> runEffect("computeSessionContext") {
-                computeSessionContext()
+                withTimeoutOrNull(effectTimeoutMs) { computeSessionContext() }
+                    ?: logger.warn { "[ACP] computeSessionContext timed out after ${effectTimeoutMs}ms" }
             }
             is SignalEffect.FetchTodos -> runEffect("fetchTodos") {
-                fetchTodos()
+                withTimeoutOrNull(effectTimeoutMs) { fetchTodos() }
+                    ?: logger.warn { "[ACP] fetchTodos timed out after ${effectTimeoutMs}ms" }
             }
             is SignalEffect.LoadSessions -> runEffect("loadSessions") {
-                service.loadSessions()
+                withTimeoutOrNull(effectTimeoutMs) { service.loadSessions() }
+                    ?: logger.warn { "[ACP] loadSessions timed out after ${effectTimeoutMs}ms" }
             }
             is SignalEffect.DrainQueue -> runEffect("drainQueue") {
                 messageQueueManager.drainQueue()
@@ -153,12 +243,14 @@ class SignalSideEffectExecutor(
                 refreshReviewFiles()
             }
             is SignalEffect.RefreshActiveSessionMessages -> runEffect("refreshActiveSessionMessages") {
-                service.refreshActiveSessionMessages()
+                withTimeoutOrNull(effectTimeoutMs) { service.refreshActiveSessionMessages() }
+                    ?: logger.warn { "[ACP] refreshActiveSessionMessages timed out after ${effectTimeoutMs}ms" }
             }
             is SignalEffect.HandleSessionDeleted -> runEffect("loadSessions [HandleSessionDeleted]") {
                 // loadSessions() refreshes the sidebar; SessionManager.processEvent
                 // already evicted the cache and switched active session if needed.
-                service.loadSessions()
+                withTimeoutOrNull(effectTimeoutMs) { service.loadSessions() }
+                    ?: logger.warn { "[ACP] loadSessions [HandleSessionDeleted] timed out after ${effectTimeoutMs}ms" }
             }
             is SignalEffect.RemoveStreamingSession -> runEffect("removeStreamingSession") {
                 service.removeStreamingSession(effect.sessionId)
@@ -175,17 +267,27 @@ class SignalSideEffectExecutor(
             is SignalEffect.AddChildPermissionPrompt -> runEffect("addChildPermissionPrompt") {
                 permissionViewModel.addChildPermissionPrompt(effect.prompt)
             }
-            is SignalEffect.HandlePermissionReplied -> runEffect("handlePermissionReplied") {
-                permissionHandler.handlePermissionReplied(effect.permissionId, effect.reply, effect.sessionId)
+            is SignalEffect.HandlePermissionReplied -> runEffect("handlePermissionReplied", securityRelevant = true) {
+                withTimeoutOrNull(effectTimeoutMs) {
+                    permissionHandler.handlePermissionReplied(effect.permissionId, effect.reply, effect.sessionId)
+                } ?: logger.warn { "[ACP] handlePermissionReplied timed out after ${effectTimeoutMs}ms" }
             }
-            is SignalEffect.HandlePermissionTimedOut -> runEffect("handlePermissionTimedOut") {
-                permissionHandler.handlePermissionTimedOut(effect.permissionId, effect.sessionId, effect.toolName)
+            is SignalEffect.HandlePermissionTimedOut -> runEffect("handlePermissionTimedOut", securityRelevant = true) {
+                withTimeoutOrNull(effectTimeoutMs) {
+                    permissionHandler.handlePermissionTimedOut(effect.permissionId, effect.sessionId, effect.toolName)
+                } ?: logger.warn { "[ACP] handlePermissionTimedOut timed out after ${effectTimeoutMs}ms" }
             }
             is SignalEffect.EmitFileChangeSignal -> runEffect("emitFileChangeSignal") {
                 emitFileChangeSignal()
             }
             is SignalEffect.ComputeSessionContextLocal -> runEffect("computeSessionContextLocal") {
                 computeSessionContextLocal()
+            }
+            is SignalEffect.LogSessionError -> runEffect("logSessionError") {
+                // Log the session error message at WARN level for idea.log visibility.
+                // Preserves the errorMessage field that was previously discarded by the router.
+                val msg = effect.errorMessage ?: "(no error message)"
+                logger.warn { "[ACP] Session error: session=${effect.sessionId}, error=$msg" }
             }
         }
     }
