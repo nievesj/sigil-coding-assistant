@@ -574,9 +574,9 @@ class SseEventParserTest {
     }
 
     @Test
-    fun `session deleted returns Ignored (informational)`() {
+    fun `session deleted parses to SessionDeleted`() {
         val event = parse("session.deleted", "{}")
-        event.shouldBeTypeOf<SseEvent.Ignored>()
+        event.shouldBeTypeOf<SseEvent.SessionDeleted>()
     }
 
     @Test

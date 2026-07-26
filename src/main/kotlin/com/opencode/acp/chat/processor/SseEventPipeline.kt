@@ -155,6 +155,11 @@ class SseEventPipeline(
                 // No local state mutation needed in SessionState.
                 return
             }
+            is SseEvent.SessionDeleted -> {
+                // Handled by SessionManager (evicts cache, switches active session, reloads list).
+                // No local state mutation needed in SessionState.
+                return
+            }
             else -> { /* handled below */ }
         }
 
@@ -328,6 +333,7 @@ class SseEventPipeline(
             is SseEvent.QuestionAsked,
             is SseEvent.SessionCompacted,
             is SseEvent.SessionCreated,
+            is SseEvent.SessionDeleted,
             is SseEvent.SessionIdle,
             is SseEvent.SessionError,
             is SseEvent.TodoUpdated,

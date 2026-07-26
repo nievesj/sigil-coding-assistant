@@ -190,10 +190,44 @@ class SignalRouterTest {
     }
 
     @Test
-    fun `Error emits no effects`() = runRouterTest { effects, emitSignal, _ ->
+    fun `Error emits SetStreamPhaseIdleGated as backstop for suppressed StreamingCompleted`() = runRouterTest { effects, emitSignal, _ ->
         emitSignal(UiSignal.Error("msg_1", "boom"))
         advanceUntilIdle()
-        effects.shouldBeEmpty()
+        effects shouldBe listOf(
+            SignalEffect.SetStreamPhaseIdleGated("msg_1"),
+        )
+    }
+
+    @Test
+    fun `Error after StreamingCompleted still emits SetStreamPhaseIdle idempotently`() = runRouterTest { effects, emitSignal, _ ->
+        // Simulate the timeout bug: StreamingCompleted fires (sets phase IDLE),
+        // then Error fires (should be a no-op on phase, but still emit safely).
+        emitSignal(UiSignal.StreamingCompleted("msg_1", emptyList(), naturalCompletion = false))
+        emitSignal(UiSignal.Error("msg_1", "timeout"))
+        advanceUntilIdle()
+        // Assert the full effects list — verifies ordering (StreamingCompleted's
+        // SetStreamPhaseIdle comes before Error's SetStreamPhaseIdleGated) and that
+        // both carry "msg_1". A router bug that swaps the order or emits a wrong
+        // messageId would fail.
+        effects shouldBe listOf(
+            // StreamingCompleted (naturalCompletion=false → no NotifyResponseComplete)
+            SignalEffect.SetStreamPhaseIdle("msg_1"),
+            SignalEffect.ComputeSessionContext(null),
+            SignalEffect.FetchTodos(null),
+            SignalEffect.LoadSessions(false),
+            SignalEffect.DrainQueue,
+            SignalEffect.RefreshReviewFiles,
+            // Error backstop
+            SignalEffect.SetStreamPhaseIdleGated("msg_1"),
+        )
+        // Double-check: exactly one SetStreamPhaseIdle and one SetStreamPhaseIdleGated,
+        // both with "msg_1".
+        val idleEffects = effects.filterIsInstance<SignalEffect.SetStreamPhaseIdle>()
+        idleEffects shouldHaveSize 1
+        idleEffects.first().messageId shouldBe "msg_1"
+        val gatedEffects = effects.filterIsInstance<SignalEffect.SetStreamPhaseIdleGated>()
+        gatedEffects shouldHaveSize 1
+        gatedEffects.first().messageId shouldBe "msg_1"
     }
 
     @Test
@@ -203,10 +237,23 @@ class SignalRouterTest {
         effects.shouldBeEmpty()
     }
 
+    @Test
+    fun `TodoUpdated with non-empty list emits no effects`() = runRouterTest { effects, emitSignal, _ ->
+        // The router's TodoUpdated branch is a no-op regardless of content.
+        // This test covers the non-empty path so a future change that adds a
+        // TodoUpdated effect would be caught for both empty and populated cases.
+        emitSignal(UiSignal.TodoUpdated(listOf(
+            com.opencode.acp.chat.model.TodoItem(content = "Task 1", status = "pending", priority = "high"),
+            com.opencode.acp.chat.model.TodoItem(content = "Task 2", status = "in_progress", priority = "medium"),
+        )))
+        advanceUntilIdle()
+        effects.shouldBeEmpty()
+    }
+
     // ── Global signals ──────────────────────────────────────────────────────
 
     @Test
-    fun `SessionCreated global emits LoadSessions`() = runRouterTest { effects, _, emitGlobal ->
+    fun `SessionCreated global emits Load_sessions`() = runRouterTest { effects, _, emitGlobal ->
         emitGlobal(UiSignal.SessionCreated("ses_1"))
         advanceUntilIdle()
         effects shouldBe listOf(
@@ -224,10 +271,22 @@ class SignalRouterTest {
     }
 
     @Test
-    fun `SessionError global emits SetStreamPhaseIdleForSession, RemoveStreamingSession`() = runRouterTest { effects, _, emitGlobal ->
+    fun `SessionError global emits LogSessionError, SetStreamPhaseIdleForSession, RemoveStreamingSession`() = runRouterTest { effects, _, emitGlobal ->
         emitGlobal(UiSignal.SessionError("ses_1", "boom"))
         advanceUntilIdle()
         effects shouldBe listOf(
+            SignalEffect.LogSessionError("ses_1", "boom"),
+            SignalEffect.SetStreamPhaseIdleForSession("ses_1"),
+            SignalEffect.RemoveStreamingSession("ses_1"),
+        )
+    }
+
+    @Test
+    fun `SessionError global with null errorMessage still emits LogSessionError`() = runRouterTest { effects, _, emitGlobal ->
+        emitGlobal(UiSignal.SessionError("ses_1", null))
+        advanceUntilIdle()
+        effects shouldBe listOf(
+            SignalEffect.LogSessionError("ses_1", null),
             SignalEffect.SetStreamPhaseIdleForSession("ses_1"),
             SignalEffect.RemoveStreamingSession("ses_1"),
         )
@@ -240,6 +299,15 @@ class SignalRouterTest {
         effects shouldBe listOf(
             SignalEffect.RefreshActiveSessionMessages("ses_1"),
             SignalEffect.ComputeSessionContext(null),
+        )
+    }
+
+    @Test
+    fun `SessionDeleted global emits HandleSessionDeleted`() = runRouterTest { effects, _, emitGlobal ->
+        emitGlobal(UiSignal.SessionDeleted("ses_1"))
+        advanceUntilIdle()
+        effects shouldBe listOf(
+            SignalEffect.HandleSessionDeleted("ses_1"),
         )
     }
 
@@ -280,11 +348,37 @@ class SignalRouterTest {
         emitSignal(UiSignal.SessionIdle("ses_1"))
         emitSignal(UiSignal.SessionError("ses_1", "boom"))
         emitSignal(UiSignal.SessionCompacted("ses_1"))
+        emitSignal(UiSignal.SessionDeleted("ses_1"))
         emitSignal(UiSignal.ChildPermissionRequested(makeChildPermissionPrompt()))
         emitSignal(UiSignal.PermissionReplied("perm_1", "allow", "ses_1"))
-        emitSignal(UiSignal.PermissionTimedOut("perm_1", "ses_1", "bash"))
         advanceUntilIdle()
         effects.shouldBeEmpty()
+    }
+
+    @Test
+    fun `PermissionTimedOut on activeSignals forwards to global handler as fallback`() = runRouterTest { effects, emitSignal, _ ->
+        // PermissionTimedOut should arrive on globalSignals, but if misrouted to
+        // activeSignals, the router forwards it to the global handler as a fallback
+        // so the permission timeout is still enforced (fail-safe, not fail-open).
+        emitSignal(UiSignal.PermissionTimedOut("perm_1", "ses_1", "bash"))
+        advanceUntilIdle()
+        effects shouldBe listOf(
+            SignalEffect.HandlePermissionTimedOut("perm_1", "ses_1", "bash"),
+        )
+    }
+
+    @Test
+    fun `PermissionTimedOut on both streams fires effect exactly once - no double-fire`() = runRouterTest { effects, emitSignal, emitGlobal ->
+        // PermissionTimedOut arriving on BOTH streams must not double-fire the effect.
+        // The activeSignals fallback delegates to routeGlobalSignal, and the dedup
+        // check (isDuplicatePermissionTimeout) in routeGlobalSignal ensures only the
+        // first emission produces an effect, even if both streams deliver the same signal.
+        emitSignal(UiSignal.PermissionTimedOut("perm_1", "ses_1", "bash"))
+        emitGlobal(UiSignal.PermissionTimedOut("perm_1", "ses_1", "bash"))
+        advanceUntilIdle()
+        effects shouldBe listOf(
+            SignalEffect.HandlePermissionTimedOut("perm_1", "ses_1", "bash"),
+        )
     }
 
     @Test
@@ -299,5 +393,102 @@ class SignalRouterTest {
         emitGlobal(UiSignal.FileChanged())
         advanceUntilIdle()
         effects.shouldBeEmpty()
+    }
+
+    // ── start() / stop() lifecycle ──────────────────────────────────────────
+
+    @Test
+    fun `stop prevents further effects from being emitted`() = runTest {
+        val signals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 64)
+        val globalSignals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 64)
+        val router = SignalRouter(this)
+        val effects = mutableListOf<SignalEffect>()
+        val collectorJob = launch {
+            router.effects.collect { effects.add(it) }
+        }
+        router.start(signals, globalSignals)
+        advanceUntilIdle()
+
+        // Emit a signal that DOES produce effects BEFORE stop — proves the collector was running.
+        signals.emit(UiSignal.FileChanged())
+        advanceUntilIdle()
+        effects shouldBe listOf(
+            SignalEffect.EmitFileChangeSignal,
+            SignalEffect.RefreshReviewFiles,
+        )
+
+        // Stop the router.
+        router.stop()
+        advanceUntilIdle()
+
+        // Emit signals after stop — should produce NO NEW effects.
+        signals.emit(UiSignal.FileChanged())
+        globalSignals.emit(UiSignal.SessionCreated("ses_1"))
+        advanceUntilIdle()
+        // Effects list unchanged — no new effects after stop.
+        effects shouldBe listOf(
+            SignalEffect.EmitFileChangeSignal,
+            SignalEffect.RefreshReviewFiles,
+        )
+
+        collectorJob.cancel()
+    }
+
+    @Test
+    fun `double start does not orphan collect jobs or produce duplicate effects`() = runTest {
+        val signals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 64)
+        val globalSignals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 64)
+        val router = SignalRouter(this)
+        val effects = mutableListOf<SignalEffect>()
+        val collectorJob = launch {
+            router.effects.collect { effects.add(it) }
+        }
+
+        // Start twice — the second start should cancel the first pair of jobs.
+        router.start(signals, globalSignals)
+        advanceUntilIdle()
+        router.start(signals, globalSignals)
+        advanceUntilIdle()
+
+        // Emit a signal — should produce effects exactly once (not duplicated).
+        signals.emit(UiSignal.FileChanged())
+        advanceUntilIdle()
+        effects shouldBe listOf(
+            SignalEffect.EmitFileChangeSignal,
+            SignalEffect.RefreshReviewFiles,
+        )
+
+        collectorJob.cancel()
+        router.stop()
+    }
+
+    @Test
+    fun `double start with signal between calls does not duplicate effects`() = runTest {
+        val signals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 64)
+        val globalSignals = MutableSharedFlow<UiSignal>(extraBufferCapacity = 64)
+        val router = SignalRouter(this)
+        val effects = mutableListOf<SignalEffect>()
+        val collectorJob = launch {
+            router.effects.collect { effects.add(it) }
+        }
+
+        router.start(signals, globalSignals)
+        advanceUntilIdle()
+
+        // Emit a signal, then immediately re-start WITHOUT advanceUntilIdle.
+        // The fix (join() after cancel()) ensures the in-flight routeSignal completes
+        // before the new collector starts, preventing duplicate effects.
+        signals.emit(UiSignal.FileChanged())
+        router.start(signals, globalSignals)
+        advanceUntilIdle()
+
+        // Should produce effects exactly once (not duplicated by the double-start).
+        effects shouldBe listOf(
+            SignalEffect.EmitFileChangeSignal,
+            SignalEffect.RefreshReviewFiles,
+        )
+
+        collectorJob.cancel()
+        router.stop()
     }
 }

@@ -24,8 +24,18 @@ import com.opencode.acp.chat.model.SelectionPrompt
  * is still important for log visibility).
  */
 sealed interface SignalEffect {
-    /** Sets the stream phase to IDLE for the active session (StreamingCompleted). */
+    /** Sets the stream phase to IDLE for the active session (StreamingCompleted).
+     *  UNGATED — always applied. The messageId is the message that just finished
+     *  streaming, so the phase must reset to IDLE regardless of whether the user
+     *  switched sessions between signal emission and effect execution. */
     data class SetStreamPhaseIdle(val messageId: String) : SignalEffect
+
+    /** Sets the stream phase to IDLE, gated on isActiveMessage (Error backstop).
+     *  Unlike [SetStreamPhaseIdle] (used by StreamingCompleted), this is only applied
+     *  if the messageId is in the active session's messages — prevents a background
+     *  Error from forcing IDLE while the active session is legitimately streaming
+     *  for a different message. */
+    data class SetStreamPhaseIdleGated(val messageId: String) : SignalEffect
 
     /** Sets the stream phase to IDLE for a specific session (SessionError). */
     data class SetStreamPhaseIdleForSession(val sessionId: String) : SignalEffect
@@ -57,6 +67,9 @@ sealed interface SignalEffect {
     /** Refresh the active session's messages from the server (after compaction). */
     data class RefreshActiveSessionMessages(val sessionId: String) : SignalEffect
 
+    /** Handle a session deletion — clear messages if it was the active session, reload session list. */
+    data class HandleSessionDeleted(val sessionId: String) : SignalEffect
+
     /** Remove a session from the streaming-session spinner set. */
     data class RemoveStreamingSession(val sessionId: String) : SignalEffect
 
@@ -72,15 +85,41 @@ sealed interface SignalEffect {
     /** Add a child-session permission prompt. */
     data class AddChildPermissionPrompt(val prompt: ChildPermissionPrompt) : SignalEffect
 
-    /** Handle a PermissionReplied SSE event (complex multi-branch logic). */
-    data class HandlePermissionReplied(val permissionId: String, val reply: String, val sessionId: String) : SignalEffect
+    /** Handle a PermissionReplied SSE event (complex multi-branch logic).
+     *
+     *  Validates the trust boundary from SSE parsing: permissionId and sessionId
+     *  must be non-blank. A blank value would indicate a malformed SSE event or
+     *  a parsing bug, and would cause downstream permission enforcement to
+     *  operate on the wrong (or no) permission — a security risk. */
+    data class HandlePermissionReplied(val permissionId: String, val reply: String, val sessionId: String) : SignalEffect {
+        init {
+            require(permissionId.isNotBlank()) { "permissionId must not be blank" }
+            require(sessionId.isNotBlank()) { "sessionId must not be blank" }
+        }
+    }
 
-    /** Handle a PermissionTimedOut SSE event (reject pending + clear prompts). */
-    data class HandlePermissionTimedOut(val permissionId: String, val sessionId: String, val toolName: String) : SignalEffect
+    /** Handle a PermissionTimedOut SSE event (reject pending + clear prompts).
+     *
+     *  Validates the trust boundary from SSE parsing: permissionId and sessionId
+     *  must be non-blank. A blank value would indicate a malformed SSE event or
+     *  a parsing bug, and would cause downstream permission timeout enforcement
+     *  to operate on the wrong (or no) permission — a security risk. */
+    data class HandlePermissionTimedOut(val permissionId: String, val sessionId: String, val toolName: String) : SignalEffect {
+        init {
+            require(permissionId.isNotBlank()) { "permissionId must not be blank" }
+            require(sessionId.isNotBlank()) { "sessionId must not be blank" }
+            require(toolName.isNotBlank()) { "toolName must not be blank" }
+        }
+    }
 
     /** Emit the file-change signal (triggers VFS refresh subscribers). */
     object EmitFileChangeSignal : SignalEffect
 
     /** Local-only context recompute (no REST) — for intermediate MessageUpdated. */
     data class ComputeSessionContextLocal(val messageId: String) : SignalEffect
+
+    /** Log a session error message (SessionError global signal). Preserves the
+     *  errorMessage field that was previously discarded by the router. The executor
+     *  logs it at WARN level for visibility in idea.log. */
+    data class LogSessionError(val sessionId: String, val errorMessage: String?) : SignalEffect
 }

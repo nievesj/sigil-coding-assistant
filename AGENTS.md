@@ -877,6 +877,28 @@ inflated numbers.
 `SseEventListener.kt` (standalone parser), `SessionManager.kt` (routing + refresh),
 `SessionState.kt` (`replaceAllMessages()`), `ChatViewModel.kt` (signal handling)
 
+### `session.deleted` SSE Event — Stale Session Cleanup
+
+The server sends `session.deleted` when a session is removed (auto-cleanup, external
+deletion, compaction side-effect). Previously this event was silently ignored, leaving
+stale sessions in the sidebar, cache, and active session ID — causing 404 "Session not
+found" errors when the user clicked a stale session.
+
+**Data flow:**
+1. SSE `session.deleted` → `SseEvent.SessionDeleted` → `SessionManager.processEvent()`
+2. `SessionManager` evicts the session from the `sessions` cache (closes SessionState)
+3. Removes from `_streamingSessionIds` if present
+4. If the deleted session was active, switches to the most-recently-used surviving session
+5. Emits `UiSignal.SessionDeleted` → `SignalEffect.HandleSessionDeleted` → `loadSessions()`
+6. `loadSessions()` also prunes the cache against the fresh server list (defense-in-depth
+   for deletions that occurred before SSE subscription was established)
+
+**Key files:** `SseEvent.kt` (`SessionDeleted`), `SseEventParser.kt` + `SseEventListener.kt`
+(parsing), `SessionManager.kt` (cache eviction + active session switch + `loadSessions`
+cache pruning), `UiSignal.kt` (`SessionDeleted`), `SignalRouter.kt` + `SignalEffect.kt`
+(`HandleSessionDeleted`), `SignalSideEffectExecutor.kt` (triggers `loadSessions`),
+`SseEventPipeline.kt` (early return), `OpenCodeAgentSession.kt` (ACP path logging)
+
 ### Smart Compaction & Context Management
 
 Implements the TDD at `docs/tdd/smart-compaction.md`. Three interconnected systems:

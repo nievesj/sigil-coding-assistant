@@ -268,6 +268,13 @@ sealed interface SseEvent {
         override val partId: String? = null,
     ) : SseEvent
 
+    /** Session deleted — server removed the session. Local cache and sidebar must be pruned. */
+    data class SessionDeleted(
+        override val sessionId: String,
+        override val messageId: String? = null,
+        override val partId: String? = null,
+    ) : SseEvent
+
     /** Message finalized with token/cost/model data from message.updated SSE event. */
     data class MessageFinalized(
         override val sessionId: String,

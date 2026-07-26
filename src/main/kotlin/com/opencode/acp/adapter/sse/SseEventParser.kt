@@ -5,6 +5,7 @@ import com.opencode.acp.SseEvent
 import com.opencode.acp.SseTodoItem
 import io.github.oshai.kotlinlogging.KLogger
 import io.github.oshai.kotlinlogging.KotlinLogging
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -342,11 +343,18 @@ class SseEventParser(
                                 logger.debug { "[ACP-SSE] SSE TOOL PART JSON: $part" }
                                 when (status) {
                                     "completed" -> {
-                                        // Parse output — can be JsonArray (most tools) or string (task tool)
+                                        // Parse output — can be JsonArray (most tools), string (task tool), or JsonObject
                                         val rawOutput = stateObj.get("output") ?: part["output"]
-                                        val output = (rawOutput as? kotlinx.serialization.json.JsonArray)
-                                            ?.mapNotNull { (it as? JsonObject) }
-                                            ?: (rawOutput as? JsonPrimitive)?.contentOrNull?.let { listOf(JsonObject(mapOf("text" to JsonPrimitive(it)))) }
+                                        val output: List<JsonObject>? = when (rawOutput) {
+                                            is kotlinx.serialization.json.JsonArray -> rawOutput.mapNotNull { (it as? JsonObject) }
+                                            is JsonPrimitive -> rawOutput.contentOrNull?.let { listOf(JsonObject(mapOf("text" to JsonPrimitive(it)))) }
+                                            is JsonObject -> listOf(rawOutput) // wrap single object as a content block
+                                            null -> null
+                                            else -> {
+                                                logger.warn { "[ACP] Unexpected output type in tool completed: ${rawOutput::class}" }
+                                                null
+                                            }
+                                        }
                                         // Also try to extract input from completed state — may update existing pill
                                         val completedInput = stateObj.get("input")?.jsonObject ?: part["input"]?.jsonObject
                                         val completedMetadata = stateObj.get("metadata")?.jsonObject
@@ -366,9 +374,16 @@ class SseEventParser(
                                     }
                                     "error" -> {
                                         val rawOutput = stateObj.get("output") ?: part["output"]
-                                        val output = (rawOutput as? kotlinx.serialization.json.JsonArray)
-                                            ?.mapNotNull { (it as? JsonObject) }
-                                            ?: (rawOutput as? JsonPrimitive)?.contentOrNull?.let { listOf(JsonObject(mapOf("text" to JsonPrimitive(it)))) }
+                                        val output: List<JsonObject>? = when (rawOutput) {
+                                            is kotlinx.serialization.json.JsonArray -> rawOutput.mapNotNull { (it as? JsonObject) }
+                                            is JsonPrimitive -> rawOutput.contentOrNull?.let { listOf(JsonObject(mapOf("text" to JsonPrimitive(it)))) }
+                                            is JsonObject -> listOf(rawOutput)
+                                            null -> null
+                                            else -> {
+                                                logger.warn { "[ACP] Unexpected output type in tool error: ${rawOutput::class}" }
+                                                null
+                                            }
+                                        }
                                         val errorInput = stateObj.get("input")?.jsonObject ?: part["input"]?.jsonObject
                                         val errorMetadata = stateObj.get("metadata")?.jsonObject
                                         SseEvent.ToolResult(
@@ -408,7 +423,7 @@ class SseEventParser(
                                 SseEvent.ToolResult(
                                     sessionId = sessionId,
                                     toolCallId = toolCallId,
-                                    isError = part["isError"]?.jsonPrimitive?.contentOrNull == "true",
+                                    isError = part["isError"]?.jsonPrimitive?.contentOrNull?.lowercase() == "true",
                                     content = output,
                                     messageId = messageId,
                                     partId = partId
@@ -541,7 +556,8 @@ class SseEventParser(
                     val errorMessage = dataObj?.get("message")?.jsonPrimitive?.contentOrNull
                         // Fallback: construct readable message from error name
                         ?: errorObj?.get("name")?.jsonPrimitive?.contentOrNull?.replace("Error", " error")
-                    SseEvent.SessionError(sessionId = sessionId, errorMessage = errorMessage)
+                    val messageId = extractMessageId(props)
+                    SseEvent.SessionError(sessionId = sessionId, errorMessage = errorMessage, messageId = messageId)
                 }
 
                 "session.updated" -> {
@@ -551,7 +567,7 @@ class SseEventParser(
                 }
 
                 "session.deleted" -> {
-                    SseEvent.Ignored(sessionId, eventType, "session.deleted — informational")
+                    SseEvent.SessionDeleted(sessionId = sessionId)
                 }
 
                 "session.compacted" -> {
@@ -733,6 +749,8 @@ class SseEventParser(
                     SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "unknown type")
                 }
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.error(e) { "[ACP] SSE parse FAILED: type=$eventType, sid=$sessionId" }
             SseEvent.Ignored(sessionId = sessionId, eventType = eventType, reason = "parse error: ${e.message}")

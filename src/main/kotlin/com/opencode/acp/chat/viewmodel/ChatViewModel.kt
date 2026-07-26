@@ -4,6 +4,7 @@ import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.model.ChildPermissionPrompt
 import com.opencode.acp.chat.processor.UiSignal
+import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.service.OpenCodeServiceApi
 import com.opencode.acp.chat.service.SendMessageResult
 import com.opencode.acp.chat.ui.compose.SlashCommand
@@ -161,8 +162,30 @@ class ChatViewModel(
         // was for the active session. Without this gate, a SessionError on an inactive/background
         // session would incorrectly reset the active session's stream phase, potentially hiding
         // the stop button while the active session is still streaming.
+        //
+        // EXCEPTION: the synthetic INTERNAL_ERROR_SESSION_ID sentinel (emitted by
+        // SessionManager.emitGlobalError for background-coroutine crashes) always resets
+        // the phase unconditionally. The original ChatViewModel did this for ALL SessionError
+        // signals; this preserves that behavior for the crash-surfacing case so the UI never
+        // gets stuck in STREAMING when a background coroutine dies.
+        //
+        // RACE NOTE: SetStreamPhaseIdleForSession and switchSession race with no
+        // synchronization. If the user switches sessions between a SessionError signal
+        // emission and this effect's execution, the gate compares against the NEW
+        // active session ID. This is safe: if the error was for the OLD session, the
+        // gate correctly skips (old sessionId != new activeId); if the error was for
+        // the NEW session, the phase resets to IDLE (correct — the new session errored).
+        // switchSession (line ~509) also resets _streamPhase based on the new session's
+        // streaming state, providing a second mitigation. The window is narrow because
+        // switchSession runs synchronously in the ViewModel scope.
+        //
+        // NOTE on INTERNAL_ERROR_SESSION_ID sentinel: this is a public constant on
+        // SessionManager, but the only emitter is SessionManager.emitGlobalError
+        // (internal), so the attack surface is internal-only. A dedicated
+        // SignalEffect.ForceStreamPhaseIdle variant would be cleaner but is deferred.
         setStreamPhaseIdleForSession = { sessionId ->
-            if (sessionId == service.activeSessionId.value) {
+            if (sessionId == service.activeSessionId.value ||
+                sessionId == SessionManager.INTERNAL_ERROR_SESSION_ID) {
                 _streamPhase.value = StreamPhase.IDLE
             }
         },
@@ -287,6 +310,19 @@ class ChatViewModel(
         // side effect) — the router only emits effects for side-effectful ops.
         // The router also collects service.signals but its StreamingStarted
         // branch is a no-op, so there's no conflict.
+        //
+        // Inline StreamingStarted collector — sets _streamPhase = STREAMING directly.
+        // SignalRouter ALSO collects service.signals but its StreamingStarted branch
+        // is a deliberate no-op (the router only emits effects for side-effectful ops).
+        // This split is intentional: StreamingStarted is a simple StateFlow update with
+        // no side effect, so it's handled inline for immediacy.
+        //
+        // MAINTENANCE NOTE: If a future active-session signal needs an inline StateFlow
+        // update (like StreamingStarted), it must be added HERE, not just to the router.
+        // There is no compile-time enforcement of this split. If logic is added to the
+        // router's StreamingStarted branch, it MUST be mirrored here or the inline
+        // collector removed. Consider extracting SetStreamPhaseStreaming as a
+        // SignalEffect in a future refactor.
         scope.launch {
             service.signals.collect { signal ->
                 if (signal is UiSignal.StreamingStarted) {
@@ -420,7 +456,17 @@ class ChatViewModel(
                     try {
                         val registry = service.toolRegistry
                         if (registry != null) {
-                            val baseUrl = "http://${service.connectionManager.host}:${service.connectionManager.port}"
+                            // SSRF defense: connectionManager.host is hardcoded to 127.0.0.1
+                            // (ProcessManager.kt:100), so baseUrl is always loopback. The port
+                            // is user-configurable but only affects the local OpenCode server.
+                            // mcpUrls come from user settings (MCP server config) and are
+                            // validated by McpServerDiscovery at registration time.
+                            val host = service.connectionManager.host
+                            val port = service.connectionManager.port
+                            require(host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0") {
+                                "OpenCode server host must be loopback (got '$host') — refusing to construct non-local baseUrl (SSRF defense)"
+                            }
+                            val baseUrl = "http://$host:$port"
                             val mcpUrls = service.mcpManager?.getServerUrls() ?: emptyMap()
                             withTimeoutOrNull(60_000) {
                                 registry.discoverAll(baseUrl, mcpUrls)
@@ -564,6 +610,12 @@ class ChatViewModel(
             }
             try {
                 val result = service.clearAllSessions()
+                // Cancel AND join BEFORE setting Done to prevent the progressJob collector
+                // from emitting a final InProgress AFTER Done is set, overwriting it.
+                // cancelAndJoin() ensures the collector coroutine has fully stopped before
+                // we assign Done, eliminating the race where cancel() returns before the
+                // collector's last emission is processed.
+                progressJob.cancelAndJoin()
                 _clearAllState.value = ClearAllState.Done(result)
                 delay(2000)
                 // Only reset to Idle if still Done — a concurrent clearAllSessions() call
@@ -572,6 +624,7 @@ class ChatViewModel(
                     _clearAllState.value = ClearAllState.Idle
                 }
             } finally {
+                // Idempotent — safety net if the try block threw before the cancel above.
                 progressJob.cancel()
                 // Reset state if coroutine was cancelled during delay (e.g., tool window
                 // disposal) — prevents _clearAllState from staying at Done/InProgress forever.
@@ -1031,10 +1084,20 @@ class ChatViewModel(
                 // Set both tool.id and tool.name to ASK — the registry may look up permissions
                 // by either key depending on the context (some tools are referenced by id, others
                 // by name). Setting both ensures fail-closed regardless of which key is used.
+                // NOTE: The per-name entry may be overwritten if two MCP servers expose a tool
+                // with the same raw name (last-write-wins). However, fail-closed is STILL
+                // reliable because every tool also has a unique `tool.id` entry
+                // ("${serverName}_${name}") set to ASK. The registry's loadEnabledAndPermissions
+                // matches by `id OR name`, so the id entry guarantees every tool gets ASK
+                // regardless of name collisions. The per-name entry is best-effort redundancy.
                 val failClosed = mutableMapOf<String, Pair<Boolean, ToolPermission>>()
                 for (tool in allDiscovered) {
                     failClosed[tool.id] = Pair(true, ToolPermission.ASK)
                     failClosed[tool.name] = Pair(true, ToolPermission.ASK)
+                    // NOTE: if two MCP servers expose tools with the same raw name, the
+                    // later one overwrites this entry, so fail-closed is per-id reliable
+                    // but per-name best-effort. See AGENTS.md "Tool Permissions —
+                    // Remaining gaps" for the underlying name-collision issue.
                 }
                 failClosed.toMap()
             }
@@ -1051,13 +1114,25 @@ class ChatViewModel(
     fun close() {
         connectionObserverJob?.cancel()
         initJob?.cancel()
+        clearAllJob?.cancel()
         // Stop the SignalRouter → SignalSideEffectExecutor pipeline.
-        signalSideEffectExecutor.stop()
-        signalRouter.stop()
+        stopSignalPipeline()
         service.permissionManager.cancelPermissionTimeout()
         // Cancel child permission timeout jobs and clear prompt state —
         // delegated to PermissionViewModel, which owns both.
         permissionViewModel.close()
+    }
+
+    /**
+     * Stop the SignalRouter → SignalSideEffectExecutor pipeline in the correct order.
+     * The executor MUST be stopped BEFORE the router to prevent in-flight routeSignal
+     * calls (which may emit effects after the router's stop() cancels its collect jobs
+     * without joining) from being executed against a disposing scope. See
+     * SignalRouter.stop() KDoc and SignalSideEffectExecutor.start() for details.
+     */
+    private fun stopSignalPipeline() {
+        signalSideEffectExecutor.stop()
+        signalRouter.stop()
     }
 
     // --- Helpers ---
