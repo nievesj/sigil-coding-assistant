@@ -1,4 +1,4 @@
-﻿# AGENTS.md —
+# AGENTS.md �
  Tracked Items & Future Work
 
 This document tracks incomplete features, deferred decisions, and known gaps
@@ -11,53 +11,63 @@ that are intentionally left for future implementation.
 **New functionality requires tests added, and the full test suite must be run to
 check that there are no regressions before work is considered complete.**
 
+**Role split - subagents write, the main task verifies.** Delegated specialist
+subagents (fixer, designer, etc.) MUST write tests alongside their code changes
+but MUST NOT run the test suite or compile the project themselves. Building
+(`.\gradlew.bat build`) and running the full test suite (`.\gradlew.bat test`)
+is the responsibility of the main orchestrator task only, performed once after
+all subagent work is reconciled. Subagents should focus on correct, complete
+edits and return; the main task gates completion on the build + test result.
+
 - **Add tests alongside new code.** Every new feature, bug fix, or refactor must
   include tests covering the new behavior. Pure-logic extractions should have unit
   tests; composables that cannot be unit-tested (see "Compose UI Tests" below)
   must have an explanatory comment and, where possible, a pure-logic test of the
   extracted function.
-- **Run the full suite before declaring done.** After any code change, run
-  `.\gradlew.bat test` (or the "Run Tests" IDE configuration) and confirm 0 failures.
-  The baseline is **1171 tests, 0 failures**. Do not mark work complete with
-  failing tests.
+- **Run the full suite before declaring done (main task only).** After all
+  subagent work is reconciled, the main orchestrator task runs
+  `.\gradlew.bat test` (or the "Run Tests" IDE configuration) and confirms 0
+  failures. The baseline is **1171 tests, 0 failures**. Do not mark work
+  complete with failing tests. Subagents must not run the suite themselves -
+  see "Role split" above.
 - **Do not commit with failing tests.** If a test is genuinely broken by an
   intentional change, update the test (not the behavior) and document why. If a
   test cannot pass due to an environmental limitation (e.g., ComposePanel requiring
   the IntelliJ application context), mark it `@Disabled` with a clear reason
   referencing the relevant AGENTS.md section.
 - **Skipped tests are allowed only with justification.** The current baseline has
-  21 skipped tests: 18 `@Disabled` Compose UI tests (see "Compose UI Tests —
+  21 skipped tests: 18 `@Disabled` Compose UI tests (see "Compose UI Tests �
   ComposePanel Cannot Render in Plain Unit Tests" below) and 3 pre-existing skips.
   Do not add new `@Disabled` tests without documenting the reason in AGENTS.md.
 
-### Compose UI Tests — ComposePanel Cannot Render in Plain Unit Tests
+### Compose UI Tests � ComposePanel Cannot Render in Plain Unit Tests
 
-`ComposePanel.addNotify()` triggers `androidx.lifecycle` → `MainDispatcherChecker`
-→ IntelliJ Platform's `ImmediateEdtCoroutineDispatcher` → `ModalityState.java:79`,
+`ComposePanel.addNotify()` triggers `androidx.lifecycle` ? `MainDispatcherChecker`
+? IntelliJ Platform's `ImmediateEdtCoroutineDispatcher` ? `ModalityState.java:79`,
 which requires `ApplicationManager.getApplication()` to be initialized. This only
 happens when the IntelliJ Platform test framework (`LightPlatformTestCase` /
-`TestApplication`) is set up — plain unit tests do not bootstrap the application
+`TestApplication`) is set up � plain unit tests do not bootstrap the application
 context.
 
 **Symptom:** `NullPointerException at ModalityState.java:79` during
 `ComposePanel.addNotify()`, before any composable runs.
 
 **What does NOT work:**
-- Providing a minimal `JewelTheme` / `ChatThemeData` directly — the failure is in
+- Providing a minimal `JewelTheme` / `ChatThemeData` directly � the failure is in
   `addNotify()`, before any composable composition starts.
-- Hosting `ComposePanel` in a `JFrame` to trigger `addNotify()` — same NPE.
-- Setting `-Djava.awt.headless=false` — fixes `HeadlessException` but not the
+- Hosting `ComposePanel` in a `JFrame` to trigger `addNotify()` � same NPE.
+- Setting `-Djava.awt.headless=false` � fixes `HeadlessException` but not the
   `ModalityState` NPE.
 
 **What works (current approach):**
 - `@Disabled` the Compose UI rendering tests with a clear reason.
 - Guard the bug-fix regressions via pure-logic tests instead:
-  - MessageList State-read stale-data fix → `ChatViewModelMessagesForwardingTest`
+  - MessageList State-read stale-data fix ? `ChatViewModelMessagesForwardingTest`
     (verifies `viewModel.messages === service.messages` reference identity).
-  - Streaming jump fix → `StreamingLifecycleManagerTest`.
-  - StreamHealer → `StreamHealerTest`.
-  - SSE V1/V2 parsing → `SseEventParserTest`.
-  - Tool pill dedup → `SessionStateTest` / `ChatViewModelTest`.
+  - Streaming jump fix ? `StreamingLifecycleManagerTest`.
+  - StreamHealer ? `StreamHealerTest`.
+  - SSE V1/V2 parsing ? `SseEventParserTest`.
+  - Tool pill dedup ? `SessionStateTest` / `ChatViewModelTest`.
 
 **To enable these tests in the future:**
 1. Add the IntelliJ Platform test framework dependency
@@ -71,12 +81,12 @@ context.
 `CheckboxChipTest.kt`, `ConnectionBannerStatesTest.kt`,
 `MessageListStaleDataTest.kt` (all `@Disabled`).
 
-### MockK SharedFlow/StateFlow — Must Stub with Real Flows
+### MockK SharedFlow/StateFlow � Must Stub with Real Flows
 
 When a test constructs a real object (e.g., `ChatViewModel`) that launches
 coroutines collecting from `service.signals`, `service.globalSignals`, or
 `service.connectionState`, a relaxed mockk's default `Flow` returns `Nothing` on
-collect suspension → `KotlinNothingValueException` in background coroutines. This
+collect suspension ? `KotlinNothingValueException` in background coroutines. This
 leaks into subsequent test classes as `UncaughtExceptionsBeforeTest`.
 
 **Fix:** Always stub `service.signals` / `service.globalSignals` with real
@@ -84,7 +94,7 @@ leaks into subsequent test classes as `UncaughtExceptionsBeforeTest`.
 a real `MutableStateFlow(...)`. Cancel all scopes (both `service.scope` and any
 scope passed to the constructed object) in `@AfterEach`.
 
-**Reference:** `ChatViewModelMessagesForwardingTest.kt` — the canonical example
+**Reference:** `ChatViewModelMessagesForwardingTest.kt` � the canonical example
 of this pattern.
 
 ---
@@ -94,7 +104,7 @@ of this pattern.
 ### Reading the Plugin Log File (idea.log)
 
 The plugin log is at `C:\Users\<username>\AppData\Local\JetBrains\IntelliJIdea<version>\log\idea.log`
-(installed plugin — see "Installed Plugin Log Location" below for the developer-specific example) or `.intellijPlatform/sandbox/sigil/IU-2026.1/log/idea.log` (runIde).
+(installed plugin � see "Installed Plugin Log Location" below for the developer-specific example) or `.intellijPlatform/sandbox/sigil/IU-2026.1/log/idea.log` (runIde).
 
 **The intellij MCP file tools (`intellij_read_file`, `intellij_search_in_files_by_text`, etc.)
 are sandboxed to the project directory and CANNOT read files outside
@@ -113,10 +123,10 @@ Select-String -Path "C:\Users\josen\AppData\Local\JetBrains\IntelliJIdea2026.1\l
 ```
 
 **Do NOT:**
-- Use `webfetch` with `file:///` protocol — it only reads the first 100K chars and truncates
-- Spawn subagents to read the log — they hit `external_directory` permission prompts and get cancelled
-- Use `intellij_read_file` or `intellij_search_in_files_by_text` on the log path — they reject paths outside the project
-- Waste time trying alternative approaches — use `intellij_execute_terminal_command` directly
+- Use `webfetch` with `file:///` protocol � it only reads the first 100K chars and truncates
+- Spawn subagents to read the log � they hit `external_directory` permission prompts and get cancelled
+- Use `intellij_read_file` or `intellij_search_in_files_by_text` on the log path � they reject paths outside the project
+- Waste time trying alternative approaches � use `intellij_execute_terminal_command` directly
 
 **Do:**
 - Use `intellij_execute_terminal_command` with `executeInShell=true` and PowerShell commands
@@ -129,17 +139,17 @@ OpenCode handles context compaction automatically on the server. After each
 assistant response, the server's prompt loop checks `compaction.isOverflow()`
 (`packages/opencode/src/session/overflow.ts`) and, if token usage exceeds the
 usable limit, creates a compaction task with `auto: true`. The plugin does NOT
-need to detect overflow or trigger compaction — the server does it transparently.
+need to detect overflow or trigger compaction � the server does it transparently.
 
 The plugin's context indicator shows usage percentage (from the last assistant
 message's tokens vs. the model's context limit) for informational purposes only.
-There is no overflow banner — auto-compaction is automatic.
+There is no overflow banner � auto-compaction is automatic.
 
 **Important distinction:** This warning applies to CLIENT-SIDE auto-compaction
 detection (overflow detection, `/compact` as an auto-compaction trigger). The
 manual `/compact` slash command (described in "Smart Compaction & Context
 Management" below) is a SEPARATE feature that calls `POST /session/{id}/summarize`
-for user-initiated compaction — it does NOT trigger auto-compaction and does NOT
+for user-initiated compaction � it does NOT trigger auto-compaction and does NOT
 race with the server's overflow detection.
 
 - **Server source:** `packages/opencode/src/session/prompt.ts` (lines 1322-1328),
@@ -175,7 +185,7 @@ Select-String -Path "C:\Users\josen\AppData\Local\JetBrains\IntelliJIdea2026.1\l
 ```
 
 To enable verbose SSE debugging in the installed plugin, add to
-`Help â†’ Debug Log Settings`:
+`Help → Debug Log Settings`:
 ```
 #com.opencode.acp.adapter.OpenCodeClient=debug
 ```
@@ -184,35 +194,35 @@ To enable verbose SSE debugging in the installed plugin, add to
 
 All plugin logging must use `logger.info {}` / `logger.error {}` / `logger.debug {}`
 (from `io.github.oshai.kotlinlogging.KotlinLogging`). This writes to IntelliJ's
-`idea.log` (Help â†’ Show Log in Finder/Explorer), which is visible regardless of
+`idea.log` (Help → Show Log in Finder/Explorer), which is visible regardless of
 how the plugin is launched (runIde or installed zip).
 
-- **Do NOT use `println()`** "” only visible in Run console when launched via `runIde`.
+- **Do NOT use `println()`** "� only visible in Run console when launched via `runIde`.
   When installed from a zip, println output goes nowhere useful.
-- **Do NOT use `java.io.File.appendText()`** "” temp files are ephemeral and hard to
+- **Do NOT use `java.io.File.appendText()`** "� temp files are ephemeral and hard to
   discover.
-- **Do NOT use `System.err.println()`** "” same problem as println.
-- **DO use `logger.info { "[ACP] ..." }`** "” prefix with `[ACP]` for grep-friendly
+- **Do NOT use `System.err.println()`** "� same problem as println.
+- **DO use `logger.info { "[ACP] ..." }`** "� prefix with `[ACP]` for grep-friendly
   filtering in idea.log.
 - **For SSE debug logging**, use `logger.debug {}` (not a temp file).
 
-To enable verbose SSE logging in idea.log, add to Help â†’ Debug Log Settings:
+To enable verbose SSE logging in idea.log, add to Help → Debug Log Settings:
 ```
 #com.opencode.acp.adapter.OpenCodeClient=debug
 ```
 
-### Configurable Log Level (Settings → Tools → Sigil)
+### Configurable Log Level (Settings ? Tools ? Sigil)
 
-The plugin has a built-in log-level dropdown in Settings → Tools → Sigil
+The plugin has a built-in log-level dropdown in Settings ? Tools ? Sigil
 ("Plugin log level") that controls the Logback level for the entire
-`com.opencode.acp` package at runtime. This is the **preferred** mechanism —
+`com.opencode.acp` package at runtime. This is the **preferred** mechanism �
 no need to manually edit Debug Log Settings.
 
 Options: OFF, ERROR, WARN, INFO (default), DEBUG, TRACE, ALL.
 
 - **INFO** (default): startup, connection, MCP registration, errors, warnings
 - **DEBUG**: adds SSE wire-format logs, tool call details, session state transitions
-- **ALL**: no filtering — every log call flows to idea.log
+- **ALL**: no filtering � every log call flows to idea.log
 - **OFF**: completely silent (even errors suppressed)
 
 The setting is applied at IDE startup (`StartupLogConfigListener.appFrameCreated`)
@@ -244,12 +254,12 @@ language header, copy button, line numbers, syntax highlighting via
 because LLMs sometimes emit ``` mid-line (e.g., `text```css`) or omit trailing
 newlines. The state machine handles all fence positions and captures the language
 identifier correctly. Language names are mapped to Jewel's expected identifiers
-via `mapLanguageId()` (e.g., "css" â†’ "CSS", "js" â†’ "JavaScript").
+via `mapLanguageId()` (e.g., "css" → "CSS", "js" → "JavaScript").
 
 - **Files:** `MarkdownSegmenter.kt`, `MessageList.kt`, `CodeBlockRenderer.kt`
 - **Deleted:** `ChatMarkdownBlockRenderer.kt` (dead override code)
 - **Warning:** Do NOT attempt to override `DefaultMarkdownBlockRenderer` methods
-  for code blocks again "” it compiles but does not dispatch at runtime in IU-261.
+  for code blocks again "� it compiles but does not dispatch at runtime in IU-261.
 
 ### Markdown Streaming: StreamHealer for Inline Formatting
 
@@ -278,7 +288,7 @@ is now applied to header and data cells.
 
 - **Files:** `InlineMarkdownText.kt`, `TableRenderer.kt`, `MarkdownSegmenter.kt`
 - **Note:** `InlineMarkdownText` strips delimiters and applies `SpanStyle` directly
-  "” it does NOT use Jewel's `Markdown` composable. This avoids the overhead of
+  "� it does NOT use Jewel's `Markdown` composable. This avoids the overhead of
   creating a full markdown processor per table cell.
 
 ### Markdown Segmenter: Leading Newline Fix
@@ -290,7 +300,7 @@ artifacts between code blocks and text segments.
 ### Jewel Markdown: Inline Code Background (InlinesStyling Propagation)
 
 Jewel renders inline code backgrounds via `SpanStyle.background` in
-`AnnotatedString` "” it is NOT a composable-level `Modifier.background()`.
+`AnnotatedString` "� it is NOT a composable-level `Modifier.background()`.
 This means `SpanStyle(background = Color.Transparent)` CAN remove the gray
 background on inline code.
 
@@ -314,16 +324,16 @@ MarkdownStyling.create(
 
 - **Files:** `MessageList.kt`
 - **Key insight:** Any custom `InlinesStyling` MUST be passed to ALL block types
-  that accept it (Paragraph, Heading.H1–H6, BlockQuote, List). Jewel's `create()`
+  that accept it (Paragraph, Heading.H1�H6, BlockQuote, List). Jewel's `create()`
   factory methods default to creating fresh `InlinesStyling` instances when the
   parameter is not explicitly provided.
 
-### SSE Reconnection "” Automatic with Exponential Backoff + Idle Detection
+### SSE Reconnection "� Automatic with Exponential Backoff + Idle Detection
 
 When the SSE stream (`/event`) drops unexpectedly (not cancelled by user action),
 `SseConnectionManager.start()` detects the stream end and calls `triggerReconnect()`.
 This sets `ConnectionState.RECONNECTING`, which the `ConnectionBanner` renders as
-"Reconnecting..." (no Retry link "” reconnection is automatic).
+"Reconnecting..." (no Retry link "� reconnection is automatic).
 
 **SseConnectionManager** (extracted from `OpenCodeService` per TDD `docs/tdd/opencode-service-decomposition.md`)
 owns the global SSE subscription lifecycle: connection, reconnection with exponential backoff,
@@ -333,15 +343,15 @@ and context recomputation are delegated to `OpenCodeService` via the `onReconnec
 and `sessionManager.computeSessionContext()`).
 
 **Reconnection strategy:**
-1. Health check with exponential backoff: 1s â†’ 2s â†’ 4s â†’ ... â†’ 30s cap
-2. Â±20% random jitter on each delay to prevent synchronization
+1. Health check with exponential backoff: 1s → 2s → 4s → ... → 30s cap
+2. ±20% random jitter on each delay to prevent synchronization
 3. On success: re-subscribe SSE, set `CONNECTED`
 4. On scope cancellation or client loss: set `ERROR`, `initialized = false`
 5. In-flight streaming responses are aborted via `sessionManager.abortStreaming()` when the
    response timeout monitor fires (see ResponseTimeoutMonitor)
 
 **SSE health-check probes (client-side):** The Java HTTP engine has no socket-level idle
-timeout (see TDD Â§4.2.1), so half-open TCP connections can go undetected indefinitely.
+timeout (see TDD §4.2.1), so half-open TCP connections can go undetected indefinitely.
 The plugin uses periodic health-check probes to detect dead connections without killing
 healthy ones during normal user thinking time.
 
@@ -351,40 +361,40 @@ health check succeeds, the connection is fine and the timer resets. If it fails,
 job is cancelled, which triggers automatic reconnection via `launchSseJob()`.
 
 This replaces the old idle-detection approach that proactively killed connections after
-120s of silence "” which was a false positive during normal user thinking time and also
+120s of silence "� which was a false positive during normal user thinking time and also
 failed to trigger reconnection (the `CancellationException` re-throw bypassed the
 reconnection code).
 
 **Key design:**
-- `launchSseJob()` "” shared function used by both `SseConnectionManager.start()` and
+- `launchSseJob()` "� shared function used by both `SseConnectionManager.start()` and
   `SseConnectionManager.triggerReconnect()`. Prevents code divergence between the two paths.
   Handles stream end by triggering reconnection for both unexpected errors and
   cancellation (checked via `isActive` after the catch block).
-- `launchHealthCheck()` "” periodic probe coroutine. Only fires when SSE has been
+- `launchHealthCheck()` "� periodic probe coroutine. Only fires when SSE has been
   silent for the full interval. Resets the timer on success.
-- `CancellationException` is no longer re-thrown "” it's caught alongside other
+- `CancellationException` is no longer re-thrown "� it's caught alongside other
   exceptions. After the catch, `isActive` distinguishes user-initiated stop
-  (scope cancelled â†’ skip reconnect) from unexpected stream end (scope active â†’ reconnect).
+  (scope cancelled → skip reconnect) from unexpected stream end (scope active → reconnect).
 
 **Constants:** `ChatConstants.RECONNECT_DELAY_MS = 1000`, `RECONNECT_MAX_DELAY_MS = 30000`, `SSE_HEALTH_CHECK_INTERVAL_MS = 60000`, `SSE_HEALTH_CHECK_TIMEOUT_MS = 10000`
 
-- **Files:** `SseConnectionManager.kt` (`start`, `launchSseJob`, `launchHealthCheck`, `triggerReconnect`, `sseLastEventTimeMs`), `OpenCodeService.kt` (construction + `onReconnectSuccess` callback), `SessionManager.kt` (`recoverBackgroundSessions`), `OpenCodeClient.kt` (timing logs in `subscribeGlobalEvents`), `ChatConstants.kt` (`SSE_HEALTH_CHECK_INTERVAL_MS`, `SSE_HEALTH_CHECK_TIMEOUT_MS`), `ConnectionBanner.kt` (RECONNECTING branch), `ChatScreen.kt` (onRetry â†’ retryConnection)
+- **Files:** `SseConnectionManager.kt` (`start`, `launchSseJob`, `launchHealthCheck`, `triggerReconnect`, `sseLastEventTimeMs`), `OpenCodeService.kt` (construction + `onReconnectSuccess` callback), `SessionManager.kt` (`recoverBackgroundSessions`), `OpenCodeClient.kt` (timing logs in `subscribeGlobalEvents`), `ChatConstants.kt` (`SSE_HEALTH_CHECK_INTERVAL_MS`, `SSE_HEALTH_CHECK_TIMEOUT_MS`), `ConnectionBanner.kt` (RECONNECTING branch), `ChatScreen.kt` (onRetry → retryConnection)
 
-### OpenCodeService Decomposition — Extracted Subsystems
+### OpenCodeService Decomposition � Extracted Subsystems
 
 `OpenCodeService.kt` was decomposed into a pure coordinator (~826 lines, down from 1303) by extracting three subsystems into dedicated classes (TDD: `docs/tdd/opencode-service-decomposition.md`):
 
-1. **`AttachmentValidator`** (`AttachmentValidator.kt`) — File attachment security validation + encoding. Stateless class taking canonicalized `projectBasePath` and `userHomePath` strings. Handles CWE-22 path traversal guard, sensitive-path denylist, TOCTOU symlink-swap detection, image size limits, base64 data-URI encoding, MIME normalization. Returns `AttachmentValidationResult` with accepted parts + rejected files.
+1. **`AttachmentValidator`** (`AttachmentValidator.kt`) � File attachment security validation + encoding. Stateless class taking canonicalized `projectBasePath` and `userHomePath` strings. Handles CWE-22 path traversal guard, sensitive-path denylist, TOCTOU symlink-swap detection, image size limits, base64 data-URI encoding, MIME normalization. Returns `AttachmentValidationResult` with accepted parts + rejected files.
 
-2. **`ResponseTimeoutMonitor`** (`ResponseTimeoutMonitor.kt`) — Activity-aware response timeout + tool-stuck detection. Launched per-send via `startMonitoring(onTimeout, onToolStuck)`. Re-fetches `sessionManager.getActiveSession()` each iteration for eviction safety. Settings injected via `() -> Int` providers (clamped internally: response timeout 10-3600s, tool-stuck 60-3600s).
+2. **`ResponseTimeoutMonitor`** (`ResponseTimeoutMonitor.kt`) � Activity-aware response timeout + tool-stuck detection. Launched per-send via `startMonitoring(onTimeout, onToolStuck)`. Re-fetches `sessionManager.getActiveSession()` each iteration for eviction safety. Settings injected via `() -> Int` providers (clamped internally: response timeout 10-3600s, tool-stuck 60-3600s).
 
-3. **`SseConnectionManager`** (`SseConnectionManager.kt`) — Global SSE subscription lifecycle: connection, reconnection with exponential backoff + jitter, health-check probes, circuit breaker, debug event-summary logging. Background session recovery delegated to `OpenCodeService` via `onReconnectSuccess` suspend callback. `recoverBackgroundSessions` moved to `SessionManager` (operates on SessionState internals).
+3. **`SseConnectionManager`** (`SseConnectionManager.kt`) � Global SSE subscription lifecycle: connection, reconnection with exponential backoff + jitter, health-check probes, circuit breaker, debug event-summary logging. Background session recovery delegated to `OpenCodeService` via `onReconnectSuccess` suspend callback. `recoverBackgroundSessions` moved to `SessionManager` (operates on SessionState internals).
 
 - **Files:** `AttachmentValidator.kt`, `ResponseTimeoutMonitor.kt`, `SseConnectionManager.kt`, `OpenCodeService.kt` (coordinator), `SessionManager.kt` (`recoverBackgroundSessions`)
 - **Tests:** `AttachmentValidatorTest.kt`, `ResponseTimeoutMonitorTest.kt`, `SseConnectionManagerTest.kt`
 - **Warning:** Do NOT re-inline these subsystems into `OpenCodeService`. The extraction enables unit testing and keeps the coordinator focused on wiring.
 
-### SSE V2 SyncEvent Wire Format "” Critical Parsing Fix
+### SSE V2 SyncEvent Wire Format "� Critical Parsing Fix
 
 OpenCode server sends two different SSE wire formats depending on event version:
 
@@ -415,9 +425,9 @@ OpenCode server sends two different SSE wire formats depending on event version:
 
 **V1 tool part format:** `message.part.updated` with `part.type = "tool"` uses `part.callID`, `part.tool`, `part.state` (running/completed/failed), and `part.input`. This differs from the documented `"tool_use"` + `"id"` + `"name"` format.
 
-- **Files:** `OpenCodeClient.kt` (`subscribeGlobalEvents` "” V2 format detection + version suffix stripping + `data` extraction), `ChatViewModel.kt` (`addToolCallPill` "” deduplication by `toolCallId`)
+- **Files:** `OpenCodeClient.kt` (`subscribeGlobalEvents` "� V2 format detection + version suffix stripping + `data` extraction), `ChatViewModel.kt` (`addToolCallPill` "� deduplication by `toolCallId`)
 
-### Question/Selection Prompt "” `question.asked` SSE Event
+### Question/Selection Prompt "� `question.asked` SSE Event
 
 The OpenCode server sends `question.asked` events when the agent uses the `question` tool to ask the user for input (multiple-choice or freeform). The plugin renders these as `SelectionPrompt` inline in the chat.
 
@@ -440,13 +450,13 @@ The OpenCode server sends `question.asked` events when the agent uses the `quest
 ```
 
 **Response endpoints:**
-- `POST /question/:requestID/reply` "” body: `{ "answers": [["selectedLabel"]] }` (one array per question, containing label strings)
-- `POST /question/:requestID/reject` "” empty body
+- `POST /question/:requestID/reply` "� body: `{ "answers": [["selectedLabel"]] }` (one array per question, containing label strings)
+- `POST /question/:requestID/reject` "� empty body
 
 **Data flow:**
-1. SSE `question.asked` â†’ `SseEvent.QuestionAsked` â†’ sets `_selectionPrompt` StateFlow
+1. SSE `question.asked` → `SseEvent.QuestionAsked` → sets `_selectionPrompt` StateFlow
 2. `SelectionPrompt` composable renders the UI
-3. User selects options â†’ `respondSelection()` â†’ `client.respondQuestion(requestId, answers)` or `client.rejectQuestion(requestId)`
+3. User selects options → `respondSelection()` → `client.respondQuestion(requestId, answers)` or `client.rejectQuestion(requestId)`
 
 **Key detail:** `SelectionOption.label` stores the server's `label` field for round-tripping in the answer payload. The UI displays `title` (which defaults to `label`).
 
@@ -454,14 +464,14 @@ The OpenCode server sends `question.asked` events when the agent uses the `quest
 
 ### MIME Type Detection for File Attachments
 
-`URLConnection.guessContentTypeFromName()` only knows ~20 common extensions and returns `null` (â†’ `application/octet-stream`) for most source code files (`.kt`, `.json`, `.yaml`, `.py`, `.rs`, `.go`, `.ts`, `.tsx`, etc.). The server rejects `application/octet-stream` for file parts.
+`URLConnection.guessContentTypeFromName()` only knows ~20 common extensions and returns `null` (→ `application/octet-stream`) for most source code files (`.kt`, `.json`, `.yaml`, `.py`, `.rs`, `.go`, `.ts`, `.tsx`, etc.). The server rejects `application/octet-stream` for file parts.
 
-**Solution:** `MimeTypes.guessFromFileName()` in `util/MimeTypes.kt` provides a comprehensive extensionâ†’MIME mapping for 80+ development file types, falling back to `URLConnection` and then `application/octet-stream`.
+**Solution:** `MimeTypes.guessFromFileName()` in `util/MimeTypes.kt` provides a comprehensive extension→MIME mapping for 80+ development file types, falling back to `URLConnection` and then `application/octet-stream`.
 
 - **Files:** `util/MimeTypes.kt`, `ChatScreen.kt:454` (`addFileAttachment`), `InputArea.kt:891` (`toAttachedFile`)
-- **Warning:** Do NOT revert to `URLConnection.guessContentTypeFromName()` alone "” it causes "file part media type application/octet-stream" errors for most dev files.
+- **Warning:** Do NOT revert to `URLConnection.guessContentTypeFromName()` alone "� it causes "file part media type application/octet-stream" errors for most dev files.
 
-### Ctrl+V / Clipboard Image Paste "” Must Use IntelliJ AnAction, NOT Compose onPreviewKeyEvent
+### Ctrl+V / Clipboard Image Paste "� Must Use IntelliJ AnAction, NOT Compose onPreviewKeyEvent
 
 IntelliJ's action system (`IdeKeyEventDispatcher`) intercepts Ctrl+V (the `$Paste`
 action) **before** Compose's `onPreviewKeyEvent` receives it. Registering Ctrl+V in
@@ -477,22 +487,22 @@ to check the clipboard for images and attach them.
   (`pasteImageSignal` + `requestImagePaste()`), `ChatScreen.kt`
   (`LaunchedEffect` collecting signal), `InputArea.kt` (`readClipboardImage()`)
 - **Warning:** Do NOT attempt to handle Ctrl+V via Compose `onPreviewKeyEvent` in
-  an IntelliJ plugin "” it does not work. The IDE action system consumes the event
+  an IntelliJ plugin "� it does not work. The IDE action system consumes the event
   before it reaches the Compose layer.
-- **Reference:** phodal/auto-dev uses the same pattern (`IdeaDevInInput.kt`) "”
+- **Reference:** phodal/auto-dev uses the same pattern (`IdeaDevInInput.kt`) "�
   `DumbAwareAction` + `registerCustomShortcutSet` for Ctrl+V on Swing components
 
-### Todo List Panel "” Collapsible Status Indicators
+### Todo List Panel "� Collapsible Status Indicators
 
 The todo panel shows active (non-completed, non-cancelled) tasks from
 `GET /session/:id/todo`. It auto-collapses when >4 incomplete items exist,
-showing only the first 2 and a "+N more…" hint.
+showing only the first 2 and a "+N more�" hint.
 
-**Status indicators:** `âœ“` completed (green), `•` in_progress (amber), `â—‹` pending (gray),
-`✗` cancelled (dim gray).
+**Status indicators:** `✓` completed (green), `�` in_progress (amber), `○` pending (gray),
+`?` cancelled (dim gray).
 
 **Data flow:**
-1. SSE `todo.updated` event â†’ updates `_todoItems` StateFlow in ChatViewModel
+1. SSE `todo.updated` event → updates `_todoItems` StateFlow in ChatViewModel
 2. `fetchTodos()` called on init, session switch, and after each response
 3. `TodoListPanel` composable reads `todoItems` and renders header + items
 4. Clicking header toggles expanded/collapsed state
@@ -501,7 +511,7 @@ showing only the first 2 and a "+N more…" hint.
   `ChatScreen.kt` (wires `todoItems` to `TodoListPanel`), `ChatModels.kt` (`TodoItem`),
   `OpenCodeClient.kt` (`getTodos()`), `SseEvent.kt` (`SseEvent.TodoUpdated`)
 
-### Slash Command Palette "” `/` Prefix Triggering
+### Slash Command Palette "� `/` Prefix Triggering
 
 Typing `/` at the start of the input field shows a popup palette with slash commands.
 The palette filters as the user types (e.g., `/cl` shows `/clear`).
@@ -509,7 +519,7 @@ The palette filters as the user types (e.g., `/cl` shows `/clear`).
 **Command sources:**
 1. **Local commands** (handled by plugin, not sent to server): `/clear`, `/cancel`, `/review-perform`, `/review-perform-gaming`, `/review-resolve`, `/review-recheck`
 2. **Server commands** (fetched from `GET /command`): `/init`, `/review`, `/simplify`, etc.
-   — any command the OpenCode server exposes dynamically
+   � any command the OpenCode server exposes dynamically
 
 **Flow:**
 1. On init and session switch, `ChatViewModel.fetchAvailableCommands()` calls
@@ -520,7 +530,7 @@ The palette filters as the user types (e.g., `/cl` shows `/clear`).
 3. `InputArea` passes the list to `SlashCommandPalette` for filtering/display.
 4. On selection: local commands route to ViewModel methods
    (`createAndSwitchSession()`, `cancel()`). Server commands route to
-   `executeServerCommand(name)` â†’ `client.executeCommand(sessionId, name, "")`.
+   `executeServerCommand(name)` → `client.executeCommand(sessionId, name, "")`.
 
 **Key detail:** `CommandInfo.id` (not `name`) is the command string sent to the server.
 
@@ -531,18 +541,18 @@ The palette filters as the user types (e.g., `/cl` shows `/clear`).
 
 - **Docs:** https://opencode.ai/docs/server/
 - **OpenAPI spec:** http://127.0.0.1:4096/doc (when server is running)
-- **Health check:** `GET /global/health` â†’ `{ healthy: true, version: string }`
-- **Create session:** `POST /session` â†’ body `{ parentID?, title? }` â†’ returns `Session` object
+- **Health check:** `GET /global/health` → `{ healthy: true, version: string }`
+- **Create session:** `POST /session` → body `{ parentID?, title? }` → returns `Session` object
 - **Session model:** `id` (required, starts with `ses_`), `slug`, `projectID`, `directory`, `title`, `version`, `time` (required), plus optional fields
-- **Send message:** `POST /session/:id/message` â†’ body `{ parts }` â†’ returns message
-- **List commands:** `GET /command` â†’ returns `CommandInfo[]` (each with `id`, `name`, `description`)
-- **Execute command:** `POST /session/:id/command` â†’ body `{ command, arguments }` â†’ returns message
-- **SSE events:** `GET /event` (global) or `GET /global/event` â†’ stream of typed events
+- **Send message:** `POST /session/:id/message` → body `{ parts }` → returns message
+- **List commands:** `GET /command` → returns `CommandInfo[]` (each with `id`, `name`, `description`)
+- **Execute command:** `POST /session/:id/command` → body `{ command, arguments }` → returns message
+- **SSE events:** `GET /event` (global) or `GET /global/event` → stream of typed events
 - **Todo events:** SSE `todo.updated` event sends `{ type: "todo.updated", properties: { todos: [...] } }` with same schema as GET
 - **OpenCodeAgentSession:** `SseEvent.TodoUpdated` branch added to exhaustive `when` (informational only for ACP path; chat UI handles via ChatViewModel)
 - **TUI vs serve:** `opencode` starts TUI + server. `opencode serve` starts server only. Both expose the same HTTP API.
 
-### Input Command History "” Up/Down Arrow Navigation
+### Input Command History "� Up/Down Arrow Navigation
 
 The input area remembers past commands (including file attachments) and lets the
 user recall them with Up/Down arrow keys, similar to a shell history.
@@ -563,8 +573,8 @@ user recall them with Up/Down arrow keys, similar to a shell history.
 ArrayList<CommandHistoryEntry>`), which is an XStream-serialized
 `PersistentStateComponent`. The entries survive IDE restarts.
 
-**History size setting:** Configurable in `Settings â†’ Tools â†’ OpenCode` as
-"Command history size" (default 15, clamped to 1–100). Changing the setting
+**History size setting:** Configurable in `Settings → Tools → OpenCode` as
+"Command history size" (default 15, clamped to 1�100). Changing the setting
 trims the history on the next `recordCommand` call.
 
 **`CommandHistoryEntry`** is a non-data class with parallel `ArrayList<String>`
@@ -574,7 +584,7 @@ the original `List<AttachedFile>`.
 
 **Bug fix included:** The `onSend` callback signature changed from `(String) -> Unit`
 to `(String, List<AttachedFile>) -> Unit`. Previously, clicking the green Send
-button or pressing Enter did NOT pass attached files "” they were silently lost.
+button or pressing Enter did NOT pass attached files "� they were silently lost.
 Now both paths pass the current `attachedFiles` list to `onSend`.
 
 - **Files:** `ChatModels.kt` (`CommandHistoryEntry`), `OpenCodeSettingsState.kt`
@@ -588,9 +598,9 @@ Now both paths pass the current `attachedFiles` list to `onSend`.
 - **Docs:** https://opencode.ai/docs/acp/
 - `opencode acp` starts an ACP server communicating via JSON-RPC over stdio
 - Used by Zed, JetBrains AI Assistant, Neovim plugins
-- Our plugin uses `opencode serve` (HTTP REST + SSE) instead "” gives more control over custom UI
+- Our plugin uses `opencode serve` (HTTP REST + SSE) instead "� gives more control over custom UI
 
-### LazyColumn items(count, key) "” Stale Data When Keys Are Stable
+### LazyColumn items(count, key) "� Stale Data When Keys Are Stable
 
 **Problem:** Compose Foundation's `LazyColumn` with `items(count, key)` does NOT
 re-render items that stay in the viewport when only the underlying data changes
@@ -609,10 +619,10 @@ closure. When LazyColumn detects stable keys (same message IDs), it reuses the
 existing composition slot. The OLD lambda (capturing OLD data) is called, not the new
 one. This is a known behavior in Compose Foundation bundled with IntelliJ Platform.
 
-**Fix (current "” State-read pattern):** Use a stable key (just `m.id`) and read
+**Fix (current "� State-read pattern):** Use a stable key (just `m.id`) and read
 `State<Map<String, ChatMessage>>` *inside* the item content lambda. The Compose
 snapshot system registers a per-item subscription when the lambda reads `.value`,
-and invalidates the item's composition when the State changes "” re-invoking the
+and invalidates the item's composition when the State changes "� re-invoking the
 lambda with fresh data, bypassing LazyColumn's key-diffing entirely.
 
 ```kotlin
@@ -620,7 +630,7 @@ items(
     count = messages.size,
     key = { index -> messages[index].id }
 ) { index ->
-    // Read State INSIDE the lambda "” creates a snapshot subscription
+    // Read State INSIDE the lambda "� creates a snapshot subscription
     val currentMessage = messagesState.value[messages[index].id] ?: messages[index]
     MessageItem(currentMessage, ...)
 }
@@ -630,7 +640,7 @@ This eliminates both the stale-data bug (snapshot system drives recomposition) a
 the flicker (no dispose+recreate when key is stable). It also preserves `remember`
 state (expanded pills, markdown caches) since the item composition is never disposed.
 
-**Previous fix (superseded "” caused flicker):** Including `parts.size` and
+**Previous fix (superseded "� caused flicker):** Including `parts.size` and
 `isStreaming` in the key forced LazyColumn to dispose+recreate the item on every
 part addition. This fixed stale data but caused a visible flicker when pills/thinking
 elements appeared, and reset all `remember` state (expanded/collapsed pills).
@@ -653,38 +663,38 @@ preferable (no flicker, preserved `remember` state).
 - **Files:** `MessageList.kt` (LazyColumn items key + State read), `ChatScreen.kt`
   (passes `State<Map<String, ChatMessage>>` to MessageList)
 
-### Streaming "Jump" — animateScrollToItem on New Streaming Message
+### Streaming "Jump" � animateScrollToItem on New Streaming Message
 
 **Problem:** When a tool completes and a new assistant message starts streaming
-(thinking begins), all visible chat messages briefly shift upward — a visual
+(thinking begins), all visible chat messages briefly shift upward � a visual
 "jump" or "flicker" lasting a fraction of a second. The effect is most noticeable
 when the chat has many messages (500+) and `Arrangement.Bottom` is used.
 
 **Root cause:** Three separate issues, all triggered at the `new_message` transition
-(tool completes → `MessageFinalized` with new server message ID → new assistant
-message auto-created → thinking starts):
+(tool completes ? `MessageFinalized` with new server message ID ? new assistant
+message auto-created ? thinking starts):
 
 1. **`finalizeStreaming` 300ms debounce (fixed):** The `new_message` path used the
    same 300ms debounced finalization as normal `stop` events. This delayed the old
-   message's `isStreaming=true→false` transition by 300ms, splitting state changes
+   message's `isStreaming=true?false` transition by 300ms, splitting state changes
    across two frames and causing a mass LazyColumn dispose+recreate when the debounce
    finally fired. Fix: dedicated `new_message` branch in `finalizeStreaming` that
    finalizes immediately (no debounce) and does NOT emit `StreamingCompleted` (the
-   new message's completion will emit it — emitting here would prematurely set
+   new message's completion will emit it � emitting here would prematurely set
    `_streamPhase=IDLE` while the new message is actively streaming).
 
 2. **`resegmentTextPartsFinal` using `segment()` instead of `segmentHealed()` (fixed):**
    On finalization, `resegmentTextPartsFinal` passed `overrideIsStreaming=false` to
    use `MarkdownSegmenter.segment()` instead of `segmentHealed()`. If the segment
    structure differed (healed closed unclosed markdown that non-healed treats as
-   literal text), part keys changed (e.g., `text_0_0` → `text_0_0 + text_0_1`), causing
+   literal text), part keys changed (e.g., `text_0_0` ? `text_0_0 + text_0_1`), causing
    every `key()` block in `AssistantMessage` to dispose+recreate. Fix: always use
-   `segmentHealed()` (pass `overrideIsStreaming=true`) — for complete content, both
+   `segmentHealed()` (pass `overrideIsStreaming=true`) � for complete content, both
    produce identical results; consistency prevents key changes.
 
 3. **`animateScrollToItem` on new streaming message (fixed):** When a new message
    appears in the list (delta == 1), the scroll coordinator used
-   `animateScrollToItem` — a 60ms-delayed animated glide to the new bottom. With
+   `animateScrollToItem` � a 60ms-delayed animated glide to the new bottom. With
    `Arrangement.Bottom`, this animation shifts all visible items upward, which IS
    the visible "jump." Fix: detect `isNewStreamingMessage` (delta == 1 and last
    message `isStreaming == true`) and use instant `scrollToItem` instead of animated.
@@ -697,13 +707,13 @@ at which point it appears in the list normally. The `ThinkingIndicator` overlay
 (pinned at the bottom of the Box) still shows activity during the gap.
 
 **Diagnostic approach (if regression):**
-- Enable DEBUG logging (Settings → Tools → Sigil → Plugin log level)
-- Search `idea.log` for `[ACP] KEYS CHANGED` — if part keys change during
+- Enable DEBUG logging (Settings ? Tools ? Sigil ? Plugin log level)
+- Search `idea.log` for `[ACP] KEYS CHANGED` � if part keys change during
   finalization, the resegment is producing different segment structures
-- Search for `[ACP] finalizeStreaming (new_message): immediate` — if this shows
+- Search for `[ACP] finalizeStreaming (new_message): immediate` � if this shows
   `debounced finalization (300ms)` instead, the immediate-finalization branch
   is not being reached
-- Search for `[ACP] AssistantMessage: EMPTY PARTS` with `isStreaming=true` —
+- Search for `[ACP] AssistantMessage: EMPTY PARTS` with `isStreaming=true` �
   if empty streaming messages appear in the list, the filter is broken
 - Check `MessageList.kt` scroll coordinator: `isNewStreamingMessage` must use
   instant `scrollToItem`, not `animateScrollToItem`
@@ -712,7 +722,7 @@ at which point it appears in the list normally. The `ThinkingIndicator` overlay
   `resegmentTextPartsFinal`), `MessageList.kt` (empty message filter,
   `isNewStreamingMessage` scroll mode, `AssistantMessage` EMPTY PARTS warning)
 
-### IntelliJ Platform Icons (AllIcons) "” Confirmed Available
+### IntelliJ Platform Icons (AllIcons) "� Confirmed Available
 
 Icons referenced via `AllIcons.*` that are **known to compile** in this project.
 Use `IntelliJIconKey.fromPlatformIcon(AllIcons.X.Y)` to wrap for Jewel `Icon`.
@@ -747,7 +757,7 @@ Use `IntelliJIconKey.fromPlatformIcon(AllIcons.X.Y)` to wrap for Jewel `Icon`.
 | Search | `AllIcons.Actions.Search` |
 | Forward (chevron) | `AllIcons.Actions.Forward` |
 | Copy | `AllIcons.Actions.Copy` |
-| Close (Ã—) | `AllIcons.Actions.Close` |
+| Close (×) | `AllIcons.Actions.Close` |
 | Add (+) | `AllIcons.General.Add` |
 | Suspend (stop) | `AllIcons.Actions.Suspend` |
 | MoveUp (send arrow) | `AllIcons.Actions.MoveUp` |
@@ -769,12 +779,12 @@ Use `IntelliJIconKey.fromPlatformIcon(AllIcons.X.Y)` to wrap for Jewel `Icon`.
 | BalloonInformation | `AllIcons.General.BalloonInformation` |
 
 **Icons that DO NOT exist** (don't waste time looking for these):
-- `AllIcons.FileTypes.Kotlin` "” use `AllIcons.Language.Kotlin` instead
-- `AllIcons.FileTypes.TypeScript` "” use `AllIcons.FileTypes.JavaScript` instead
-- `AllIcons.FileTypes.Markdown` "” use `AllIcons.FileTypes.Text` instead
-- `AllIcons.Nodes.Gradle` "” use `AllIcons.Nodes.Folder` as fallback (no Gradle-specific icon confirmed)
-- `AllIcons.FileTypes.Any_type` "” use `AllIcons.FileTypes.Text` instead
-- `AllIcons.Nodes.File` "” use `AllIcons.FileTypes.Text` instead
+- `AllIcons.FileTypes.Kotlin` "� use `AllIcons.Language.Kotlin` instead
+- `AllIcons.FileTypes.TypeScript` "� use `AllIcons.FileTypes.JavaScript` instead
+- `AllIcons.FileTypes.Markdown` "� use `AllIcons.FileTypes.Text` instead
+- `AllIcons.Nodes.Gradle` "� use `AllIcons.Nodes.Folder` as fallback (no Gradle-specific icon confirmed)
+- `AllIcons.FileTypes.Any_type` "� use `AllIcons.FileTypes.Text` instead
+- `AllIcons.Nodes.File` "� use `AllIcons.FileTypes.Text` instead
 
 ### File Type Icon Mapping (Review Tab)
 
@@ -803,7 +813,7 @@ The Review tab uses file type icons for visual identification. Use `getFileTypeI
 ### API Testing (REST Endpoints)
 
 The OpenCode server exposes a REST API at `http://127.0.0.1:4096`. Use PowerShell's
-`Invoke-RestMethod` to test endpoints "” `jq` is not available on Windows.
+`Invoke-RestMethod` to test endpoints "� `jq` is not available on Windows.
 
 **List sessions:**
 ```powershell
@@ -825,8 +835,8 @@ pwsh -Command "$msgs = Invoke-RestMethod -Uri 'http://127.0.0.1:4096/session/SES
 pwsh -Command "Invoke-RestMethod -Uri 'http://127.0.0.1:4096/global/health' | ConvertTo-Json"
 ```
 
-**Verified (2026-06-08, pinned OpenCode binary version — re-verify after any version bump):**
-- `GET /session/:id` returns `tokens` and `cost` fields but they are **always zero** "” the V1
+**Verified (2026-06-08, pinned OpenCode binary version � re-verify after any version bump):**
+- `GET /session/:id` returns `tokens` and `cost` fields but they are **always zero** "� the V1
   API does NOT populate cumulative session-level token/cost data. Per-message
   `tokens`/`cost`/`modelID` are populated correctly in `GET /session/:id/message` and
   `message.updated` SSE events.
@@ -846,13 +856,13 @@ local message cache (summing across all `ChatMessage` fields populated by
 `OpenCodeSession.tokens`/`.cost`. Session `summary` and `time` can be read from
 the REST response.
 
-### Context Manager "” Design Deviations from TDD
+### Context Manager "� Design Deviations from TDD
 
-**Error state on fetch failure (TDD Â§7.1):** `computeSessionContext()` returns
+**Error state on fetch failure (TDD §7.1):** `computeSessionContext()` returns
 `Loaded` with defaults (0 for summary/time, controlState fallback for model)
 instead of `Error` when `GET /session/:id` fails. This is intentional because
 token/cost data (the primary context data) is still available from the local
-message cache "” only secondary metadata degrades gracefully. Showing an Error
+message cache "� only secondary metadata degrades gracefully. Showing an Error
 state for a transient session-fetch failure would be too aggressive.
 
 **Dedup guard:** `computeSessionContext()` skips re-computation if the last call
@@ -860,36 +870,36 @@ was < 300ms ago and the current state is `Loaded`. This prevents redundant REST
 calls when `StreamingCompleted` and `SessionIdle` fire close together for the
 same response.
 
-### `session.compacted` SSE Event "” Auto-Compaction Cache Invalidation
+### `session.compacted` SSE Event "� Auto-Compaction Cache Invalidation
 
 The server sends `session.compacted` when auto-compaction occurs (context window
-overflow). After compaction, the local message cache is stale "” compacted messages
+overflow). After compaction, the local message cache is stale "� compacted messages
 are removed/summarized server-side, so local token accumulation would produce
 inflated numbers.
 
 **Data flow:**
-1. SSE `session.compacted` â†’ `SseEvent.SessionCompacted` â†’ `UiSignal.SessionCompacted`
-2. `ChatViewModel` handles `SessionCompacted` â†’ calls `service.refreshActiveSessionMessages()`
-3. `SessionManager.refreshActiveSessionMessages()` â†’ `GET /session/:id/message` â†’ `SessionState.replaceAllMessages()`
+1. SSE `session.compacted` → `SseEvent.SessionCompacted` → `UiSignal.SessionCompacted`
+2. `ChatViewModel` handles `SessionCompacted` → calls `service.refreshActiveSessionMessages()`
+3. `SessionManager.refreshActiveSessionMessages()` → `GET /session/:id/message` → `SessionState.replaceAllMessages()`
 4. Then `computeSessionContext()` runs on the fresh cache
 
 **Key files:** `SseEvent.kt` (`SessionCompacted`), `OpenCodeClient.kt` (parsing),
 `SseEventListener.kt` (standalone parser), `SessionManager.kt` (routing + refresh),
 `SessionState.kt` (`replaceAllMessages()`), `ChatViewModel.kt` (signal handling)
 
-### `session.deleted` SSE Event — Stale Session Cleanup
+### `session.deleted` SSE Event � Stale Session Cleanup
 
 The server sends `session.deleted` when a session is removed (auto-cleanup, external
 deletion, compaction side-effect). Previously this event was silently ignored, leaving
-stale sessions in the sidebar, cache, and active session ID — causing 404 "Session not
+stale sessions in the sidebar, cache, and active session ID � causing 404 "Session not
 found" errors when the user clicked a stale session.
 
 **Data flow:**
-1. SSE `session.deleted` → `SseEvent.SessionDeleted` → `SessionManager.processEvent()`
+1. SSE `session.deleted` ? `SseEvent.SessionDeleted` ? `SessionManager.processEvent()`
 2. `SessionManager` evicts the session from the `sessions` cache (closes SessionState)
 3. Removes from `_streamingSessionIds` if present
 4. If the deleted session was active, switches to the most-recently-used surviving session
-5. Emits `UiSignal.SessionDeleted` → `SignalEffect.HandleSessionDeleted` → `loadSessions()`
+5. Emits `UiSignal.SessionDeleted` ? `SignalEffect.HandleSessionDeleted` ? `loadSessions()`
 6. `loadSessions()` also prunes the cache against the fresh server list (defense-in-depth
    for deletions that occurred before SSE subscription was established)
 
@@ -903,29 +913,29 @@ cache pruning), `UiSignal.kt` (`SessionDeleted`), `SignalRouter.kt` + `SignalEff
 
 Implements the TDD at `docs/tdd/smart-compaction.md`. Three interconnected systems:
 
-**1. Context Breakdown Bar** — A 5-category visual breakdown (System + Tool Definitions,
+**1. Context Breakdown Bar** � A 5-category visual breakdown (System + Tool Definitions,
 User, Assistant, Tool Calls, Other) in the Context panel tab, replacing the flat token
 list with a proportional bar chart. `BreakdownComputer` categorizes tokens from the local
 message cache using a calibrated char-to-token ratio (default ~4, EMA-adjusted after each
-`MessageFinalized` SSE event). The server does NOT expose per-part token counts — these
+`MessageFinalized` SSE event). The server does NOT expose per-part token counts � these
 are estimates.
 
-**2. Manual Compaction** — A `/compact` slash command and a "Compact Now" button in the
+**2. Manual Compaction** � A `/compact` slash command and a "Compact Now" button in the
 Context tab, wired to the existing `POST /session/{id}/summarize` endpoint (which was
 previously dead code in `OpenCodeClient.compactSession()`).
 
 **IMPORTANT: The server does NOT support a `guidance` field.** The TDD originally specified
 guidance features (default guidance, per-compaction guidance input, `/compact <guidance>`),
 but librarian research confirmed the server's `SummarizePayload` schema is only
-`{ providerID, modelID, auto }` — unknown fields are silently ignored. All guidance
+`{ providerID, modelID, auto }` � unknown fields are silently ignored. All guidance
 features were dropped from the implementation. The `/compact` command takes no arguments.
 
-**3. Smart Context Manager** — Client-side preprocessing + background compaction:
+**3. Smart Context Manager** � Client-side preprocessing + background compaction:
 - `ToolOutputTruncator` (opt-in, off by default): truncates tool results > N chars at
   insertion time, JSON-safe (keeps complete objects until limit, appends marker object)
 - `FileReadCache` (opt-in, off by default): detects duplicate file reads by (path, mtime,
   size) tuple, emits `[unchanged]` instead of re-emitting content
-- `BackgroundCompactor` (**DISABLED** — see warning below): pre-computes compaction summaries
+- `BackgroundCompactor` (**DISABLED** � see warning below): pre-computes compaction summaries
   at 60% context for instant swap at 80%. Uses checkpoint/swap pattern with model mismatch guard
   and max-age staleness check (5 min). Cleared on session switch and on `session.compacted` SSE.
   The auto-trigger was removed because the server's `/summarize` endpoint performs ACTUAL
@@ -936,18 +946,18 @@ features were dropped from the implementation. The `/compact` command takes no a
   estimated turns until compaction, computes burn rate (tokens/min). Reset on session
   switch and after compaction (`onCompaction()`).
 
-**Settings:** All compaction settings live under Settings → Tools → Sigil → Context
+**Settings:** All compaction settings live under Settings ? Tools ? Sigil ? Context
 (new child configurable `OpenCodeContextConfigurable`). Includes: show context breakdown,
 pressure notification threshold, truncate tool output + char limit, detect duplicate reads,
 enable background compaction + checkpoint/swap thresholds, compact confirmation.
 
 **Context indicator pressure badge:** The context indicator shows a pressure suffix
-(`·` ELEVATED, `▲` HIGH, `⚠` CRITICAL) next to the percent when pressure meets the
+(`�` ELEVATED, `?` HIGH, `?` CRITICAL) next to the percent when pressure meets the
 user's configured notification threshold. Controlled by `pressureNotificationThreshold`
 setting (NEVER / ELEVATED / HIGH / CRITICAL).
 
 **Key files:**
-- `CompactionConstants.kt` — single source of truth for all constants
+- `CompactionConstants.kt` � single source of truth for all constants
 - `ContextBreakdown.kt` (`BreakdownComputer`), `ContextPressureMonitor.kt`,
   `BackgroundCompactor.kt`, `ToolOutputTruncator.kt`, `FileReadCache.kt`
 - `ChatModels.kt` (`ContextBreakdown`, `ToolCategoryBreakdown`, `ContextPressure`,
@@ -958,11 +968,11 @@ setting (NEVER / ELEVATED / HIGH / CRITICAL).
 - `ChatViewModel.kt` (`compactSession()`, `compactionState` StateFlow, `resetCompactionState()`)
 - `ContextPanel.kt` (proportional bar + breakdown legend + Compact button + compaction state)
 - `ContextIndicator.kt` (pressure badge via `pressureBadgeText()`)
-- `OpenCodeContextConfigurable.kt` (Settings → Tools → Sigil → Context)
+- `OpenCodeContextConfigurable.kt` (Settings ? Tools ? Sigil ? Context)
 - `OpenCodeSettingsState.kt` (compaction settings + clamping in `loadState`)
 - `plugin.xml` (Context configurable registration)
 
-**Warning:** Do NOT re-add a `guidance` field to the compaction request — the server's
+**Warning:** Do NOT re-add a `guidance` field to the compaction request � the server's
 `SummarizePayload` schema does not include it and silently ignores unknown fields.
 The `/compact` command takes no arguments.
 
@@ -972,11 +982,11 @@ ACTUAL compaction (removes/summarizes messages server-side), not a preview. Auto
 it on context computation causes the session to compact immediately on load when usage
 exceeds the checkpoint threshold (default 60%). There is no server API to pre-compute a
 summary without side effects. Manual compaction (`/compact` command, "Compact Now" button)
-is the correct path — it is user-initiated and expected.
+is the correct path � it is user-initiated and expected.
 
-**Action item:** Mark `BackgroundCompactor.kt` with `@Deprecated("Auto-trigger disabled — server /summarize performs actual compaction. Do NOT re-enable auto-trigger. See AGENTS.md 'Smart Compaction & Context Management'.")` to prevent accidental re-enabling.
+**Action item:** Mark `BackgroundCompactor.kt` with `@Deprecated("Auto-trigger disabled � server /summarize performs actual compaction. Do NOT re-enable auto-trigger. See AGENTS.md 'Smart Compaction & Context Management'.")` to prevent accidental re-enabling.
 
-### `message.removed` SSE Event "” Message Deletion
+### `message.removed` SSE Event "� Message Deletion
 
 The server sends `message.removed` when a message is deleted (e.g., after
 compaction). The plugin removes the message from the local cache by matching
@@ -987,17 +997,17 @@ refresh token totals.
 `SseEventListener.kt` (standalone parser), `SessionManager.kt` (routing + context refresh),
 `SessionState.kt` (`removeMessageByServerId()`)
 
-### SseEventListener Standalone Parser "” V1 Format Fix
+### SseEventListener Standalone Parser "� V1 Format Fix
 
 The standalone `parseByType` method now extracts `properties` from V1 bus events
 before accessing event-specific fields. Previously, V1 events like `session.error`
 read from the top-level JSON object (`obj["error"]`), which was `null` because
 V1 nests data under `properties`. The fix: `val props = obj["properties"]?.jsonObject ?: obj`
-"” V1 events use `props`, V2 events fall back to `obj` (no `properties` wrapper).
+"� V1 events use `props`, V2 events fall back to `obj` (no `properties` wrapper).
 
 ### Configurable Server Port
 
-The plugin has a configurable port setting in `Settings â†’ Tools â†’ OpenCode`
+The plugin has a configurable port setting in `Settings → Tools → OpenCode`
 (default: 4096). This allows the plugin to coexist with other opencode consumers
 (e.g., the OpenCode Desktop app) by automatically finding a free port.
 
@@ -1007,37 +1017,37 @@ The plugin has a configurable port setting in `Settings â†’ Tools â†’ 
    (tries up to 10 ports beyond the configured one)
 3. Launch `opencode serve --hostname $host --port $actualPort` and wait for
    health check with exponential backoff
-4. The plugin never connects to an externally-managed server "” it always owns
+4. The plugin never connects to an externally-managed server "� it always owns
    its process to avoid stale state, auth mismatches, or version incompatibilities
 
 **Shutdown behavior:** The plugin kills its own launched process on IDE dispose
-(`shutdown()` â†’ `killProcess()`). Other OpenCode instances (e.g., the Desktop
+(`shutdown()` → `killProcess()`). Other OpenCode instances (e.g., the Desktop
 app) are left untouched since the plugin uses a different port.
 
 **Key files:** `OpenCodeSettingsState.kt` (`port` field), `OpenCodeSettingsPanel.kt`
 (port UI), `ProcessManager.kt` (`findAvailablePort`, connection logic)
 
-### ComposePanel.dispose() — EDT Hang on Tool Window Close / IDE Restart
+### ComposePanel.dispose() � EDT Hang on Tool Window Close / IDE Restart
 
 **Problem:** `ComposePanel.dispose()` blocks the EDT when Skiko's render thread is
 mid-frame, causing the entire IDE to lock up during tool window close or IDE restart.
 This is a known issue in Compose for Desktop / Jewel (see Jewel #454, CMP-5713).
 
 Three separate disposal paths raced to dispose the same `ComposePanel`:
-1. Content disposer (`ChatToolWindowFactory`) — ran synchronously on EDT
-2. `ShutdownListener` (`AppLifecycleListener.appWillBeClosed`) — ran synchronously on EDT
-3. Shutdown hook (`Runtime.addShutdownHook`) — ran on daemon thread, but leaked on every
+1. Content disposer (`ChatToolWindowFactory`) � ran synchronously on EDT
+2. `ShutdownListener` (`AppLifecycleListener.appWillBeClosed`) � ran synchronously on EDT
+3. Shutdown hook (`Runtime.addShutdownHook`) � ran on daemon thread, but leaked on every
    `createToolWindowContent()` call (ClassLoader leak during dynamic plugin reload)
 
 **Solution:** All dispose paths now use `disposeActiveComposePanelAsync()`, which disposes
 the `ComposePanel` on a daemon thread. This prevents EDT blocking regardless of Skiko's
 render thread state.
 
-1. **Content disposer** — replaced synchronous `composePanelRef?.dispose()` with
+1. **Content disposer** � replaced synchronous `composePanelRef?.dispose()` with
    `disposeActiveComposePanelAsync()`
-2. **ShutdownListener** — replaced synchronous `panel.dispose()` with
+2. **ShutdownListener** � replaced synchronous `panel.dispose()` with
    `disposeActiveComposePanelAsync()`
-3. **Shutdown hook removed** — was redundant (ShutdownListener already handles restart),
+3. **Shutdown hook removed** � was redundant (ShutdownListener already handles restart),
    leaked ClassLoaders on dynamic plugin reload, and raced with the content disposer
 
 **Race condition safety:** `activeComposePanel` is `@Volatile` and
@@ -1046,13 +1056,13 @@ disposes; subsequent calls find `null` and skip.
 
 - **Files:** `ChatToolWindowFactory.kt` (content disposer, shutdown hook removed),
   `ShutdownListener.kt` (async dispose)
-- **Warning:** Do NOT re-add synchronous `ComposePanel.dispose()` calls on EDT — they
+- **Warning:** Do NOT re-add synchronous `ComposePanel.dispose()` calls on EDT � they
   block the IDE when Skiko is mid-frame.
 - **Reference:** Jewel `addComposeTab()` source uses `JewelComposePanel` which wraps
   `ComposePanel`; the same async-dispose pattern is required for any `ComposePanel`
   lifecycle management in IntelliJ plugins.
 
-### GDI nativeBlit Hang — Continuous Animation Frame Pressure (JDK-8301926)
+### GDI nativeBlit Hang � Continuous Animation Frame Pressure (JDK-8301926)
 
 The EDT can hang in `GDIBlitLoops.nativeBlit()` (Windows GDI `BitBlt`) when
 DWM composition enters a bad state. This is a known JDK issue (suspected match:
@@ -1064,8 +1074,8 @@ JDK-8301926, unverified). The hang occurs below the JVM, in `win32k.sys` /
 Three `rememberInfiniteTransition` animations (glow sweep in `InputArea.kt`,
 pulse in `ContextIndicator.kt`, shimmer in `SessionSidebar.kt`) generate
 continuous frame rendering at ~60fps. Each frame flows through Skiko SOFTWARE
-render → `BufferedImage` → Swing `RepaintManager.paintDoubleBuffered()` →
-`GDIBlitLoops.nativeBlit()` → GDI `BitBlt` → DWM composition. A static UI
+render ? `BufferedImage` ? Swing `RepaintManager.paintDoubleBuffered()` ?
+`GDIBlitLoops.nativeBlit()` ? GDI `BitBlt` ? DWM composition. A static UI
 rarely hits `nativeBlit`; animations hit it 60 times per second, giving DWM
 60 chances per second to deadlock.
 
@@ -1092,22 +1102,22 @@ entirely when the UI is idle.
 setting the property in `createToolWindowContent()` is likely a no-op.
 
 **Do NOT:**
-- Disable vsync (`skiko.vsync.enabled=false`) — increases frame rate
-- Use EDT watchdog — disposing ComposePanel from daemon thread while EDT is
+- Disable vsync (`skiko.vsync.enabled=false`) � increases frame rate
+- Use EDT watchdog � disposing ComposePanel from daemon thread while EDT is
   stuck in native call risks JVM crashes
-- Rely on `-Dsun.java2d.opengl=true` as "definitive" — silently falls back
+- Rely on `-Dsun.java2d.opengl=true` as "definitive" � silently falls back
   to GDI on incompatible hardware
 
 **Full investigation:** `docs/tdd/Done/ide-hang-investigation.md`
 
-### Follow Agent — Expanded: EXECUTE and SEARCH Tool Coverage
+### Follow Agent � Expanded: EXECUTE and SEARCH Tool Coverage
 
 Follow Agent now covers **all tool kinds**, not just file-based ones (READ, EDIT, DELETE, MOVE).
 
 **EXECUTE tools (bash/shell commands):** When the agent runs a command, a read-only
 `ConsoleView` opens in the Run tool window showing the agent name, model, working
 directory, the command (as `$ <command>`), and the command output (stdout in normal
-color, stderr in error color, exit status footer). The command is NOT re-executed —
+color, stderr in error color, exit status footer). The command is NOT re-executed �
 the agent already ran it on the OpenCode server. We display the output the agent received.
 
 - **Manager:** `CommandFollowManager` (project-level service)
@@ -1115,7 +1125,7 @@ the agent already ran it on the OpenCode server. We display the output the agent
 - **Throttling:** 2-second cooldown between opening new console tabs
 - **Tab limit:** Max 5 concurrent console tabs (oldest evicted)
 - **Settings:** `followCommandsInConsole` (default: true when Follow Agent is on)
-- **ToolPill button:** Console icon on EXECUTE pills — activates the Run tool window
+- **ToolPill button:** Console icon on EXECUTE pills � activates the Run tool window
 
 **SEARCH tools (grep/glob/find):** When the agent searches, IntelliJ's native "Find in
 Files" opens with the agent's search pattern, directory scope, and file mask. The IDE
@@ -1124,20 +1134,20 @@ potentially stale snapshot). The user gets an interactive result set they can na
 filter, and group.
 
 - **Manager:** `SearchFollowManager` (project-level service)
-- **Entry point:** `followSearch()` (on ToolUse) — calls `FindInProjectManager.startFindInProject(findModel)`
+- **Entry point:** `followSearch()` (on ToolUse) � calls `FindInProjectManager.startFindInProject(findModel)`
 - **Throttling:** 2-second cooldown between opening Find in Files
 - **Settings:** `followSearchesInFindWindow` (default: true when Follow Agent is on)
-- **ToolPill button:** Search icon on SEARCH pills — re-triggers Find in Files via `reopenSearch()`
+- **ToolPill button:** Search icon on SEARCH pills � re-triggers Find in Files via `reopenSearch()`
 - **FindModel scope:** Uses `directoryName` property (not `directory`) for directory-scoped search
 - **No DataContext needed:** `startFindInProject()` runs the search directly without a dialog,
   unlike `findInProject()` which shows the Find dialog first
 
 **Integration in SessionState.kt:**
-- ToolUse handler (line ~976): EXECUTE → `CommandFollowManager.followCommand()`, SEARCH → `SearchFollowManager.followSearch()`
+- ToolUse handler (line ~976): EXECUTE ? `CommandFollowManager.followCommand()`, SEARCH ? `SearchFollowManager.followSearch()`
 - Duplicate ToolUse handler (line ~912): Same additions for when input arrives on the "running" event
-- ToolResult handler (line ~1070): EXECUTE → `CommandFollowManager.followCommandResult()` + `finishCommand()`
+- ToolResult handler (line ~1070): EXECUTE ? `CommandFollowManager.followCommandResult()` + `finishCommand()`
 
-**Settings UI (Settings → Tools → Sigil → Follow Agent):**
+**Settings UI (Settings ? Tools ? Sigil ? Follow Agent):**
 - "Show agent commands in Run console" checkbox
 - "Open Find in Files for agent searches" checkbox
 - Both default to true (if the user opted into Follow Agent, they want full coverage)
@@ -1152,7 +1162,7 @@ filter, and group.
 ### Image Content Support (v2)
 
 - **Status:** Data plumbing complete (`MessagePart.Image`, SSE parsing, REST model,
-  markdown rendering). Image pixel rendering is NOT yet implemented — currently
+  markdown rendering). Image pixel rendering is NOT yet implemented � currently
   shows a metadata card (icon + filename + MIME type).
 - **Action:** Implement actual image rendering in `MessageList.kt` (decode from
   URL or data-URI, display inline). Add URL/data-URI decoder to `ImageUtils.kt`.
@@ -1174,32 +1184,32 @@ filter, and group.
 ### AcpServerConfig `parse()` Method
 
 - **Status:** `AcpServerConfig.parse()` reads CLI args and env vars but is only used in `Main.kt` (standalone server mode). The IntelliJ plugin uses `OpenCodeSettingsState` instead.
-- **Decision (2026-06-24, stakeholder-confirmed): Retain.** The standalone `Main.kt` + `AcpServerConfig` path is kept as a reference implementation and entry point for external consumers of the ACP SDK bridge. `AcpServerConfigTest.kt` and `OpenCodeAgentSupport.kt`'s `config` field are retained alongside it. See `docs/tdd/outstanding-tech-debt.md` §6 for the alternatives analysis.
+- **Decision (2026-06-24, stakeholder-confirmed): Retain.** The standalone `Main.kt` + `AcpServerConfig` path is kept as a reference implementation and entry point for external consumers of the ACP SDK bridge. `AcpServerConfigTest.kt` and `OpenCodeAgentSupport.kt`'s `config` field are retained alongside it. See `docs/tdd/outstanding-tech-debt.md` �6 for the alternatives analysis.
 - **Files:** `AcpServerConfig.kt`, `Main.kt`, `AcpServerConfigTest.kt`
 
 ---
 
-### MCP Integration "” JetBrains MCP Server Discovery
+### MCP Integration "� JetBrains MCP Server Discovery
 
-The JetBrains MCP Server plugin (bundled with IntelliJ IDEA 2025.2+) runs on its **own port** (default 64342), separate from the IDE's built-in web server (port 63342). `BuiltInServerManager.getPort()` returns the web server port, NOT the MCP server port "” do NOT use it for MCP discovery.
+The JetBrains MCP Server plugin (bundled with IntelliJ IDEA 2025.2+) runs on its **own port** (default 64342), separate from the IDE's built-in web server (port 63342). `BuiltInServerManager.getPort()` returns the web server port, NOT the MCP server port "� do NOT use it for MCP discovery.
 
 **Correct discovery flow:**
-1. User copies the SSE URL from Settings â†’ Tools â†’ MCP Server â†’ "Copy SSE Config" (e.g., `http://127.0.0.1:64342/sse`)
+1. User copies the SSE URL from Settings → Tools → MCP Server → "Copy SSE Config" (e.g., `http://127.0.0.1:64342/sse`)
 2. User pastes it into the OpenCode settings `mcpServerUrl` field
 3. `McpServerDiscovery` validates the URL format and verifies the endpoint by sending `GET` with `Accept: text/event-stream`
 4. A 200 response means the MCP server is running; 404 or connection refused means it's not
 
 **Key design decisions:**
-- No auto-detection of the MCP server port "” it's on a separate port from the built-in web server
-- No `BuiltInServerManager` reflection "” wrong port, classloader issues
-- No `/api/mcp/list_tools` REST endpoint "” the JetBrains MCP Server uses SSE+JSON-RPC transport only
+- No auto-detection of the MCP server port "� it's on a separate port from the built-in web server
+- No `BuiltInServerManager` reflection "� wrong port, classloader issues
+- No `/api/mcp/list_tools` REST endpoint "� the JetBrains MCP Server uses SSE+JSON-RPC transport only
 - Verification is via SSE endpoint HTTP status, not a REST API call
 - Tool listing via `McpToolList` stores an empty list per server (registration confirmation only); OpenCode manages tool details internally
 - `DiscoverySource.BUILTIN_IDE` = URL from IntelliJ MCP settings, `DiscoverySource.MANUAL` = URL from additional servers config
 
-**MCP registration "” dual approach (file + API):**
-- **Primary: `.opencode/opencode.json`** "” `McpConfigWriter` writes MCP server configs to `<project>/.opencode/opencode.json` before the OpenCode binary launches. OpenCode reads this file on startup and connects to MCP servers persistently (survives restarts). The file is merged atomically "” existing config (model, agent, provider, non-plugin MCP entries) is preserved.
-- **Supplement: `POST /mcp`** "” `McpRegistrar` still calls `POST /mcp` for immediate registration without requiring a restart. This is called by `McpManager.initialize()` after the OpenCode server is healthy.
+**MCP registration "� dual approach (file + API):**
+- **Primary: `.opencode/opencode.json`** "� `McpConfigWriter` writes MCP server configs to `<project>/.opencode/opencode.json` before the OpenCode binary launches. OpenCode reads this file on startup and connects to MCP servers persistently (survives restarts). The file is merged atomically "� existing config (model, agent, provider, non-plugin MCP entries) is preserved.
+- **Supplement: `POST /mcp`** "� `McpRegistrar` still calls `POST /mcp` for immediate registration without requiring a restart. This is called by `McpManager.initialize()` after the OpenCode server is healthy.
 - **On settings change:** `reinitializeMcpFromSettings()` writes the config file AND calls `POST /mcp` via `McpManager`.
 - **On server restart:** `resetMcpOnServerRestart()` re-writes the config file (in case it's stale) and resets `McpRegistrar` state.
 - **On disable:** When MCP is disabled, `McpConfigWriter.clearAllEntries()` removes plugin-managed entries from the config file.
@@ -1207,9 +1217,9 @@ The JetBrains MCP Server plugin (bundled with IntelliJ IDEA 2025.2+) runs on its
 - **Files:** `McpServerDiscovery.kt`, `McpRegistrar.kt`, `McpConfigWriter.kt`, `McpToolList.kt`, `McpManager.kt`, `McpModels.kt`, `McpStatusBarWidget.kt`, `ChatConstants.kt`, `OpenCodeSettingsPanel.kt`, `OpenCodeSettingsState.kt`, `ProcessManager.kt`, `OpenCodeService.kt`, `McpToolDiscovery.kt`, `ToolRegistry.kt`, `OpenCodeSettingsConfigurable.kt`
 - **TDD deviation log:** `docs/tdd/intellij-mcp-integration.md` has a detailed "Implementation Deviations" section at the top
 
-### Tool Permissions — Implementation Status
+### Tool Permissions � Implementation Status
 
-The tool permissions feature (TDD §10) is substantially implemented.
+The tool permissions feature (TDD �10) is substantially implemented.
 
 **Working:**
 - `ToolRegistry` aggregates tools from built-in + MCP sources
