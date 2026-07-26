@@ -29,6 +29,9 @@ import androidx.compose.ui.input.key.type
  * @param hasMatchingSlashCommand whether the first word after `/` matches a known
  *   slash command. Computed by the executor before calling the reducer so the
  *   reducer stays pure (no access to the commands list).
+ * @param showSkillPalette whether the skill (`$`) palette is visible
+ * @param filteredSkillSize the number of filtered skills (0 means palette empty)
+ * @param skillSelectedIndex the currently highlighted skill index
  */
 data class InputKeyboardState(
     val text: String,
@@ -44,6 +47,9 @@ data class InputKeyboardState(
     val inHistoryMode: Boolean,
     val commandHistorySize: Int,
     val hasMatchingSlashCommand: Boolean = false,
+    val showSkillPalette: Boolean = false,
+    val filteredSkillSize: Int = 0,
+    val skillSelectedIndex: Int = 0,
 )
 
 /**
@@ -88,6 +94,12 @@ sealed interface InputKeyboardAction {
     object Cancel : InputKeyboardAction
     /** Dismiss the slash command palette. */
     object DismissSlashPalette : InputKeyboardAction
+    /** Move the skill palette selection to [index]. */
+    data class SelectSkillIndex(val index: Int) : InputKeyboardAction
+    /** Execute the currently selected skill (inject content into text field). */
+    object ExecuteSkillCommand : InputKeyboardAction
+    /** Dismiss the skill command palette. */
+    object DismissSkillPalette : InputKeyboardAction
     /** Dismiss the attach menu popup. */
     object DismissAttachMenu : InputKeyboardAction
     /** No action — pass the event through. */
@@ -100,16 +112,18 @@ sealed interface InputKeyboardAction {
  * Branch order (MUST NOT change — `//` escape must be checked before slash
  * interception, and Escape cascade must follow the documented order):
  *
+ * 0. Up/Down arrow → skill palette navigation (if palette visible & non-empty)
  * 1. Up/Down arrow → slash palette navigation (if palette visible & non-empty)
  * 2. Up/Down arrow → mention palette navigation (if palette visible & non-empty)
  * 3. Enter + mention palette → select file
  * 4. Escape + mention palette → dismiss
  * 5. Up/Down arrow → command history (if no palettes visible)
- * 6. Enter + slash palette → execute command
- * 7. Enter (no modifiers) → `//` escape OR slash interception OR send
- * 8. Shift+Enter → insert newline
- * 9. Escape → dismiss slash / dismiss attach / cancel history / cancel streaming
- * 10. else → None
+ * 6. Enter + skill palette → execute skill (inject content)
+ * 7. Enter + slash palette → execute command
+ * 8. Enter (no modifiers) → `$$`/`//` escape OR slash interception OR send
+ * 9. Shift+Enter → insert newline
+ * 10. Escape → dismiss skill / dismiss slash / dismiss attach / cancel history / cancel streaming
+ * 11. else → None
  *
  * The reducer does NOT touch TextFieldState, Compose state, or any side-effectful
  * API. It only inspects the [KeyboardEventInput] and [InputKeyboardState] and
@@ -145,10 +159,21 @@ object InputKeyboardHandler {
         if (!event.isKeyDown) return InputKeyboardAction.None
 
         val slashPaletteVisible = state.showSlashPalette && state.filteredSlashSize > 0
+        val skillPaletteVisible = state.showSkillPalette && state.filteredSkillSize > 0
         val mentionPaletteVisible = state.showMentionPalette && state.filteredMentionSize > 0
         val historyAvailable = state.commandHistorySize > 0
 
         return when {
+            // 0. Up arrow — navigate skill palette selection (older)
+            event.key == Key.DirectionUp && !event.isShiftPressed && skillPaletteVisible -> {
+                InputKeyboardAction.SelectSkillIndex((state.skillSelectedIndex - 1).coerceAtLeast(0))
+            }
+            // Down arrow — navigate skill palette selection (newer)
+            event.key == Key.DirectionDown && !event.isShiftPressed && skillPaletteVisible -> {
+                InputKeyboardAction.SelectSkillIndex(
+                    (state.skillSelectedIndex + 1).coerceAtMost(state.filteredSkillSize - 1)
+                )
+            }
             // 1. Up arrow — navigate slash palette selection (older)
             event.key == Key.DirectionUp && !event.isShiftPressed && slashPaletteVisible -> {
                 InputKeyboardAction.SelectSlashIndex((state.slashSelectedIndex - 1).coerceAtLeast(0))
@@ -179,13 +204,13 @@ object InputKeyboardHandler {
             }
             // 5. Up arrow — navigate command history (older).
             event.key == Key.DirectionUp && !event.isShiftPressed &&
-                !state.showSlashPalette && !state.showMentionPalette && historyAvailable -> {
+                !state.showSlashPalette && !state.showMentionPalette && !state.showSkillPalette && historyAvailable -> {
                 InputKeyboardAction.NavigateHistory(1)
             }
             // Down arrow — navigate command history (newer) or restore draft.
             // Only fires when in history mode (no palettes visible).
             event.key == Key.DirectionDown && !event.isShiftPressed &&
-                !state.showSlashPalette && !state.showMentionPalette && state.inHistoryMode -> {
+                !state.showSlashPalette && !state.showMentionPalette && !state.showSkillPalette && state.inHistoryMode -> {
                 val newIndex = state.historyIndex - 1
                 if (newIndex < 0) {
                     InputKeyboardAction.RestoreDraft
@@ -193,15 +218,21 @@ object InputKeyboardHandler {
                     InputKeyboardAction.NavigateHistory(-1)
                 }
             }
-            // 6. Enter with slash palette: execute selected command
+            // 6. Enter with skill palette: inject selected skill content
+            event.key == Key.Enter && !event.isShiftPressed && skillPaletteVisible -> {
+                InputKeyboardAction.ExecuteSkillCommand
+            }
+            // 7. Enter with slash palette: execute selected command
             event.key == Key.Enter && !event.isShiftPressed && state.showSlashPalette -> {
                 InputKeyboardAction.ExecuteSlashCommand
             }
-            // 7. Enter (no modifiers) — // escape OR slash interception OR send.
-            // CRITICAL: // escape must be checked BEFORE slash interception.
+            // 8. Enter (no modifiers) — $$ or // escape OR slash interception OR send.
+            // CRITICAL: $$ and // escape must be checked BEFORE slash interception.
             event.key == Key.Enter && !event.isShiftPressed -> {
                 val text = state.text.trim()
                 when {
+                    // $$ escape: strip one $ and send (lets user type literal $)
+                    text.startsWith("$$") -> InputKeyboardAction.Send
                     // Escape mechanism: "//" prefix strips one "/" and sends the
                     // rest as literal text (lets the user send text starting with
                     // "/" without triggering a slash command).
@@ -215,20 +246,21 @@ object InputKeyboardHandler {
                     else -> InputKeyboardAction.Send
                 }
             }
-            // 8. Shift+Enter — insert newline
+            // 9. Shift+Enter — insert newline
             event.key == Key.Enter && event.isShiftPressed -> {
                 InputKeyboardAction.InsertNewline
             }
-            // 9. Escape — cascade: dismiss slash → dismiss attach → cancel history → cancel streaming
+            // 10. Escape — cascade: dismiss skill → dismiss slash → dismiss attach → cancel history → cancel streaming
             event.key == Key.Escape -> {
                 when {
+                    state.showSkillPalette -> InputKeyboardAction.DismissSkillPalette
                     state.showSlashPalette -> InputKeyboardAction.DismissSlashPalette
                     state.showAttachMenu -> InputKeyboardAction.DismissAttachMenu
                     state.inHistoryMode -> InputKeyboardAction.RestoreDraft
                     else -> InputKeyboardAction.Cancel
                 }
             }
-            // 10. else
+            // 11. else
             else -> InputKeyboardAction.None
         }
     }

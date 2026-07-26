@@ -1217,6 +1217,55 @@ The JetBrains MCP Server plugin (bundled with IntelliJ IDEA 2025.2+) runs on its
 - **Files:** `McpServerDiscovery.kt`, `McpRegistrar.kt`, `McpConfigWriter.kt`, `McpToolList.kt`, `McpManager.kt`, `McpModels.kt`, `McpStatusBarWidget.kt`, `ChatConstants.kt`, `OpenCodeSettingsPanel.kt`, `OpenCodeSettingsState.kt`, `ProcessManager.kt`, `OpenCodeService.kt`, `McpToolDiscovery.kt`, `ToolRegistry.kt`, `OpenCodeSettingsConfigurable.kt`
 - **TDD deviation log:** `docs/tdd/intellij-mcp-integration.md` has a detailed "Implementation Deviations" section at the top
 
+### JetBrains Skill Bridge — IDE Skills ? OpenCode Discovery
+
+Two interconnected features that make JetBrains AI Assistant skills work seamlessly with OpenCode through Sigil. TDD: `docs/tdd/Done/jetbrains-skill-bridge.md`.
+
+**Feature 1 — Skill Bridge:** Automatically detects the IDE's skill storage path and writes it into `skills.paths` in `.opencode/opencode.json` before the OpenCode server launches, so OpenCode discovers IDE-installed skills natively. No file copying, no format conversion, no user configuration.
+
+The bridge runs at three points: (1) initial server launch in `ProcessManager.initialize()`, (2) server restart in `OpenCodeService.resetMcpOnServerRestart()`, and (3) settings reapplication in `OpenCodeService.reinitializeMcpFromSettings()`. At each point, it detects the IDE skill path, merges it into the existing `skills.paths` array (deduplicating + evicting stale plugin-managed paths), and writes the config atomically.
+
+**Stale-path eviction (Q4):** Plugin-managed paths are fully determined at runtime by `JetBrainsSkillBridge.detectSkillPaths()`. On each write, plugin-managed paths from previous writes (e.g., from an old IDE version) are evicted via `isPluginManagedPath()` (path-shape-based matching), while user-added paths are always preserved. This handles IDE version upgrades (2026.1 ? 2026.2) and plugin uninstalls cleanly.
+
+**Detected paths:**
+1. IDE-level skill storage: `{PathManager.getSystemPath()}/aia/agents/.agents/skills` — gated on AI Assistant plugin presence (`com.intellij.ai.assistant`) + directory existence.
+2. Codex Global scope: `~/.codex/skills` — gated on directory existence only (no plugin to detect).
+
+**Feature 2 — `$` Skill Invocation:** A skill palette in the input area (mirroring the existing `/` slash command palette) that lets the user manually invoke a skill by typing `$` followed by the skill name. Skills are fetched from OpenCode's `GET /skill` endpoint. When selected, the skill content is injected into the user's message text (wrapped in `<skill_content name="...">...</skill_content>` tags) for review before sending. This guarantees the agent receives the skill instructions directly — no dependency on the agent deciding to call the `skill` tool.
+
+**`` escape:** `foo` at send time strips to `` (literal `$`), mirroring the `//` ? `/` escape for slash commands. The `` check is in the keyboard handler's Enter branch, BEFORE the `//` check.
+
+**Mutual exclusion:** Only one palette is visible at a time. The first non-escape character determines which: `/` ? slash palette, `$` ? skill palette. `showSkillPalette` is false when `showSlashPalette` is true, and vice versa.
+
+**Skill content injection (H2):** On palette selection, the skill content is injected INTO the text field (not sent immediately). The user reviews/edits and presses Enter to send via the normal send path. This gives the user a chance to see what was injected (important for large skills) and avoids polluting command history with giant `<skill_content>` blobs.
+
+**Size indicator (Q5):** The palette shows `~Nk` next to the skill name (where N = content.length / 1024, rounded) for skills > 1KB. A warning is logged if injected content > 8KB.
+
+**Staleness-based re-fetch (Q6):** `SkillManager` tracks `lastSkillFetchTimeMs`. On `$` palette trigger, if the cache is stale (> 30s), a re-fetch is forced. On fetch error, the cached list is preserved (not cleared).
+
+**Key files:**
+- `JetBrainsSkillBridge.kt` — path detection (`detectSkillPaths()`, `detectSkillPathsPure()`, `isPluginManagedPath()`)
+- `McpConfigWriter.kt` — `writeSkillPaths()` method (read-modify-write with stale-path eviction)
+- `ProcessManager.kt` — bridge call in `initialize()` (outside MCP enable/disable guard)
+- `OpenCodeService.kt` — bridge calls in `resetMcpOnServerRestart()` + `reinitializeMcpFromSettings()`, `fetchAvailableSkills()` implementation
+- `SkillManager.kt` — skill fetching with staleness tracking (mirrors `CommandManager`)
+- `OpenCodeClient.kt` — `listSkills()` (GET /skill)
+- `OpenCodeModels.kt` — `SkillInfo` data class
+- `OpenCodeServiceApi.kt` — `fetchAvailableSkills()` on `OpenCodeContextApi`
+- `SkillPalette.kt` — skill palette composable (mirrors `SlashCommandPalette.kt`)
+- `InputArea.kt` — skill palette state, query extraction, popup rendering, keyboard action handling
+- `InputKeyboardHandler.kt` — `SelectSkillIndex`, `ExecuteSkillCommand`, `DismissSkillPalette` actions + `` escape
+- `ChatViewModel.kt` — `availableSkills` StateFlow, `fetchAvailableSkills()`, `onSkillPaletteTriggered()`
+- `ChatScreen.kt` — wiring (`availableSkills` collection + passed to InputArea)
+
+**Tests:** `JetBrainsSkillBridgeTest.kt`, `McpConfigWriterSkillPathsTest.kt`, `SkillManagerTest.kt`, `InputKeyboardHandlerSkillTest.kt`
+
+**Warning:** The bridge runs regardless of MCP enable/disable state. Skill bridging is independent of MCP configuration — a user may have MCP disabled but still want JetBrains skills bridged. The `writeSkillPaths()` call is outside the `if (settings.enableIntellijMcp || ...)` guard.
+
+**Warning:** Do NOT re-add immediate-send behavior to the skill palette. The inject-into-field pattern (H2) is intentional — it lets the user review the injected content before sending.
+
+### Tool Permissions — Implementation Status
+
 ### Tool Permissions — Implementation Status
 
 The tool permissions feature (TDD §10) is substantially implemented.

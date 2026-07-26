@@ -76,6 +76,7 @@ import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.model.SessionContextState
 import com.opencode.acp.chat.model.ThinkingEffort
 import com.opencode.acp.chat.model.TodoItem
+import com.opencode.acp.adapter.SkillInfo
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
 import org.jetbrains.jewel.ui.component.Icon
@@ -196,6 +197,8 @@ fun InputArea(
     onRecentFileClick: (RecentFile) -> Unit = {},
     onSlashCommand: (SlashCommand) -> Unit = {},
     commands: List<SlashCommand> = emptyList(),
+    availableSkills: List<SkillInfo> = emptyList(),
+    onSkillPaletteTriggered: () -> Unit = {},
     // @ mention file autocomplete
     mentionFiles: List<RecentFile> = emptyList(),
     onMentionSearch: (String) -> Unit = {},
@@ -233,6 +236,25 @@ fun InputArea(
     }
 
     LaunchedEffect(filtered.size) { selectedIndex = 0 }
+
+    // Skill palette state: shown when text starts with "$" (but not "$$")
+    var showSkillPalette by remember { mutableStateOf(false) }
+    var skillSelectedIndex by remember { mutableStateOf(0) }
+    // Only treat a single leading "$" as a skill query; "$$" is the escape
+    // mechanism to send literal text starting with "$".
+    // Gate: $ at position 0, not $$, no newline, and second char is a valid
+    // skill-name-start character (letter/digit/hyphen/underscore).
+    val skillQuery = if (currentText.startsWith("$") && !currentText.startsWith("$$") &&
+        currentText.length > 1 &&
+        (currentText[1].isLetterOrDigit() || currentText[1] == '-' || currentText[1] == '_'))
+        currentText.substring(1) else ""
+
+    val filteredSkills = remember(skillQuery, availableSkills) {
+        if (skillQuery.isBlank()) availableSkills
+        else availableSkills.filter { it.name.startsWith(skillQuery, ignoreCase = true) }
+    }
+
+    LaunchedEffect(filteredSkills.size) { skillSelectedIndex = 0 }
 
     /** Extract trailing args from slashQuery for the given command. */
     fun extractArgs(cmd: SlashCommand): String =
@@ -455,18 +477,31 @@ fun InputArea(
         }
     }
 
-    // Watch text changes to show/hide slash palette.
-    // The palette stays open as long as the text starts with "/" and has no
-    // newline — commands with args (e.g. "/review-perform glm5.2 claude") can
-    // be long, so we don't cap by length here. The palette itself filters by
-    // command-name prefix; non-matching text shows "No matching commands".
+    // Watch text changes to show/hide slash and skill palettes.
+    // Merged into a single collector to ensure atomic mutual exclusion —
+    // two independent collectors on the same snapshotFlow had a race
+    // condition where stale showSlashPalette could suppress showSkillPalette.
     LaunchedEffect(Unit) {
         androidx.compose.runtime.snapshotFlow { textState.text.toString() }
             .collect { text ->
-                // Show palette only for a single leading "/" — "//" is the escape
+                // Show slash palette only for a single leading "/" — "//" is the escape
                 // mechanism to send literal text starting with "/".
                 showSlashPalette = text.startsWith("/") && !text.startsWith("//") && !text.contains("\n")
+                // Show skill palette only for a single leading "$" — "$$" is the escape
+                // mechanism to send literal text starting with "$".
+                // Mutual exclusion: only one palette visible at a time (first char wins).
+                showSkillPalette = !showSlashPalette &&
+                    text.startsWith("$") &&
+                    !text.startsWith("$$") &&
+                    !text.contains("\n") &&
+                    text.length > 1 &&
+                    (text[1].isLetterOrDigit() || text[1] == '-' || text[1] == '_')
             }
+    }
+
+    // Q6: Re-fetch skills when the palette is triggered, if stale.
+    LaunchedEffect(showSkillPalette) {
+        if (showSkillPalette) onSkillPaletteTriggered()
     }
 
     // Watch text changes to detect "@" mention triggers.
@@ -536,8 +571,44 @@ fun InputArea(
             }
         }
 
+        // Skill palette — shown above the input when text starts with "$"
+        if (showSkillPalette && !showSlashPalette && !showMentionPalette) {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.BottomStart
+            ) {
+                Popup(
+                    alignment = Alignment.BottomStart,
+                    offset = IntOffset(0, -4),
+                    properties = PopupProperties(
+                        focusable = false,
+                        dismissOnBackPress = true,
+                        dismissOnClickOutside = true,
+                    ),
+                    onDismissRequest = { showSkillPalette = false },
+                ) {
+                    SkillPalette(
+                        filtered = filteredSkills,
+                        selectedIndex = skillSelectedIndex,
+                        onSelectedIndexChange = { skillSelectedIndex = it },
+                        onSkillSelected = { skill ->
+                            showSkillPalette = false
+                            if (skill.content.length > 8192) {
+                                logger.warn {
+                                    "[ACP] Skill '${skill.name}' is large (${skill.content.length} chars) — consider trimming"
+                                }
+                            }
+                            val injectedContent = buildSkillInjection(skill, currentText)
+                            textState.edit { replace(0, textState.text.length, injectedContent) }
+                        },
+                        onDismiss = { showSkillPalette = false },
+                    )
+                }
+            }
+        }
+
         // @ mention palette — shown above the input when the user types "@query"
-        if (showMentionPalette && !showSlashPalette) {
+        if (showMentionPalette && !showSlashPalette && !showSkillPalette) {
             Box(
                 modifier = Modifier.fillMaxWidth(),
                 contentAlignment = Alignment.BottomStart
@@ -865,6 +936,9 @@ fun InputArea(
                                         inHistoryMode = inHistoryMode,
                                         commandHistorySize = commandHistory.size,
                                         hasMatchingSlashCommand = hasMatchingSlashCommand,
+                                        showSkillPalette = showSkillPalette,
+                                        filteredSkillSize = filteredSkills.size,
+                                        skillSelectedIndex = skillSelectedIndex,
                                     )
                                     val action = InputKeyboardHandler.handleKeyEvent(event, state)
                                     // Executor: apply the action to the real Compose state.
@@ -872,6 +946,10 @@ fun InputArea(
                                     when (action) {
                                         is InputKeyboardAction.SelectSlashIndex -> {
                                             selectedIndex = action.index
+                                            true
+                                        }
+                                        is InputKeyboardAction.SelectSkillIndex -> {
+                                            skillSelectedIndex = action.index
                                             true
                                         }
                                         is InputKeyboardAction.SelectMentionIndex -> {
@@ -946,16 +1024,35 @@ fun InputArea(
                                             }
                                             true
                                         }
+                                        InputKeyboardAction.ExecuteSkillCommand -> {
+                                            val skill = filteredSkills.getOrNull(skillSelectedIndex) ?: filteredSkills.firstOrNull()
+                                            if (skill != null) {
+                                                showSkillPalette = false
+                                                val freshText = textState.text.toString()
+                                                if (skill.content.length > 8192) {
+                                                    logger.warn {
+                                                        "[ACP] Skill '${skill.name}' is large (${skill.content.length} chars) — consider trimming"
+                                                    }
+                                                }
+                                                val injectedContent = buildSkillInjection(skill, freshText)
+                                                textState.edit { replace(0, textState.text.length, injectedContent) }
+                                            }
+                                            true
+                                        }
                                         InputKeyboardAction.Send -> {
                                             val text = textState.text.toString().trim()
-                                            // Escape mechanism: "//" prefix strips one "/" and sends
-                                            // the rest as literal text (lets the user send text that
-                                            // starts with "/" without triggering a slash command).
-                                            val sendText = if (text.startsWith("//")) text.substring(1) else text
+                                            // $$ escape: strip one $ and send (lets user type literal $)
+                                            // // escape: strip one / and send (lets user type literal /)
+                                            val sendText = when {
+                                                text.startsWith("$$") -> text.substring(1)
+                                                text.startsWith("//") -> text.substring(1)
+                                                else -> text
+                                            }
                                             if (sendText.isNotEmpty()) {
                                                 onSend(sendText, attachedFiles)
                                                 textState.edit { replace(0, length, "") }
                                                 showSlashPalette = false
+                                                showSkillPalette = false
                                                 inHistoryMode = false
                                                 historyIndex = -1
                                             }
@@ -968,6 +1065,7 @@ fun InputArea(
                                             textState.edit { replace(pos, pos, "\n") }
                                             showSlashPalette = false
                                             showMentionPalette = false
+                                            showSkillPalette = false
                                             true
                                         }
                                         InputKeyboardAction.Cancel -> {
@@ -976,6 +1074,10 @@ fun InputArea(
                                         }
                                         InputKeyboardAction.DismissSlashPalette -> {
                                             showSlashPalette = false
+                                            true
+                                        }
+                                        InputKeyboardAction.DismissSkillPalette -> {
+                                            showSkillPalette = false
                                             true
                                         }
                                         InputKeyboardAction.DismissAttachMenu -> {

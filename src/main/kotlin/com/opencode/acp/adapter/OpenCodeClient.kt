@@ -567,6 +567,10 @@ class OpenCodeClient(
     suspend fun listCommands(): List<CommandInfo> =
         getJson("/command")
 
+    /** Fetch all discovered skills from GET /skill. */
+    suspend fun listSkills(): List<SkillInfo> =
+        getJson("/skill")
+
     /**
      * Executes a command in the context of a session.
      * POST /session/{id}/command

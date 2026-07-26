@@ -1,6 +1,7 @@
 package com.opencode.acp.chat.viewmodel
 
 import com.opencode.acp.adapter.OpenCodeClient
+import com.opencode.acp.adapter.SkillInfo
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.model.ChildPermissionPrompt
 import com.opencode.acp.chat.processor.UiSignal
@@ -110,6 +111,9 @@ class ChatViewModel(
 
     private val _availableCommands = MutableStateFlow<List<SlashCommand>>(emptyList())
     val availableCommands: StateFlow<List<SlashCommand>> = _availableCommands.asStateFlow()
+
+    private val _availableSkills = MutableStateFlow<List<SkillInfo>>(emptyList())
+    val availableSkills: StateFlow<List<SkillInfo>> = _availableSkills.asStateFlow()
 
     private val _clearAllState = MutableStateFlow<ClearAllState>(ClearAllState.Idle)
     val clearAllState: StateFlow<ClearAllState> = _clearAllState.asStateFlow()
@@ -488,6 +492,7 @@ class ChatViewModel(
                     computeSessionContext()
                     fetchTodos()
                     fetchAvailableCommands()
+                    fetchAvailableSkills()
 
                     logger.info { "[ACP] ReadyState: LOADING_MCP → READY" }
                     _readyState.value = ReadyState.READY
@@ -874,6 +879,19 @@ class ChatViewModel(
     fun fetchAvailableCommands() {
         scope.launch {
             _availableCommands.value = service.fetchAvailableCommands()
+        }
+    }
+
+    fun fetchAvailableSkills() {
+        scope.launch {
+            _availableSkills.value = service.fetchAvailableSkills()
+        }
+    }
+
+    /** Re-fetch skills when the $ palette is triggered, forcing a fresh fetch to catch newly installed skills. */
+    fun onSkillPaletteTriggered() {
+        scope.launch {
+            _availableSkills.value = service.fetchAvailableSkills(force = true)
         }
     }
 

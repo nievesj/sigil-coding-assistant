@@ -5,6 +5,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
 import com.opencode.acp.adapter.OpenCodeClient
+import com.opencode.acp.adapter.SkillInfo
 import com.opencode.acp.chat.model.*
 import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.processor.UiSignal
@@ -83,6 +84,9 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
     val commandManager = CommandManager(
         clientProvider = { connectionManager.client },
         sessionIdProvider = { sessionManager.activeSessionId.value }
+    )
+    private val skillManager = SkillManager(
+        clientProvider = { connectionManager.client },
     )
     private val mcpConfigWriter by lazy {
         val path = project.basePath?.let { java.nio.file.Path.of(it) }
@@ -483,6 +487,9 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                 } else {
                     configWriter.clearAllEntries()
                 }
+                // Bridge JetBrains AI Assistant skills (independent of MCP enable/disable)
+                val skillPaths = com.opencode.acp.skill.JetBrainsSkillBridge.detectSkillPaths()
+                configWriter.writeSkillPaths(skillPaths)
             } catch (e: Exception) {
                 logger.warn(e) { "[ACP] Failed to reinitialize MCP from settings" }
             }
@@ -502,6 +509,9 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                 if (settings.enableIntellijMcp || settings.additionalMcpServers.isNotBlank()) {
                     configWriter.write()
                 }
+                // Bridge JetBrains AI Assistant skills (independent of MCP enable/disable)
+                val skillPaths = com.opencode.acp.skill.JetBrainsSkillBridge.detectSkillPaths()
+                configWriter.writeSkillPaths(skillPaths)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -894,6 +904,11 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
 
     override suspend fun fetchAvailableCommands(): List<SlashCommand> =
         commandManager.fetchAvailableCommands()
+
+    override suspend fun fetchAvailableSkills(force: Boolean): List<SkillInfo> {
+        skillManager.fetchAvailableSkills(force)
+        return skillManager.availableSkills.value
+    }
 
     override suspend fun executeServerCommand(commandName: String, args: String) =
         commandManager.executeServerCommand(commandName, args)

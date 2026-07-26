@@ -5,7 +5,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -28,46 +28,38 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.intellij.icons.AllIcons
+import com.opencode.acp.adapter.SkillInfo
+import com.opencode.acp.chat.ui.theme.ChatTheme
 import org.jetbrains.jewel.ui.component.Icon
 import org.jetbrains.jewel.ui.component.Text
-import com.opencode.acp.chat.ui.theme.ChatTheme
+import org.jetbrains.jewel.bridge.icon.fromPlatformIcon
+import org.jetbrains.jewel.ui.icon.IntelliJIconKey
+
+// First non-escape char determines palette: '/' → slash, '$' → skill. See TDD §10 Q7.
 
 /**
- * A slash command definition.
- * @param name the command name without `/` prefix (e.g. "compact")
- * @param description short description shown in the palette
- * @param icon optional platform icon key
- */
-data class SlashCommand(
-    val name: String,
-    val description: String,
-    val iconKey: org.jetbrains.jewel.ui.icon.IconKey? = null,
-    val isServerCommand: Boolean = false,
-    /** Trailing arguments typed after the command name (e.g. for
-     *  `/review-perform glm5.2 claude-sonnet`, args = "glm5.2 claude-sonnet").
-     *  Populated at invocation time by InputArea; empty for palette-selected
-     *  commands with no trailing text. */
-    val args: String = ""
-)
-
-// First non-escape char determines palette: '/' -> slash, '$' -> skill. See TDD section 10 Q7.
-
-/**
- * Slash command palette popup. Shown when the user types `/` at the start of the input.
- * Filtering and selection are owned by the caller (InputArea); this composable only renders.
+ * Skill palette popup. Shown when the user types `$` at the start of the input.
+ * Mirrors SlashCommandPalette in structure and behavior.
  *
- * @param filtered the pre-filtered list of commands to display
- * @param selectedIndex the index of the currently highlighted command
+ * Displays skill name + size indicator + description, filtered by user input.
+ * Keyboard: Up/Down to navigate, Enter to select, Escape to dismiss.
+ *
+ * Size indicator: shows "~Nk" next to the skill name so the user can gauge
+ * context-window cost before injecting. Computed from content.length.
+ *
+ * @param filtered the pre-filtered list of skills to display
+ * @param selectedIndex the index of the currently highlighted skill
  * @param onSelectedIndexChange called when hover or keyboard changes the highlighted index
- * @param onCommandSelected callback with the selected SlashCommand (click or Enter)
+ * @param onSkillSelected callback with the selected SkillInfo (click or Enter)
  * @param onDismiss callback when the palette should close (Escape, click outside)
  */
 @Composable
-fun SlashCommandPalette(
-    filtered: List<SlashCommand>,
+fun SkillPalette(
+    filtered: List<SkillInfo>,
     selectedIndex: Int,
     onSelectedIndexChange: (Int) -> Unit,
-    onCommandSelected: (SlashCommand) -> Unit,
+    onSkillSelected: (SkillInfo) -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -78,7 +70,6 @@ fun SlashCommandPalette(
     val fontWeights = ChatTheme.fontWeights
 
     if (filtered.isEmpty()) {
-        // No matches — show "No matching commands"
         Column(
             modifier = modifier
                 .clip(shapes.paletteCornerRadius)
@@ -86,7 +77,7 @@ fun SlashCommandPalette(
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             Text(
-                text = "No matching commands",
+                text = "No matching skills",
                 fontSize = fonts.paletteEmpty,
                 color = colors.text.muted,
             )
@@ -102,7 +93,7 @@ fun SlashCommandPalette(
             .heightIn(max = 320.dp)
             .verticalScroll(rememberScrollState())
     ) {
-        filtered.forEachIndexed { index, command ->
+        filtered.forEachIndexed { index, skill ->
             val interactionSource = remember { MutableInteractionSource() }
             val isHovered by interactionSource.collectIsHoveredAsState()
             LaunchedEffect(isHovered) {
@@ -115,34 +106,31 @@ fun SlashCommandPalette(
                     .clip(shapes.paletteRowCornerRadius)
                     .background(if (index == selectedIndex) colors.component.paletteHoverBg else Color.Transparent)
                     .hoverable(interactionSource)
-                    .clickable(interactionSource = interactionSource, indication = null) { onCommandSelected(command) }
+                    .clickable(interactionSource = interactionSource, indication = null) { onSkillSelected(skill) }
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                // Icon column — fixed width, center-aligned
+                // Icon column — lightning bolt
                 Box(
                     modifier = Modifier.width(20.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    if (command.iconKey != null) {
-                        Icon(
-                            key = command.iconKey,
-                            contentDescription = command.name,
-                            modifier = Modifier.size(14.dp),
-                            tint = colors.accent.blue,
-                        )
-                    }
+                    Icon(
+                        key = IntelliJIconKey.fromPlatformIcon(AllIcons.Actions.Lightning),
+                        contentDescription = skill.name,
+                        modifier = Modifier.size(14.dp),
+                        tint = colors.accent.blue,
+                    )
                 }
 
-                // Spacer
                 Spacer(modifier = Modifier.width(8.dp))
 
-                // Name column — fixed min/max width
+                // Name column
                 Box(
                     modifier = Modifier.widthIn(min = 100.dp, max = 180.dp),
                 ) {
                     Text(
-                        text = "/${command.name}",
+                        text = "$${skill.name}",
                         fontSize = fonts.paletteCommand,
                         fontWeight = fontWeights.commandName,
                         color = colors.accent.blue,
@@ -151,12 +139,23 @@ fun SlashCommandPalette(
                     )
                 }
 
-                // Spacer
                 Spacer(modifier = Modifier.width(8.dp))
+
+                // Size indicator — only for skills > 1KB
+                if (skill.content.length > 1024) {
+                    val sizeK = (skill.content.length / 1024).coerceAtLeast(1)
+                    Text(
+                        text = "~${sizeK}k",
+                        fontSize = fonts.paletteDescription,
+                        color = colors.text.muted,
+                        maxLines = 1,
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
 
                 // Description column — takes remaining space
                 Text(
-                    text = command.description,
+                    text = skill.description,
                     fontSize = fonts.paletteDescription,
                     color = colors.text.muted,
                     maxLines = 1,

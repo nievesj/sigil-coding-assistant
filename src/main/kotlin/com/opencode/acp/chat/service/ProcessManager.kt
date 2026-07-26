@@ -129,6 +129,16 @@ class ProcessManager(private val scope: CoroutineScope) {
             configWriter.clearAllEntries()
         }
 
+        // Bridge JetBrains AI Assistant skills to OpenCode.
+        // Always call writeSkillPaths (even if empty) to evict stale paths from
+        // old IDE versions. writeSkillPaths handles the empty case by
+        // preserving user paths and evicting plugin-managed paths.
+        // This runs OUTSIDE the MCP enable/disable guard — skill bridging is
+        // independent of MCP configuration.
+        val skillConfigWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), mcpSettings)
+        val skillPaths = com.opencode.acp.skill.JetBrainsSkillBridge.detectSkillPaths()
+        skillConfigWriter.writeSkillPaths(skillPaths)
+
         // Extract sigil-pruner.ts and write pruner config BEFORE launching the binary.
         // The OpenCode server loads plugins from .opencode/plugins/ on startup and
         // the TS plugin reads .opencode/sigil-pruner.json on load.

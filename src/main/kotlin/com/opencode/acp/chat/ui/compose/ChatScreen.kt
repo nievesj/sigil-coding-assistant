@@ -90,6 +90,7 @@ fun
     val isActiveSessionChild by viewModel.isActiveSessionChild.collectAsState()
     val activeSessionParentId by viewModel.activeSessionParentId.collectAsState()
     val availableCommands by viewModel.availableCommands.collectAsState()
+    val availableSkills by viewModel.availableSkills.collectAsState()
     val commandHistory by viewModel.commandHistory.collectAsState()
     val queuedMessages by viewModel.queuedMessages.collectAsState()
     val followAgentEnabled by viewModel.followAgentEnabled.collectAsState()
@@ -620,6 +621,8 @@ fun
                     }
                 },
                 commands = allSlashCommands,
+                availableSkills = availableSkills,
+                onSkillPaletteTriggered = { viewModel.onSkillPaletteTriggered() },
                 // @ mention file autocomplete
                 mentionFiles = mentionSearchResults,
                 onMentionSearch = onMentionSearch,

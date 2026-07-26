@@ -13,6 +13,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.put
 import java.nio.file.Files
 import java.nio.file.Path
@@ -38,7 +39,11 @@ private val logger = KotlinLogging.logger {}
  */
 class McpConfigWriter(
     private val projectBasePath: Path,
-    private val settings: OpenCodeMcpSettingsState
+    private val settings: OpenCodeMcpSettingsState,
+    /** Predicate identifying plugin-managed skill paths for eviction in [writeSkillPaths].
+     *  Defaults to [com.opencode.acp.skill.JetBrainsSkillBridge.isPluginManagedPath].
+     *  Injectable for testing and to avoid a hard cross-package dependency. */
+    private val isPluginManagedPath: (String) -> Boolean = com.opencode.acp.skill.JetBrainsSkillBridge::isPluginManagedPath
 ) {
 
     /** Serializes all writeConfig calls to prevent concurrent read-modify-write races.
@@ -479,6 +484,77 @@ class McpConfigWriter(
         }
         if (success) {
             logger.info { "[ACP] McpConfigWriter: cleared plugin MCP entries" }
+        }
+        return success
+    }
+
+    /**
+     * Write skill paths to the "skills.paths" array in opencode.json.
+     *
+     * Implements stale-path eviction: overwrites the plugin-managed
+     * subset of skills.paths (paths matching JetBrainsSkillBridge.isPluginManagedPath)
+     * with [paths], while preserving user-added paths and skills.urls.
+     *
+     * Plugin-managed paths from previous writes (e.g., from an old IDE version)
+     * are evicted. User-added paths (custom paths not matching the plugin-managed
+     * pattern) are always preserved.
+     *
+     * Preserves skills.urls and all other config keys including $schema
+     * (writeConfig handles $schema — do not strip it here).
+     *
+     * @param paths Plugin-managed skill directory paths to write (from detectSkillPaths)
+     * @return true if config was written successfully, false on error
+     */
+    fun writeSkillPaths(paths: List<String>): Boolean {
+        val success = writeConfig { config ->
+            val existingSkills = config["skills"]?.jsonObject
+            val existingUrls = existingSkills?.get("urls")?.jsonArray
+            val existingPaths = existingSkills?.get("paths")?.jsonArray
+                ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                ?: emptyList()
+
+            // Partition existing paths into user-added (preserve) and
+            // plugin-managed (evict). Plugin-managed paths are fully
+            // determined at runtime by detectSkillPaths() — there is no
+            // reason to keep stale ones from old IDE versions.
+            val userPaths = existingPaths.filter { !isPluginManagedPath(it) }
+            val finalPaths = (userPaths + paths).distinct()
+
+            // Build the new config. Preserve all keys except "skills" (rebuilt below).
+            buildJsonObject {
+                for ((key, value) in config) {
+                    if (key != "skills") {
+                        put(key, value)
+                    }
+                }
+                // Only write the "skills" section if there are paths, urls, or
+                // unknown keys to preserve.
+                if (finalPaths.isNotEmpty() || existingUrls != null || existingSkills != null) {
+                    put("skills", buildJsonObject {
+                        // Preserve unknown keys from the existing skills object
+                        // (e.g., future schema additions, user-added custom keys).
+                        if (existingSkills != null) {
+                            for ((key, value) in existingSkills) {
+                                if (key != "paths" && key != "urls") {
+                                    put(key, value)
+                                }
+                            }
+                        }
+                        if (finalPaths.isNotEmpty()) {
+                            put("paths", buildJsonArray {
+                                finalPaths.forEach { add(JsonPrimitive(it)) }
+                            })
+                        }
+                        // Preserve existing urls if present
+                        if (existingUrls != null) {
+                            put("urls", existingUrls)
+                        }
+                    })
+                }
+            }
+        }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: wrote ${paths.size} skill path(s)" }
         }
         return success
     }
