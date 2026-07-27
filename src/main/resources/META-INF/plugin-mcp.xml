@@ -1,0 +1,17 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<!-- Plugin descriptor for MCP Server integration — loaded only when the
+     com.intellij.mcpServer plugin is present (optional dependency in plugin.xml).
+     Registers PSI code intelligence toolsets via the McpToolset extension point. -->
+<idea-plugin>
+    <extensions defaultExtensionNs="com.intellij">
+        <mcpServer.mcpToolset implementation="com.opencode.acp.intelligence.SymbolSearchToolset"/>
+        <mcpServer.mcpToolset implementation="com.opencode.acp.intelligence.FindUsagesToolset"/>
+        <mcpServer.mcpToolset implementation="com.opencode.acp.intelligence.CallHierarchyToolset"/>
+        <mcpServer.mcpToolset implementation="com.opencode.acp.intelligence.ImpactAnalysisToolset"/>
+        <mcpServer.mcpToolset implementation="com.opencode.acp.intelligence.FileStructureToolset"/>
+        <mcpServer.mcpToolset implementation="com.opencode.acp.intelligence.RepoMapToolset"/>
+    </extensions>
+
+    <!-- Pre-warm the repo_map cache on project open (fire-and-forget background). -->
+    <postStartupActivity implementation="com.opencode.acp.intelligence.RepoMapPreWarmActivity"/>
+</idea-plugin>

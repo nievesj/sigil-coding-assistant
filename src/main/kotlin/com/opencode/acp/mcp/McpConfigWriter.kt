@@ -57,6 +57,80 @@ class McpConfigWriter(
         /** File-level locks keyed by canonical project path — prevents concurrent writes
          *  from multiple McpConfigWriter instances targeting the same project. */
         private val projectLocks = java.util.concurrent.ConcurrentHashMap<String, ReentrantLock>()
+
+        /**
+         * Flatten a recursive glob pattern by removing recursive glob segments (double-star followed by slash).
+         * Used for the "covers" check in [mergeInstructions].
+         *
+         * E.g., a recursive glob like `.opencode/context/RECURSIVE.md` becomes `.opencode/context/FLAT.md`
+         * (where RECURSIVE means double-star-slash-prefix, FLAT means no recursion prefix).
+         *
+         * Limitation: this replaces ALL double-star-slash occurrences, so a multi-level
+         * recursive glob becomes fully flattened. This is correct for the current single
+         * use case (CONTEXT_GLOB_PATTERN) but may produce incorrect results for multi-level
+         * recursive globs if reused elsewhere.
+         */
+        private fun flattenRecursiveGlob(glob: String): String = glob.replace("**/", "")
+
+        /**
+         * Merge the plugin's context-file glob into the existing `instructions` array.
+         *
+         * Contract:
+         * - If [ourGlob] is already present (exact string match), return [existing] unchanged.
+         * - If [existing] contains a glob that covers [ourGlob] (e.g., a flat context glob
+         *   covers a recursive context glob), return [existing] unchanged.
+         *  A glob A covers glob B if `flattenRecursiveGlob(B).startsWith(flattenRecursiveGlob(A))`.
+         * - Otherwise, append [ourGlob] to the array.
+         * - Preserve all existing entries regardless of type (string or object).
+         *
+         * @param existing The existing instructions JsonArray (may contain strings and objects).
+         * @param ourGlob The glob pattern to merge in (e.g., ".opencode/context/**/*.md").
+         * @return The merged JsonArray.
+         */
+        fun mergeInstructions(existing: JsonArray, ourGlob: String): JsonArray {
+            // Extract string entries from the existing array (skip non-string elements like objects).
+            val existingStrings = existing.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+
+            // 1. Exact match — already present.
+            if (ourGlob in existingStrings) {
+                return existing
+            }
+
+            // 2. Covers check — an existing glob covers ourGlob.
+            val normalizedOurs = flattenRecursiveGlob(ourGlob)
+            for (existingGlob in existingStrings) {
+                val normalizedExisting = flattenRecursiveGlob(existingGlob)
+                // A glob A covers glob B if A's directory prefix is a prefix of B's
+                // (using startsWith on the directory portion). This is a prefix match,
+                // not a proper parent-directory check — a glob like ".opencode" would
+                // match ".opencode-evil/" via startsWith. This is acceptable for the
+                // current use case (CONTEXT_GLOB_PATTERN) but may need tightening if
+                // reused for arbitrary globs.
+                // Check: does normalizedOurs start with the directory portion of
+                // normalizedExisting (everything up to the last path segment)?
+                val existingDir = normalizedExisting.substringBeforeLast("/", "")
+                if (existingDir.isEmpty()) {
+                    // Existing glob has no directory — only covers if it's the same glob
+                    // (e.g., "README.md" does NOT cover ".opencode/context/**/*.md")
+                    if (normalizedOurs == normalizedExisting) {
+                        return existing
+                    }
+                    // No directory prefix to match — skip this entry
+                    continue
+                }
+                if (normalizedOurs.startsWith(existingDir + "/") || normalizedOurs == normalizedExisting) {
+                    return existing
+                }
+            }
+
+            // 3. Append ourGlob, preserving all existing entries.
+            return buildJsonArray {
+                for (element in existing) {
+                    add(element)
+                }
+                add(JsonPrimitive(ourGlob))
+            }
+        }
     }
 
     /**
@@ -555,6 +629,34 @@ class McpConfigWriter(
         }
         if (success) {
             logger.info { "[ACP] McpConfigWriter: wrote ${paths.size} skill path(s)" }
+        }
+        return success
+    }
+
+    /**
+     * Write the context-file instructions glob to `.opencode/opencode.json`.
+     *
+     * Merges [glob] into the existing `instructions` array with dedup.
+     * Preserves all existing config keys.
+     *
+     * @param glob The glob pattern to add (e.g., ".opencode/context/**/*.md").
+     * @return true if the config was written successfully, false otherwise.
+     */
+    fun writeInstructions(glob: String): Boolean {
+        val success = writeConfig { config ->
+            val existingInstructions = config["instructions"]?.jsonArray ?: buildJsonArray {}
+            val merged = mergeInstructions(existingInstructions, glob)
+            buildJsonObject {
+                for ((key, value) in config) {
+                    if (key != "instructions" && key != "\$schema") {
+                        put(key, value)
+                    }
+                }
+                put("instructions", merged)
+            }
+        }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: wrote instructions glob: $glob" }
         }
         return success
     }

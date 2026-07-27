@@ -107,6 +107,7 @@ fun
             SlashCommand("review-perform-gaming", "Adversarial review: game-engine checklist (Unreal C++ / Unity C#)", AllIconsKeys.General.BalloonError),
             SlashCommand("review-resolve", "Fix all open review comments", AllIconsKeys.General.BalloonInformation),
             SlashCommand("review-recheck", "Re-review: verify replies, re-raise open issues, add new comments", AllIconsKeys.General.BalloonInformation),
+            SlashCommand("generate-context", "Generate repo-structure context file from PSI", AllIconsKeys.General.BalloonInformation),
         )
     }
     // Merged list: local commands first, then server commands
@@ -616,6 +617,7 @@ fun
                             "review-perform-gaming" -> viewModel.executeReviewPerformGamingCommand(command.args)
                             "review-resolve" -> viewModel.executeReviewResolveCommand()
                             "review-recheck" -> viewModel.executeReviewRecheckCommand(command.args)
+                            "generate-context" -> viewModel.generateContext()
                             else -> viewModel.executeServerCommand(command.name)
                         }
                     }

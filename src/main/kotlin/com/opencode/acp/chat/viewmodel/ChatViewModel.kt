@@ -26,6 +26,24 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 
 /**
+ * State of the `/generate-context` slash command (TDD §11).
+ *
+ * Drives the UI feedback (spinner / success / error) while [ChatViewModel.generateContext]
+ * collects PSI data, formats the markdown, and writes it to
+ * `.opencode/context/repo-structure.md`.
+ */
+sealed class ContextGenerationState {
+    /** Idle — no generation in progress. */
+    object Idle : ContextGenerationState()
+    /** Running — PSI collection / file write in progress. */
+    object Running : ContextGenerationState()
+    /** Success — the context file was written. */
+    object Success : ContextGenerationState()
+    /** Failed — an error occurred; [message] describes the cause. */
+    data class Failed(val message: String) : ContextGenerationState()
+}
+
+/**
  * Thin UI wrapper around [OpenCodeService].
  *
  * Owns only UI-specific state (control bar, permission prompts, etc.).
@@ -215,6 +233,14 @@ class ChatViewModel(
      *  Owned by [CompactionViewModel]; written by [computeSessionContext] via
      *  `compactionViewModel.setCheckpointReady()`. */
     val checkpointReady: StateFlow<Boolean> = compactionViewModel.checkpointReady
+
+    // --- Context generation state (TDD §11) ---
+    // Tracks the /generate-context slash command: Idle / Running / Success / Failed.
+    // The command collects PSI data via ContextGenerator, writes the markdown to
+    // .opencode/context/repo-structure.md via ContextFileWriter, and merges the
+    // instructions glob into .opencode/opencode.json via McpConfigWriter.
+    private val _contextGenerationState = MutableStateFlow<ContextGenerationState>(ContextGenerationState.Idle)
+    val contextGenerationState: StateFlow<ContextGenerationState> = _contextGenerationState.asStateFlow()
 
     private val initMutex = Mutex()
     private var initJob: Job? = null
@@ -869,6 +895,111 @@ class ChatViewModel(
 
     /** Reset compaction state to Idle (e.g., after user dismisses an error). */
     fun resetCompactionState() = compactionViewModel.resetCompactionState()
+
+    // --- Context generation (TDD §11) ---
+
+    /**
+     * Generate a repo-structure context file from PSI.
+     *
+     * Called by the `/generate-context` slash command. Collects PSI data via
+     * [com.opencode.acp.intelligence.context.ContextGenerator], writes the
+     * markdown to `.opencode/context/repo-structure.md` via
+     * [com.opencode.acp.intelligence.context.ContextFileWriter], and merges
+     * the instructions glob (`.opencode/context/**/*.md`) into
+     * `.opencode/opencode.json` via
+     * [com.opencode.acp.mcp.McpConfigWriter.writeInstructions] so the file is
+     * included in every subsequent prompt.
+     *
+     * Waits for smart mode (indexing) before collecting PSI; times out after
+     * 60s if indexing never completes. Updates [contextGenerationState]
+     * throughout so the UI can show progress / success / failure.
+     */
+    fun generateContext() {
+        scope.launch {
+            _contextGenerationState.value = ContextGenerationState.Running
+            try {
+                val contextGen = com.opencode.acp.intelligence.context.ContextGenerator(project)
+                // Wait for smart mode with its own timeout (30s max for indexing)
+                val smartModeReady = withTimeoutOrNull(30_000) {
+                    com.intellij.openapi.project.DumbService.getInstance(project).waitForSmartMode()
+                    true
+                } ?: false
+
+                if (!smartModeReady) {
+                    _contextGenerationState.value = ContextGenerationState.Failed("Timed out waiting for indexing to complete")
+                    notifyContextGeneration("Context generation failed: timed out waiting for indexing", isError = true)
+                    return@launch
+                }
+
+                // Generate context with remaining time budget (30s for PSI collection)
+                val content = withTimeoutOrNull(30_000) {
+                    contextGen.generate()
+                }
+                if (content == null) {
+                    _contextGenerationState.value = ContextGenerationState.Failed("Timed out during PSI collection")
+                    notifyContextGeneration("Context generation failed: timed out during PSI collection", isError = true)
+                    return@launch
+                }
+                val basePath = project.basePath
+                    ?: run {
+                        _contextGenerationState.value = ContextGenerationState.Failed("Project has no base path (default/remote project)")
+                        notifyContextGeneration("Context generation failed: project has no base path", isError = true)
+                        return@launch
+                    }
+                val writer = com.opencode.acp.intelligence.context.ContextFileWriter(
+                    java.nio.file.Path.of(basePath)
+                )
+                val success = writer.writeRepoStructure(content)
+                if (success) {
+                    // Also write the instructions glob to opencode.json so the
+                    // context file is included in every prompt.
+                    try {
+                        val settings = com.opencode.acp.config.settings.OpenCodeMcpSettingsState.getInstance()
+                        val configWriter = com.opencode.acp.mcp.McpConfigWriter(
+                            java.nio.file.Path.of(basePath),
+                            settings
+                        )
+                        configWriter.writeInstructions(com.opencode.acp.intelligence.CONTEXT_GLOB_PATTERN)
+                    } catch (e: Exception) {
+                        logger.warn(e) { "[ACP] Failed to write instructions glob" }
+                    }
+                    _contextGenerationState.value = ContextGenerationState.Success
+                    notifyContextGeneration("Context file generated: .opencode/context/repo-structure.md", isError = false)
+                } else {
+                    _contextGenerationState.value = ContextGenerationState.Failed("Failed to write context file")
+                    notifyContextGeneration("Context generation failed: could not write file", isError = true)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(e) { "[ACP] Context generation failed" }
+                _contextGenerationState.value = ContextGenerationState.Failed(e.message ?: "Unknown error")
+                notifyContextGeneration("Context generation failed: ${e.message ?: "Unknown error"}", isError = true)
+            }
+        }
+    }
+
+    private fun notifyContextGeneration(message: String, isError: Boolean) {
+        try {
+            val notification = com.intellij.notification.NotificationGroupManager.getInstance()
+                .getNotificationGroup("Sigil")
+                ?.createNotification(
+                    "Sigil",
+                    message,
+                    if (isError) com.intellij.notification.NotificationType.ERROR else com.intellij.notification.NotificationType.INFORMATION,
+                )
+            if (notification != null) {
+                com.intellij.notification.Notifications.Bus.notify(notification, project)
+            }
+        } catch (e: Exception) {
+            logger.warn(e) { "[ACP] Failed to show context generation notification" }
+        }
+    }
+
+    /** Reset context generation state to idle. */
+    fun resetContextGenerationState() {
+        _contextGenerationState.value = ContextGenerationState.Idle
+    }
 
     // --- Todos ---
 
