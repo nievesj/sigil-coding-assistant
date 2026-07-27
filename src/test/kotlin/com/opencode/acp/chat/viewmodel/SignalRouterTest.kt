@@ -491,4 +491,71 @@ class SignalRouterTest {
         collectorJob.cancel()
         router.stop()
     }
+
+    /**
+     * Regression guard: `start()` must set `stopped = false` SYNCHRONOUSLY
+     * (before returning), NOT inside the `scope.launch { ... }` coroutine.
+     *
+     * Background: The original implementation set `stopped = false` inside the
+     * `scope.launch` block. Because `scope.launch` is asynchronous, there was a
+     * window where `stopped` was still `true` (initial value or from a prior
+     * `stop()`) when a signal arrived between `start()` returning and the launch
+     * coroutine running. The `routeSignal` guard `if (stopped) return` would then
+     * drop the signal — most critically `StreamingCompleted`, whose loss leaves
+     * `_streamPhase` stuck in STREAMING forever (the "stuck animation" regression).
+     *
+     * This test verifies the fix: immediately after `start()` returns (BEFORE any
+     * `advanceUntilIdle()` or coroutine dispatcher advancement), a signal emitted
+     * to the flows is NOT dropped by the `stopped` guard. We assert that the signal
+     * produces its effects after a single `advanceUntilIdle()`, proving the guard
+     * was already cleared when the collector coroutine began running.
+     *
+     * Note: We cannot directly assert the private `stopped` flag, so we assert its
+     * observable consequence — a signal emitted right after `start()` (before
+     * `advanceUntilIdle`) is routed (not dropped) once the dispatcher runs.
+     */
+    @Test
+    fun `start sets stopped=false synchronously so signals before advanceUntilIdle are not dropped`() = runTest {
+        // replay=1 so a signal emitted before the collector starts is replayed
+        // to it when it attaches. The real service.signals uses replay=0 with
+        // SharingStarted.Eagerly (collector is always active), but in this test
+        // the router's collector launches asynchronously inside scope.launch,
+        // so we need replay to bridge the gap. The test verifies the `stopped`
+        // flag behavior, not SharedFlow replay semantics.
+        val signals = MutableSharedFlow<UiSignal>(replay = 1, extraBufferCapacity = 64)
+        val globalSignals = MutableSharedFlow<UiSignal>(replay = 1, extraBufferCapacity = 64)
+        val router = SignalRouter(this)
+        val effects = mutableListOf<SignalEffect>()
+        val collectorJob = launch {
+            router.effects.collect { effects.add(it) }
+        }
+
+        // Start the router. The fix requires `stopped = false` to be set BEFORE
+        // start() returns (synchronously), not inside the scope.launch coroutine.
+        router.start(signals, globalSignals)
+
+        // Emit a signal IMMEDIATELY — before any advanceUntilIdle(). If `stopped`
+        // were still true at the time the collector coroutine runs (because it was
+        // set inside the launch block which hadn't executed yet), the signal would
+        // be dropped by the `if (stopped) return` guard in routeSignal.
+        signals.emit(UiSignal.StreamingCompleted("msg_1", emptyList(), naturalCompletion = true))
+
+        // Now advance the dispatcher so the launch coroutine + collectors run.
+        advanceUntilIdle()
+
+        // The signal must have been routed (not dropped). If `stopped` had not been
+        // cleared synchronously, the effects list would be empty (signal dropped).
+        effects shouldBe listOf(
+            SignalEffect.SetStreamPhaseIdle("msg_1"),
+            SignalEffect.NotifyResponseComplete("msg_1"),
+            SignalEffect.ComputeSessionContext(null),
+            SignalEffect.FetchTodos(null),
+            SignalEffect.LoadSessions(false),
+            SignalEffect.DrainQueue,
+            SignalEffect.RefreshReviewFiles,
+        )
+
+        collectorJob.cancel()
+        router.stop()
+    }
 }

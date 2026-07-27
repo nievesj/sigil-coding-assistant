@@ -70,8 +70,14 @@ class SessionState(
     val streamingText: StateFlow<String> get() = textStreamingState.streamingText
 
     /** UI signals for this session.
-     *  Uses replay = 0 (NOT replay = 1) to avoid stale signal replay on session switch. */
-    private val _signals = MutableSharedFlow<UiSignal>(replay = 0, extraBufferCapacity = 15)
+     *  Uses replay = 0 (NOT replay = 1) to avoid stale signal replay on session switch.
+     *  Buffer capacity 64 matches SessionManager._allSessionSignals (SessionManager.kt:217).
+     *  A smaller buffer (previously 15) could fill under burst load (e.g. many tool-call
+     *  pills + StreamingCompleted emitted back-to-back), causing tryEmit to silently drop
+     *  StreamingCompleted — leaving _streamPhase stuck in STREAMING forever (the
+     *  "stuck animation" regression). 64 gives enough headroom for burst emissions while
+     *  a slow collector drains the buffer. */
+    private val _signals = MutableSharedFlow<UiSignal>(replay = 0, extraBufferCapacity = 64)
     val signals: SharedFlow<UiSignal> = _signals.asSharedFlow()
 
     /** Internal accessor for SseEventPipeline to emit signals without exposing _signals. */
