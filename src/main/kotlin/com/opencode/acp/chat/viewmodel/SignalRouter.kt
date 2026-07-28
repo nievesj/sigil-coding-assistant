@@ -95,6 +95,13 @@ class SignalRouter(
      * ordering: old collectors finish → new collectors start.
      */
     fun start(signals: Flow<UiSignal>, globalSignals: Flow<UiSignal>) {
+        // Set stopped = false SYNCHRONOUSLY so signals arriving before the
+        // scope.launch block runs are NOT dropped by the routeSignal guard.
+        // If this were set inside the launch coroutine, there would be a window
+        // where `stopped` is still true (initial value or from a prior stop())
+        // and a StreamingCompleted signal arriving in that window would be
+        // silently dropped — leaving _streamPhase stuck in STREAMING forever.
+        stopped = false
         // Cancel any existing jobs before launching new ones. Without this guard,
         // a double-start would orphan the first pair of collect jobs (still running,
         // producing duplicate effects from the old Flow references).
@@ -104,7 +111,6 @@ class SignalRouter(
         // The cancel+join+relaunch runs in a single coroutine so the suspend
         // join() is in a coroutine context and the relaunch happens after join.
         scope.launch {
-            stopped = false
             activeJob?.cancel()
             globalJob?.cancel()
             activeJob?.join()

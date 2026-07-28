@@ -50,6 +50,8 @@ data class SlashCommand(
     val args: String = ""
 )
 
+// First non-escape char determines palette: '/' -> slash, '$' -> skill. See TDD section 10 Q7.
+
 /**
  * Slash command palette popup. Shown when the user types `/` at the start of the input.
  * Filtering and selection are owned by the caller (InputArea); this composable only renders.

@@ -28,6 +28,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.dp
 import com.opencode.acp.chat.model.PartState
+import com.opencode.acp.chat.markdown.clampOrderedLists
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import org.jetbrains.jewel.foundation.ExperimentalJewelApi
@@ -129,7 +130,7 @@ fun CollapsibleThinkingPill(
         if (expanded && content.isNotBlank()) {
             val markdownProcessor = remember { MarkdownProcessor() }
             val parsedBlocks = remember(content) {
-                markdownProcessor.processMarkdownDocument(content)
+                clampOrderedLists(markdownProcessor.processMarkdownDocument(content))
             }
             Markdown(
                 markdownBlocks = parsedBlocks,

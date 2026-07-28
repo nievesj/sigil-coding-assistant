@@ -10,6 +10,7 @@ import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.collections.shouldHaveSize
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -656,5 +657,159 @@ class StreamingLifecycleManagerTest {
         // And the content must be healed (closing "**" appended).
         val textPart = messages.value[msgId]!!.parts.values.filterIsInstance<MessagePart.Text>().single()
         textPart.content shouldBe "Intro **bold** text with **unclosed**"
+    }
+
+    // ── emitStreamingCompleted: buffer-full retry guard ──────────────────────
+
+    /**
+     * Regression guard: when the `signals` SharedFlow buffer is full,
+     * `emitStreamingCompleted` must NOT set `streamingCompletedEmitted = true`.
+     *
+    * Background: The original implementation set the guard flag BEFORE calling
+    * `tryEmit`. If `tryEmit` failed (buffer full), the flag was already `true`,
+    * so the SessionIdle/Error backstop retry path (which calls
+    * `emitStreamingCompleted` again) would hit the early-return guard and the
+    * signal was permanently lost — leaving `_streamPhase` stuck in STREAMING
+    * forever (the "stuck animation" regression).
+     *
+     * The fix: try to emit FIRST, only set the flag if emission succeeded. This
+     * test verifies that on a failed `tryEmit`, the flag stays `false` so a retry
+     * is possible.
+     *
+    * To simulate a full buffer, we construct a `StreamingLifecycleManager` with
+    * a `signals` SharedFlow whose `extraBufferCapacity` is 0 AND `replay` is 0
+    * AND there is no active collector. With no collector and no buffer slots,
+    * `tryEmit` returns `false` (the value cannot be stored or delivered).
+     *
+     * IMPORTANT SharedFlow semantics: `tryEmit` returns `true` (not `false`)
+     * when there is NO subscriber — the value is silently dropped, not "buffer
+     * full." To force `tryEmit` to return `false`, we need a subscriber that is
+     * suspended (never collects) AND `extraBufferCapacity = 0`. With a slow
+     * subscriber and no buffer slots, `tryEmit` cannot deliver or buffer the
+     * value, so it returns `false`.
+     */
+    @Test
+    fun `emitStreamingCompleted with full buffer does not set streamingCompletedEmitted flag`() = runTest {
+        val msgId = "msg_full_buffer"
+        messageMap.add(ChatMessage(
+            id = msgId, role = MessageRole.ASSISTANT, parts = linkedMapOf(),
+            isStreaming = true, state = MessageState.Created, timestamp = 1_000_000L,
+        ))
+        turnLifecycleState.activeMessageId = msgId
+        turnLifecycleState.isStreaming = true
+
+        // Construct a signals flow with NO buffer and NO replay.
+        val fullSignals = MutableSharedFlow<UiSignal>(replay = 0, extraBufferCapacity = 0)
+
+        // Launch a subscriber that suspends forever (never collects). With a slow
+        // subscriber and extraBufferCapacity=0, tryEmit returns false because it
+        // cannot deliver to the suspended subscriber and has no buffer slots.
+        val slowSubscriber = launch {
+            fullSignals.collect { /* never reaches here — suspended on first emit */ }
+        }
+        advanceUntilIdle() // let the subscriber start and suspend on collect
+
+        val lifecycle = StreamingLifecycleManager(
+            turnLifecycleState = turnLifecycleState,
+            toolCallState = toolCallState,
+            stateLock = stateLock,
+            scope = scope,
+            messageMap = messageMap,
+            textStreaming = textStreaming,
+            signals = fullSignals,
+            completeResponseDeferred = { },
+            logger = logger,
+        )
+
+        // Attempt to emit — should fail (slow subscriber, no buffer slots).
+        lifecycle.emitStreamingCompleted(msgId)
+        advanceUntilIdle()
+
+        // The flag MUST still be false — the signal was dropped, so a retry path
+        // (SessionIdle/Error backstop) can re-attempt. If the flag were set to true
+        // on a failed emit, the retry would early-return and the signal would be
+        // permanently lost (the "stuck animation" bug).
+        turnLifecycleState.streamingCompletedEmitted shouldBe false
+
+        // Clean up the slow subscriber.
+        slowSubscriber.cancel()
+    }
+
+    /**
+     * Regression guard: after a failed `emitStreamingCompleted` (buffer full),
+     * a subsequent call after the buffer drains MUST succeed and set the flag.
+     *
+     * This verifies the retry path works: the SessionIdle/Error backstop calls
+     * `emitStreamingCompleted` again, and because the flag was NOT set on the
+     * first failed attempt, the second call proceeds and succeeds once the
+     * buffer has capacity (e.g. a collector has drained it).
+     *
+     * Test sequence:
+     *   1. Use a no-buffer flow with a slow subscriber → first emit fails, flag stays false.
+     *   2. Cancel the slow subscriber and swap to a flow with capacity (simulating
+     *      buffer drain / subscriber attach).
+     *   3. Second emit succeeds, flag set to true, signal delivered.
+     */
+    @Test
+    fun `emitStreamingCompleted retries successfully after buffer drain`() = runTest {
+        val msgId = "msg_retry_after_drain"
+        messageMap.add(ChatMessage(
+            id = msgId, role = MessageRole.ASSISTANT, parts = linkedMapOf(),
+            isStreaming = true, state = MessageState.Created, timestamp = 1_000_000L,
+        ))
+        turnLifecycleState.activeMessageId = msgId
+        turnLifecycleState.isStreaming = true
+
+        // Step 1: a "full" signals flow (no buffer) with a slow subscriber — tryEmit fails.
+        val fullSignals = MutableSharedFlow<UiSignal>(replay = 0, extraBufferCapacity = 0)
+        val slowSubscriber = launch {
+            fullSignals.collect { /* suspended forever */ }
+        }
+        advanceUntilIdle() // let the subscriber start and suspend
+
+        val lifecycleWithFull = StreamingLifecycleManager(
+            turnLifecycleState = turnLifecycleState,
+            toolCallState = toolCallState,
+            stateLock = stateLock,
+            scope = scope,
+            messageMap = messageMap,
+            textStreaming = textStreaming,
+            signals = fullSignals,
+            completeResponseDeferred = { },
+            logger = logger,
+        )
+        lifecycleWithFull.emitStreamingCompleted(msgId)
+        advanceUntilIdle()
+        // Flag must still be false (failed emit did not set it).
+        turnLifecycleState.streamingCompletedEmitted shouldBe false
+
+        // Step 2: cancel the slow subscriber (simulates buffer drain) and swap to
+        // a flow with capacity. The retry path uses a flow that can accept the emission.
+        slowSubscriber.cancel()
+        val drainedSignals = MutableSharedFlow<UiSignal>(replay = 1, extraBufferCapacity = 64)
+        val lifecycleWithDrained = StreamingLifecycleManager(
+            turnLifecycleState = turnLifecycleState,
+            toolCallState = toolCallState,
+            stateLock = stateLock,
+            scope = scope,
+            messageMap = messageMap,
+            textStreaming = textStreaming,
+            signals = drainedSignals,
+            completeResponseDeferred = { },
+            logger = logger,
+        )
+
+        // Step 3: retry — should succeed now that the buffer has capacity.
+        lifecycleWithDrained.emitStreamingCompleted(msgId)
+        advanceUntilIdle()
+
+        // Flag now set to true (successful emit).
+        turnLifecycleState.streamingCompletedEmitted shouldBe true
+
+        // The signal was delivered.
+        val completed = drainedSignals.replayCache.filterIsInstance<UiSignal.StreamingCompleted>()
+        completed shouldHaveSize 1
+        completed[0].messageId shouldBe msgId
+        completed[0].naturalCompletion shouldBe true
     }
 }

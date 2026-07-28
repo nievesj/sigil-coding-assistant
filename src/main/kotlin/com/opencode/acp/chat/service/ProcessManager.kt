@@ -129,6 +129,26 @@ class ProcessManager(private val scope: CoroutineScope) {
             configWriter.clearAllEntries()
         }
 
+        // Bridge JetBrains AI Assistant skills to OpenCode.
+        // Always call writeSkillPaths (even if empty) to evict stale paths from
+        // old IDE versions. writeSkillPaths handles the empty case by
+        // preserving user paths and evicting plugin-managed paths.
+        // This runs OUTSIDE the MCP enable/disable guard — skill bridging is
+        // independent of MCP configuration.
+        val skillConfigWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), mcpSettings)
+        val skillPaths = com.opencode.acp.skill.JetBrainsSkillBridge.detectSkillPaths()
+        skillConfigWriter.writeSkillPaths(skillPaths)
+
+        // Extract bundled skills (e.g., psi-code-intelligence) to .opencode/skills/
+        // BEFORE launching the binary. The OpenCode server discovers skills from
+        // .opencode/skills/ on startup. This runs unconditionally — skills are
+        // independent of MCP/pruner settings.
+        val skillExtractor = com.opencode.acp.intelligence.SkillResourceExtractor(java.nio.file.Path.of(projectBasePath))
+        val skillsExtracted = skillExtractor.extractAll()
+        if (!skillsExtracted) {
+            logger.warn { "[ACP] ProcessManager.initialize: failed to extract bundled skills — some skills may be unavailable" }
+        }
+
         // Extract sigil-pruner.ts and write pruner config BEFORE launching the binary.
         // The OpenCode server loads plugins from .opencode/plugins/ on startup and
         // the TS plugin reads .opencode/sigil-pruner.json on load.
@@ -221,12 +241,17 @@ class ProcessManager(private val scope: CoroutineScope) {
 
         // TOCTOU retry: the port we chose may have been taken between findAvailablePort's
         // test bind and the OpenCode server's actual bind. If the binary was launched and
-        // the health check timed out (process still alive, not ProcessExited), try ONE
-        // more port before giving up. This handles the race described in findAvailablePort.
+        // the health check timed out (process still alive, not ProcessExited), try up to
+        // 3 alternate ports before giving up. On busy dev machines, multiple ports may
+        // be taken between findAvailablePort's test bind and the OpenCode server's actual
+        // bind. This handles the race described in findAvailablePort.
         if (launchedBinaryPath != null && checkProcessAlive() == null) {
-            val retryPort = findAvailablePort(port + 1)
-            if (retryPort != port) {
-                logger.warn { "[ACP] ProcessManager.initialize: first launch health check timed out on port $port — retrying on port $retryPort (TOCTOU retry)" }
+            var retrySucceeded = false
+            for (retryAttempt in 1..3) {
+                val retryPort = findAvailablePort(port + retryAttempt)
+                if (retryPort == port) continue // no alternate port available
+
+                logger.warn { "[ACP] ProcessManager.initialize: TOCTOU retry $retryAttempt on port $retryPort" }
                 // Kill the current process and relaunch on the new port
                 killProcess(openCodeProcess)
                 openCodeProcess = null
@@ -240,15 +265,16 @@ class ProcessManager(private val scope: CoroutineScope) {
                 )
                 openCodeClient = retryClient
                 val relaunched = launchOpenCodeBinary(settings.binaryPath)
-                if (relaunched && pollHealthCheck(retryClient, 15_000L, "attempt 2 (TOCTOU retry)")) {
+                if (relaunched && pollHealthCheck(retryClient, 15_000L, "TOCTOU retry $retryAttempt")) {
                     _connectionErrorReason.value = null
                     _connectionState.value = ConnectionState.CONNECTED
                     initialized = true
                     return true
                 }
-                logger.warn { "[ACP] ProcessManager.initialize: TOCTOU retry on port $retryPort also failed" }
-            } else {
-                logger.warn { "[ACP] ProcessManager.initialize: no alternate port available for TOCTOU retry (tried ${port + 1}..${port + MAX_PORT_ATTEMPTS})" }
+                logger.warn { "[ACP] ProcessManager.initialize: TOCTOU retry $retryAttempt on port $retryPort failed" }
+            }
+            if (!retrySucceeded) {
+                logger.warn { "[ACP] ProcessManager.initialize: all TOCTOU retries failed (tried ${port + 1}..${port + 3})" }
             }
         }
 
@@ -446,21 +472,40 @@ class ProcessManager(private val scope: CoroutineScope) {
         try {
             val pid = process.pid()
             if (System.getProperty("os.name").lowercase().contains("windows")) {
-                // Use waitFor with timeout — taskkill can hang if the process tree is
-                // large or has stuck child processes. Without a timeout, this blocks
-                // the EDT indefinitely during IDE restart/plugin update.
-                val taskkill = Runtime.getRuntime().exec(arrayOf("taskkill", "/F", "/T", "/PID", pid.toString()))
-                if (taskkill.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
-                    val exitCode = taskkill.exitValue()
-                    if (exitCode != 0) {
-                        val stderr = try { taskkill.errorStream.bufferedReader().readText().take(200) } catch (_: Exception) { "" }
-                        logger.warn { "[ACP] taskkill exited with code $exitCode for PID $pid — stderr: $stderr" }
-                        // Still fall through to destroyForcibly as a fallback
+                // Use ProcessHandle.destroyForcibly() (Java API) to avoid PATH injection
+                // risk from Runtime.exec("taskkill") which resolves via system PATH.
+                // ProcessHandle is available since Java 9 and doesn't shell out.
+                try {
+                    val handle = ProcessHandle.of(pid)
+                    if (handle.isPresent) {
+                        handle.get().descendants().forEach { it.destroyForcibly() }
+                        handle.get().destroyForcibly()
+                        // Wait briefly for the process to die
+                        // ProcessHandle has no waitFor(); use process.waitFor() instead
+                        // since we still have the Process reference.
+                        if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                            logger.warn { "[ACP] ProcessHandle.destroyForcibly() did not terminate PID $pid within 5s — falling back to taskkill" }
+                            // Fallback: use taskkill with absolute path to avoid PATH injection
+                            val taskkillPath = java.io.File(System.getenv("SystemRoot") ?: "C:\\Windows", "System32\\taskkill.exe").path
+                            val taskkill = Runtime.getRuntime().exec(arrayOf(taskkillPath, "/F", "/T", "/PID", pid.toString()))
+                            if (taskkill.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                                val exitCode = taskkill.exitValue()
+                                if (exitCode != 0) {
+                                    logger.warn { "[ACP] taskkill exited with code $exitCode for PID $pid" }
+                                    process.destroyForcibly()
+                                }
+                            } else {
+                                logger.warn { "[ACP] taskkill timed out after 5s for PID $pid — falling back to destroyForcibly" }
+                                taskkill.destroyForcibly()
+                                process.destroyForcibly()
+                            }
+                        }
+                    } else {
+                        // Process already dead or not found
                         process.destroyForcibly()
                     }
-                } else {
-                    logger.warn { "[ACP] taskkill timed out after 5s for PID $pid — falling back to destroyForcibly" }
-                    taskkill.destroyForcibly()
+                } catch (e: Exception) {
+                    logger.warn(e) { "[ACP] ProcessHandle kill failed for PID $pid — falling back to destroyForcibly" }
                     process.destroyForcibly()
                 }
             } else {

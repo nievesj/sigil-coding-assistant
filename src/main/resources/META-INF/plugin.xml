@@ -71,6 +71,11 @@
         <module name="intellij.libraries.skiko"/>
     </dependencies>
 
+    <!-- Optional: MCP Server plugin for code intelligence toolsets.
+         When present, PSI code intelligence tools are exposed to the opencode agent.
+         When absent, the plugin works normally — tools are simply not registered. -->
+    <depends config-file="plugin-mcp.xml" optional="true">com.intellij.mcpServer</depends>
+
     <extensions defaultExtensionNs="com.intellij">
         <applicationConfigurable
             parentId="tools"
@@ -95,6 +100,12 @@
             instance="com.opencode.acp.config.settings.OpenCodeContextConfigurable"
             id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.context"
             displayName="Context"/>
+
+        <applicationConfigurable
+            parentId="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
+            instance="com.opencode.acp.intelligence.OpenCodePsiToolsConfigurable"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.psi"
+            displayName="PSI Tools"/>
 
         <toolWindow
             id="Sigil - Coding Assistant"

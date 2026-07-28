@@ -234,6 +234,14 @@ data class CommandInfo(
 )
 
 @Serializable
+data class SkillInfo(
+    val name: String,
+    val description: String = "",
+    val location: String = "",
+    val content: String = ""
+)
+
+@Serializable
 data class ConfigData(
     val model: String? = null,
     val agent: String? = null,

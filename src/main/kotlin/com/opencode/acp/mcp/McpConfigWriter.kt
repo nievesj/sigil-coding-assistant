@@ -13,6 +13,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.put
 import java.nio.file.Files
 import java.nio.file.Path
@@ -38,7 +39,11 @@ private val logger = KotlinLogging.logger {}
  */
 class McpConfigWriter(
     private val projectBasePath: Path,
-    private val settings: OpenCodeMcpSettingsState
+    private val settings: OpenCodeMcpSettingsState,
+    /** Predicate identifying plugin-managed skill paths for eviction in [writeSkillPaths].
+     *  Defaults to [com.opencode.acp.skill.JetBrainsSkillBridge.isPluginManagedPath].
+     *  Injectable for testing and to avoid a hard cross-package dependency. */
+    private val isPluginManagedPath: (String) -> Boolean = com.opencode.acp.skill.JetBrainsSkillBridge::isPluginManagedPath
 ) {
 
     /** Serializes all writeConfig calls to prevent concurrent read-modify-write races.
@@ -52,6 +57,80 @@ class McpConfigWriter(
         /** File-level locks keyed by canonical project path — prevents concurrent writes
          *  from multiple McpConfigWriter instances targeting the same project. */
         private val projectLocks = java.util.concurrent.ConcurrentHashMap<String, ReentrantLock>()
+
+        /**
+         * Flatten a recursive glob pattern by removing recursive glob segments (double-star followed by slash).
+         * Used for the "covers" check in [mergeInstructions].
+         *
+         * E.g., a recursive glob like `.opencode/context/RECURSIVE.md` becomes `.opencode/context/FLAT.md`
+         * (where RECURSIVE means double-star-slash-prefix, FLAT means no recursion prefix).
+         *
+         * Limitation: this replaces ALL double-star-slash occurrences, so a multi-level
+         * recursive glob becomes fully flattened. This is correct for the current single
+         * use case (CONTEXT_GLOB_PATTERN) but may produce incorrect results for multi-level
+         * recursive globs if reused elsewhere.
+         */
+        private fun flattenRecursiveGlob(glob: String): String = glob.replace("**/", "")
+
+        /**
+         * Merge the plugin's context-file glob into the existing `instructions` array.
+         *
+         * Contract:
+         * - If [ourGlob] is already present (exact string match), return [existing] unchanged.
+         * - If [existing] contains a glob that covers [ourGlob] (e.g., a flat context glob
+         *   covers a recursive context glob), return [existing] unchanged.
+         *  A glob A covers glob B if `flattenRecursiveGlob(B).startsWith(flattenRecursiveGlob(A))`.
+         * - Otherwise, append [ourGlob] to the array.
+         * - Preserve all existing entries regardless of type (string or object).
+         *
+         * @param existing The existing instructions JsonArray (may contain strings and objects).
+         * @param ourGlob The glob pattern to merge in (e.g., ".opencode/context/**/*.md").
+         * @return The merged JsonArray.
+         */
+        fun mergeInstructions(existing: JsonArray, ourGlob: String): JsonArray {
+            // Extract string entries from the existing array (skip non-string elements like objects).
+            val existingStrings = existing.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+
+            // 1. Exact match — already present.
+            if (ourGlob in existingStrings) {
+                return existing
+            }
+
+            // 2. Covers check — an existing glob covers ourGlob.
+            val normalizedOurs = flattenRecursiveGlob(ourGlob)
+            for (existingGlob in existingStrings) {
+                val normalizedExisting = flattenRecursiveGlob(existingGlob)
+                // A glob A covers glob B if A's directory prefix is a prefix of B's
+                // (using startsWith on the directory portion). This is a prefix match,
+                // not a proper parent-directory check — a glob like ".opencode" would
+                // match ".opencode-evil/" via startsWith. This is acceptable for the
+                // current use case (CONTEXT_GLOB_PATTERN) but may need tightening if
+                // reused for arbitrary globs.
+                // Check: does normalizedOurs start with the directory portion of
+                // normalizedExisting (everything up to the last path segment)?
+                val existingDir = normalizedExisting.substringBeforeLast("/", "")
+                if (existingDir.isEmpty()) {
+                    // Existing glob has no directory — only covers if it's the same glob
+                    // (e.g., "README.md" does NOT cover ".opencode/context/**/*.md")
+                    if (normalizedOurs == normalizedExisting) {
+                        return existing
+                    }
+                    // No directory prefix to match — skip this entry
+                    continue
+                }
+                if (normalizedOurs.startsWith(existingDir + "/") || normalizedOurs == normalizedExisting) {
+                    return existing
+                }
+            }
+
+            // 3. Append ourGlob, preserving all existing entries.
+            return buildJsonArray {
+                for (element in existing) {
+                    add(element)
+                }
+                add(JsonPrimitive(ourGlob))
+            }
+        }
     }
 
     /**
@@ -479,6 +558,105 @@ class McpConfigWriter(
         }
         if (success) {
             logger.info { "[ACP] McpConfigWriter: cleared plugin MCP entries" }
+        }
+        return success
+    }
+
+    /**
+     * Write skill paths to the "skills.paths" array in opencode.json.
+     *
+     * Implements stale-path eviction: overwrites the plugin-managed
+     * subset of skills.paths (paths matching JetBrainsSkillBridge.isPluginManagedPath)
+     * with [paths], while preserving user-added paths and skills.urls.
+     *
+     * Plugin-managed paths from previous writes (e.g., from an old IDE version)
+     * are evicted. User-added paths (custom paths not matching the plugin-managed
+     * pattern) are always preserved.
+     *
+     * Preserves skills.urls and all other config keys including $schema
+     * (writeConfig handles $schema — do not strip it here).
+     *
+     * @param paths Plugin-managed skill directory paths to write (from detectSkillPaths)
+     * @return true if config was written successfully, false on error
+     */
+    fun writeSkillPaths(paths: List<String>): Boolean {
+        val success = writeConfig { config ->
+            val existingSkills = config["skills"]?.jsonObject
+            val existingUrls = existingSkills?.get("urls")?.jsonArray
+            val existingPaths = existingSkills?.get("paths")?.jsonArray
+                ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                ?: emptyList()
+
+            // Partition existing paths into user-added (preserve) and
+            // plugin-managed (evict). Plugin-managed paths are fully
+            // determined at runtime by detectSkillPaths() — there is no
+            // reason to keep stale ones from old IDE versions.
+            val userPaths = existingPaths.filter { !isPluginManagedPath(it) }
+            val finalPaths = (userPaths + paths).distinct()
+
+            // Build the new config. Preserve all keys except "skills" (rebuilt below).
+            buildJsonObject {
+                for ((key, value) in config) {
+                    if (key != "skills") {
+                        put(key, value)
+                    }
+                }
+                // Only write the "skills" section if there are paths, urls, or
+                // unknown keys to preserve.
+                if (finalPaths.isNotEmpty() || existingUrls != null || existingSkills != null) {
+                    put("skills", buildJsonObject {
+                        // Preserve unknown keys from the existing skills object
+                        // (e.g., future schema additions, user-added custom keys).
+                        if (existingSkills != null) {
+                            for ((key, value) in existingSkills) {
+                                if (key != "paths" && key != "urls") {
+                                    put(key, value)
+                                }
+                            }
+                        }
+                        if (finalPaths.isNotEmpty()) {
+                            put("paths", buildJsonArray {
+                                finalPaths.forEach { add(JsonPrimitive(it)) }
+                            })
+                        }
+                        // Preserve existing urls if present
+                        if (existingUrls != null) {
+                            put("urls", existingUrls)
+                        }
+                    })
+                }
+            }
+        }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: wrote ${paths.size} skill path(s)" }
+        }
+        return success
+    }
+
+    /**
+     * Write the context-file instructions glob to `.opencode/opencode.json`.
+     *
+     * Merges [glob] into the existing `instructions` array with dedup.
+     * Preserves all existing config keys.
+     *
+     * @param glob The glob pattern to add (e.g., ".opencode/context/**/*.md").
+     * @return true if the config was written successfully, false otherwise.
+     */
+    fun writeInstructions(glob: String): Boolean {
+        val success = writeConfig { config ->
+            val existingInstructions = config["instructions"]?.jsonArray ?: buildJsonArray {}
+            val merged = mergeInstructions(existingInstructions, glob)
+            buildJsonObject {
+                for ((key, value) in config) {
+                    if (key != "instructions" && key != "\$schema") {
+                        put(key, value)
+                    }
+                }
+                put("instructions", merged)
+            }
+        }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: wrote instructions glob: $glob" }
         }
         return success
     }

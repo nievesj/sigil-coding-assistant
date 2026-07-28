@@ -3,6 +3,7 @@ package com.opencode.acp.chat.service
 import com.opencode.acp.adapter.AgentInfo
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.adapter.ProviderResponse
+import com.opencode.acp.adapter.SkillInfo
 import com.opencode.acp.chat.model.AttachedFile
 import com.opencode.acp.chat.model.ChatMessage
 import com.opencode.acp.chat.model.ClearAllResult
@@ -159,6 +160,7 @@ interface OpenCodeContextApi {
     fun isCheckpointReady(): Boolean
     suspend fun fetchTodos()
     suspend fun fetchAvailableCommands(): List<SlashCommand>
+    suspend fun fetchAvailableSkills(force: Boolean = false): List<SkillInfo>
     suspend fun executeServerCommand(commandName: String, args: String = "")
     suspend fun listAgents(): List<AgentInfo>
     suspend fun listProviders(): ProviderResponse?

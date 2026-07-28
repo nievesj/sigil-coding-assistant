@@ -49,6 +49,7 @@ dependencies {
     testImplementation(libs.junit.api)
     testImplementation(libs.junit.engine)
     testImplementation(libs.junit.params)
+    testImplementation(libs.junit4)
     testImplementation(libs.kotest.runner)
     testImplementation(libs.kotest.assertions)
     testImplementation(libs.kotlinx.coroutines.test)
@@ -68,6 +69,23 @@ dependencies {
         bundledModule("intellij.platform.jewel.markdown.extensions.gfmAlerts")
         bundledModule("intellij.platform.jewel.markdown.extensions.gfmStrikethrough")
         bundledModule("intellij.platform.jewel.markdown.extensions.autolink")
+
+        // MCP Server plugin — provides McpToolset EP for PSI code intelligence tools.
+        // Optional: plugin works without it; toolsets are registered only when present.
+        bundledPlugin("com.intellij.mcpServer")
+
+        // Kotlin plugin — provides Kotlin Analysis API (KaSession) for resolving
+        // inferred Kotlin types in file_structure and find_symbol signatures.
+        bundledPlugin("org.jetbrains.kotlin")
+
+        // Test framework for PSI integration tests (LightPlatformTestCase).
+        // Per AGENTS.md: enables IntelliJ application context bootstrap for tests.
+        // NOTE: The IntelliJ test framework registers a JUnit5TestSessionListener
+        // via ServiceLoader that crashes the Gradle JUnit Platform executor. We
+        // shadow it with an empty service file in test resources to prevent the
+        // crash, then bootstrap the application context manually in PSI test
+        // setup via TestApplication.
+        testFramework(org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform)
     }
 }
 
@@ -190,6 +208,9 @@ tasks.withType<Test> {
     jvmArgs = buildList {
         add("-Dskiko.renderApi=SOFTWARE")
         add("-Djava.awt.headless=true")
+        // PSI integration tests are tagged @Tag("psi") and run in a separate
+        // Gradle task (testPsi) to isolate their heavier JVM startup from the
+        // main test suite. The main `test` task excludes the "psi" tag.
         // NOTE: ComposePanel-based UI tests are @Disabled because ComposePanel.addNotify()
         // triggers androidx.lifecycle → MainDispatcherChecker → IntelliJ's
         // ImmediateEdtCoroutineDispatcher → ModalityState, which requires
@@ -198,4 +219,27 @@ tasks.withType<Test> {
         // See ComposePanelTestBase.kt for details.
     }
     maxParallelForks = 1
+}
+
+// PSI integration tests use @Tag("psi") and run in a dedicated task to isolate
+// the heavier IntelliJ Platform test-framework JVM startup from the main suite.
+// The main `test` task excludes the "psi" tag; `testPsi` includes only it.
+tasks.named<Test>("test") {
+    useJUnitPlatform {
+        excludeTags("psi")
+    }
+}
+
+val testPsi by tasks.registering(Test::class) {
+    group = "verification"
+    description = "Runs PSI integration tests (tagged @Tag(\"psi\")) requiring the IntelliJ Platform test framework."
+    useJUnitPlatform {
+        includeTags("psi")
+    }
+    jvmArgs = buildList {
+        add("-Dskiko.renderApi=SOFTWARE")
+        add("-Djava.awt.headless=true")
+    }
+    maxParallelForks = 1
+    shouldRunAfter(tasks.named("test"))
 }

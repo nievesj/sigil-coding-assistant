@@ -169,9 +169,20 @@ internal class StreamingLifecycleManager(
     /** Emit StreamingStarted signal once per turn (idempotent via turnLifecycleState.streamingStartedEmitted). */
     fun emitStreamingStartedIfNeeded(msgId: String) {
         if (!turnLifecycleState.streamingStartedEmitted) {
-            turnLifecycleState.streamingStartedEmitted = true
-            messageMap.update(msgId) { it.copy(state = MessageState.Streaming) }
-            signals.tryEmit(UiSignal.StreamingStarted(msgId))
+            // Try to emit FIRST. Only set the flag + update message state if emission
+            // succeeded. If the buffer is full, tryEmit returns false and we leave
+            // the flag false so a retry path can re-attempt. Setting the flag before
+            // tryEmit would block all retries and leave the UI stuck in the prior state.
+            val emitted = signals.tryEmit(UiSignal.StreamingStarted(msgId))
+            if (emitted) {
+                turnLifecycleState.streamingStartedEmitted = true
+                messageMap.update(msgId) { it.copy(state = MessageState.Streaming) }
+            } else {
+                // Buffer full — signal DROPPED. Do NOT set the flag so a retry path
+                // can re-attempt. Without this, the message state would never advance
+                // to Streaming and the UI would not reflect the active stream.
+                logger.error { "[ACP] emitStreamingStartedIfNeeded: signals buffer full — StreamingStarted DROPPED (msgId=$msgId)." }
+            }
         }
     }
 
@@ -179,7 +190,22 @@ internal class StreamingLifecycleManager(
      *  @param naturalCompletion true for natural end (Stop/idle/debounce), false for abort/error/timeout. */
     fun emitStreamingCompleted(msgId: String, naturalCompletion: Boolean = true) {
         if (turnLifecycleState.streamingCompletedEmitted) return
-        turnLifecycleState.streamingCompletedEmitted = true
-        signals.tryEmit(UiSignal.StreamingCompleted(msgId, toolCallState.pendingFileChanges.toList(), naturalCompletion))
+        // Try to emit FIRST. Only set the flag if emission succeeded. If the buffer
+        // is full, tryEmit returns false and we leave the flag false so a retry
+        // path (SessionIdle backstop, Error backstop) can re-attempt. Setting the
+        // flag before tryEmit would block all retries — the signal would be
+        // permanently lost and _streamPhase would stay STREAMING forever (the
+        // "stuck animation" bug).
+        val emitted = signals.tryEmit(
+            UiSignal.StreamingCompleted(msgId, toolCallState.pendingFileChanges.toList(), naturalCompletion)
+        )
+        if (emitted) {
+            turnLifecycleState.streamingCompletedEmitted = true
+        } else {
+            // Buffer full — signal DROPPED. Do NOT set the flag so a retry path
+            // (SessionIdle backstop, Error backstop) can re-attempt. Without this,
+            // _streamPhase stays STREAMING forever (the "stuck animation" bug).
+            logger.error { "[ACP] emitStreamingCompleted: signals buffer full — StreamingCompleted DROPPED (msgId=$msgId). UI will stay stuck in STREAMING until SessionIdle/Error backstop retries." }
+        }
     }
 }
