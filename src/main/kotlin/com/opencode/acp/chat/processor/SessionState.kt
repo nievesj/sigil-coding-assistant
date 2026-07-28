@@ -280,8 +280,30 @@ class SessionState(
      * Without the fallback, [abortStreaming] would no-op and the assistant message would be
      * stuck in isStreaming=true forever (invisible but never finalized — a "ghost message").
      */
-    fun abortStreamingWithFallback(reason: String, fallbackMessageId: String) =
-        messageLifecycle.abortStreamingWithFallback(reason, fallbackMessageId)
+    fun abortStreamingWithFallback(reason: String, fallbackMessageId: String) {
+        try {
+            messageLifecycle.abortStreamingWithFallback(reason, fallbackMessageId)
+        } finally {
+            // Defensive backup: complete responseDeferred directly in case the signal
+            // buffer is full and the StreamingCompleted emission was dropped by tryEmit,
+            // OR in case messageLifecycle.abortStreamingWithFallback() threw an exception.
+            // CompletableDeferred.complete() is idempotent so this is safe. Mirrors the
+            // same pattern in handleSessionError. Without this, sendMessageInternal hangs
+            // at deferred.await() forever and sendMutex stays locked.
+            //
+            // Wrapped in stateLock.withLock to match handleSessionError's pattern and
+            // to close the TOCTOU window with close() (which completes responseDeferred
+            // exceptionally and nulls it under stateLock). Without the lock, a concurrent
+            // close() could complete the deferred exceptionally between our read and our
+            // complete(Unit) call, causing the awaiter to receive CancellationException
+            // ("Session closed") instead of Unit — semantically wrong (the abort path
+            // should signal normal completion, not session closure).
+            stateLock.withLock {
+                responseDeferred?.complete(Unit)
+                responseDeferred = null
+            }
+        }
+    }
 
     fun addMessage(message: ChatMessage) = messageMap.add(message)
 
@@ -365,8 +387,11 @@ class SessionState(
     }
 
     internal fun handlePatch(event: SseEvent.Patch, msgId: String) {
-        toolCallState.activePatches.add(event)
-        addSimplePart(msgId, "patch_${toolCallState.activePatches.size - 1}", MessagePart.Patch(event.hash, event.files))
+        val patchIndex = stateLock.withLock {
+            toolCallState.activePatches.add(event)
+            toolCallState.activePatches.size - 1
+        }
+        addSimplePart(msgId, "patch_$patchIndex", MessagePart.Patch(event.hash, event.files))
     }
 
     internal fun handleAgent(event: SseEvent.Agent, msgId: String) {
@@ -455,12 +480,15 @@ class SessionState(
                 msg.copy(parts = parts, isStreaming = false, state = MessageState.Failed(reason))
             }
             _signals.tryEmit(UiSignal.Error(msgId, reason))
-            emitStreamingCompleted(msgId, naturalCompletion = false)
-            // Defensive backup: complete responseDeferred directly in case the signal
-            // buffer is full and the StreamingCompleted emission above was dropped by
-            // tryEmit. CompletableDeferred.complete() is idempotent so this is safe.
+            // Complete responseDeferred BEFORE emitStreamingCompleted — if the emit
+            // throws (unlikely but possible), the deferred is still completed so
+            // sendMessageInternal's deferred.await() unblocks and sendMutex is released.
+            // CompletableDeferred.complete() is idempotent so this is safe — the
+            // StreamingCompleted signal path also completes it via the global signal
+            // collector.
             responseDeferred?.complete(Unit)
             responseDeferred = null
+            emitStreamingCompleted(msgId, naturalCompletion = false)
             // Targeted clear: mark turn as aborted and clear identity so stale events
             // are dropped by SseEventPipeline's isAborted guard. Do NOT call full
             // resetTurnState() — that would clear streamingCompletedEmitted (risking
@@ -788,7 +816,15 @@ class SessionState(
     }
 
     internal fun handleToolUse(event: SseEvent.ToolUse, msgId: String) {
-        val existingPill = toolCallState.toolCallPills[event.toolCallId]
+        // Read+update pill under stateLock — toolCallPills/toolCallIndex are
+        // LinkedHashMaps (non-thread-safe) also read by snapshotToolState() under
+        // stateLock from a different coroutine (ResponseTimeoutMonitor). The lock
+        // must protect writers, not just readers.
+        val (existingPill, targetMsgId) = stateLock.withLock {
+            val pill = toolCallState.toolCallPills[event.toolCallId]
+            val idx = toolCallState.toolCallIndex[event.toolCallId]
+            pill to idx
+        }
         if (existingPill != null) {
             val updatedPill = existingPill.copy(
                 metadata = event.metadata ?: existingPill.metadata,
@@ -797,9 +833,11 @@ class SessionState(
                 // only a non-empty input replaces the existing pill's input.
                 input = if (event.input != null && event.input.isNotEmpty()) event.input else existingPill.input,
             )
-            toolCallState.toolCallPills[event.toolCallId] = updatedPill
-            val targetMsgId = toolCallState.toolCallIndex[event.toolCallId] ?: return
-            messageMap.update(targetMsgId) { msg ->
+            stateLock.withLock {
+                toolCallState.toolCallPills[event.toolCallId] = updatedPill
+            }
+            val resolvedTargetMsgId = targetMsgId ?: return
+            messageMap.update(resolvedTargetMsgId) { msg ->
                 val parts = LinkedHashMap(msg.parts)
                 val existing = parts[event.toolCallId]
                 if (existing is MessagePart.ToolCall) {
@@ -826,34 +864,40 @@ class SessionState(
         }
         emitStreamingStartedIfNeeded(msgId)
 
-        toolCallState.toolPartStates[event.toolCallId] = PartState.InProgress
-        val baseKind = ToolMapper.toAcpKind(event.toolName)
-        val toolKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(event.input) else baseKind
-        val resolvedTitle = event.title
-            ?: event.input?.let { input ->
-                // Intentionally broad catch — should ideally only catch JsonException,
-                // but kept broad for safety against unexpected input shapes.
-                try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
-            }
-            ?: event.toolName
-        logger.info { "[ACP] ToolUse: callID=${event.toolCallId}, toolName=${event.toolName}, title=${event.title}, kind=$toolKind, hasInput=${event.input != null}, inputKeys=${event.input?.keys}, resolvedTitle=$resolvedTitle" }
-        val pill = ToolCallPill(
-            toolCallId = event.toolCallId,
-            toolName = event.toolName,
-            title = resolvedTitle,
-            kind = toolKind,
-            status = ToolCallStatus.IN_PROGRESS,
-            input = event.input,
-            metadata = event.metadata,
-            startTimeMs = System.currentTimeMillis(),
-        )
-        toolCallState.toolCallPills[event.toolCallId] = pill
-        toolCallState.toolCallIndex[event.toolCallId] = msgId
+        // Wrap toolCallState map mutations in stateLock.withLock — these are
+        // LinkedHashMaps (non-thread-safe) read by snapshotToolState() under
+        // stateLock from a different coroutine (ResponseTimeoutMonitor).
+        val pill = stateLock.withLock {
+            toolCallState.toolPartStates[event.toolCallId] = PartState.InProgress
+            val baseKind = ToolMapper.toAcpKind(event.toolName)
+            val toolKind = if (baseKind == ToolKind.OTHER) ToolMapper.detectKindFromInput(event.input) else baseKind
+            val resolvedTitle = event.title
+                ?: event.input?.let { input ->
+                    // Intentionally broad catch — should ideally only catch JsonException,
+                    // but kept broad for safety against unexpected input shapes.
+                    try { input["description"]?.jsonPrimitive?.contentOrNull } catch (_: Exception) { null }
+                }
+                ?: event.toolName
+            logger.info { "[ACP] ToolUse: callID=${event.toolCallId}, toolName=${event.toolName}, title=${event.title}, kind=$toolKind, hasInput=${event.input != null}, inputKeys=${event.input?.keys}, resolvedTitle=$resolvedTitle" }
+            val pill = ToolCallPill(
+                toolCallId = event.toolCallId,
+                toolName = event.toolName,
+                title = resolvedTitle,
+                kind = toolKind,
+                status = ToolCallStatus.IN_PROGRESS,
+                input = event.input,
+                metadata = event.metadata,
+                startTimeMs = System.currentTimeMillis(),
+            )
+            toolCallState.toolCallPills[event.toolCallId] = pill
+            toolCallState.toolCallIndex[event.toolCallId] = msgId
+            pill
+        }
 
         followAgent.dispatchToolUse(
             toolCallId = event.toolCallId,
             toolName = event.toolName,
-            toolKind = toolKind,
+            toolKind = pill.kind,
             input = event.input,
             metadata = event.metadata,
             startTimeMs = pill.startTimeMs,

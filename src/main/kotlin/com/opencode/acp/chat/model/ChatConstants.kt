@@ -51,4 +51,34 @@ object ChatConstants {
      *  Caps animation count to avoid GDI nativeBlit hang risk (AGENTS.md).
      *  Child sessions beyond this cap show a static forward-arrow icon instead. */
     const val MAX_VISIBLE_CHILD_SPINNERS = 5
+
+    // ── Send POST hard ceiling ────────────────────────────────────────────
+    /**
+     * Hard ceiling for the POST /session/:id/message HTTP call (sendMessageAsync).
+     *
+     * sendMessageAsync uses TimeoutProfile.INFINITE (the POST blocks until the LLM finishes
+     * generating, which can be minutes for complex tool chains). The activity monitor
+     * handles intelligent timeouts (no SSE activity for responseTimeoutSeconds). This
+     * constant is a BELT-AND-SUSPENDERS backstop for the case where the TCP connection is
+     * half-open (no FIN/RST, just silent) AND the activity monitor's onTimeout callback
+     * cannot cancel the coroutine (e.g., the monitor job itself was cancelled).
+     *
+     * 30 minutes is generous enough that legitimate long generations (subagents, complex
+     * tool chains) will not be killed — the activity monitor resets on SSE events, so a
+     * healthy long generation never hits this ceiling. The ceiling only fires for dead TCP
+     * where no data is moving.
+     *
+    * See AGENTS.md "SSE Reconnection" section for why the Java HTTP engine has no
+    * socket-level idle timeout.
+     *
+     * WATCHDOG NOTE: If both the activity monitor and this ceiling fail (e.g., monitor
+     * job cancelled by scope cancellation + ceiling not yet reached), the user is stuck
+     * for up to 30 minutes with sendMutex locked and all subsequent sends silently failing.
+     * A secondary UI-level watchdog could detect this: if sendMutex has been held for
+     * > responseTimeoutSeconds * 2 without any SSE activity, show a notification suggesting
+     * the user disconnect/reconnect. This is deferred — the activity monitor + ceiling
+     * cover the known failure modes, and the connection-state observer already resets
+     * _streamPhase on disconnect.
+     */
+    const val SEND_POST_HARD_CEILING_MS = 30 * 60 * 1000L  // 30 minutes
 }

@@ -75,6 +75,13 @@ class MessageQueueManager(
      *  cannot bypass the retry delay. */
     private val nextRetryTime = ConcurrentHashMap<String, Long>()
 
+    /** Generation counter — incremented by clearQueue() so in-flight drainQueue
+     *  calls can detect that the queue was cleared during their send and skip
+     *  re-queuing. Without this, a message removed from the queue at the start
+     *  of drainQueue could be re-queued after clearQueue runs, resurrecting a
+     *  message the user intended to clear. */
+    @Volatile private var queueGeneration = 0
+
     /**
      * Add a message to the queue instead of sending it immediately.
      * Used when streaming is active (SENDING or STREAMING phase) and queue mode is enabled.
@@ -123,6 +130,7 @@ class MessageQueueManager(
                 _queuedMessages.value = emptyList()
                 queueRetryCounts.clear()
                 nextRetryTime.clear()
+                queueGeneration++  // Signal in-flight drainQueue to skip re-queue
                 logger.info { "[ACP] clearQueue: cleared $count queued messages" }
             }
         }
@@ -155,11 +163,28 @@ class MessageQueueManager(
         val retryAt = nextRetryTime[next.id]
         if (retryAt != null && System.currentTimeMillis() < retryAt) {
             // Not yet time to retry — re-queue at end and return without sending.
+            // Check retry count: if exceeded, drop the message instead of re-queuing.
+            // Without this check, a failing message could bounce between front and end
+            // of the queue indefinitely via delay-based re-queues (the retry count only
+            // increments on actual send failures, not on delay-based re-queues).
             queueLock.withLock {
-                _queuedMessages.value = _queuedMessages.value + next
+                val retryCount = queueRetryCounts.getOrDefault(next.id, 0)
+                if (retryCount >= MAX_QUEUE_RETRIES) {
+                    queueRetryCounts.remove(next.id)
+                    nextRetryTime.remove(next.id)
+                    logger.error { "[ACP] drainQueue: dropping message after $MAX_QUEUE_RETRIES failed attempts (delay-requeue path) — ${next.text.take(50)}" }
+                } else {
+                    _queuedMessages.value = _queuedMessages.value + next
+                }
             }
             return@withLock
         }
+        // Capture generation before send — if clearQueue runs during the send,
+        // queueGeneration will differ and we skip re-queuing (the user cleared the queue).
+        val genBeforeSend = queueGeneration
+        // NOTE: _queuedMessages.value.size is read outside queueLock — this is a benign
+        // data race (MutableStateFlow.value is thread-safe). The size may be stale if a
+        // concurrent queueMessage added items, but it's only used for logging.
         logger.info { "[ACP] drainQueue: sending '${next.text.take(50)}' (${_queuedMessages.value.size} remaining)" }
 
         val result = try {
@@ -171,6 +196,32 @@ class MessageQueueManager(
             SendMessageResult.Error(e.message ?: "Send failed")
         }
         if (result is SendMessageResult.Error) {
+            // Stuck-send bug guard: if the sendMutex is stuck (e.g., after a
+            // timeout/HTTP error left it locked), the "Another message is already
+            // being sent" rejection will recur on every retry. Retrying spins forever
+            // (up to MAX_QUEUE_RETRIES) with no chance of success — the mutex only
+            // unlocks on disconnect/reconnect or IDE restart. Drop the message
+            // immediately and let the surfaced error (injectLocalMessage in
+            // ChatViewModel.sendMessageWithModel) tell the user to reconnect.
+            // See AGENTS.md "Stuck Send" / OpenCodeService.kt:584 for the source.
+            if (result.isStuckMutex) {
+                queueLock.withLock {
+                    queueRetryCounts.remove(next.id)
+                    nextRetryTime.remove(next.id)
+                }
+                logger.error { "[ACP] drainQueue: dropping message — sendMutex stuck (stuck-send bug): ${result.message}" }
+                return@withLock
+            }
+            // Skip re-queue if clearQueue was called during the send — the user
+            // cleared the queue and this message should not be resurrected.
+            if (queueGeneration != genBeforeSend) {
+                queueLock.withLock {
+                    queueRetryCounts.remove(next.id)
+                    nextRetryTime.remove(next.id)
+                }
+                logger.info { "[ACP] drainQueue: skipping re-queue — queue was cleared during send" }
+                return@withLock
+            }
             queueLock.withLock {
                 // Check retry count inside queueLock to prevent race with clearQueue
                 // (which clears queueRetryCounts under queueLock as well)

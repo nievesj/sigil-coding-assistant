@@ -157,6 +157,13 @@ class ChatViewModel(
     }
 
     // --- Message queue (delegated to MessageQueueManager) ---
+    // DESIGN LIMITATION: The queue drain path competes with user-initiated sends for
+    // sendMutex. If the user clicks Send while the queue is draining, both calls race
+    // for sendMutex — the loser gets isStuckMutex=true and the message is dropped (for
+    // queue) or surfaced as an error (for user). This is acceptable because the UI is
+    // single-threaded and the queue only drains after StreamingCompleted (when the user
+    // is typically not sending). If concurrent senders are added in the future, prioritize
+    // user sends over queue drains.
     private val messageQueueManager = MessageQueueManager(
         sendFunction = { msg -> sendMessage(msg.text, msg.files) }
     )
@@ -356,8 +363,16 @@ class ChatViewModel(
         scope.launch {
             service.signals.collect { signal ->
                 if (signal is UiSignal.StreamingStarted) {
-                    logger.info { "[ACP] signal: StreamingStarted → _streamPhase = STREAMING (current=${_streamPhase.value})" }
-                    _streamPhase.value = StreamPhase.STREAMING
+                    // Gate on connection state to avoid a stale STREAMING indicator after
+                    // a disconnect: if the connectionObserverJob already reset _streamPhase
+                    // to IDLE (because the connection dropped), don't re-arm STREAMING.
+                    // This closes the race between this collector and connectionObserverJob.
+                    if (connectionState.value == ConnectionState.CONNECTED) {
+                        logger.info { "[ACP] signal: StreamingStarted → _streamPhase = STREAMING (current=${_streamPhase.value})" }
+                        _streamPhase.value = StreamPhase.STREAMING
+                    } else {
+                        logger.info { "[ACP] signal: StreamingStarted ignored — connection not CONNECTED (${connectionState.value})" }
+                    }
                 }
             }
         }
@@ -396,6 +411,15 @@ class ChatViewModel(
                         if (_readyState.value != ReadyState.NOT_STARTED) {
                             logger.info { "[ACP] ReadyState: ${_readyState.value} → NOT_STARTED (connectionState=$state)" }
                             _readyState.value = ReadyState.NOT_STARTED
+                        }
+                        // Reset _streamPhase on disconnect/reconnect/error. If a send was in progress
+                        // when the connection dropped, _streamPhase stays SENDING/STREAMING and the UI
+                        // shows a perpetual streaming indicator. This is a defensive reset — the primary
+                        // fix (cancellable POST) handles the mutex, but this ensures the UI recovers
+                        // even if the send coroutine is still suspended on a dead connection.
+                        if (_streamPhase.value != StreamPhase.IDLE) {
+                            logger.info { "[ACP] _streamPhase: ${_streamPhase.value} → IDLE (connectionState=$state)" }
+                            _streamPhase.value = StreamPhase.IDLE
                         }
                     }
                     ConnectionState.CONNECTED -> {
@@ -733,12 +757,21 @@ class ChatViewModel(
                 is SendMessageResult.Error -> {
                     _streamPhase.value = StreamPhase.IDLE
                     sessionId?.let { service.removeStreamingSession(it) }
+                    // Surface the error to the user so they know their message wasn't sent.
+                    // Without this, the send fails silently — the user sees their text disappear
+                    // with no feedback. This is especially important for the "Another message is
+                    // already being sent" rejection (stuck sendMutex) so the user knows to
+                    // disconnect/reconnect rather than repeatedly typing into a void.
+                    if (result.message.isNotBlank()) {
+                        service.injectLocalMessage("⚠️ ${result.message}")
+                    }
                 }
             }
             result
         } catch (e: Exception) {
             _streamPhase.value = StreamPhase.IDLE
             sessionId?.let { service.removeStreamingSession(it) }
+            service.injectLocalMessage("⚠️ Send failed: ${e.message ?: e::class.simpleName}")
             throw e
         }
     }
@@ -782,7 +815,7 @@ class ChatViewModel(
             _streamPhase.value = StreamPhase.IDLE
             service.sessionId?.let { service.removeStreamingSession(it) }
             logger.warn { "[ACP] steerMessage: timed out after ${MAX_STEER_WAIT_MS}ms" }
-            service.injectLocalMessage("⚠️ Could not send steering message — timed out. Please try again.")
+            service.injectLocalMessage("⚠️ Could not send steering message — timed out. The abort may still be in progress server-side. Please try again or disconnect/reconnect if the UI is stuck.")
             return
         }
 
@@ -915,14 +948,29 @@ class ChatViewModel(
      * throughout so the UI can show progress / success / failure.
      */
     fun generateContext() {
+        // Guard against concurrent generateContext calls — each call launches a
+        // coroutine that blocks an IO thread on waitForSmartMode(). Without this
+        // guard, rapid /generate-context invocations accumulate blocked IO threads.
+        if (_contextGenerationState.value is ContextGenerationState.Running) {
+            logger.warn { "[ACP] generateContext: already in progress — ignoring duplicate call" }
+            return
+        }
         scope.launch {
             _contextGenerationState.value = ContextGenerationState.Running
             try {
                 val contextGen = com.opencode.acp.intelligence.context.ContextGenerator(project)
-                // Wait for smart mode with its own timeout (30s max for indexing)
-                val smartModeReady = withTimeoutOrNull(30_000) {
-                    com.intellij.openapi.project.DumbService.getInstance(project).waitForSmartMode()
-                    true
+                // Wait for smart mode with its own timeout (30s max for indexing).
+                // Run the blocking waitForSmartMode() on Dispatchers.IO so that if
+                // withTimeoutOrNull cancels the coroutine, a blocked IO thread (not
+                // a Default dispatch thread) is leaked. The Default pool retains
+                // parallelism for SSE processing. withTimeoutOrNull cannot interrupt
+                // a blocking call, so the thread it ran on stays blocked until the
+                // call returns; using IO keeps the Default pool healthy.
+                val smartModeReady = withContext(Dispatchers.IO) {
+                    withTimeoutOrNull(30_000) {
+                        com.intellij.openapi.project.DumbService.getInstance(project).waitForSmartMode()
+                        true
+                    }
                 } ?: false
 
                 if (!smartModeReady) {
@@ -1228,6 +1276,13 @@ class ChatViewModel(
             logger.error(e) { "[ACP] Corrupted tool permissions JSON — failing closed (all tools → ASK)" }
             val allDiscovered = registry?.tools?.values ?: emptyList()
             if (allDiscovered.isEmpty()) {
+                // No tools discovered yet (MCP init may have failed or not run).
+                // Returning emptyMap() means the caller skips loadEnabledAndPermissions,
+                // leaving tools at their discovery default (ALLOW). This is a fail-open
+                // path, but discoverToolsInBackground (in OpenCodeService) will apply
+                // fail-closed when it runs later with the registry populated. Log a
+                // warning so the gap is visible.
+                logger.warn { "[ACP] Corrupted tool permissions JSON but no tools discovered yet — fail-closed deferred to discoverToolsInBackground. Tools will be at ALLOW until then." }
                 emptyMap()
             } else {
                 // Set both tool.id and tool.name to ASK — the registry may look up permissions

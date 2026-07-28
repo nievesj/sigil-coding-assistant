@@ -415,6 +415,16 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                             // Map every discovered tool to (enabled=true, permission="ask").
                             // Keying by both id and name ensures loadEnabledAndPermissions
                             // matches every tool (it matches by id OR raw name).
+                            // FAIL-CLOSED: All tools set to ASK (uniform permission).
+                            // WARNING: The per-name entry (failClosed[tool.name]) is overwritten
+                            // when two MCP servers expose tools with the same raw name
+                            // (last-write-wins). This is safe ONLY because ALL fail-closed
+                            // entries use the same permission ("ask"). If this logic ever
+                            // changes to use tool-specific permissions, the name collision
+                            // would cause a security bypass (one server's tool could inherit
+                            // another server's permission). The per-id entry is always
+                            // unique and reliable. Do NOT make fail-closed permissions
+                            // tool-specific without fixing the name-collision issue first.
                             val failClosed = mutableMapOf<String, Pair<Boolean, String>>()
                             for (tool in allDiscovered) {
                                 failClosed[tool.id] = Pair(true, "ask")
@@ -581,7 +591,14 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
     ): SendMessageResult {
         if (!sendMutex.tryLock()) {
             logger.warn { "[ACP] sendMessage: rejected — another send is already in progress" }
-            return SendMessageResult.Error("Another message is already being sent. Please wait for it to complete.")
+            // NOTE: The message says "Please wait for it to complete" which is correct for
+            // concurrent sends but misleading when the mutex is genuinely stuck (the previous
+            // send's finally block never ran due to a hung POST). In the stuck case, the
+            // message will never complete — the user should disconnect/reconnect. The
+            // MessageQueueManager (MessageQueueManager.kt:182) correctly drops the message
+            // and logs "sendMutex stuck". A future improvement could check how long the mutex
+            // has been held and provide a different message for the stuck case.
+            return SendMessageResult.Error("Another message is already being sent. Please wait for it to complete.", isStuckMutex = true)
         }
         try {
             return sendMessageInternal(text, files, modelID, providerID, variant, agent, model)
@@ -663,28 +680,102 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
             // The monitor is started BEFORE sendMessageAsync so it also covers the send phase.
             // lastActivityTimeMs is reset here so the send-phase timeout is measured from this point.
             // sendMessageAsync uses TimeoutProfile.INFINITE (the POST blocks until generation
-            // finishes) — do NOT wrap it in withTimeoutOrNull, as that would cancel the POST
-            // client-side while the server is still actively generating.
+            // finishes). The POST is launched in a cancellable child coroutine (sendJob) so the
+            // activity monitor's onTimeout/onToolStuck callbacks can cancel a hanging POST when
+            // the TCP connection is half-open (no FIN/RST, just silent). A hard ceiling
+            // (withTimeoutOrNull, SEND_POST_HARD_CEILING_MS) is a belt-and-suspenders backstop
+            // for the case where the activity monitor itself cannot fire (e.g., its job was
+            // cancelled). The activity monitor handles the intelligent case (no SSE activity);
+            // the ceiling only fires for dead TCP where no data is moving. See AGENTS.md
+            // "Stuck-send recovery" section.
             sendSession?.let { it.turnLifecycleState.lastActivityTimeMs = System.currentTimeMillis() }
-            val activityMonitorJob = responseTimeoutMonitor.startMonitoring(
-                onTimeout = { msg -> sessionManager.abortStreamingWithFallback(msg, assistantMsgId) },
-                onToolStuck = { msg -> sessionManager.abortStreamingWithFallback(msg, assistantMsgId) },
-                effectiveLastActivityMsProvider = { sessionManager.getEffectiveLastActivityMs() },
-                childActivityProvider = { sessionManager.isAnyChildActivelyGenerating() },
-            )
+
+            // Launch sendMessageAsync in a cancellable child coroutine so the activity monitor's
+            // onTimeout/onToolStuck callbacks can cancel the hanging HTTP POST. Without this, a
+            // half-open TCP connection (no FIN/RST) hangs the POST forever — the finally block at
+            // the end of sendMessage() never runs, sendMutex stays locked, and every subsequent
+            // send silently fails at tryLock(). See AGENTS.md "Stuck-send recovery" section.
+            //
+            // The hard ceiling (withTimeoutOrNull) is a belt-and-suspenders backstop for the case
+            // where the activity monitor itself cannot fire (e.g., its job was cancelled). The
+            // activity monitor handles the intelligent case (no SSE activity); the ceiling only
+            // fires for dead TCP where no data is moving.
+            val sendJob = scope.async {
+                withTimeoutOrNull(ChatConstants.SEND_POST_HARD_CEILING_MS) {
+                    client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
+                }
+            }
             try {
-                // sessionId validation is handled by OpenCodeClient.sendMessageAsync (validatePathId)
-                // sendMessageAsync uses TimeoutProfile.INFINITE because the server POST blocks
-                // until the LLM finishes generating (can be minutes for complex tool chains).
-                // The activity monitor (started above) handles generation timeouts with its
-                // tool-running guard — do NOT wrap in withTimeoutOrNull here, as that would
-                // cancel the POST client-side while the server is still actively generating.
-                val serverMessageId = client.sendMessageAsync(currentSessionId, parts, variant = variant, agent = agent, model = model)
-                logger.info { "[ACP] sendMessage: got serverMessageId=$serverMessageId" }
-                sessionManager.updateServerMessageId(assistantMsgId, serverMessageId)
-                deferred.await()
-            } finally {
-                activityMonitorJob.cancel()
+                val activityMonitorJob = responseTimeoutMonitor.startMonitoring(
+                    onTimeout = { msg ->
+                        sendJob.cancel(kotlinx.coroutines.CancellationException("Response timeout: $msg"))
+                        try {
+                            sessionManager.abortStreamingWithFallback(msg, assistantMsgId)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            logger.error(e) { "[ACP] onTimeout: abortStreamingWithFallback failed — completing deferred directly" }
+                            val session = sessionManager.getActiveSession()
+                            session?.responseDeferred?.complete(Unit)
+                            session?.responseDeferred = null
+                        }
+                    },
+                    onToolStuck = { msg ->
+                        sendJob.cancel(kotlinx.coroutines.CancellationException("Tool stuck: $msg"))
+                        try {
+                            sessionManager.abortStreamingWithFallback(msg, assistantMsgId)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            logger.error(e) { "[ACP] onToolStuck: abortStreamingWithFallback failed — completing deferred directly" }
+                            val session = sessionManager.getActiveSession()
+                            session?.responseDeferred?.complete(Unit)
+                            session?.responseDeferred = null
+                        }
+                    },
+                    effectiveLastActivityMsProvider = { sessionManager.getEffectiveLastActivityMs() },
+                    childActivityProvider = { sessionManager.isAnyChildActivelyGenerating() },
+                )
+
+                try {
+                    // sessionId validation is handled by OpenCodeClient.sendMessageAsync (validatePathId)
+                    // sendMessageAsync uses TimeoutProfile.INFINITE because the server POST blocks
+                    // until the LLM finishes generating (can be minutes for complex tool chains).
+                    // The activity monitor (started above) handles generation timeouts with its
+                    // tool-running guard. The POST runs in a cancellable child coroutine (sendJob)
+                    // so the monitor's onTimeout/onToolStuck callbacks can cancel a hanging POST on a
+                    // half-open TCP connection. The hard ceiling (withTimeoutOrNull inside sendJob)
+                    // is a backstop for the case where the monitor itself cannot fire.
+                    val serverMessageId = sendJob.await()
+                    if (serverMessageId == null) {
+                        // Hard ceiling fired — the POST was cancelled by withTimeoutOrNull after
+                        // SEND_POST_HARD_CEILING_MS. Treat as a timeout. Cancel the activity
+                        // monitor first to prevent a concurrent onTimeout/onToolStuck callback
+                        // from double-aborting (idempotent but wasteful + duplicate logs).
+                        activityMonitorJob.cancel()
+                        logger.error { "[ACP] sendMessage: POST hard ceiling exceeded (${ChatConstants.SEND_POST_HARD_CEILING_MS}ms) — treating as timeout" }
+                        try {
+                            sessionManager.abortStreamingWithFallback("Response timed out (hard ceiling ${ChatConstants.SEND_POST_HARD_CEILING_MS / 1000 / 60}min)", assistantMsgId)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            logger.error(e) { "[ACP] sendMessage: abortStreamingWithFallback failed during hard ceiling handling" }
+                        }
+                        // Fall through to the wasAborted check below, which returns Error.
+                    } else {
+                        logger.info { "[ACP] sendMessage: got serverMessageId=$serverMessageId" }
+                        sessionManager.updateServerMessageId(assistantMsgId, serverMessageId)
+                        deferred.await()
+                    }
+                } finally {
+                    activityMonitorJob.cancel()
+                    // Cancel the send job if still active (e.g., deferred.await() returned via timeout
+                    // signal path while the POST was still in flight). This prevents a leaked coroutine.
+                    if (sendJob.isActive) sendJob.cancel()
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                if (sendJob.isActive) sendJob.cancel()
+                throw e
             }
             // If the monitor completed the deferred (timeout), isStreaming is now false
             // and the message was aborted. Check for that case.
@@ -847,6 +938,12 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                 while (isActive) {
                     if (sendMutex.tryLock()) {
                         sendMutex.unlock()
+                        // TOCTOU: between this unlock and the caller's subsequent sendMessage()
+                        // call, another coroutine could acquire the mutex. In practice this
+                        // doesn't happen because the codebase has no concurrent senders
+                        // (sendMutex serializes all sends, and the UI is single-threaded).
+                        // If concurrent senders are added in the future, this path needs
+                        // to hold the mutex across the send instead of just signaling.
                         deferred.complete(Unit)
                         return@launch
                     }
@@ -965,5 +1062,5 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
 /** Result of a sendMessage call. */
 sealed interface SendMessageResult {
     data class Success(val messageId: String) : SendMessageResult
-    data class Error(val message: String) : SendMessageResult
+    data class Error(val message: String, val isStuckMutex: Boolean = false) : SendMessageResult
 }
