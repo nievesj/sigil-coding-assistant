@@ -18,6 +18,7 @@ import com.opencode.acp.chat.model.TodoItem
 import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.ui.compose.SlashCommand
+import com.opencode.acp.config.AgentConstants
 import com.opencode.acp.mcp.McpConnectionStatus
 import com.opencode.acp.mcp.McpManager
 import com.opencode.acp.mcp.ToolRegistry
@@ -142,7 +143,7 @@ interface OpenCodePermissionApi {
         response: PermissionResponse,
         toolName: String = "",
         patterns: List<String> = emptyList(),
-        agentName: String = "orchestrator",
+        agentName: String = AgentConstants.CODING_ASSISTANT_AGENT_NAME,
     )
     suspend fun respondQuestion(promptId: String, answers: List<List<String>>, sessionId: String)
     suspend fun rejectQuestion(promptId: String, sessionId: String)

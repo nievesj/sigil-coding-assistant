@@ -11,6 +11,8 @@ import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.processor.UiSignal
 import com.opencode.acp.chat.ui.compose.SlashCommand
 import com.opencode.acp.chat.util.generateId
+import com.opencode.acp.config.AgentConfigWriter
+import com.opencode.acp.config.settings.OpenCodeAgentSettingsState
 import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.mcp.McpConfigWriter
@@ -47,30 +49,32 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
     // Late-binding reference for error surfacing — set after sessionManager is created.
     // This breaks the initialization circular dependency: scope's CoroutineExceptionHandler
     // needs sessionManager, but sessionManager needs scope.
-    @Volatile private var errorSurfacer: ((String) -> Unit)? = null
+    @Volatile
+    private var errorSurfacer: ((String) -> Unit)? = null
 
-    override val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, throwable ->
-        logger.error(throwable) { "[ACP] Uncaught coroutine exception in OpenCodeService scope" }
-        // Surface critical errors to the UI via the global signals flow.
-        // SessionManager._globalSignals is collected by the ViewModel and routed
-        // to the SessionError handler, which resets _streamPhase and removes the
-        // streaming session indicator. This prevents the UI from appearing stuck
-        // when a background coroutine crashes.
-        if (throwable !is CancellationException) {
-            try {
-                errorSurfacer?.invoke(throwable.message ?: throwable.javaClass.simpleName)
-            } catch (e: Exception) {
-                // Don't let the error-surfacing mechanism itself throw —
-                // the original exception is already logged above.
-                logger.warn(e) { "[ACP] Error surfacing mechanism failed — original exception was logged at error level above" }
+    override val scope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, throwable ->
+            logger.error(throwable) { "[ACP] Uncaught coroutine exception in OpenCodeService scope" }
+            // Surface critical errors to the UI via the global signals flow.
+            // SessionManager._globalSignals is collected by the ViewModel and routed
+            // to the SessionError handler, which resets _streamPhase and removes the
+            // streaming session indicator. This prevents the UI from appearing stuck
+            // when a background coroutine crashes.
+            if (throwable !is CancellationException) {
+                try {
+                    errorSurfacer?.invoke(throwable.message ?: throwable.javaClass.simpleName)
+                } catch (e: Exception) {
+                    // Don't let the error-surfacing mechanism itself throw —
+                    // the original exception is already logged above.
+                    logger.warn(e) { "[ACP] Error surfacing mechanism failed — original exception was logged at error level above" }
+                }
             }
-        }
-        // RESOLVED: errorSurfacer is set immediately after SessionManager construction
-        // (see the .also{} block below). During the brief window before it's set, early
-        // failures are logged at error level above and swallowed — this is acceptable
-        // because the connectionObserverJob will retry the connection. Once errorSurfacer
-        // is wired, all subsequent exceptions surface to the UI.
-    })
+            // RESOLVED: errorSurfacer is set immediately after SessionManager construction
+            // (see the .also{} block below). During the brief window before it's set, early
+            // failures are logged at error level above and swallowed — this is acceptable
+            // because the connectionObserverJob will retry the connection. Once errorSurfacer
+            // is wired, all subsequent exceptions surface to the UI.
+        })
 
     // ── Sub-components ─────────────────────────────────────────────────────
 
@@ -117,15 +121,17 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
     // boundary check depends on canonical form to handle symlinked project roots.
     private val attachmentValidator = AttachmentValidator(
         projectBasePath = project.basePath?.let {
-            try { java.io.File(it).canonicalPath }
-            catch (e: java.io.IOException) {
+            try {
+                java.io.File(it).canonicalPath
+            } catch (e: java.io.IOException) {
                 logger.warn(e) { "[ACP] Failed to canonicalize project base path: $it — using non-canonical form" }
                 it
             }
         },
         userHomePath = System.getProperty("user.home")?.let {
-            try { java.io.File(it).canonicalPath }
-            catch (e: java.io.IOException) {
+            try {
+                java.io.File(it).canonicalPath
+            } catch (e: java.io.IOException) {
                 logger.warn(e) { "[ACP] Failed to canonicalize user home path: $it — using non-canonical form" }
                 it
             }
@@ -146,15 +152,27 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
             // All three post-reconnect calls stay in OpenCodeService — SseConnectionManager
             // signals success via this callback and stays focused on transport.
             // Each call is independently wrapped so a failure in one doesn't skip the others.
-            try { sessionManager.recoverBackgroundSessions(connectionManager.client) }
-            catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: Exception) { logger.warn(e) { "[ACP] recoverBackgroundSessions failed on reconnect" } }
-            try { sessionManager.fetchTodos() }
-            catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: Exception) { logger.warn(e) { "[ACP] fetchTodos failed on reconnect" } }
-            try { sessionManager.computeSessionContext() }
-            catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: Exception) { logger.warn(e) { "[ACP] computeSessionContext failed on reconnect" } }
+            try {
+                sessionManager.recoverBackgroundSessions(connectionManager.client)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] recoverBackgroundSessions failed on reconnect" }
+            }
+            try {
+                sessionManager.fetchTodos()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] fetchTodos failed on reconnect" }
+            }
+            try {
+                sessionManager.computeSessionContext()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] computeSessionContext failed on reconnect" }
+            }
         },
     )
 
@@ -206,12 +224,14 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                         session?.responseDeferred?.complete(Unit)
                         session?.responseDeferred = null
                     }
+
                     is UiSignal.PermissionRequested -> {
                         // Delegate to PermissionRelayHandler — handles Brave Mode
                         // relay-point auto-approve and orphan-retry fallback. Returns
                         // false for active-session requests (handled via activeSignals).
                         permissionRelayHandler.handlePermissionRequested(sessionId, signal)
                     }
+
                     is UiSignal.PermissionReplied -> {
                         // Confirm server processed the reply — clear child pending permission flag
                         // and forward to ViewModel via globalSignals. The ViewModel's activeSignals
@@ -224,7 +244,9 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                         // cascade rejection) actually executes. Without this, that handler is dead code.
                         sessionManager.emitGlobalSignal(signal)
                     }
-                    else -> { /* other signals handled by ViewModel via activeSignals */ }
+
+                    else -> { /* other signals handled by ViewModel via activeSignals */
+                    }
                 }
             }
         }
@@ -269,6 +291,7 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                     sessionManager.switchSession(state.sessions.first().id)
                 }
             }
+
             is SessionListState.Error -> {
                 // Retry without directory filter — the filter may have caused the error
                 // (e.g., server doesn't support ?directory= or path mismatch).
@@ -278,7 +301,8 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                     sessionManager.switchSession(retry.sessions.first().id)
                 }
             }
-            is SessionListState.Loading -> { }
+
+            is SessionListState.Loading -> {}
         }
 
         // ── Initialize MCP integration ──────────────────────────────────────
@@ -302,8 +326,11 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                 logger.warn { "[ACP] MCP: skipping initialization — no client available" }
                 return
             }
-            mcpManager = McpManager(client, settings, scope, client.mcpHttpClient)
-            val configs = mcpManager!!.resolveConfigs()
+            // Use a local val so the subsequent calls don't rely on the mutable field
+            // (which a refactor could reassign). The field is set after construction succeeds.
+            val mgr = McpManager(client, settings, scope, client.mcpHttpClient)
+            mcpManager = mgr
+            val configs = mgr.resolveConfigs()
             if (configs.isEmpty()) {
                 logger.info { "[ACP] MCP: no servers configured (enableIntellijMcp=${settings.enableIntellijMcp}, additionalMcpServersLen=${settings.additionalMcpServers.length})" }
                 return
@@ -315,7 +342,7 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
             // background retry in McpManager keeps trying for 60s; when it
             // connects, this callback re-discovers tools so MCP tools become
             // available without restarting the session.
-            mcpManager!!.initialize(onServerConnected = {
+            mgr.initialize(onServerConnected = {
                 logger.info { "[ACP] MCP: background retry connected — re-running tool discovery" }
                 discoverToolsInBackground()
             })
@@ -496,10 +523,26 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                     reinitializeMcp()
                 } else {
                     configWriter.clearAllEntries()
+                    // Null out stale manager/registry so the UI (MCP status widget,
+                    // settings panel "Discover Tools") reflects the disabled state
+                    // immediately, not the last-connected server's status. Without this,
+                    // mcpServerStatuses keeps returning the old (empty-after-disconnect)
+                    // status and toolRegistry retains the last-discovered tool list until
+                    // IDE restart. disconnectAllMcp() was already called above.
+                    toolRegistry = null
+                    mcpManager = null
                 }
                 // Bridge JetBrains AI Assistant skills (independent of MCP enable/disable)
                 val skillPaths = com.opencode.acp.skill.JetBrainsSkillBridge.detectSkillPaths()
                 configWriter.writeSkillPaths(skillPaths)
+                // Write custom agent files
+                val agentSettings = OpenCodeAgentSettingsState.getInstance()
+                val agentConfigWriter = AgentConfigWriter(
+                    projectPath,
+                    agentSettings,
+                    configWriter
+                )
+                agentConfigWriter.writeAll(settings.enableIntellijMcp)
             } catch (e: Exception) {
                 logger.warn(e) { "[ACP] Failed to reinitialize MCP from settings" }
             }
@@ -522,6 +565,14 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                 // Bridge JetBrains AI Assistant skills (independent of MCP enable/disable)
                 val skillPaths = com.opencode.acp.skill.JetBrainsSkillBridge.detectSkillPaths()
                 configWriter.writeSkillPaths(skillPaths)
+                // Write custom agent files
+                val agentSettings = OpenCodeAgentSettingsState.getInstance()
+                val agentConfigWriter = AgentConfigWriter(
+                    projectPath,
+                    agentSettings,
+                    configWriter
+                )
+                agentConfigWriter.writeAll(settings.enableIntellijMcp)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -598,7 +649,10 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
             // MessageQueueManager (MessageQueueManager.kt:182) correctly drops the message
             // and logs "sendMutex stuck". A future improvement could check how long the mutex
             // has been held and provide a different message for the stuck case.
-            return SendMessageResult.Error("Another message is already being sent. Please wait for it to complete.", isStuckMutex = true)
+            return SendMessageResult.Error(
+                "Another message is already being sent. Please wait for it to complete.",
+                isStuckMutex = true
+            )
         }
         try {
             return sendMessageInternal(text, files, modelID, providerID, variant, agent, model)
@@ -651,7 +705,8 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
         val sendSession = activeSession
 
         try {
-            val parts = mutableListOf<com.opencode.acp.adapter.OpenCodePart>(com.opencode.acp.adapter.OpenCodePart.Text(text = text))
+            val parts =
+                mutableListOf<com.opencode.acp.adapter.OpenCodePart>(com.opencode.acp.adapter.OpenCodePart.Text(text = text))
             val addedFileNames: List<String>
             if (files.isNotEmpty()) {
                 val result = attachmentValidator.validateAndEncode(files)
@@ -755,7 +810,10 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                         activityMonitorJob.cancel()
                         logger.error { "[ACP] sendMessage: POST hard ceiling exceeded (${ChatConstants.SEND_POST_HARD_CEILING_MS}ms) — treating as timeout" }
                         try {
-                            sessionManager.abortStreamingWithFallback("Response timed out (hard ceiling ${ChatConstants.SEND_POST_HARD_CEILING_MS / 1000 / 60}min)", assistantMsgId)
+                            sessionManager.abortStreamingWithFallback(
+                                "Response timed out (hard ceiling ${ChatConstants.SEND_POST_HARD_CEILING_MS / 1000 / 60}min)",
+                                assistantMsgId
+                            )
                         } catch (e: kotlinx.coroutines.CancellationException) {
                             throw e
                         } catch (e: Exception) {
@@ -794,11 +852,12 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
             // If the session was evicted during the send, completeStreaming is a no-op
             // on a closed SessionState — re-fetch to ensure we finalize the right session.
             val currentSession = sessionManager.getActiveSession()
-            val sessionToFinalize = if (currentSession != null && !currentSession.isClosed && currentSession === sendSession) {
-                currentSession
-            } else {
-                sendSession?.takeIf { it.isClosed.not() }
-            }
+            val sessionToFinalize =
+                if (currentSession != null && !currentSession.isClosed && currentSession === sendSession) {
+                    currentSession
+                } else {
+                    sendSession?.takeIf { it.isClosed.not() }
+                }
             // Wrap in withTimeoutOrNull to avoid hanging the cancellation path if
             // the event processing coroutine is holding stateLock (e.g., inside
             // resegmentDirect's long markdown parse).
@@ -833,6 +892,7 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
                 is kotlinx.coroutines.TimeoutCancellationException -> {
                     logger.error { "[ACP] sendMessage: TimeoutCancellationException — streamingSessions=$streamingIds activeSessionStreaming=${sendSession?.isStreaming} childActive=${sessionManager.isAnyChildActivelyGenerating()}" }
                 }
+
                 is java.net.SocketTimeoutException -> {
                     logger.error { "[ACP] sendMessage: SocketTimeoutException — streamingSessions=$streamingIds activeSessionStreaming=${sendSession?.isStreaming} childActive=${sessionManager.isAnyChildActivelyGenerating()}" }
                 }
@@ -840,12 +900,16 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
             val errorMsg = when {
                 e is kotlinx.coroutines.TimeoutCancellationException ->
                     "Request timed out. Check that the server is running."
+
                 e is java.net.ConnectException ->
                     "Connection lost to server."
+
                 e is java.net.SocketTimeoutException ->
                     "Request timed out. Check that the server is running."
+
                 e.message?.contains("refused", ignoreCase = true) == true ->
                     "Connection refused by server."
+
                 else -> "Error: ${e.message ?: e.javaClass.simpleName}"
             }
             sessionManager.abortStreamingWithFallback(errorMsg, assistantMsgId)
@@ -972,7 +1036,15 @@ class OpenCodeService(private val project: Project) : OpenCodeServiceApi, Dispos
         toolName: String,
         patterns: List<String>,
         agentName: String,
-    ) = permissionManager.respondPermission(permissionId, toolCallId, sessionId, response, toolName, patterns, agentName)
+    ) = permissionManager.respondPermission(
+        permissionId,
+        toolCallId,
+        sessionId,
+        response,
+        toolName,
+        patterns,
+        agentName
+    )
 
     override suspend fun respondQuestion(promptId: String, answers: List<List<String>>, sessionId: String) =
         permissionManager.respondQuestion(promptId, answers, sessionId)

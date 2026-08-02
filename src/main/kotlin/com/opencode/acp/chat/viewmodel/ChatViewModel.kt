@@ -9,6 +9,7 @@ import com.opencode.acp.chat.processor.SessionManager
 import com.opencode.acp.chat.service.OpenCodeServiceApi
 import com.opencode.acp.chat.service.SendMessageResult
 import com.opencode.acp.chat.ui.compose.SlashCommand
+import com.opencode.acp.config.AgentConstants
 import com.opencode.acp.config.settings.OpenCodeFollowSettingsState
 import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
@@ -24,6 +25,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.serialization.SerializationException
 
 /**
  * State of the `/generate-context` slash command (TDD §11).
@@ -35,10 +37,13 @@ import kotlinx.coroutines.sync.Mutex
 sealed class ContextGenerationState {
     /** Idle — no generation in progress. */
     object Idle : ContextGenerationState()
+
     /** Running — PSI collection / file write in progress. */
     object Running : ContextGenerationState()
+
     /** Success — the context file was written. */
     object Success : ContextGenerationState()
+
     /** Failed — an error occurred; [message] describes the cause. */
     data class Failed(val message: String) : ContextGenerationState()
 }
@@ -106,7 +111,8 @@ class ChatViewModel(
         braveModeProvider = { OpenCodeFollowSettingsState.getInstance().braveModeEnabled },
     )
     val permissionPrompt: StateFlow<PermissionPrompt?> = permissionViewModel.permissionPrompt
-    val childPermissionPrompts: StateFlow<Map<String, List<ChildPermissionPrompt>>> = permissionViewModel.childPermissionPrompts
+    val childPermissionPrompts: StateFlow<Map<String, List<ChildPermissionPrompt>>> =
+        permissionViewModel.childPermissionPrompts
     val selectionPrompt: StateFlow<SelectionPrompt?> = permissionViewModel.selectionPrompt
 
     private val _pasteImageSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
@@ -214,7 +220,8 @@ class ChatViewModel(
         // SignalEffect.ForceStreamPhaseIdle variant would be cleaner but is deferred.
         setStreamPhaseIdleForSession = { sessionId ->
             if (sessionId == service.activeSessionId.value ||
-                sessionId == SessionManager.INTERNAL_ERROR_SESSION_ID) {
+                sessionId == SessionManager.INTERNAL_ERROR_SESSION_ID
+            ) {
                 _streamPhase.value = StreamPhase.IDLE
             }
         },
@@ -325,7 +332,11 @@ class ChatViewModel(
                 if (msgMap.isNotEmpty()) {
                     val userCount = msgMap.values.count { it.role == MessageRole.USER }
                     val assistantCount = msgMap.values.count { it.role == MessageRole.ASSISTANT }
-                    logger.info { "[ACP] VM messages snapshot: ${msgMap.size} total (${userCount} user, $assistantCount assistant), ids=${msgMap.keys.toList().takeLast(3).joinToString(",")}" }
+                    logger.info {
+                        "[ACP] VM messages snapshot: ${msgMap.size} total (${userCount} user, $assistantCount assistant), ids=${
+                            msgMap.keys.toList().takeLast(3).joinToString(",")
+                        }"
+                    }
                 } else {
                     logger.info { "[ACP] VM messages snapshot: EMPTY map" }
                 }
@@ -422,6 +433,7 @@ class ChatViewModel(
                             _streamPhase.value = StreamPhase.IDLE
                         }
                     }
+
                     ConnectionState.CONNECTED -> {
                         // Auto-reconnect: if readyState is NOT_STARTED after a reconnect,
                         // re-run initialization to reload agents/providers/MCP tools.
@@ -432,7 +444,7 @@ class ChatViewModel(
                             initJob?.cancel()
                             logger.info { "[ACP] Auto-reconnect detected — re-running initialize()" }
                             try {
-                                initialize(projectBasePath = null)
+                                initialize(projectBasePath = project.basePath)
                             } catch (e: kotlinx.coroutines.CancellationException) {
                                 throw e
                             } catch (e: Exception) {
@@ -440,7 +452,9 @@ class ChatViewModel(
                             }
                         }
                     }
-                    else -> { /* CONNECTING — no action */ }
+
+                    else -> { /* CONNECTING — no action */
+                    }
                 }
             }
         }
@@ -517,7 +531,7 @@ class ChatViewModel(
                             // validated by McpServerDiscovery at registration time.
                             val host = service.connectionManager.host
                             val port = service.connectionManager.port
-                            require(host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0") {
+                            require(host == "127.0.0.1" || host == "localhost") {
                                 "OpenCode server host must be loopback (got '$host') — refusing to construct non-local baseUrl (SSRF defense)"
                             }
                             val baseUrl = "http://$host:$port"
@@ -754,6 +768,7 @@ class ChatViewModel(
                     // immediately), StreamingCompleted already set it to IDLE.
                     // No action needed here — the signal collector owns the phase.
                 }
+
                 is SendMessageResult.Error -> {
                     _streamPhase.value = StreamPhase.IDLE
                     sessionId?.let { service.removeStreamingSession(it) }
@@ -880,7 +895,8 @@ class ChatViewModel(
     suspend fun respondPermission(response: PermissionResponse) {
         permissionViewModel.respondPermission(
             response,
-            agentName = controlBarViewModel.controlState.value.selectedAgent?.id ?: "orchestrator",
+            agentName = controlBarViewModel.controlState.value.selectedAgent?.id
+                ?: AgentConstants.CODING_ASSISTANT_AGENT_NAME,
         )
     }
 
@@ -974,7 +990,8 @@ class ChatViewModel(
                 } ?: false
 
                 if (!smartModeReady) {
-                    _contextGenerationState.value = ContextGenerationState.Failed("Timed out waiting for indexing to complete")
+                    _contextGenerationState.value =
+                        ContextGenerationState.Failed("Timed out waiting for indexing to complete")
                     notifyContextGeneration("Context generation failed: timed out waiting for indexing", isError = true)
                     return@launch
                 }
@@ -985,12 +1002,16 @@ class ChatViewModel(
                 }
                 if (content == null) {
                     _contextGenerationState.value = ContextGenerationState.Failed("Timed out during PSI collection")
-                    notifyContextGeneration("Context generation failed: timed out during PSI collection", isError = true)
+                    notifyContextGeneration(
+                        "Context generation failed: timed out during PSI collection",
+                        isError = true
+                    )
                     return@launch
                 }
                 val basePath = project.basePath
                     ?: run {
-                        _contextGenerationState.value = ContextGenerationState.Failed("Project has no base path (default/remote project)")
+                        _contextGenerationState.value =
+                            ContextGenerationState.Failed("Project has no base path (default/remote project)")
                         notifyContextGeneration("Context generation failed: project has no base path", isError = true)
                         return@launch
                     }
@@ -999,6 +1020,26 @@ class ChatViewModel(
                 )
                 val success = writer.writeRepoStructure(content)
                 if (success) {
+                    // Generate the intellij-mcp-tools.md context file from the live tool
+                    // registry so the reference reflects the actual MCP tools exposed by the
+                    // current IDE and the user's permission settings. Non-fatal if this fails
+                    // (repo-structure.md is the primary context file).
+                    try {
+                        val toolRegistry = service.toolRegistry
+                        val tools = toolRegistry?.tools?.values?.toList() ?: emptyList()
+                        // loadPersistedPermissions returns Map<String, Pair<Boolean, ToolPermission>>;
+                        // extract just the ToolPermission for the doc generator.
+                        val permissions = loadPersistedPermissions(toolRegistry)
+                            .mapValues { it.value.second }
+                        val mcpDoc = com.opencode.acp.intelligence.context.McpToolsDocGenerator()
+                            .generate(tools, permissions)
+                        val mcpOk = writer.writeMcpToolsDoc(mcpDoc)
+                        if (!mcpOk) {
+                            logger.warn { "[ACP] generateContext: failed to write intellij-mcp-tools.md (non-fatal)" }
+                        }
+                    } catch (e: Exception) {
+                        logger.warn(e) { "[ACP] generateContext: failed to generate intellij-mcp-tools.md (non-fatal)" }
+                    }
                     // Also write the instructions glob to opencode.json so the
                     // context file is included in every prompt.
                     try {
@@ -1012,7 +1053,10 @@ class ChatViewModel(
                         logger.warn(e) { "[ACP] Failed to write instructions glob" }
                     }
                     _contextGenerationState.value = ContextGenerationState.Success
-                    notifyContextGeneration("Context file generated: .opencode/context/repo-structure.md", isError = false)
+                    notifyContextGeneration(
+                        "Context files generated: .opencode/context/repo-structure.md and intellij-mcp-tools.md",
+                        isError = false
+                    )
                 } else {
                     _contextGenerationState.value = ContextGenerationState.Failed("Failed to write context file")
                     notifyContextGeneration("Context generation failed: could not write file", isError = true)
@@ -1084,7 +1128,8 @@ class ChatViewModel(
 
     /** Cancellation flag for multi-model review loops. Set by [cancel] to
      *  stop the loop after the current model finishes. */
-    @Volatile private var multiModelReviewCancelled = false
+    @Volatile
+    private var multiModelReviewCancelled = false
 
     private val reviewCommandHandler = ReviewCommandHandler(
         scope = scope,
@@ -1185,8 +1230,9 @@ class ChatViewModel(
     }
 
     suspend fun connect(projectBasePath: String?) {
-        if (connectionState.value == ConnectionState.CONNECTED || 
-            connectionState.value == ConnectionState.CONNECTING) {
+        if (connectionState.value == ConnectionState.CONNECTED ||
+            connectionState.value == ConnectionState.CONNECTING
+        ) {
             return
         }
         // Cancel any in-flight initialization before connecting. Same reason
@@ -1240,8 +1286,8 @@ class ChatViewModel(
             val confirm = com.intellij.openapi.ui.Messages.showOkCancelDialog(
                 project,
                 "Brave Mode will auto-approve ALL tool permission prompts without showing the confirmation dialog.\n\n" +
-                    "Explicit 'deny' rules are still enforced server-side, but any tool without a deny rule " +
-                    "will run without asking.\n\nEnable Brave Mode?",
+                        "Explicit 'deny' rules are still enforced server-side, but any tool without a deny rule " +
+                        "will run without asking.\n\nEnable Brave Mode?",
                 "Confirm Brave Mode",
                 com.intellij.openapi.ui.Messages.OK_BUTTON,
                 com.intellij.openapi.ui.Messages.CANCEL_BUTTON,
@@ -1269,47 +1315,46 @@ class ChatViewModel(
             service.parsePersistedToolPermissions(permsJson).mapValues { (_, pair) ->
                 Pair(pair.first, ToolPermission.fromActionString(pair.second))
             }
-        } catch (e: kotlinx.serialization.SerializationException) {
-            // FAIL-CLOSED: corrupted permissions JSON → set all discovered tools to ASK
-            // (safest interactive default) instead of leaving them at ALLOW. See
-            // OpenCodeService.discoverToolsInBackground for the full rationale.
-            logger.error(e) { "[ACP] Corrupted tool permissions JSON — failing closed (all tools → ASK)" }
-            val allDiscovered = registry?.tools?.values ?: emptyList()
-            if (allDiscovered.isEmpty()) {
-                // No tools discovered yet (MCP init may have failed or not run).
-                // Returning emptyMap() means the caller skips loadEnabledAndPermissions,
-                // leaving tools at their discovery default (ALLOW). This is a fail-open
-                // path, but discoverToolsInBackground (in OpenCodeService) will apply
-                // fail-closed when it runs later with the registry populated. Log a
-                // warning so the gap is visible.
-                logger.warn { "[ACP] Corrupted tool permissions JSON but no tools discovered yet — fail-closed deferred to discoverToolsInBackground. Tools will be at ALLOW until then." }
-                emptyMap()
-            } else {
-                // Set both tool.id and tool.name to ASK — the registry may look up permissions
-                // by either key depending on the context (some tools are referenced by id, others
-                // by name). Setting both ensures fail-closed regardless of which key is used.
-                // NOTE: The per-name entry may be overwritten if two MCP servers expose a tool
-                // with the same raw name (last-write-wins). However, fail-closed is STILL
-                // reliable because every tool also has a unique `tool.id` entry
-                // ("${serverName}_${name}") set to ASK. The registry's loadEnabledAndPermissions
-                // matches by `id OR name`, so the id entry guarantees every tool gets ASK
-                // regardless of name collisions. The per-name entry is best-effort redundancy.
-                val failClosed = mutableMapOf<String, Pair<Boolean, ToolPermission>>()
-                for (tool in allDiscovered) {
-                    failClosed[tool.id] = Pair(true, ToolPermission.ASK)
-                    failClosed[tool.name] = Pair(true, ToolPermission.ASK)
-                    // NOTE: if two MCP servers expose tools with the same raw name, the
-                    // later one overwrites this entry, so fail-closed is per-id reliable
-                    // but per-name best-effort. See AGENTS.md "Tool Permissions —
-                    // Remaining gaps" for the underlying name-collision issue.
-                }
-                failClosed.toMap()
-            }
+        } catch (e: SerializationException) {
+            // FAIL-CLOSED: corrupted permissions JSON (parseToJsonElement threw) — delegate
+            // to the shared fail-closed helper. See failClosedOnCorruptedPermissions.
+            failClosedOnCorruptedPermissions(e, registry)
+        } catch (e: IllegalArgumentException) {
+            // FAIL-CLOSED: wrong-typed entry (.jsonObject on non-object) — same handler
+            // as SerializationException. Delegates to the shared fail-closed helper.
+            failClosedOnCorruptedPermissions(e, registry)
         } catch (e: Exception) {
             // Non-parse exceptions (NPE, ClassCastException, etc.) indicate a code bug,
             // not corrupted JSON. Log and rethrow to surface the real issue.
             logger.error(e) { "[ACP] Unexpected error parsing tool permissions (not a JSON error)" }
             throw e
+        }
+    }
+
+    /**
+     * Shared fail-closed handler for corrupted tool-permissions JSON.
+     * Sets every discovered tool to ASK so a corrupted settings file cannot silently
+     * downgrade all tool permissions to ALLOW (security-relevant). See
+     * [com.opencode.acp.chat.service.OpenCodeService.discoverToolsInBackground] for the
+     * full rationale. Called from both the SerializationException and IllegalArgumentException
+     * catch clauses of [loadPersistedPermissions].
+     */
+    private fun failClosedOnCorruptedPermissions(
+        e: Exception,
+        registry: com.opencode.acp.mcp.ToolRegistry?,
+    ): Map<String, Pair<Boolean, ToolPermission>> {
+        logger.error(e) { "[ACP] Corrupted tool permissions JSON — failing closed (all tools → ASK)" }
+        val allDiscovered = registry?.tools?.values ?: emptyList()
+        return if (allDiscovered.isEmpty()) {
+            logger.warn { "[ACP] Corrupted tool permissions JSON but no tools discovered yet — fail-closed deferred to discoverToolsInBackground. Tools will be at ALLOW until then." }
+            emptyMap()
+        } else {
+            val failClosed = mutableMapOf<String, Pair<Boolean, ToolPermission>>()
+            for (tool in allDiscovered) {
+                failClosed[tool.id] = Pair(true, ToolPermission.ASK)
+                failClosed[tool.name] = Pair(true, ToolPermission.ASK)
+            }
+            failClosed.toMap()
         }
     }
 

@@ -6,6 +6,7 @@ import com.opencode.acp.chat.model.OpenCodeAgentInfo
 import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.model.ThinkingEffort
 import com.opencode.acp.chat.service.OpenCodeServiceApi
+import com.opencode.acp.config.AgentConstants
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -54,7 +55,7 @@ class ControlBarViewModel(
                         OpenCodeAgentInfo(id = info.id, name = info.name, description = info.description)
                     }
                 )
-                val defaultAgentInfo = filtered.firstOrNull { it.name == "orchestrator" }
+                val defaultAgentInfo = filtered.firstOrNull { it.name == AgentConstants.CODING_ASSISTANT_AGENT_NAME }
                     ?: filtered.firstOrNull()
                 if (defaultAgentInfo != null) {
                     val agentInfo = _controlState.value.agents.find { it.id == defaultAgentInfo.id }
@@ -95,6 +96,7 @@ class ControlBarViewModel(
                         }
                     }
                 }
+
                 val models = buildProviderModels(providers.all.filter { it.id in connectedIds })
                 val allModels = buildProviderModels(providers.all)
                 val savedKey = settings.lastSelectedModelKey
@@ -106,22 +108,6 @@ class ControlBarViewModel(
                     allModels = allModels,
                     selectedModel = restoredModel ?: models.firstOrNull()
                 )
-                // Restore persisted agent selection
-                val savedAgentId = settings.lastSelectedAgent
-                if (savedAgentId.isNotEmpty()) {
-                    val restoredAgent = _controlState.value.agents.find { it.id == savedAgentId }
-                    if (restoredAgent != null) {
-                        _controlState.value = _controlState.value.copy(selectedAgent = restoredAgent)
-                    }
-                }
-                // Restore persisted thinking effort
-                val savedEffortName = settings.lastSelectedThinkingEffort
-                if (savedEffortName.isNotEmpty()) {
-                    val restoredEffort = ThinkingEffort.entries.firstOrNull { it.name == savedEffortName }
-                    if (restoredEffort != null) {
-                        _controlState.value = _controlState.value.copy(thinkingEffort = restoredEffort)
-                    }
-                }
                 logger.info { "[ACP] ControlBarViewModel: providers loaded (${providers.all.size} total)" }
             }
         } catch (e: Exception) {
@@ -130,6 +116,27 @@ class ControlBarViewModel(
             // TODO: surface a non-blocking notification (snackbar/status bar) on failure
             // for discoverability — requires design discussion (out of scope here).
             logger.warn { "[ACP] Provider loading failed: ${e.message} — model picker will be empty. User should check connection and retry." }
+        }
+        // Phase 3: Restore persisted agent + thinking-effort selections.
+        // IMPORTANT: This runs OUTSIDE the providers-success block so the user's
+        // selections survive even when provider loading times out or fails. The agent
+        // list comes from Phase 1 (which has its own try/catch); if Phase 1 also failed,
+        // `agents` is empty and these are no-ops (correct graceful degradation).
+        run {
+            val savedAgentId = settings.lastSelectedAgent
+            if (savedAgentId.isNotEmpty()) {
+                val restoredAgent = _controlState.value.agents.find { it.id == savedAgentId }
+                if (restoredAgent != null) {
+                    _controlState.value = _controlState.value.copy(selectedAgent = restoredAgent)
+                }
+            }
+            val savedEffortName = settings.lastSelectedThinkingEffort
+            if (savedEffortName.isNotEmpty()) {
+                val restoredEffort = ThinkingEffort.entries.firstOrNull { it.name == savedEffortName }
+                if (restoredEffort != null) {
+                    _controlState.value = _controlState.value.copy(thinkingEffort = restoredEffort)
+                }
+            }
         }
     }
 

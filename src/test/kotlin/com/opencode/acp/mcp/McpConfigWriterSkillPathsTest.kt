@@ -129,7 +129,7 @@ class McpConfigWriterSkillPathsTest {
                 }
               },
               "agent": {
-                "orchestrator": {
+                "coding-assistant": {
                   "model": "gpt-4"
                 }
               }
@@ -147,7 +147,7 @@ class McpConfigWriterSkillPathsTest {
 
         val agent = config["agent"]?.jsonObject
         agent shouldNotBe null
-        agent!!["orchestrator"]?.jsonObject?.get("model")?.jsonPrimitive?.content shouldBe "gpt-4"
+        agent!!["coding-assistant"]?.jsonObject?.get("model")?.jsonPrimitive?.content shouldBe "gpt-4"
     }
 
     @Test
@@ -347,5 +347,60 @@ class McpConfigWriterSkillPathsTest {
         // does NOT end with it (ends with 'skills-backup'), so it's user-added
         // and must be preserved.
         paths shouldBe listOf("/home/user/my-aia/agents/.agents/skills-backup")
+    }
+
+    // ── writeAgentOverrides: stale agent eviction ────────────────────
+
+    @Test
+    fun `writeAgentOverrides evicts stale orchestrator agent entry`() {
+        writeInitialConfig(
+            """{
+              "${'$'}schema": "https://opencode.ai/config.json",
+              "agent": {
+                "orchestrator": {
+                  "permission": { "read": "allow", "edit": "deny" }
+                },
+                "coding-assistant": {
+                  "model": "gpt-4"
+                }
+              }
+            }""".trimIndent()
+        )
+
+        val writer = newWriter()
+        val result = writer.writeAgentOverrides(enableExplore = true, enableGeneral = true, disabledAgentNames = emptyList())
+        result shouldBe true
+
+        val agent = readConfig()["agent"]?.jsonObject
+        agent shouldNotBe null
+        // orchestrator must be evicted
+        agent!!["orchestrator"] shouldBe null
+        // coding-assistant must be preserved
+        agent["coding-assistant"]?.jsonObject?.get("model")?.jsonPrimitive?.content shouldBe "gpt-4"
+    }
+
+    @Test
+    fun `writeAgentOverrides evicts orchestrator and applies explore general overrides`() {
+        writeInitialConfig(
+            """{
+              "${'$'}schema": "https://opencode.ai/config.json",
+              "agent": {
+                "orchestrator": { "permission": { "read": "allow" } },
+                "explore": { "disable": true },
+                "general": { "disable": true }
+              }
+            }""".trimIndent()
+        )
+
+        val writer = newWriter()
+        val result = writer.writeAgentOverrides(enableExplore = true, enableGeneral = true, disabledAgentNames = listOf("adversarial-glm-5.1"))
+        result shouldBe true
+
+        val agent = readConfig()["agent"]?.jsonObject
+        agent shouldNotBe null
+        agent!!["orchestrator"] shouldBe null
+        agent["explore"]?.jsonObject?.get("disable")?.jsonPrimitive?.content shouldBe "false"
+        agent["general"]?.jsonObject?.get("disable")?.jsonPrimitive?.content shouldBe "false"
+        agent["adversarial-glm-5.1"]?.jsonObject?.get("disable")?.jsonPrimitive?.content shouldBe "true"
     }
 }

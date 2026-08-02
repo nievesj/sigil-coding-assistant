@@ -1,6 +1,7 @@
 package com.opencode.acp.mcp
 
 import com.opencode.acp.chat.model.ChatConstants
+import com.opencode.acp.config.AgentConstants
 import com.opencode.acp.config.settings.OpenCodeMcpSettingsState
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.serialization.json.Json
@@ -58,6 +59,13 @@ class McpConfigWriter(
          *  from multiple McpConfigWriter instances targeting the same project. */
         private val projectLocks = java.util.concurrent.ConcurrentHashMap<String, ReentrantLock>()
 
+        /** Agent names that are stale leftovers from older plugin versions and should
+         *  be evicted from opencode.json during [writeAgentOverrides]. The "orchestrator"
+         *  agent accumulated "Always Allow" permission clicks before the custom-agents
+         *  TDD introduced coding-assistant; it does not correspond to any agent the
+         *  plugin defines or the server provides. */
+        private val STALE_AGENT_NAMES = setOf("orchestrator")
+
         /**
          * Flatten a recursive glob pattern by removing recursive glob segments (double-star followed by slash).
          * Used for the "covers" check in [mergeInstructions].
@@ -83,6 +91,12 @@ class McpConfigWriter(
          * - Otherwise, append [ourGlob] to the array.
          * - Preserve all existing entries regardless of type (string or object).
          *
+         * WARNING: The "covers" check uses [flattenRecursiveGlob], which has a
+         * known limitation with multi-level recursive globs (see its doc). This
+         * method is safe for the current single use case (CONTEXT_GLOB_PATTERN
+         * = `.opencode/context/**/*.md`) but may produce incorrect results for
+         * arbitrary multi-level globs. Do not reuse for general glob merging.
+         *
          * @param existing The existing instructions JsonArray (may contain strings and objects).
          * @param ourGlob The glob pattern to merge in (e.g., ".opencode/context/**/*.md").
          * @return The merged JsonArray.
@@ -100,6 +114,10 @@ class McpConfigWriter(
             val normalizedOurs = flattenRecursiveGlob(ourGlob)
             for (existingGlob in existingStrings) {
                 val normalizedExisting = flattenRecursiveGlob(existingGlob)
+                // Only recursive globs can cover other globs
+                val isRecursive =
+                    existingGlob.contains("**") || existingGlob.endsWith("/*") || existingGlob.endsWith("/")
+                if (!isRecursive) continue
                 // A glob A covers glob B if A's directory prefix is a prefix of B's
                 // (using startsWith on the directory portion). This is a prefix match,
                 // not a proper parent-directory check — a glob like ".opencode" would
@@ -191,7 +209,12 @@ class McpConfigWriter(
                     val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
                     Files.writeString(tempFile, json.encodeToString(JsonObject.serializer(), finalConfig))
                     try {
-                        Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                        Files.move(
+                            tempFile,
+                            configFile,
+                            StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.ATOMIC_MOVE
+                        )
                     } catch (e: java.nio.file.AtomicMoveNotSupportedException) {
                         logger.warn { "[ACP] McpConfigWriter: atomic move not supported, falling back to non-atomic replace" }
                         Files.move(tempFile, configFile, StandardCopyOption.REPLACE_EXISTING)
@@ -199,7 +222,10 @@ class McpConfigWriter(
                     true
                 } catch (e: Exception) {
                     // Clean up temp file on failure
-                    try { Files.deleteIfExists(tempFile) } catch (_: Exception) {}
+                    try {
+                        Files.deleteIfExists(tempFile)
+                    } catch (_: Exception) {
+                    }
                     throw e
                 }
             } catch (e: Exception) {
@@ -217,7 +243,7 @@ class McpConfigWriter(
     fun write(): Boolean {
         val success = writeConfig { config ->
             // Get the existing mcp section or start with empty object
-            val existingMcp = config["mcp"]?.jsonObject ?: buildJsonObject {}
+            val existingMcp = (config["mcp"] as? JsonObject) ?: buildJsonObject {}
 
             // Build new mcp entries from settings
             val newMcp = buildMcpEntries(existingMcp)
@@ -320,19 +346,22 @@ class McpConfigWriter(
      * merged with existing agent config, preserving other agent settings.
      *
      * @param permissions Map of tool name to permission (allow/deny/ask)
-     * @param agentName The agent to apply permissions to (default: "orchestrator")
+     * @param agentName The agent to apply permissions to (default: "coding-assistant")
      * @return true if the config was written successfully, false otherwise
      */
-    fun writeToolPermissions(permissions: Map<String, ToolPermission>, agentName: String = "orchestrator"): Boolean {
+    fun writeToolPermissions(
+        permissions: Map<String, ToolPermission>,
+        agentName: String = AgentConstants.CODING_ASSISTANT_AGENT_NAME
+    ): Boolean {
         val success = writeConfig { config ->
             // Get existing agent section or start with empty object
-            val existingAgents = config["agent"]?.jsonObject ?: buildJsonObject {}
+            val existingAgents = (config["agent"] as? JsonObject) ?: buildJsonObject {}
 
             // Get existing agent config or start with empty object
-            val existingAgentConfig = existingAgents[agentName]?.jsonObject ?: buildJsonObject {}
+            val existingAgentConfig = (existingAgents[agentName] as? JsonObject) ?: buildJsonObject {}
 
             // Get existing permission section or start with empty object
-            val existingPermissions = existingAgentConfig["permission"]?.jsonObject ?: buildJsonObject {}
+            val existingPermissions = (existingAgentConfig["permission"] as? JsonObject) ?: buildJsonObject {}
 
             // Build new permission entries
             val newPermissions = buildPermissionEntries(permissions, existingPermissions)
@@ -388,11 +417,15 @@ class McpConfigWriter(
      * For pattern-based tools (e.g., bash), patterns are stored but the tool-level
      * permission is set to "allow" — the server handles pattern-level evaluation.
      *
-     * @param agentName The agent to apply the permission to (e.g., "orchestrator", "fixer")
+     * @param agentName The agent to apply the permission to (e.g., "coding-assistant", "fixer")
      * @param toolName The tool name to allow (e.g., "bash", "read", "edit")
      * @param patterns Optional patterns for pattern-based tools (currently informational —
      *   the tool-level permission is set to "allow")
-     * @return true if the config was written successfully, false otherwise
+     * @return true if the rule was applied AND the config file was written successfully;
+     *   false if (a) an existing deny rule was preserved by the deny-guard (the write
+     *   succeeded but the "Always Allow" was NOT applied — see deniedByGuard in the
+     *   implementation), or (b) the config write failed (I/O error). Callers that only
+     *   care about whether the permission is now "allow" should treat false as "not applied".
      */
     fun writeAlwaysAllowRule(agentName: String, toolName: String, patterns: List<String>): Boolean {
         // Validate inputs — agentName and toolName become JSON object keys in the
@@ -405,15 +438,16 @@ class McpConfigWriter(
             return false
         }
 
+        var deniedByGuard = false
         val success = writeConfig { config ->
             // Get existing agent section or start with empty object
-            val existingAgents = config["agent"]?.jsonObject ?: buildJsonObject {}
+            val existingAgents = (config["agent"] as? JsonObject) ?: buildJsonObject {}
 
             // Get existing agent config or start with empty object
-            val existingAgentConfig = existingAgents[agentName]?.jsonObject ?: buildJsonObject {}
+            val existingAgentConfig = (existingAgents[agentName] as? JsonObject) ?: buildJsonObject {}
 
             // Get existing permission section or start with empty object
-            val existingPermissions = existingAgentConfig["permission"]?.jsonObject ?: buildJsonObject {}
+            val existingPermissions = (existingAgentConfig["permission"] as? JsonObject) ?: buildJsonObject {}
 
             // Build updated permissions: copy existing + add/override the tool.
             // If the existing value is a JsonObject (pattern-specific rules), merge
@@ -431,6 +465,7 @@ class McpConfigWriter(
                     val existingWildcard = existingToolPermission["*"]
                     if (existingWildcard is JsonPrimitive && existingWildcard.content == "deny") {
                         logger.warn { "[ACP] McpConfigWriter: refusing to overwrite existing wildcard 'deny' rule for tool '$toolName' — keeping deny. User must manually update config if they want to allow." }
+                        deniedByGuard = true
                         // Keep the existing permission object unchanged — do NOT add "*": "allow"
                         put(toolName, existingToolPermission)
                     } else {
@@ -441,7 +476,19 @@ class McpConfigWriter(
                         })
                     }
                 } else {
-                    put(toolName, JsonPrimitive("allow"))
+                    // Guard: do NOT silently flip an existing simple-string "deny" to "allow".
+                    // A user who set a tool to Deny via the settings panel (writeToolPermissions
+                    // writes JsonPrimitive(permission.toActionString())) should not have their
+                    // deny overwritten by a single "Always Allow" click. Mirrors the object-form
+                    // wildcard-deny guard above.
+                    if (existingToolPermission is JsonPrimitive && existingToolPermission.content == "deny") {
+                        logger.warn { "[ACP] McpConfigWriter: refusing to overwrite existing 'deny' rule for tool '$toolName' — keeping deny. User must manually update config if they want to allow." }
+                        deniedByGuard = true
+                        // Keep the existing deny unchanged — do NOT overwrite with "allow"
+                        put(toolName, existingToolPermission)
+                    } else {
+                        put(toolName, JsonPrimitive("allow"))
+                    }
                 }
             }
 
@@ -474,6 +521,13 @@ class McpConfigWriter(
                 }
                 put("agent", updatedAgents)
             }
+        }
+        if (deniedByGuard) {
+            // Config write succeeded (file updated) but the deny-guard refused
+            // to flip the permission. Return false so the caller knows the
+            // "Always Allow" was NOT applied to the config.
+            logger.warn { "[ACP] McpConfigWriter: always-allow rule for agent=$agentName, tool=$toolName was refused by deny-guard (existing deny preserved)" }
+            return false
         }
         if (success) {
             logger.info { "[ACP] McpConfigWriter: wrote always-allow rule for agent=$agentName, tool=$toolName" }
@@ -522,7 +576,7 @@ class McpConfigWriter(
         }
 
         val success = writeConfig { config ->
-            val existingMcp = config["mcp"]?.jsonObject ?: return@writeConfig config
+            val existingMcp = (config["mcp"] as? JsonObject) ?: return@writeConfig config
 
             // Determine plugin-managed keys (same logic as write())
             val pluginManagedKeys = mutableSetOf(ChatConstants.MCP_SERVER_NAME_INTELLIJ)
@@ -534,7 +588,8 @@ class McpConfigWriter(
                         val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: continue
                         if (name.isNotBlank()) pluginManagedKeys.add(name)
                     }
-                } catch (_: Exception) { /* best effort */ }
+                } catch (_: Exception) { /* best effort */
+                }
             }
 
             // Rebuild mcp section without plugin-managed entries
@@ -581,9 +636,9 @@ class McpConfigWriter(
      */
     fun writeSkillPaths(paths: List<String>): Boolean {
         val success = writeConfig { config ->
-            val existingSkills = config["skills"]?.jsonObject
-            val existingUrls = existingSkills?.get("urls")?.jsonArray
-            val existingPaths = existingSkills?.get("paths")?.jsonArray
+            val existingSkills = config["skills"] as? JsonObject
+            val existingUrls = existingSkills?.get("urls") as? JsonArray
+            val existingPaths = (existingSkills?.get("paths") as? JsonArray)
                 ?.mapNotNull { it.jsonPrimitive.contentOrNull }
                 ?: emptyList()
 
@@ -644,7 +699,7 @@ class McpConfigWriter(
      */
     fun writeInstructions(glob: String): Boolean {
         val success = writeConfig { config ->
-            val existingInstructions = config["instructions"]?.jsonArray ?: buildJsonArray {}
+            val existingInstructions = (config["instructions"] as? JsonArray) ?: buildJsonArray {}
             val merged = mergeInstructions(existingInstructions, glob)
             buildJsonObject {
                 for ((key, value) in config) {
@@ -657,6 +712,95 @@ class McpConfigWriter(
         }
         if (success) {
             logger.info { "[ACP] McpConfigWriter: wrote instructions glob: $glob" }
+        }
+        return success
+    }
+
+    /**
+     * Writes agent enable/disable overrides to the `agent` section of opencode.json.
+     *
+     * Re-enables `explore` and `general` (council depends on them) and disables
+     * known leaked agents (e.g., stale global agents from a developer machine's
+     * global config that leak into the project session).
+     *
+     * Uses the existing [writeConfig] read-modify-write + ReentrantLock, mirroring
+     * the [writeSkillPaths] pattern. Preserves existing agent entries except for
+     * [STALE_AGENT_NAMES] (e.g., `orchestrator`), which are evicted.
+     *
+     * @param enableExplore re-enable the `explore` agent (set `disable: false`).
+     * @param enableGeneral re-enable the `general` agent (set `disable: false`).
+     * @param disabledAgentNames agent names to disable (set `disable: true`).
+     * @return true if the config was written successfully, false otherwise.
+     */
+    fun writeAgentOverrides(
+        enableExplore: Boolean = true,
+        enableGeneral: Boolean = true,
+        disabledAgentNames: List<String> = emptyList()
+    ): Boolean {
+        val success = writeConfig { config ->
+            val existingAgent = (config["agent"] as? JsonObject) ?: buildJsonObject {}
+
+            // Build updated agent section
+            val updatedAgent = buildJsonObject {
+                // Copy all existing agent entries EXCEPT known-stale agents.
+                // The "orchestrator" agent is a stale leftover from an older plugin
+                // version that accumulated "Always Allow" permission clicks before
+                // the custom-agents TDD introduced coding-assistant. It does not
+                // correspond to any agent the plugin defines or the server provides.
+                for ((key, value) in existingAgent) {
+                    if (key in STALE_AGENT_NAMES) continue
+                    put(key, value)
+                }
+                // Re-enable explore if requested
+                if (enableExplore) {
+                    val existingExplore = (existingAgent["explore"] as? JsonObject) ?: buildJsonObject {}
+                    put("explore", buildJsonObject {
+                        for ((k, v) in existingExplore) {
+                            if (k != "disable") put(k, v)
+                        }
+                        put("disable", JsonPrimitive(false))
+                    })
+                }
+                // Re-enable general if requested
+                if (enableGeneral) {
+                    val existingGeneral = (existingAgent["general"] as? JsonObject) ?: buildJsonObject {}
+                    put("general", buildJsonObject {
+                        for ((k, v) in existingGeneral) {
+                            if (k != "disable") put(k, v)
+                        }
+                        put("disable", JsonPrimitive(false))
+                    })
+                }
+                // Disable known leaked agents
+                // Validate each name via isValidConfigKey (defense-in-depth — mirrors
+                // writeAlwaysAllowRule). Today disabledAgentNames is always
+                // AgentConstants.KNOWN_LEAKED_AGENTS (hardcoded trusted strings), but
+                // the method is public and a future caller could pass untrusted names.
+                for (agentName in disabledAgentNames) {
+                    if (!isValidConfigKey(agentName)) {
+                        logger.warn { "[ACP] McpConfigWriter.writeAgentOverrides: skipping invalid agent name in disabledAgentNames: '$agentName'" }
+                        continue
+                    }
+                    val existing = (existingAgent[agentName] as? JsonObject) ?: buildJsonObject {}
+                    put(agentName, buildJsonObject {
+                        for ((k, v) in existing) {
+                            if (k != "disable") put(k, v)
+                        }
+                        put("disable", JsonPrimitive(true))
+                    })
+                }
+            }
+
+            // Build new config preserving all other keys
+            buildJsonObject {
+                for ((key, value) in config) {
+                    if (key != "agent" && key != "\$schema") put(key, value)
+                }
+                put("agent", updatedAgent)
+            }
+        }
+        if (success) {
+            logger.info { "[ACP] McpConfigWriter: wrote agent overrides (explore=$enableExplore, general=$enableGeneral, disabled=${disabledAgentNames.size})" }
         }
         return success
     }

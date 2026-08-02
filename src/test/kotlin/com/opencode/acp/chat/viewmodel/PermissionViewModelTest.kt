@@ -145,7 +145,7 @@ class PermissionViewModelTest {
         viewModel.setPermissionPrompt(prompt)
         coEvery { service.respondPermission(any(), any(), any(), any(), any(), any(), any()) } just runs
 
-        viewModel.respondPermission(PermissionResponse.ALLOW_ONCE, "orchestrator")
+        viewModel.respondPermission(PermissionResponse.ALLOW_ONCE, "coding-assistant")
 
         viewModel.permissionPrompt.value shouldBe null
         verify { permissionManager.cancelPermissionTimeout() }
@@ -157,7 +157,7 @@ class PermissionViewModelTest {
         viewModel.setPermissionPrompt(prompt)
         coEvery { service.respondPermission(any(), any(), any(), any(), any(), any(), any()) } throws RuntimeException("network")
 
-        viewModel.respondPermission(PermissionResponse.ALLOW_ONCE, "orchestrator")
+        viewModel.respondPermission(PermissionResponse.ALLOW_ONCE, "coding-assistant")
 
         // Prompt should still be visible
         viewModel.permissionPrompt.value shouldBe prompt
@@ -167,7 +167,7 @@ class PermissionViewModelTest {
 
     @Test
     fun `respondPermission with no prompt is no-op`() = runBlocking {
-        viewModel.respondPermission(PermissionResponse.ALLOW_ONCE, "orchestrator")
+        viewModel.respondPermission(PermissionResponse.ALLOW_ONCE, "coding-assistant")
         viewModel.permissionPrompt.value shouldBe null
     }
 

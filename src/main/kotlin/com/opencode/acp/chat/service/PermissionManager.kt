@@ -5,6 +5,7 @@ import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.chat.model.PartState
 import com.opencode.acp.chat.model.PermissionResponse
 import com.opencode.acp.chat.processor.SessionManager
+import com.opencode.acp.config.AgentConstants
 import com.opencode.acp.mcp.McpConfigWriter
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
@@ -21,10 +22,13 @@ class PermissionManager(
 ) {
 
     private val logger = KotlinLogging.logger {}
+
     /** @Volatile because read/written from multiple threads:
      *  - startPermissionTimeout() / cancelPermissionTimeout() from ViewModel scope (Dispatchers.Default)
      *  - cancelPermissionTimeout() from dispose() on EDT */
-    @Volatile private var permissionTimeoutJob: Job? = null
+    @Volatile
+    private var permissionTimeoutJob: Job? = null
+
     /** Serializes the cancel+launch sequence in [startPermissionTimeout] so two
      *  concurrent calls cannot both leak an uncancelled job. Non-suspending lock
      *  because [startPermissionTimeout] / [cancelPermissionTimeout] are called
@@ -44,14 +48,14 @@ class PermissionManager(
         response: PermissionResponse,
         toolName: String = "",
         patterns: List<String> = emptyList(),
-        agentName: String = "orchestrator",
+        agentName: String = AgentConstants.CODING_ASSISTANT_AGENT_NAME,
     ) {
-        // NOTE (ABA race): This uses optimistic local updates before the server call.
-        // If an SSE event arrives between the optimistic update and a rollback (on
-        // server failure), that SSE-driven state could be overwritten by the rollback.
-        // This is an accepted limitation — the window is small and the server is
-        // authoritative on retry (the prompt re-appears if the server never received
-        // the response).
+        // NOTE: ALLOW_* updates local state optimistically (before the server call) but
+        // does NOT roll back on POST failure (see catch block below — rolling back to
+        // PENDING would overwrite SSE-driven state that already moved the tool to
+        // IN_PROGRESS). Because there is no rollback, there is no ABA race window for
+        // ALLOW_*. REJECT_ONCE is updated AFTER the server call succeeds (not
+        // optimistically), so there is no optimistic update to race with either.
         val client = clientProvider()
         if (client == null) {
             logger.warn { "[ACP] Permission response dropped: client is null (server may not be connected)" }
