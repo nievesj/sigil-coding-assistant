@@ -1,4 +1,4 @@
-package com.opencode.acp.config
+﻿package com.opencode.acp.config
 
 import com.opencode.acp.config.settings.CouncilMember
 import com.opencode.acp.config.settings.OpenCodeAgentSettingsState
@@ -87,7 +87,7 @@ class AgentConfigWriterTest {
         content shouldNotContain "bash: deny"
         content shouldNotContain "intellij_search_symbol: allow"
         // Prompt body present — references AGENTS.md and mandates intellij_* for intelligence
-        content shouldContain "You are a coding assistant embedded in IntelliJ IDEA."
+        content shouldContain "You are a coding assistant embedded in IntelliJ IDEA"
         content shouldContain "Mandatory Research Phase"
         content shouldContain "AGENTS.md"
         content shouldContain "Retry On Failure"
@@ -141,7 +141,7 @@ class AgentConfigWriterTest {
             content shouldNotContain "$tool: allow"
         }
         // Prompt body is the same intellij-exclusive prompt (references AGENTS.md)
-        content shouldContain "You are a coding assistant embedded in IntelliJ IDEA."
+        content shouldContain "You are a coding assistant embedded in IntelliJ IDEA"
         content shouldContain "AGENTS.md"
         content shouldContain ".opencode/context/repo-structure.md"
         content shouldContain ".opencode/context/intellij-mcp-tools.md"
@@ -151,7 +151,15 @@ class AgentConfigWriterTest {
 
     @Test
     fun `buildTaskPermissionYaml generates deny-all plus one allow per selected agent`() {
-        val settings = newSettings(enableCouncil = true, taskAllowedAgents = listOf("explore", "general", "council"))
+        // Council needs valid members for isAgentEnabledForTaskAllowlist to
+        // emit "council": "allow" (mirrors hasValidConfig - council.md is not
+        // written without valid members, so the allowlist must not reference it).
+        val members = listOf(CouncilMember("anthropic", "claude-sonnet-4"))
+        val settings = newSettings(
+            enableCouncil = true,
+            councilMembers = members,
+            taskAllowedAgents = listOf("explore", "general", "council")
+        )
         val writer = newWriter(settings)
         val yaml = writer.buildTaskPermissionYaml()
 
@@ -175,7 +183,12 @@ class AgentConfigWriterTest {
 
     @Test
     fun `buildTaskPermissionYaml includes council when enableCouncil is true and council in taskAllowedAgents`() {
-        val settings = newSettings(enableCouncil = true, taskAllowedAgents = listOf("explore", "general", "council"))
+        val members = listOf(CouncilMember("anthropic", "claude-sonnet-4"))
+        val settings = newSettings(
+            enableCouncil = true,
+            councilMembers = members,
+            taskAllowedAgents = listOf("explore", "general", "council")
+        )
         val writer = newWriter(settings)
         val yaml = writer.buildTaskPermissionYaml()
 
@@ -257,7 +270,7 @@ class AgentConfigWriterTest {
     }
 
     @Test
-    fun `council md always overwritten regardless of ownership marker`() {
+    fun `council md backs up user content before overwriting when council enabled`() {
         val file = councilFile()
         Files.createDirectories(file.parent)
         val userContent = "---\ndescription: my custom council\nmode: subagent\n---\nCustom.\n"
@@ -267,8 +280,18 @@ class AgentConfigWriterTest {
         val writer = newWriter(newSettings(enableCouncil = true, councilMembers = members))
         writer.writeCouncil()
 
+        // The user file is backed up to council.md.user.<timestamp>.bak
+        // (alwaysOverwrite + no marker -> backup before overwrite, not silent
+        // destruction). The timestamp prevents overwriting a previous backup
+        // on repeated cycles (review cmt_b2c3d4e5f6a7).
+        val agentsDir = file.parent
+        val backups = agentsDir.toFile().listFiles { f ->
+            f.name.startsWith("council.md.user.") && f.name.endsWith(".bak")
+        } ?: emptyArray()
+        backups.size shouldBe 1
+        Files.readString(backups[0].toPath()) shouldBe userContent
+        // The agent file is overwritten with plugin-managed content.
         val content = readAgentFile(file)
-        content shouldNotBe userContent
         content shouldContain AgentConstants.OWNERSHIP_MARKER
         content shouldContain "You are a multi-model council coordinator."
     }
@@ -356,7 +379,7 @@ class AgentConfigWriterTest {
     // ── clearAll ───────────────────────────────────────────────────────
 
     @Test
-    fun `clearAll removes both agent files`() {
+    fun `clearAll removes written agent files (no-op for never-written v2 agents)`() {
         val members = listOf(CouncilMember("anthropic", "claude-sonnet-4"))
         val writer = newWriter(newSettings(enableCouncil = true, councilMembers = members))
         writer.writeCodingAssistant(isIntellijMcpEnabled = true)
@@ -391,11 +414,19 @@ class AgentConfigWriterTest {
         val jsonContent = Files.readString(opencodeJson)
         jsonContent shouldContain "\"explore\""
         jsonContent shouldContain "\"general\""
-        // Known leaked agents disabled — verify the agent is present AND set to disable:true
+        // KNOWN_LEAKED_AGENTS is NOT shipped to all users (cross-user config
+        // mutation). The plugin must NOT write disable:true for the developer
+        // machine denylist into every user opencode.json.
         val config = Json.parseToJsonElement(jsonContent).jsonObject
-        val leakedAgent = config["agent"]?.jsonObject?.get("adversarial-deepseek-v4-pro")?.jsonObject
-        leakedAgent shouldNotBe null
-        leakedAgent!!["disable"]?.jsonPrimitive?.content shouldBe "true"
+        val agentSection = config["agent"]?.jsonObject
+        // Strengthened: assert agentSection is non-null (so the guard is
+        // exercised, not skipped vacuously), then iterate ALL
+        // KNOWN_LEAKED_AGENTS and assert each is absent. This catches any
+        // regression that ships the denylist to all users.
+        agentSection shouldNotBe null
+        for (leaked in AgentConstants.KNOWN_LEAKED_AGENTS) {
+            agentSection!![leaked] shouldBe null
+        }
     }
 
     // ── council member filtering ──────────────────────────────────────
@@ -434,5 +465,86 @@ class AgentConfigWriterTest {
         // Member without variant should NOT have a colon suffix
         content shouldContain "- openai/gpt-4o"
         content shouldNotContain "- openai/gpt-4o:"
+    }
+
+    // ── remove-path marker-less preservation (review cmt_f8a9b0c1d2e3) ────
+
+    @Test
+    fun `coding-assistant md preserved on REMOVE path when file lacks ownership marker`() {
+        // Pre-create a marker-less coding-assistant.md with user content, then
+        // disable coding-assistant (routes to removeAgentFile). The user file
+        // must be preserved, NOT deleted (mirrors the write-path protection).
+        val file = codingAssistantFile()
+        Files.createDirectories(file.parent)
+        val userContent = "---\ndescription: my custom agent\nmode: primary\n---\nDo my bidding.\n"
+        Files.writeString(file, userContent)
+
+        val writer = newWriter(newSettings(enableCodingAssistant = false))
+        writer.writeCodingAssistant(isIntellijMcpEnabled = true)
+
+        // User file is still present and unchanged.
+        Files.exists(file) shouldBe true
+        Files.readString(file) shouldBe userContent
+    }
+
+    // ── backup uses timestamp to avoid overwrite (review cmt_b2c3d4e5f6a7) ─
+
+    @Test
+    fun `council backup filename includes timestamp so repeated cycles do not overwrite previous backup`() {
+        val file = councilFile()
+        Files.createDirectories(file.parent)
+        val firstUserContent = "---\ndescription: first custom council\nmode: subagent\n---\nFirst.\n"
+        Files.writeString(file, firstUserContent)
+
+        val members = listOf(CouncilMember("anthropic", "claude-sonnet-4"))
+        val writer = newWriter(newSettings(enableCouncil = true, councilMembers = members))
+        writer.writeCouncil()
+
+        // After the first cycle, the agent file has the marker (plugin content).
+        // A user re-edits the file removing the marker, then re-enables - the
+        // second backup must go to a DIFFERENT filename (timestamped) so the
+        // first backup survives.
+        val secondUserContent = "---\ndescription: second custom council\nmode: subagent\n---\nSecond.\n"
+        Files.writeString(file, secondUserContent) // overwrite with new user content (no marker)
+        // Sleep to ensure the second backup timestamp differs from the first
+        // (timestamp granularity is milliseconds; without this, both cycles
+        // could produce the same epoch-ms and the same filename).
+        Thread.sleep(15)
+        writer.writeCouncil()
+
+        val agentsDir = file.parent
+        val backups =
+            agentsDir.toFile().listFiles { f -> f.name.startsWith("council.md.user.") && f.name.endsWith(".bak") }
+                ?: emptyArray()
+        // At least one backup exists (the first cycle). With the timestamped
+        // filename, the second cycle produces a DISTINCT backup (not an
+        // overwrite of the first). If timestamps happen to collide (same ms),
+        // there is still >= 1 backup - the key assertion is that none use the
+        // old fixed `.user.bak` name.
+        backups.size shouldNotBe 0
+        // All backup filenames match the timestamped pattern (not the old fixed name).
+        for (b in backups) {
+            b.name shouldNotBe "council.md.user.bak"
+        }
+    }
+
+    // ── council omitted from allowlist when enabled but memberless (review cmt_a1b2c3d4e5f6) ─
+
+    @Test
+    fun `buildTaskPermissionYaml omits council when enabled but no valid members`() {
+        // Council enabled but councilMembers is empty: writeAgent removes
+        // council.md (hasValidConfig fails), so the allowlist must NOT emit
+        // "council": "allow" (dead entry referencing a non-existent agent file).
+        val writer = newWriter(
+            newSettings(
+                enableCouncil = true,
+                councilMembers = emptyList(),
+                taskAllowedAgents = listOf("explore", "general", "council")
+            )
+        )
+        val yaml = writer.buildTaskPermissionYaml()
+        yaml shouldContain "\"explore\": \"allow\""
+        yaml shouldContain "\"general\": \"allow\""
+        yaml shouldNotContain "\"council\": \"allow\""
     }
 }

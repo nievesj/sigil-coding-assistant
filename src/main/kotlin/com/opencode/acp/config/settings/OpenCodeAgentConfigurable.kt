@@ -1,4 +1,4 @@
-package com.opencode.acp.config.settings
+﻿package com.opencode.acp.config.settings
 
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
@@ -14,6 +14,9 @@ import com.opencode.acp.chat.model.DropdownItem
 import com.opencode.acp.chat.model.ProviderModel
 import com.opencode.acp.chat.model.ThinkingEffort
 import com.opencode.acp.chat.service.OpenCodeService
+import com.opencode.acp.config.AgentConstants
+import com.opencode.acp.config.AgentDefinition
+import com.opencode.acp.config.AgentRegistry
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -23,10 +26,8 @@ import java.awt.Component
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.Font
-import java.awt.GridLayout
 import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
-import java.util.ArrayList
 import javax.swing.AbstractListModel
 import javax.swing.BorderFactory
 import javax.swing.DefaultListCellRenderer
@@ -44,7 +45,6 @@ import javax.swing.ListCellRenderer
 import javax.swing.SwingConstants
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
-import javax.swing.event.ListSelectionListener
 
 private val logger = KotlinLogging.logger {}
 
@@ -52,11 +52,21 @@ private val logger = KotlinLogging.logger {}
  * Child configurable for Custom Agents settings.
  * Appears as "Agents" under the "Sigil" settings node.
  *
+ * v2 (TDD `docs/tdd/custom-agents-v2.md` §4.7.2C): the UI is **data-driven** —
+ * it iterates [AgentRegistry.ALL_AGENTS] to build enable-checkboxes, the
+ * delegation allowlist, and per-agent model rows dynamically instead of v1's
+ * hardcoded widgets. Adding a new agent = add a [AgentRegistry] entry + the
+ * settings field; no new UI wiring.
+ *
  * Exposes:
- *  - `coding-assistant` agent enable/disable toggle
- *  - `council` subagent enable/disable toggle
- *  - Delegation allowlist (which agents can be invoked via the `task` tool)
- *  - Council member models (selected from connected providers' model lists)
+ *  - One enable checkbox per [AgentRegistry] agent (coding-assistant,
+ *    council, coder, researcher, planner, tester).
+ *  - Delegation allowlist (which agents can be invoked via the `task` tool):
+ *    built-ins (explore, general) + all registry subagents.
+ *  - Council member models (v1, unchanged): a dynamic list of model pickers.
+ *  - Per-agent model pickers for v2 subagents with
+ *    [AgentDefinition.hasPerAgentModel] == true (coder, researcher, planner,
+ *    tester). null/empty = inherit parent's model (v1 default).
  *
  * Council member models use a searchable, provider-grouped dropdown that
  * mirrors the model picker in the main chat screen (using the same
@@ -70,15 +80,29 @@ private val logger = KotlinLogging.logger {}
 class OpenCodeAgentConfigurable : Configurable {
 
     private var panel: JPanel? = null
-    private var enableCodingAssistantCheckbox: JBCheckBox? = null
-    private var enableCouncilCheckbox: JBCheckBox? = null
 
-    // Delegation allowlist checkboxes
-    private var exploreCheckbox: JBCheckBox? = null
-    private var generalCheckbox: JBCheckBox? = null
-    private var councilCheckbox: JBCheckBox? = null
+    /** Tracks the async model-fetch coroutine so it can be cancelled in disposeUIResources. */
+    private var fetchModelsJob: kotlinx.coroutines.Job? = null
 
-    // Council member rows
+    /**
+     * When true, the enable-checkbox ItemListener suppresses its auto-check of
+     * the allowlist checkbox. Set during `reset()`/`apply()` programmatic
+     * `setSelected` calls so the listener does not clobber the explicitly
+     * restored allowlist state. The listener only fires on genuine user clicks
+     * (when this flag is false).
+     */
+    private var suppressAutoCheck = false
+
+    /** Per-agent enable checkboxes, keyed by agent name. */
+    private val enableCheckboxes: MutableMap<String, JBCheckBox> = mutableMapOf()
+
+    /** Delegation allowlist checkboxes, keyed by agent name (or "explore"/"general"). */
+    private val allowlistCheckboxes: MutableMap<String, JBCheckBox> = mutableMapOf()
+
+    /** Per-agent model picker rows (only for agents with hasPerAgentModel=true). */
+    private val agentModelRows: MutableMap<String, AgentModelRow> = mutableMapOf()
+
+    // Council member rows (v1, unchanged)
     private val memberRows: MutableList<MemberRow> = mutableListOf()
     private var membersPanel: JPanel? = null
     private var addMemberButton: JButton? = null
@@ -91,7 +115,7 @@ class OpenCodeAgentConfigurable : Configurable {
 
     /**
      * Helper pairing the model picker and thinking-level dropdown with the
-     * remove button and the row panel.
+     * remove button and the row panel. Used for council member rows.
      */
     private data class MemberRow(
         val modelPicker: ModelPickerComboBox,
@@ -105,47 +129,71 @@ class OpenCodeAgentConfigurable : Configurable {
         var pendingThinkingVariant: String = "",
     )
 
+    /**
+     * Helper for per-agent model rows (v2). One row per
+     * [AgentDefinition.hasPerAgentModel] agent. The agent name is fixed (keyed
+     * in [agentModelRows]); the row only carries the picker + thinking combo.
+     */
+    private data class AgentModelRow(
+        val agentName: String,
+        val modelPicker: ModelPickerComboBox,
+        val thinkingCombo: JComboBox<ThinkingEffort>,
+        val rowPanel: JPanel,
+        var pendingThinkingVariant: String = "",
+    )
+
     override fun getDisplayName(): String = "Agents"
 
     override fun createComponent(): JComponent {
         val settings = OpenCodeAgentSettingsState.getInstance()
 
-        enableCodingAssistantCheckbox = JBCheckBox("Enable Coding Assistant", settings.enableCodingAssistant).apply {
-            toolTipText = "A primary agent optimized for hands-on coding that prefers IntelliJ MCP tools " +
-                    "(symbol search, call hierarchy, build, debugger) and falls back to generic tools when MCP is unavailable. " +
-                    "Can delegate to subagents including the council agent for multi-model review."
-        }
-        enableCouncilCheckbox = JBCheckBox("Enable Council", settings.enableCouncil).apply {
-            toolTipText = "A subagent that fans out a review prompt to N configured models via parallel subtasks, " +
-                    "then spawns a dedicated synthesis subtask to produce a consolidated consensus report."
-            // Auto-check the 'council' delegation checkbox when Council is enabled.
-            // Without this, a user can enable Council (writing the council agent file)
-            // but forget to check the delegation checkbox, leaving the council agent
-            // unreachable (buildTaskPermissionYaml omits 'council' from the task
-            // allowlist). The user can still uncheck it manually if desired.
-            addItemListener { e ->
-                if (e.stateChange == java.awt.event.ItemEvent.SELECTED) {
-                    councilCheckbox?.isSelected = true
+        // ── Per-agent enable toggles (iterate registry) ────────────────
+        for (def in AgentRegistry.ALL_AGENTS) {
+            val label = "Enable " + prettyName(def.name)
+            val cb = JBCheckBox(label, isEnabledInSettings(def.name, settings)).apply {
+                toolTipText = def.description
+            }
+            enableCheckboxes[def.name] = cb
+            // Auto-check the delegation allowlist checkbox when an enable
+            // toggle flips ON (Q3 — mirrors v1 council behavior). Without
+            // this, a user who enables `coder` but forgets to check the
+            // delegation box leaves coding-assistant unable to reach it.
+            // The user can still uncheck manually.
+            // Auto-check the delegation allowlist checkbox when an enable
+            // toggle flips ON (Q3). The reverse is INTENTIONAL: unchecking
+            // an enable toggle does NOT uncheck the allowlist -- the
+            // allowlist is sticky so a user who temporarily disables an
+            // agent keeps the delegation entry for quick re-enable. The
+            // emitted YAML is still correct (buildTaskPermissionYaml gates
+            // each allowlisted agent on its enable flag at emit time).
+            cb.addItemListener { e ->
+                if (e.stateChange == java.awt.event.ItemEvent.SELECTED && !suppressAutoCheck) {
+                    allowlistCheckboxes[def.name]?.isSelected = true
                 }
             }
         }
 
-        // Delegation allowlist
-        exploreCheckbox = JBCheckBox("explore", "explore" in settings.taskAllowedAgents).apply {
-            toolTipText = "Built-in read-only agent for fast codebase search and pattern matching."
-        }
-        generalCheckbox = JBCheckBox("general", "general" in settings.taskAllowedAgents).apply {
-            toolTipText = "Built-in general-purpose agent for running multiple units of work in parallel."
-        }
-        councilCheckbox = JBCheckBox("council", "council" in settings.taskAllowedAgents).apply {
-            toolTipText = "Multi-model council review agent. Only available when Council is enabled above."
+        // ── Delegation allowlist (built-ins + registry subagents) ──────
+        // Built-in agents first (explore, general), then all registry agents
+        // EXCEPT coding-assistant (the primary — it's the delegator, not a
+        // delegatee).
+        val allowlistNames = listOf("explore", "general") +
+                AgentRegistry.ALL_NAMES.filter { it != AgentConstants.CODING_ASSISTANT_AGENT_NAME }
+        for (name in allowlistNames) {
+            val cb = JBCheckBox(name, name in settings.taskAllowedAgents).apply {
+                toolTipText = allowlistTooltip(name)
+            }
+            allowlistCheckboxes[name] = cb
         }
 
-        // Council members panel
-        membersPanel = JPanel(GridLayout(0, 1, 4, 4))
+        // ── Council members panel (v1, unchanged) ──────────────────────
+        membersPanel = JPanel(java.awt.GridLayout(0, 1, 4, 4))
         memberRows.clear()
         for (member in settings.councilMembers) {
-            addMemberRow(member.providerID, member.modelID)
+            // Pass thinkingVariant so persisted thinking levels are restored on
+            // initial settings-panel open (not just on reset()). Without this,
+            // apply() would overwrite the persisted variant with DEFAULT.
+            addMemberRow(member.providerID, member.modelID, member.thinkingVariant)
         }
         // If no members, add one empty row so the user has a starting point
         if (memberRows.isEmpty()) {
@@ -156,40 +204,78 @@ class OpenCodeAgentConfigurable : Configurable {
             addActionListener { addMemberRow("", "") }
         }
 
+        // ── Per-agent model pickers (v2 — hasPerAgentModel agents only) ─
+        // One row per agent with hasPerAgentModel=true. Built dynamically
+        // from the registry; coder/researcher/planner/tester each get a row.
+        // coding-assistant and council do NOT (primary uses chat's active
+        // model; council has its own per-MEMBER list).
+        for (def in AgentRegistry.ALL_AGENTS.filter { it.hasPerAgentModel }) {
+            val binding = settings.modelFor(def.name)
+            val providerID = binding?.providerID ?: ""
+            val modelID = binding?.modelID ?: ""
+            val variant = binding?.thinkingVariant ?: ""
+            val row = addAgentModelRow(def.name, providerID, modelID, variant)
+            agentModelRows[def.name] = row
+        }
+
         restartHintLabel = JBLabel("ℹ Changes take effect on next server restart").apply {
             foreground = JBColor.GRAY
         }
 
-        // Build the allowlist panel (horizontal checkboxes)
-        val allowlistPanel = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
-            add(exploreCheckbox!!)
-            add(generalCheckbox!!)
-            add(councilCheckbox!!)
+        // ── Assemble panel ─────────────────────────────────────────────
+        val builder = FormBuilder.createFormBuilder()
+
+        // Enable toggles + descriptions (iterate registry in order)
+        for (def in AgentRegistry.ALL_AGENTS) {
+            builder.addComponent(enableCheckboxes[def.name]!!)
+            builder.addComponent(JBLabel(def.description).apply {
+                foreground = JBColor.GRAY
+                font = font.deriveFont(font.size2D - 1f)
+            })
         }
 
-        panel = FormBuilder.createFormBuilder()
-            .addComponent(enableCodingAssistantCheckbox!!)
-            .addComponent(JBLabel("A primary agent for hands-on coding that prefers IntelliJ MCP tools and degrades gracefully when MCP is off.").apply {
-                foreground = JBColor.GRAY
-                font = font.deriveFont(font.size2D - 1f)
-            })
-            .addComponent(enableCouncilCheckbox!!)
-            .addComponent(JBLabel("A subagent that gathers reviews from multiple AI models and synthesizes a consensus report.").apply {
-                foreground = JBColor.GRAY
-                font = font.deriveFont(font.size2D - 1f)
-            })
-            .addVerticalGap(8)
+        builder.addVerticalGap(8)
             .addSeparator()
             .addVerticalGap(4)
-            .addComponent(JBLabel("Delegation Allowlist (applies to both agents)").apply {
+            .addComponent(JBLabel("Delegation Allowlist (applies to coding-assistant)").apply {
                 font = font.deriveFont(Font.BOLD)
             })
-            .addComponent(JBLabel("Which agents can be invoked via the task tool. Built-in agents (explore, general) and the council subagent.").apply {
+            .addComponent(JBLabel("Which agents can be invoked via the task tool. Built-in agents (explore, general) and plugin-defined subagents. Subagents auto-appear here when their enable toggle is on.").apply {
                 foreground = JBColor.GRAY
                 font = font.deriveFont(font.size2D - 1f)
             })
-            .addComponent(allowlistPanel)
-            .addVerticalGap(8)
+
+        // Allowlist panel (horizontal checkboxes)
+        val allowlistPanel = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
+            for (name in allowlistNames) {
+                add(allowlistCheckboxes[name]!!)
+            }
+        }
+        builder.addComponent(allowlistPanel)
+
+        // Per-agent model pickers (v2)
+        if (agentModelRows.isNotEmpty()) {
+            builder.addVerticalGap(8)
+                .addSeparator()
+                .addVerticalGap(4)
+                .addComponent(JBLabel("Per-Agent Models (v2 subagents)").apply {
+                    font = font.deriveFont(Font.BOLD)
+                })
+                .addComponent(JBLabel("Pin each subagent to a specific model. Empty = inherit the chat's active model (v1 default behavior).").apply {
+                    foreground = JBColor.GRAY
+                    font = font.deriveFont(font.size2D - 1f)
+                })
+            for (def in AgentRegistry.ALL_AGENTS.filter { it.hasPerAgentModel }) {
+                val row = agentModelRows[def.name] ?: continue
+                builder.addComponent(JBLabel(prettyName(def.name)).apply {
+                    font = font.deriveFont(Font.BOLD)
+                })
+                builder.addComponent(row.rowPanel)
+            }
+        }
+
+        // Council members (v1, unchanged)
+        builder.addVerticalGap(8)
             .addSeparator()
             .addVerticalGap(4)
             .addComponent(JBLabel("Council Members").apply {
@@ -203,7 +289,8 @@ class OpenCodeAgentConfigurable : Configurable {
             .addComponent(addMemberButton!!)
             .addVerticalGap(8)
             .addComponent(restartHintLabel!!)
-            .panel
+
+        panel = builder.panel
 
         // Fetch available models from the OpenCode server asynchronously
         fetchAvailableModels()
@@ -212,19 +299,71 @@ class OpenCodeAgentConfigurable : Configurable {
     }
 
     /**
+     * Pretty-print an agent name for the UI: "coding-assistant" → "Coding Assistant".
+     */
+    private fun prettyName(name: String): String =
+        name.replace("-", " ").replaceFirstChar { it.uppercase() }
+
+    /**
+     * Tooltip for an allowlist checkbox.
+     */
+    private fun allowlistTooltip(name: String): String = when (name) {
+        "explore" -> "Built-in read-only agent for fast codebase search and pattern matching."
+        "general" -> "Built-in general-purpose agent for running multiple units of work in parallel."
+        AgentConstants.COUNCIL_AGENT_NAME -> "Multi-model council review agent. Only available when Council is enabled above."
+        AgentConstants.CODER_AGENT_NAME -> "Scoped implementation subagent for fan-out implementation."
+        AgentConstants.RESEARCHER_AGENT_NAME -> "Semantic codebase investigator (read-only, PSI tools)."
+        AgentConstants.PLANNER_AGENT_NAME -> "Task decomposer that produces a chunk plan for parallel coder fan-out."
+        AgentConstants.TESTER_AGENT_NAME -> "Scoped test implementer that mirrors existing test patterns."
+        else -> "Agent: $name"
+    }
+
+    /**
+     * Read the enable flag for [name] from [settings].
+     *
+     * Uses a `when` expression (acceptable for 6 agents; revisit at ~8+).
+     * See [AgentConfigWriter.isEnabled] for the parallel write-side logic.
+     */
+    private fun isEnabledInSettings(name: String, s: OpenCodeAgentSettingsState): Boolean = when (name) {
+        AgentConstants.CODING_ASSISTANT_AGENT_NAME -> s.enableCodingAssistant
+        AgentConstants.COUNCIL_AGENT_NAME -> s.enableCouncil
+        AgentConstants.CODER_AGENT_NAME -> s.enableCoder
+        AgentConstants.RESEARCHER_AGENT_NAME -> s.enableResearcher
+        AgentConstants.PLANNER_AGENT_NAME -> s.enablePlanner
+        AgentConstants.TESTER_AGENT_NAME -> s.enableTester
+        else -> false
+    }
+
+    /**
+     * Write the enable flag for [name] into [settings].
+     */
+    private fun setEnabledInSettings(name: String, s: OpenCodeAgentSettingsState, value: Boolean) {
+        when (name) {
+            AgentConstants.CODING_ASSISTANT_AGENT_NAME -> s.enableCodingAssistant = value
+            AgentConstants.COUNCIL_AGENT_NAME -> s.enableCouncil = value
+            AgentConstants.CODER_AGENT_NAME -> s.enableCoder = value
+            AgentConstants.RESEARCHER_AGENT_NAME -> s.enableResearcher = value
+            AgentConstants.PLANNER_AGENT_NAME -> s.enablePlanner = value
+            AgentConstants.TESTER_AGENT_NAME -> s.enableTester = value
+            else -> {}
+        }
+    }
+
+    /**
      * Fetch the list of available models from connected providers via the
      * OpenCodeService. Populates [availableModels] and refreshes all member
-     * pickers on the EDT.
+     * pickers + per-agent model pickers on the EDT.
      */
     private fun fetchAvailableModels() {
         val project = getActiveProject() ?: return
+        if (project.isDisposed) return
         val service = try {
             project.service<OpenCodeService>()
         } catch (e: Exception) {
             return
         }
 
-        service.scope.launch {
+        fetchModelsJob = service.scope.launch {
             try {
                 val providers = service.listProviders()
                 if (providers == null) {
@@ -257,14 +396,26 @@ class OpenCodeAgentConfigurable : Configurable {
                     if (panel?.isDisplayable != true) return@invokeLater
                     availableModels = models
                     refreshMemberPickers()
+                    refreshAgentModelPickers()
                 }, modality)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 logger.warn(e) { "[ACP] AgentConfigurable: failed to fetch available models" }
+                val hint = restartHintLabel
+                if (hint != null) {
+                    ApplicationManager.getApplication().invokeLater {
+                        if (panel?.isDisplayable == true) {
+                            hint.text = "[!] Failed to load models - retry by reopening settings"
+                            hint.foreground = JBColor.RED
+                        }
+                    }
+                }
             }
         }
     }
+
+    // ── Council member rows (v1, unchanged) ─────────────────────────────
 
     /**
      * Add a member row with a searchable, provider-grouped model picker and a
@@ -331,6 +482,59 @@ class OpenCodeAgentConfigurable : Configurable {
         membersPanel?.repaint()
     }
 
+    // ── Per-agent model rows (v2) ───────────────────────────────────────
+
+    /**
+     * Add a per-agent model row for [agentName] with the persisted model
+     * (providerID/modelID/variant), or empty if no model configured (inherit).
+     *
+     * Mirrors [addMemberRow] but the row is fixed to one agent (no remove
+     * button — each agent has exactly one model slot).
+     */
+    private fun addAgentModelRow(
+        agentName: String,
+        providerID: String,
+        modelID: String,
+        thinkingVariant: String
+    ): AgentModelRow {
+        val picker = ModelPickerComboBox()
+        picker.setAvailableModels(availableModels)
+
+        val thinkingCombo = JComboBox<ThinkingEffort>()
+        thinkingCombo.renderer = ThinkingEffortRenderer()
+
+        picker.onModelSelected = { newModel ->
+            val previous = thinkingCombo.selectedItem as? ThinkingEffort
+            updateThinkingOptions(thinkingCombo, newModel)
+            if (previous != null) {
+                thinkingCombo.selectedItem = previous
+            }
+        }
+
+        if (providerID.isNotBlank() && modelID.isNotBlank()) {
+            picker.setSelectedModel(providerID, modelID)
+        }
+
+        if (thinkingVariant.isNotBlank()) {
+            val effort = ThinkingEffort.entries.find { it.variant == thinkingVariant }
+            if (effort != null && thinkingCombo.model.size > 0) {
+                thinkingCombo.selectedItem = effort
+            }
+        }
+
+        val row = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
+            add(picker)
+            add(JBLabel("Thinking:"))
+            add(thinkingCombo)
+            add(JBLabel("(empty = inherit)").apply {
+                foreground = JBColor.GRAY
+                font = font.deriveFont(font.size2D - 1f)
+            })
+        }
+
+        return AgentModelRow(agentName, picker, thinkingCombo, row, pendingThinkingVariant = thinkingVariant)
+    }
+
     /**
      * Update the thinking-level combo box to show only the options supported by
      * the given model's [ProviderModel.variants]. Always includes DEFAULT; adds
@@ -356,7 +560,7 @@ class OpenCodeAgentConfigurable : Configurable {
     }
 
     /**
-     * Refresh all member pickers with the latest [availableModels],
+     * Refresh all council member pickers with the latest [availableModels],
      * preserving the current model and thinking selection if they still exist.
      */
     private fun refreshMemberPickers() {
@@ -388,15 +592,52 @@ class OpenCodeAgentConfigurable : Configurable {
         }
     }
 
+    /**
+     * Refresh all per-agent model pickers with the latest [availableModels],
+     * preserving the current model and thinking selection if they still exist.
+     *
+     * Mirrors [refreshMemberPickers] but iterates [agentModelRows].
+     */
+    private fun refreshAgentModelPickers() {
+        for (row in agentModelRows.values) {
+            val currentModel = row.modelPicker.getSelectedModel()
+            val currentThinking = row.thinkingCombo.selectedItem as? ThinkingEffort
+            row.modelPicker.setAvailableModels(availableModels)
+            if (currentModel != null) {
+                row.modelPicker.setSelectedModel(currentModel.providerID, currentModel.modelID)
+            }
+            updateThinkingOptions(row.thinkingCombo, row.modelPicker.getSelectedModel())
+            if (currentThinking == null || currentThinking == ThinkingEffort.DEFAULT) {
+                if (row.pendingThinkingVariant.isNotBlank()) {
+                    val effort = ThinkingEffort.entries.find { it.variant == row.pendingThinkingVariant }
+                    if (effort != null) {
+                        row.thinkingCombo.selectedItem = effort
+                    }
+                    if (effort != null) {
+                        row.pendingThinkingVariant = ""
+                    }
+                }
+            } else {
+                row.thinkingCombo.selectedItem = currentThinking
+            }
+        }
+    }
+
+    // ── apply / reset / isModified ─────────────────────────────────────
+
     override fun isModified(): Boolean {
         val settings = OpenCodeAgentSettingsState.getInstance()
-        if (enableCodingAssistantCheckbox?.isSelected != settings.enableCodingAssistant) return true
-        if (enableCouncilCheckbox?.isSelected != settings.enableCouncil) return true
 
+        // Enable toggles
+        for (def in AgentRegistry.ALL_AGENTS) {
+            if (enableCheckboxes[def.name]?.isSelected != isEnabledInSettings(def.name, settings)) return true
+        }
+
+        // Allowlist
         val currentAllowed = buildAllowedAgentsList()
         if (currentAllowed != settings.taskAllowedAgents.toSet()) return true
 
-        // Compare council members (only valid members are persisted)
+        // Council members (only valid members are persisted)
         val currentMembers = memberRows.mapNotNull { row ->
             val selected = row.modelPicker.getSelectedModel()
             if (selected != null && selected.providerID.isNotBlank() && selected.modelID.isNotBlank()) {
@@ -409,17 +650,52 @@ class OpenCodeAgentConfigurable : Configurable {
         }
         if (currentMembers != settingsMembers) return true
 
+        // Per-agent models: only compare bindings for agents that have a UI
+        // row (agentModelRows.keys, i.e. hasPerAgentModel==true agents).
+        // Bindings for agents WITHOUT a UI row (coding-assistant, council,
+        // future agents) are preserved by apply() and must NOT be compared
+        // here -- otherwise a stale binding for coding-assistant (from a
+        // prior version or hand-edited XML) would make isModified() return
+        // true, forcing a data-loss Apply that drops the binding.
+        val uiAgentNames = agentModelRows.keys
+        val currentAgentModels = buildAgentModelBindings()
+        val settingsAgentModels = settings.agentModels
+            .filter { it.agentName in uiAgentNames && it.hasModel() }
+            .associateBy { it.agentName }
+        if (currentAgentModels.size != settingsAgentModels.size) return true
+        for ((name, binding) in currentAgentModels) {
+            val existing = settingsAgentModels[name]
+            if (existing == null) return true
+            val existingModel = existing.model
+            val newModel = binding.model
+            // Both existingModel and newModel are guaranteed non-null here:
+            // settingsAgentModels is filtered by hasModel() (line 651), and
+            // buildAgentModelBindings() only emits entries with a non-blank
+            // selected model (line 720-721). The dead null-branches that were
+            // here have been removed to avoid misleading future maintainers.
+            // The `!!` asserts document the non-null guarantee from the filters.
+            if (existingModel!!.providerID != newModel!!.providerID ||
+                existingModel.modelID != newModel.modelID ||
+                existingModel.thinkingVariant != newModel.thinkingVariant
+            ) return true
+        }
+
         return false
     }
 
     override fun apply() {
         val settings = OpenCodeAgentSettingsState.getInstance()
-        settings.enableCodingAssistant = enableCodingAssistantCheckbox?.isSelected ?: true
-        settings.enableCouncil = enableCouncilCheckbox?.isSelected ?: false
-        settings.taskAllowedAgents = ArrayList(buildAllowedAgentsList().toList())
+
+        // Enable toggles
+        for (def in AgentRegistry.ALL_AGENTS) {
+            setEnabledInSettings(def.name, settings, enableCheckboxes[def.name]?.isSelected ?: def.defaultEnabled)
+        }
+
+        // Allowlist
+        settings.taskAllowedAgents = java.util.ArrayList(buildAllowedAgentsList().toList())
 
         // Save council members (only valid ones are persisted)
-        val members = ArrayList<CouncilMember>()
+        val members = java.util.ArrayList<CouncilMember>()
         // Dedup by (providerID, modelID, thinkingVariant) — mirrors loadState's
         // dedup contract. Without this, a user who adds the same model twice in
         // the UI persists duplicates that cause the council prompt to emit
@@ -436,17 +712,58 @@ class OpenCodeAgentConfigurable : Configurable {
             }
         }
         settings.councilMembers = members
+
+        // Save per-agent models (v2). MERGE: preserve bindings for agents
+        // WITHOUT a UI row (coding-assistant, council -- hasPerAgentModel==false),
+        // then add/overwrite with the UI bindings from buildAgentModelBindings().
+        // This prevents apply() from silently dropping non-UI bindings that
+        // may exist from a prior plugin version or hand-edited XML.
+        val uiBindings = buildAgentModelBindings()
+        val uiAgentNames = agentModelRows.keys
+        settings.agentModels =
+            java.util.ArrayList(mergeAgentModelBindings(settings.agentModels, uiBindings.values.toList(), uiAgentNames))
+    }
+
+    /**
+     * Read the per-agent model pickers and build a `Map<agentName, AgentModelBinding>`.
+     *
+     * Agents with an empty picker (no model selected) are omitted (inherit
+     * parent's model — no binding).
+     */
+    private fun buildAgentModelBindings(): Map<String, AgentModelBinding> {
+        val result = LinkedHashMap<String, AgentModelBinding>()
+        for ((agentName, row) in agentModelRows) {
+            val selected = row.modelPicker.getSelectedModel()
+            if (selected != null && selected.providerID.isNotBlank() && selected.modelID.isNotBlank()) {
+                val variant = (row.thinkingCombo.selectedItem as? ThinkingEffort)?.variant ?: ""
+                result[agentName] =
+                    AgentModelBinding(agentName, CouncilMember(selected.providerID, selected.modelID, variant))
+            }
+        }
+        return result
     }
 
     override fun reset() {
         val settings = OpenCodeAgentSettingsState.getInstance()
-        enableCodingAssistantCheckbox?.isSelected = settings.enableCodingAssistant
-        enableCouncilCheckbox?.isSelected = settings.enableCouncil
-        exploreCheckbox?.isSelected = "explore" in settings.taskAllowedAgents
-        generalCheckbox?.isSelected = "general" in settings.taskAllowedAgents
-        councilCheckbox?.isSelected = "council" in settings.taskAllowedAgents
 
-        // Clear and rebuild member rows
+        // Enable toggles. suppressAutoCheck prevents the enable-checkbox
+        // ItemListener from clobbering the allowlist restore below (the
+        // listener fires synchronously on programmatic setSelected).
+        suppressAutoCheck = true
+        try {
+            for (def in AgentRegistry.ALL_AGENTS) {
+                enableCheckboxes[def.name]?.isSelected = isEnabledInSettings(def.name, settings)
+            }
+        } finally {
+            suppressAutoCheck = false
+        }
+
+        // Allowlist
+        for ((name, cb) in allowlistCheckboxes) {
+            cb.isSelected = name in settings.taskAllowedAgents
+        }
+
+        // Clear and rebuild council member rows
         memberRows.clear()
         membersPanel?.removeAll()
         for (member in settings.councilMembers) {
@@ -457,32 +774,55 @@ class OpenCodeAgentConfigurable : Configurable {
         }
         membersPanel?.revalidate()
         membersPanel?.repaint()
+
+        // Reset per-agent model pickers
+        for (def in AgentRegistry.ALL_AGENTS.filter { it.hasPerAgentModel }) {
+            val row = agentModelRows[def.name] ?: continue
+            val binding = settings.modelFor(def.name)
+            row.modelPicker.setAvailableModels(availableModels)
+            if (binding != null) {
+                row.modelPicker.setSelectedModel(binding.providerID, binding.modelID)
+                updateThinkingOptions(row.thinkingCombo, row.modelPicker.getSelectedModel())
+                if (binding.thinkingVariant.isNotBlank()) {
+                    val effort = ThinkingEffort.entries.find { it.variant == binding.thinkingVariant }
+                    if (effort != null) {
+                        row.thinkingCombo.selectedItem = effort
+                    }
+                }
+            } else {
+                // Clear the picker — inherit
+                row.modelPicker.setSelectedModel("", "")
+                updateThinkingOptions(row.thinkingCombo, null)
+            }
+        }
     }
 
     override fun disposeUIResources() {
+        // Cancel the async model-fetch coroutine so it does not outlive the
+        // configurable (structured concurrency). Without this, repeated
+        // open/close of the Settings dialog while the server is slow leaks
+        // coroutines that hang on listProviders() until project close.
+        fetchModelsJob?.cancel()
+        fetchModelsJob = null
         // Null out Swing component references so the async fetchAvailableModels
         // callback (which checks panel?.isDisplayable) does not update a
-        // disposed panel. Without this, the coroutine launched in
-        // fetchAvailableModels could call refreshMemberPickers on disposed
-        // components if the settings dialog is closed while the fetch is
-        // still in flight.
+        // disposed panel. The cancel() above stops new invocations; the null
+        // guards here stop any callback already past the await.
         panel = null
         membersPanel = null
         memberRows.clear()
-        enableCodingAssistantCheckbox = null
-        enableCouncilCheckbox = null
-        exploreCheckbox = null
-        generalCheckbox = null
-        councilCheckbox = null
+        agentModelRows.clear()
+        enableCheckboxes.clear()
+        allowlistCheckboxes.clear()
         addMemberButton = null
         restartHintLabel = null
     }
 
     private fun buildAllowedAgentsList(): Set<String> {
         val result = mutableSetOf<String>()
-        if (exploreCheckbox?.isSelected == true) result.add("explore")
-        if (generalCheckbox?.isSelected == true) result.add("general")
-        if (councilCheckbox?.isSelected == true) result.add("council")
+        for ((name, cb) in allowlistCheckboxes) {
+            if (cb.isSelected) result.add(name)
+        }
         return result
     }
 
@@ -490,13 +830,55 @@ class OpenCodeAgentConfigurable : Configurable {
      * Find the active project for accessing the OpenCodeService.
      * Mirrors the pattern in OpenCodeMcpConfigurable.
      */
+    /**
+     * Find the active project for accessing the OpenCodeService.
+     *
+     * Agent settings are APPLICATION-scoped (@Service(Service.Level.APP)) so
+     * the settings dialog edits a shared state. The model list, however, is
+     * fetched from an arbitrary open project OpenCodeService (best-effort:
+     * `focusedProject` if set by ChatToolWindowFactory, else the first open
+     * project). If two projects are open with different providers, the user
+     * may see models from the "wrong" project. This is a known cosmetic
+     * limitation of app-scoped agent settings; the agent files themselves
+     * only store providerID/modelID (resolved server-side), so cross-project
+     * model availability does not corrupt the persisted config.
+     */
     private fun getActiveProject(): com.intellij.openapi.project.Project? {
         val focused = focusedProject
         if (focused != null && !focused.isDisposed) return focused
-        return ProjectManager.getInstance().openProjects.firstOrNull()
+        val fallback = ProjectManager.getInstance().openProjects.firstOrNull()
+        if (fallback != null && focused != null && !focused.isDisposed) {
+            // No log needed - focused was returned above.
+        } else if (fallback != null) {
+            logger.debug { "[ACP] AgentConfigurable: no focused project - using fallback open project '${fallback.name}' for model list (app-scoped settings may show models from a different project than the one the user opened Settings from)" }
+        }
+        return fallback
     }
 
     companion object {
+        /**
+         * Pure merge of per-agent model bindings: preserve non-UI bindings
+         * (agentName NOT in [uiAgentNames]) then add/overwrite with the UI
+         * bindings. Extracted from apply() so the merge logic is unit-testable
+         * without the IntelliJ application context (review cmt_d8e9f0a1b2c3).
+         *
+         * @param existing the current settings.agentModels (may contain non-UI
+         *   bindings from a prior plugin version or hand-edited XML)
+         * @param uiBindings the bindings built from the UI rows
+         *   (buildAgentModelBindings() result)
+         * @param uiAgentNames the set of agent names that HAVE a UI row
+         *   (agentModelRows.keys, i.e. hasPerAgentModel==true agents)
+         * @return the merged list to assign to settings.agentModels
+         */
+        internal fun mergeAgentModelBindings(
+            existing: List<AgentModelBinding>,
+            uiBindings: List<AgentModelBinding>,
+            uiAgentNames: Set<String>,
+        ): List<AgentModelBinding> {
+            val preserved = existing.filter { it.agentName !in uiAgentNames }
+            return preserved + uiBindings
+        }
+
         /**
          * The currently focused project, set by ChatToolWindowFactory or a focus
          * listener. Falls back to the first open project when null.
@@ -519,6 +901,8 @@ class OpenCodeAgentConfigurable : Configurable {
  *
  * When no models are available (server not running), a placeholder text field
  * is shown so the user can type a `providerID/modelID` pair manually.
+ *
+ * Used by BOTH council member rows (v1) and per-agent model rows (v2).
  */
 internal class ModelPickerComboBox : JPanel(BorderLayout()) {
 
@@ -659,6 +1043,16 @@ internal class ModelPickerComboBox : JPanel(BorderLayout()) {
     fun getSelectedModel(): ProviderModel? = selectedModel
 
     fun setSelectedModel(providerID: String, modelID: String) {
+        if (providerID.isBlank() && modelID.isBlank()) {
+            // Clear the selection (used by reset to "inherit")
+            selectedModel = null
+            suppressFilter = true
+            searchField.text = ""
+            suppressFilter = false
+            dropdownButton.text = "Select a model... (inherit)"
+            onModelSelected?.invoke(null)
+            return
+        }
         val match = allItems.mapNotNull { (it as? DropdownItem.ModelItem)?.model }
             .find { it.providerID == providerID && it.modelID == modelID }
         if (match != null) {

@@ -114,9 +114,13 @@ class McpConfigWriter(
             val normalizedOurs = flattenRecursiveGlob(ourGlob)
             for (existingGlob in existingStrings) {
                 val normalizedExisting = flattenRecursiveGlob(existingGlob)
-                // Only recursive globs can cover other globs
+                // Only directory-style globs (recursive or wildcarded last segment) can cover other globs.
+                // A glob like ".opencode/context/*.md" has a wildcard in its last segment and covers
+                // ".opencode/context/sub/foo.md" after normalization, so it must pass the gate.
                 val isRecursive =
-                    existingGlob.contains("**") || existingGlob.endsWith("/*") || existingGlob.endsWith("/")
+                    existingGlob.contains("**") ||
+                            existingGlob.endsWith("/") ||
+                            existingGlob.substringAfterLast("/", existingGlob).contains("*")
                 if (!isRecursive) continue
                 // A glob A covers glob B if A's directory prefix is a prefix of B's
                 // (using startsWith on the directory portion). This is a prefix match,
