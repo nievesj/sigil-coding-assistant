@@ -180,7 +180,7 @@ class PermissionManagerTest {
         )
 
         verify(exactly = 1) {
-            mcpConfigWriter.writeAlwaysAllowRule("orchestrator", "bash", listOf("**/*.sh"))
+            mcpConfigWriter.writeAlwaysAllowRule("coding-assistant", "bash", listOf("**/*.sh"))
         }
     }
 

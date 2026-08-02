@@ -2,15 +2,23 @@ package com.opencode.acp.chat.service
 
 import com.opencode.acp.adapter.OpenCodeClient
 import com.opencode.acp.config.AcpDefaults
+import com.opencode.acp.config.AgentConfigWriter
+import com.opencode.acp.config.settings.OpenCodeAgentSettingsState
 import com.opencode.acp.config.settings.OpenCodeSettingsState
 import com.opencode.acp.chat.model.ConnectionErrorReason
 import com.opencode.acp.chat.model.ConnectionState
 import com.opencode.acp.chat.processor.PrunerConfigWriter
 import com.opencode.acp.chat.processor.PrunerResourceExtractor
 import com.opencode.acp.mcp.McpConfigWriter
+import com.opencode.acp.mcp.ToolPermission
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.net.ServerSocket
 
 /**
@@ -41,22 +49,29 @@ class ProcessManager(private val scope: CoroutineScope) {
         _connectionState.value = ConnectionState.ERROR
     }
 
-    @Volatile private var openCodeClient: OpenCodeClient? = null
-    @Volatile private var openCodeProcess: Process? = null
+    @Volatile
+    private var openCodeClient: OpenCodeClient? = null
+    @Volatile
+    private var openCodeProcess: Process? = null
     private var processWatcherJob: Job? = null
     private val outputBuffer = StringBuffer()
-    @Volatile var initialized: Boolean = false
+    @Volatile
+    var initialized: Boolean = false
         private set
 
-    @Volatile var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
+    @Volatile
+    var host: String = AcpDefaults.DEFAULT_OPENCODE_HOST
         private set
-    @Volatile var port: Int = AcpDefaults.DEFAULT_OPENCODE_PORT
+    @Volatile
+    var port: Int = AcpDefaults.DEFAULT_OPENCODE_PORT
         private set
-    @Volatile var authToken: String? = null
+    @Volatile
+    var authToken: String? = null
         private set
 
     /** Path to the binary we launched (if we started the process ourselves). */
-    @Volatile private var launchedBinaryPath: String? = null
+    @Volatile
+    private var launchedBinaryPath: String? = null
 
     /** The current OpenCode client. Null until [initialize] succeeds. */
     val client: OpenCodeClient? get() = openCodeClient
@@ -70,8 +85,10 @@ class ProcessManager(private val scope: CoroutineScope) {
     companion object {
         /** Maximum time to wait for the server to become healthy. */
         private const val INIT_TIMEOUT_MS = 60_000L
+
         /** Initial health check delay after launch. */
         private const val INIT_DELAY_MS = 500L
+
         /** Maximum number of ports to try beyond the configured port. */
         private const val MAX_PORT_ATTEMPTS = 10
     }
@@ -129,6 +146,34 @@ class ProcessManager(private val scope: CoroutineScope) {
             configWriter.clearAllEntries()
         }
 
+        // Write persisted tool permissions from Settings to opencode.json.
+        // The agent file (coding-assistant.md) no longer hardcodes tool permissions
+        // in its frontmatter — opencode.json is the single source of truth for
+        // tool permissions, written here at launch and on Settings Apply.
+        if (mcpSettings.toolPermissions.isNotBlank()) {
+            try {
+                val obj = Json.parseToJsonElement(mcpSettings.toolPermissions).jsonObject
+                val permissions = mutableMapOf<String, ToolPermission>()
+                for ((toolName, element) in obj) {
+                    val toolObj = try {
+                        element.jsonObject
+                    } catch (e: Exception) {
+                        logger.warn(e) { "[ACP] ProcessManager.initialize: skipping malformed tool permission entry for '$toolName'" }
+                        continue
+                    }
+                    val permStr = toolObj["permission"]?.jsonPrimitive?.contentOrNull ?: "allow"
+                    permissions[toolName] = ToolPermission.fromActionString(permStr)
+                }
+                if (permissions.isNotEmpty()) {
+                    val permWriter = McpConfigWriter(java.nio.file.Path.of(projectBasePath), mcpSettings)
+                    permWriter.writeToolPermissions(permissions)
+                    logger.info { "[ACP] ProcessManager.initialize: wrote ${permissions.size} tool permissions from Settings to opencode.json" }
+                }
+            } catch (e: Exception) {
+                logger.warn(e) { "[ACP] ProcessManager.initialize: failed to write tool permissions from Settings" }
+            }
+        }
+
         // Bridge JetBrains AI Assistant skills to OpenCode.
         // Always call writeSkillPaths (even if empty) to evict stale paths from
         // old IDE versions. writeSkillPaths handles the empty case by
@@ -139,11 +184,21 @@ class ProcessManager(private val scope: CoroutineScope) {
         val skillPaths = com.opencode.acp.skill.JetBrainsSkillBridge.detectSkillPaths()
         skillConfigWriter.writeSkillPaths(skillPaths)
 
+        // Write custom agent files before server launch
+        val agentSettings = OpenCodeAgentSettingsState.getInstance()
+        val agentConfigWriter = AgentConfigWriter(
+            java.nio.file.Path.of(projectBasePath),
+            agentSettings,
+            McpConfigWriter(java.nio.file.Path.of(projectBasePath), mcpSettings)
+        )
+        agentConfigWriter.writeAll(mcpSettings.enableIntellijMcp)
+
         // Extract bundled skills (e.g., psi-code-intelligence) to .opencode/skills/
         // BEFORE launching the binary. The OpenCode server discovers skills from
         // .opencode/skills/ on startup. This runs unconditionally — skills are
         // independent of MCP/pruner settings.
-        val skillExtractor = com.opencode.acp.intelligence.SkillResourceExtractor(java.nio.file.Path.of(projectBasePath))
+        val skillExtractor =
+            com.opencode.acp.intelligence.SkillResourceExtractor(java.nio.file.Path.of(projectBasePath))
         val skillsExtracted = skillExtractor.extractAll()
         if (!skillsExtracted) {
             logger.warn { "[ACP] ProcessManager.initialize: failed to extract bundled skills — some skills may be unavailable" }
@@ -173,9 +228,10 @@ class ProcessManager(private val scope: CoroutineScope) {
             val launched = launchOpenCodeBinary(settings.binaryPath)
             if (!launched) {
                 // Only set generic error if launchOpenCodeBinary didn't set a specific reason
-                if (_connectionErrorReason.value == null) _connectionErrorReason.value = ConnectionErrorReason.BinaryLaunchFailed(
-                    detail = "Could not start ${settings.binaryPath}. Check the path and permissions."
-                )
+                if (_connectionErrorReason.value == null) _connectionErrorReason.value =
+                    ConnectionErrorReason.BinaryLaunchFailed(
+                        detail = "Could not start ${settings.binaryPath}. Check the path and permissions."
+                    )
                 _connectionState.value = ConnectionState.ERROR
                 return false
             }
@@ -212,7 +268,11 @@ class ProcessManager(private val scope: CoroutineScope) {
                 // Check if the launched process died — if so, fail fast instead of polling to timeout
                 val processStatus = checkProcessAlive()
                 if (processStatus != null) {
-                    val exitCode = try { openCodeProcess?.exitValue() ?: -1 } catch (_: Exception) { -1 }
+                    val exitCode = try {
+                        openCodeProcess?.exitValue() ?: -1
+                    } catch (_: Exception) {
+                        -1
+                    }
                     val outputTail = synchronized(outputBuffer) { outputBuffer.toString().takeIf { it.isNotBlank() } }
                     logger.error { "[ACP] ProcessManager.initialize: $label $processStatus" }
                     _connectionErrorReason.value = ConnectionErrorReason.ProcessExited(
@@ -246,9 +306,9 @@ class ProcessManager(private val scope: CoroutineScope) {
         // be taken between findAvailablePort's test bind and the OpenCode server's actual
         // bind. This handles the race described in findAvailablePort.
         if (launchedBinaryPath != null && checkProcessAlive() == null) {
-            var retrySucceeded = false
+            val originalPort = port
             for (retryAttempt in 1..3) {
-                val retryPort = findAvailablePort(port + retryAttempt)
+                val retryPort = findAvailablePort(originalPort + retryAttempt)
                 if (retryPort == port) continue // no alternate port available
 
                 logger.warn { "[ACP] ProcessManager.initialize: TOCTOU retry $retryAttempt on port $retryPort" }
@@ -258,7 +318,10 @@ class ProcessManager(private val scope: CoroutineScope) {
                 port = retryPort
                 // Close the old client and create a new one with the new base URL.
                 // OpenCodeClient.baseUrl is immutable, so we must recreate the client.
-                try { opencodeClient.shutdown() } catch (_: Exception) { }
+                try {
+                    opencodeClient.shutdown()
+                } catch (_: Exception) {
+                }
                 val retryClient = OpenCodeClient(
                     baseUrl = "http://$host:$port",
                     authToken = authToken
@@ -273,9 +336,24 @@ class ProcessManager(private val scope: CoroutineScope) {
                 }
                 logger.warn { "[ACP] ProcessManager.initialize: TOCTOU retry $retryAttempt on port $retryPort failed" }
             }
-            if (!retrySucceeded) {
-                logger.warn { "[ACP] ProcessManager.initialize: all TOCTOU retries failed (tried ${port + 1}..${port + 3})" }
+            // All retries failed — clean up the last attempt's process + client so
+            // they don't leak (orphan process + undrained HTTP connection pool) until
+            // the next initialize() call or IDE shutdown. Mirrors disconnect()/resetForRetry().
+            killProcess(openCodeProcess)
+            openCodeProcess = null
+            val leakedClient = openCodeClient
+            openCodeClient = null
+            if (leakedClient != null) {
+                Thread({
+                    try {
+                        leakedClient.shutdown()
+                    } catch (_: Exception) {
+                    }
+                }, "opencode-retry-client-close").apply { isDaemon = true; start() }
             }
+            // `port` has been reassigned to the last-tried port; report the full
+            // range relative to the ORIGINAL first-attempt port for clarity.
+            logger.warn { "[ACP] ProcessManager.initialize: all TOCTOU retries failed (first attempt on $originalPort, then ${originalPort + 1}..${originalPort + 3})" }
         }
 
         // Timed out
@@ -362,7 +440,8 @@ class ProcessManager(private val scope: CoroutineScope) {
                             logger.debug { "[opencode] $line" }
                         }
                     }
-                } catch (_: Exception) { }
+                } catch (_: Exception) {
+                }
             }, "opencode-stdout-drain").apply {
                 isDaemon = true
                 start()
@@ -400,7 +479,11 @@ class ProcessManager(private val scope: CoroutineScope) {
             }
             if (!isActive) return@launch
 
-            val exitCode = try { proc.exitValue() } catch (_: Exception) { -1 }
+            val exitCode = try {
+                proc.exitValue()
+            } catch (_: Exception) {
+                -1
+            }
             logger.warn { "[ACP] Process watcher: opencode process exited with code $exitCode" }
 
             // Only restart if we weren't cancelled (i.e., process died unexpectedly,
@@ -486,8 +569,12 @@ class ProcessManager(private val scope: CoroutineScope) {
                         if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
                             logger.warn { "[ACP] ProcessHandle.destroyForcibly() did not terminate PID $pid within 5s — falling back to taskkill" }
                             // Fallback: use taskkill with absolute path to avoid PATH injection
-                            val taskkillPath = java.io.File(System.getenv("SystemRoot") ?: "C:\\Windows", "System32\\taskkill.exe").path
-                            val taskkill = Runtime.getRuntime().exec(arrayOf(taskkillPath, "/F", "/T", "/PID", pid.toString()))
+                            val taskkillPath = java.io.File(
+                                System.getenv("SystemRoot") ?: "C:\\Windows",
+                                "System32\\taskkill.exe"
+                            ).path
+                            val taskkill =
+                                Runtime.getRuntime().exec(arrayOf(taskkillPath, "/F", "/T", "/PID", pid.toString()))
                             if (taskkill.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
                                 val exitCode = taskkill.exitValue()
                                 if (exitCode != 0) {
@@ -537,11 +624,16 @@ class ProcessManager(private val scope: CoroutineScope) {
         _connectionState.value = ConnectionState.DISCONNECTED
         if (client != null) {
             Thread({
-                try { client.shutdown() } catch (_: Exception) { }
+                try {
+                    client.shutdown()
+                } catch (_: Exception) {
+                }
             }, "opencode-client-close").apply { isDaemon = true; start() }
         }
-        // Do NOT kill the process — it may still be healthy. initialize() will
-        // find the same port occupied by our own process and launch on the same port.
+        // Do NOT kill the process — it may still be healthy. Note: initialize()
+        // will call findAvailablePort which skips occupied ports, so it may pick
+        // a DIFFERENT port if the old process still holds the original. The old
+        // process is killed inside launchOpenCodeBinary before the new one starts.
     }
 
     /**

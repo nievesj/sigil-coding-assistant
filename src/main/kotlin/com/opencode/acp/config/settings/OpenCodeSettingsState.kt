@@ -23,32 +23,43 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     var binaryPath: String = ""
     var permissionTimeoutSeconds: Int = 60
+
     /** Favorite model keys in format "providerID/modelID" (slash-separated for XML safety). */
     var favoriteModels: java.util.ArrayList<String> = java.util.ArrayList()
+
     /** Inline code text color as "#RRGGBB" */
     var inlineCodeColor: String = "#6BBE50"
+
     /** List number color as "#RRGGBB" */
     var listNumberColor: String = "#6BBE50"
+
     /** Last selected model key in format "providerID/modelID". */
     var lastSelectedModelKey: String = ""
+
     /** Last selected agent ID. Persisted across IDE restarts. */
     var lastSelectedAgent: String = ""
+
     /** Last selected thinking effort name (ThinkingEffort enum name). Persisted across IDE restarts. */
     var lastSelectedThinkingEffort: String = ""
+
     /** Whether the session sidebar is visible. Persisted across tool window reopens. */
     var sidebarVisible: Boolean = true
+
     /** Maximum number of entries kept in the input command history. */
     var commandHistorySize: Int = 15
+
     /** Maximum time (seconds) to wait for a response from the LLM before timing out.
      *  Controls the `withTimeout` on `deferred.await()` in `sendMessageInternal()`.
      *  Default 300 (5 minutes). The previous `sseSocketTimeoutSeconds` was misleading —
      *  `socketTimeoutMillis` is a no-op on the Java HTTP engine (see TDD §4.2, §7.1). */
     var responseTimeoutSeconds: Int = 300
+
     /** Buffer time (seconds) added to responseTimeoutSeconds for LONG-profile HTTP calls
      *  (e.g., executeCommand, compactSession). Accounts for server-side overhead beyond
      *  LLM generation time: request queuing, tool execution, network latency, and
      *  bookkeeping. Default 30, minimum 10. */
     var longTimeoutBufferSeconds: Int = 30
+
     /** Maximum time (seconds) a single tool call can run with no SSE activity before
      *  being considered stuck. This is a safety net for lost ToolResult events — if a
      *  tool's result is never received (e.g., child session crash, SSE event lost during
@@ -56,17 +67,22 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      *  normal timeout. This ceiling fires regardless of hasRunningTools.
      *  Default 300 (5 minutes). Range: 60-3600. */
     var toolStuckTimeoutSeconds: Int = 300
+
     /** @deprecated Migrated to [responseTimeoutSeconds]. Kept for XStream backward compatibility.
      *  Can be removed once all users have migrated (i.e., after 2+ release cycles).
      *  The migration logic in loadState() handles the transition from old to new setting. */
     @Deprecated("Migrated to responseTimeoutSeconds", ReplaceWith("responseTimeoutSeconds"))
     var sseSocketTimeoutSeconds: Int = 60
+
     /** Whether to automatically connect when the plugin opens. */
     var autoConnect: Boolean = true
+
     /** Port for the OpenCode server (default 4096). */
     var port: Int = 4096
+
     /** Whether to load all sessions at once (bypasses pagination). Shows performance warning. */
     var loadAllSessions: Boolean = false
+
     /** Persisted input command history (most recent first). Trimmed to [commandHistorySize] on save.
      *  THREAD SAFETY: Write operations (recordCommand, clearCommandHistory) replace the ArrayList
      *  reference atomically via `settings.commandHistory = ArrayList(...)`. XStream serialization
@@ -75,14 +91,17 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      *  Compose UI observe the StateFlow, which is thread-safe. Do NOT mutate the list in-place
      *  from background threads — always replace the entire reference. */
     var commandHistory: java.util.ArrayList<CommandHistoryEntry> = java.util.ArrayList()
+
     /**
      * Tool kinds that default to expanded in the chat.
      * Stored as a comma-separated string of ToolKind names for XStream compatibility.
      * Default: EXECUTE,EDIT,READ,THINK
      */
     var expandedToolKinds: String = "EXECUTE,EDIT,READ,THINK"
+
     /** Whether task/subtask pills default to expanded in the chat. */
     var expandTaskPillsByDefault: Boolean = false
+
     /**
      * Whether to queue messages instead of steering (aborting) when sending during streaming.
      * true = queue mode: messages wait for the current response to complete, then auto-send.
@@ -92,16 +111,27 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     // ── MCP integration ────────────────────────────────────────────────
     /** Whether to enable IntelliJ MCP server integration. */
-    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().enableIntellijMcp"))
+    @Deprecated(
+        "Migrated to OpenCodeMcpSettingsState",
+        ReplaceWith("OpenCodeMcpSettingsState.getInstance().enableIntellijMcp")
+    )
     var enableIntellijMcp: Boolean = false
+
     /** IntelliJ MCP server SSE URL. Copy from Settings → Tools → MCP Server → "Copy SSE Config". */
-    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().mcpServerUrl"))
+    @Deprecated(
+        "Migrated to OpenCodeMcpSettingsState",
+        ReplaceWith("OpenCodeMcpSettingsState.getInstance().mcpServerUrl")
+    )
     var mcpServerUrl: String = ""
+
     /**
      * Additional MCP servers as JSON array: [{"name":"github","url":"http://127.0.0.1:8080/sse"}].
      * Stored as JSON string for XStream serialization compatibility.
      */
-    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().additionalMcpServers"))
+    @Deprecated(
+        "Migrated to OpenCodeMcpSettingsState",
+        ReplaceWith("OpenCodeMcpSettingsState.getInstance().additionalMcpServers")
+    )
     var additionalMcpServers: String = ""
 
     // ── Tool Permissions ──────────────────────────────────────────────
@@ -110,7 +140,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Format: {"toolName":{"enabled":true,"permission":"allow"},...}
      * Stored as JSON string for XStream serialization compatibility.
      */
-    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().toolPermissions"))
+    @Deprecated(
+        "Migrated to OpenCodeMcpSettingsState",
+        ReplaceWith("OpenCodeMcpSettingsState.getInstance().toolPermissions")
+    )
     var toolPermissions: String = ""
 
     /**
@@ -120,7 +153,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Format: {"toolId":"allow",...} (tool ID → permission action string).
      * Empty when no Disable All has been performed.
      */
-    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().savedToolPermissionsBeforeDisable"))
+    @Deprecated(
+        "Migrated to OpenCodeMcpSettingsState",
+        ReplaceWith("OpenCodeMcpSettingsState.getInstance().savedToolPermissionsBeforeDisable")
+    )
     var savedToolPermissionsBeforeDisable: String = ""
 
     /**
@@ -128,7 +164,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Format: [{"name":"bash","description":"...","source":"builtin","serverName":"builtin"},...]
      * Allows showing previously discovered tools without re-discovery.
      */
-    @Deprecated("Migrated to OpenCodeMcpSettingsState", ReplaceWith("OpenCodeMcpSettingsState.getInstance().discoveredToolsJson"))
+    @Deprecated(
+        "Migrated to OpenCodeMcpSettingsState",
+        ReplaceWith("OpenCodeMcpSettingsState.getInstance().discoveredToolsJson")
+    )
     var discoveredToolsJson: String = ""
 
     /** Whether to show a confirmation dialog before disconnecting from the server. */
@@ -136,72 +175,145 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
 
     // ── Context & Compaction settings (Tools → Sigil → Context) ─────────────
     /** When on, tool results exceeding the char limit are truncated at insertion time. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().truncateToolOutput"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().truncateToolOutput")
+    )
     var truncateToolOutput: Boolean = false
+
     /** Max chars per tool output before truncation. Clamped to 10_000..200_000 on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().toolOutputCharLimit"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().toolOutputCharLimit")
+    )
     var toolOutputCharLimit: Int = 50_000
+
     /** When on, repeated reads of unchanged files emit [unchanged] instead of re-emitting content. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().detectDuplicateReads"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().detectDuplicateReads")
+    )
     var detectDuplicateReads: Boolean = false
+
     /** When on, pre-computes compaction summaries in the background for instant swap.
      *  OFF by default — the server's /summarize endpoint performs ACTUAL compaction
      *  (not a preview), so auto-triggering it compacts the session immediately.
      *  Retained as a setting in case a preview API is added in the future. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().enableBackgroundCompaction"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().enableBackgroundCompaction")
+    )
     var enableBackgroundCompaction: Boolean = false
+
     /** Context usage % at which background checkpointing starts. Clamped to 40f..80f on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().checkpointThresholdPercent"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().checkpointThresholdPercent")
+    )
     var checkpointThresholdPercent: Float = 60f
+
     /** Context usage % at which pre-computed summary is ready for instant swap. Clamped to 60f..95f on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().swapThresholdPercent"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().swapThresholdPercent")
+    )
     var swapThresholdPercent: Float = 80f
+
     /** Show the 5-category proportional bar in Context tab. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().showContextBreakdown"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().showContextBreakdown")
+    )
     var showContextBreakdown: Boolean = true
+
     /** When to show pressure warnings on the context indicator. One of NEVER / ELEVATED / HIGH / CRITICAL. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().pressureNotificationThreshold"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().pressureNotificationThreshold")
+    )
     var pressureNotificationThreshold: String = "HIGH"
+
     /** Ask for confirmation before triggering manual compaction. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().compactConfirmation"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().compactConfirmation")
+    )
     var compactConfirmation: Boolean = true
 
     // ── Context Pruner settings (Tools → Sigil → Context) ─────────────
     /** When on, the sigil-pruner.ts plugin is extracted and loaded by the OpenCode server.
      *  Performs server-side deterministic pruning (dedup, old tool output pruning, errored
      *  tool input pruning) and LLM-driven compression via a compress tool. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().enableContextPruner"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().enableContextPruner")
+    )
     var enableContextPruner: Boolean = false
+
     /** Prune tool outputs older than N messages. Clamped to 5..100 on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerMaxToolOutputMessages"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerMaxToolOutputMessages")
+    )
     var prunerMaxToolOutputMessages: Int = 20
+
     /** Prune errored tool inputs after N turns. Clamped to 1..20 on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerErroredToolTurns"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerErroredToolTurns")
+    )
     var prunerErroredToolTurns: Int = 4
+
     /** Enable LLM-driven compression (compress tool). */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerCompressEnabled"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerCompressEnabled")
+    )
     var prunerCompressEnabled: Boolean = true
+
     /** Compression mode: "range" or "message". Whitelisted on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerCompressMode"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerCompressMode")
+    )
     var prunerCompressMode: String = "range"
 
     // ── Context Pruner: Nudge settings ────────────────────────────────
     /** When on, injects a system reminder prompting the model to call the compress
      *  tool when context usage exceeds the threshold. Two levels: gentle (threshold)
      *  and urgent (urgentPercent). Cooldown prevents nagging every turn. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeEnabled"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeEnabled")
+    )
     var prunerNudgeEnabled: Boolean = true
+
     /** Gentle nudge threshold (% of context limit). Clamped to 30..90 on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeThresholdPercent"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeThresholdPercent")
+    )
     var prunerNudgeThresholdPercent: Int = 60
+
     /** Urgent nudge threshold (% of context limit). Clamped to 50..99 on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeUrgentPercent"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeUrgentPercent")
+    )
     var prunerNudgeUrgentPercent: Int = 80
+
     /** Minimum turns between nudges. Clamped to 1..10 on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeCooldownTurns"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerNudgeCooldownTurns")
+    )
     var prunerNudgeCooldownTurns: Int = 3
+
     /** Fallback context limit when the model object doesn't expose one. Clamped to 1000..2_000_000 on set. */
-    @Deprecated("Migrated to OpenCodeContextSettingsState", ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerDefaultContextLimit"))
+    @Deprecated(
+        "Migrated to OpenCodeContextSettingsState",
+        ReplaceWith("OpenCodeContextSettingsState.getInstance().prunerDefaultContextLimit")
+    )
     var prunerDefaultContextLimit: Int = 128000
 
     /** Target FPS for throttled infinite animations (glow, pulse, spinner).
@@ -238,38 +350,76 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * editor on every read tool call, which can be jarring for users who
      * have not opted in.
      */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followAgentEnabled"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followAgentEnabled")
+    )
     var followAgentEnabled: Boolean = false
+
     /** Highlight color for READ tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followReadColor"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followReadColor")
+    )
     var followReadColor: String = "#5078C888"
+
     /** Highlight color for EDIT tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followEditColor"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followEditColor")
+    )
     var followEditColor: String = "#50A05088"
+
     /** Highlight color for SEARCH tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followSearchColor"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followSearchColor")
+    )
     var followSearchColor: String = "#C8B43C88"
+
     /** Highlight color for EXECUTE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followExecuteColor"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followExecuteColor")
+    )
     var followExecuteColor: String = "#B4785088"
+
     /** Highlight color for DELETE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followDeleteColor"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followDeleteColor")
+    )
     var followDeleteColor: String = "#C8505088"
+
     /** Highlight color for MOVE tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followMoveColor"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followMoveColor")
+    )
     var followMoveColor: String = "#A050C888"
+
     /** Highlight color for FETCH tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followFetchColor"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followFetchColor")
+    )
     var followFetchColor: String = "#50A0C888"
+
     /** Highlight color for OTHER tool calls as "#RRGGBBAA" hex. Default alpha 0x88 ≈53%. */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().followOtherColor"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().followOtherColor")
+    )
     var followOtherColor: String = "#80808088"
 
     /**
      * Returns the persisted hex color for a [com.agentclientprotocol.model.ToolKind].
      * THINK and SWITCH_MODE have no persisted color and fall back to OTHER.
      */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().getFollowColor(kind)"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().getFollowColor(kind)")
+    )
     fun getFollowColor(kind: com.agentclientprotocol.model.ToolKind): String =
         OpenCodeFollowSettingsState.getInstance().getFollowColor(kind)
 
@@ -277,7 +427,10 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Persists the hex color for a [com.agentclientprotocol.model.ToolKind].
      * THINK and SWITCH_MODE have no persisted color — no-op.
      */
-    @Deprecated("Migrated to OpenCodeFollowSettingsState", ReplaceWith("OpenCodeFollowSettingsState.getInstance().setFollowColor(kind, hex)"))
+    @Deprecated(
+        "Migrated to OpenCodeFollowSettingsState",
+        ReplaceWith("OpenCodeFollowSettingsState.getInstance().setFollowColor(kind, hex)")
+    )
     fun setFollowColor(kind: com.agentclientprotocol.model.ToolKind, hex: String) {
         OpenCodeFollowSettingsState.getInstance().setFollowColor(kind, hex)
     }
@@ -314,7 +467,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             )
             true
         } catch (e: Exception) {
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeMcpSettingsState" }
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                .error(e) { "[ACP] Failed to forward settings to OpenCodeMcpSettingsState" }
             false
         }
     }
@@ -340,7 +494,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             )
             true
         } catch (e: Exception) {
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeFollowSettingsState" }
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                .error(e) { "[ACP] Failed to forward settings to OpenCodeFollowSettingsState" }
             false
         }
     }
@@ -373,7 +528,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             )
             true
         } catch (e: Exception) {
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.error(e) { "[ACP] Failed to forward settings to OpenCodeContextSettingsState" }
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                .error(e) { "[ACP] Failed to forward settings to OpenCodeContextSettingsState" }
             false
         }
     }
@@ -388,6 +544,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         inlineCodeColor = state.inlineCodeColor
         listNumberColor = state.listNumberColor
         lastSelectedModelKey = state.lastSelectedModelKey
+        lastSelectedAgent = state.lastSelectedAgent
+        lastSelectedThinkingEffort = state.lastSelectedThinkingEffort
         sidebarVisible = state.sidebarVisible
         commandHistorySize = state.commandHistorySize.coerceIn(1, 100)
         // Migrate legacy sseSocketTimeoutSeconds → responseTimeoutSeconds.
@@ -403,11 +561,12 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
                 // was customized. Using the legacy value. Log a warning so the user can correct if needed.
                 io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
                     "[ACP] Migration: responseTimeoutSeconds was at default (300), using legacy sseSocketTimeoutSeconds=${state.sseSocketTimeoutSeconds} " +
-                    "(coerced to ${state.sseSocketTimeoutSeconds.coerceAtLeast(60)}). " +
-                    "If you explicitly set responseTimeoutSeconds to 300, please re-set it in Settings."
+                            "(coerced to ${state.sseSocketTimeoutSeconds.coerceAtLeast(60)}). " +
+                            "If you explicitly set responseTimeoutSeconds to 300, please re-set it in Settings."
                 }
                 state.sseSocketTimeoutSeconds.coerceAtLeast(60)
             }
+
             else -> 300
         }
         // NOTE: If the user explicitly set responseTimeoutSeconds to 300 (the default)
@@ -428,7 +587,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         // launch time, ProcessManager finds the next available port — actual runtime
         // port may differ from this persisted value.
         port = if (state.port in 1024..65535) state.port else {
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] Invalid port ${state.port} in settings, resetting to 4096" }
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                .warn { "[ACP] Invalid port ${state.port} in settings, resetting to 4096" }
             4096
         }
         loadAllSessions = state.loadAllSessions
@@ -451,7 +611,7 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
                     // Validate each element has required keys: name and url
                     val allValid = parsed.all { element ->
                         element is kotlinx.serialization.json.JsonObject &&
-                            element.containsKey("name") && element.containsKey("url")
+                                element.containsKey("name") && element.containsKey("url")
                     }
                     if (allValid) {
                         state.additionalMcpServers
@@ -462,18 +622,20 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
                         ""
                     }
                 } else {
-                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] Invalid additionalMcpServers in settings: expected JSON array, got ${parsed::class.simpleName} — clearing" }
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                        .warn { "[ACP] Invalid additionalMcpServers in settings: expected JSON array, got ${parsed::class.simpleName} — clearing" }
                     ""
                 }
             } else ""
         } catch (e: Exception) {
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] Invalid additionalMcpServers in settings, clearing" }
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                .warn(e) { "[ACP] Invalid additionalMcpServers in settings, clearing" }
             ""
         }
         toolPermissions = state.toolPermissions
         savedToolPermissionsBeforeDisable = state.savedToolPermissionsBeforeDisable
         discoveredToolsJson = state.discoveredToolsJson
-       showDisconnectConfirmation = state.showDisconnectConfirmation
+        showDisconnectConfirmation = state.showDisconnectConfirmation
         // Context & Compaction settings (with clamping for corrupt/out-of-range values)
         truncateToolOutput = state.truncateToolOutput
         toolOutputCharLimit = state.toolOutputCharLimit.coerceIn(10_000, 200_000)
@@ -562,9 +724,9 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         }
         // Set the aggregate flag for backward compatibility (old code checks this).
         settingsMigratedToChildClasses = mcpSettingsMigrated && followSettingsMigrated && contextSettingsMigrated
-         // Clear deprecated Follow Agent fields after migration to prevent re-persistence
-         // to opencode-settings.xml. Same pattern as sseSocketTimeoutSeconds (line 410).
-         // The values now live in OpenCodeFollowSettingsState.
+        // Clear deprecated Follow Agent fields after migration to prevent re-persistence
+        // to opencode-settings.xml. Same pattern as sseSocketTimeoutSeconds (line 410).
+        // The values now live in OpenCodeFollowSettingsState.
         // NOTE: The legacy values were forwarded via the `state` parameter above
         // (forwardToFollowSettings reads from `state`, not from `this`), so clearing
         // `this` here does not lose data — it only prevents the deprecated fields from
@@ -595,7 +757,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             followOtherColor = ""
         }
         if (!settingsMigratedToChildClasses) {
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn { "[ACP] One or more settings forwardings failed; per-class flags set — failed classes will retry on next restart" }
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                .warn { "[ACP] One or more settings forwardings failed; per-class flags set — failed classes will retry on next restart" }
         }
     }
 
@@ -605,7 +768,8 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
      * Located in the IDE config dir (same as opencode-settings.xml).
      */
     private fun migrationMarkerFile(): java.io.File {
-        val configDir = java.io.File(System.getProperty("idea.config.path", System.getProperty("user.home") + "/.intellij"))
+        val configDir =
+            java.io.File(System.getProperty("idea.config.path", System.getProperty("user.home") + "/.intellij"))
         return java.io.File(configDir, "opencode-migration-markers.txt")
     }
 
@@ -614,7 +778,9 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
         if (!file.exists()) return emptySet()
         return try {
             file.readLines().filter { it.isNotBlank() }.toSet()
-        } catch (_: Exception) { emptySet() }
+        } catch (_: Exception) {
+            emptySet()
+        }
     }
 
     private fun writeMigrationMarker(className: String) {
@@ -623,10 +789,17 @@ class OpenCodeSettingsState : PersistentStateComponent<OpenCodeSettingsState> {
             file.parentFile?.mkdirs()
             val existing = readMigrationMarkers()
             if (className !in existing) {
-                file.writeText((existing + className).joinToString("\n"))
+                // Atomic write (temp + move) so an interrupted write doesn't leave a
+                // truncated/corrupt marker file. Best-effort — failure is caught below
+                // and the per-class flag is the fallback defense.
+                com.opencode.acp.chat.util.AtomicFileWriter.writeAtomically(
+                    file.toPath(),
+                    (existing + className).joinToString("\n"),
+                )
             }
         } catch (e: Exception) {
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(e) { "[ACP] Failed to write migration marker for $className" }
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                .warn(e) { "[ACP] Failed to write migration marker for $className" }
         }
     }
 

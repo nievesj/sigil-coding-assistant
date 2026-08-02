@@ -79,10 +79,10 @@ class ControlBarViewModelTest {
 
     @Test
     fun `selectAgent updates controlState selectedAgent and persists to settings`() {
-        val agent = OpenCodeAgentInfo(id = "orchestrator", name = "orchestrator")
+        val agent = OpenCodeAgentInfo(id = "coding-assistant", name = "coding-assistant")
         viewModel.selectAgent(agent)
         viewModel.controlState.value.selectedAgent shouldBe agent
-        verify { settings.lastSelectedAgent = "orchestrator" }
+        verify { settings.lastSelectedAgent = "coding-assistant" }
     }
 
     @Test
@@ -123,7 +123,7 @@ class ControlBarViewModelTest {
     @Test
     fun `loadAgentsAndProviders populates agents from service`() = runTest {
         coEvery { service.listAgents() } returns listOf(
-            makeAgent("orchestrator"),
+            makeAgent("coding-assistant"),
             makeAgent("fixer", mode = "subagent"),   // filtered out
             makeAgent("hidden-one", hidden = true),  // filtered out
             makeAgent("builder"),
@@ -132,24 +132,24 @@ class ControlBarViewModelTest {
 
         viewModel.loadAgentsAndProviders()
 
-        viewModel.controlState.value.agents.map { it.id } shouldBe listOf("orchestrator", "builder")
+        viewModel.controlState.value.agents.map { it.id } shouldBe listOf("coding-assistant", "builder")
     }
 
     @Test
-    fun `loadAgentsAndProviders selects orchestrator as default agent`() = runTest {
+    fun `loadAgentsAndProviders selects coding-assistant as default agent`() = runTest {
         coEvery { service.listAgents() } returns listOf(
             makeAgent("builder"),
-            makeAgent("orchestrator"),
+            makeAgent("coding-assistant"),
         )
         coEvery { service.listProviders() } returns null
 
         viewModel.loadAgentsAndProviders()
 
-        viewModel.controlState.value.selectedAgent?.id shouldBe "orchestrator"
+        viewModel.controlState.value.selectedAgent?.id shouldBe "coding-assistant"
     }
 
     @Test
-    fun `loadAgentsAndProviders falls back to first agent when orchestrator absent`() = runTest {
+    fun `loadAgentsAndProviders falls back to first agent when coding-assistant absent`() = runTest {
         coEvery { service.listAgents() } returns listOf(
             makeAgent("builder"),
             makeAgent("fixer"),
@@ -215,7 +215,7 @@ class ControlBarViewModelTest {
     fun `loadAgentsAndProviders restores saved agent from lastSelectedAgent`() = runTest {
         every { settings.lastSelectedAgent } returns "builder"
         coEvery { service.listAgents() } returns listOf(
-            makeAgent("orchestrator"),
+            makeAgent("coding-assistant"),
             makeAgent("builder"),
         )
         coEvery { service.listProviders() } returns ProviderResponse(
@@ -230,7 +230,7 @@ class ControlBarViewModelTest {
 
         viewModel.loadAgentsAndProviders()
 
-        // Orchestrator is selected first as default, then overridden by saved agent.
+        // coding-assistant is selected first as default, then overridden by saved agent.
         viewModel.controlState.value.selectedAgent?.id shouldBe "builder"
     }
 

@@ -30,6 +30,10 @@ private val logger = KotlinLogging.logger {}
 class ContextGenerator(private val project: Project) {
 
     companion object {
+        // Maximum number of symbols to collect. Matches the take(100) in
+        // collectProjectSymbols — collecting more is wasted work.
+        private const val MAX_SYMBOLS = 100
+
         // Kotlin PSI classes are only present when the Kotlin plugin is installed
         // (IntelliJ IDEA, Android Studio). On Rider, PyCharm, WebStorm, etc. the
         // classes are absent from the classloader and an `is KtFile` check would
@@ -37,6 +41,20 @@ class ContextGenerator(private val project: Project) {
         // loaded when the plugin is unavailable.
         private val kotlinPluginAvailable: Boolean = try {
             Class.forName("org.jetbrains.kotlin.psi.KtFile")
+            true
+        } catch (_: Throwable) {
+            false
+        }
+
+        // Java PSI classes (PsiClassOwner, PsiClass) are only present when the
+        // Java plugin is installed. On some IDE configurations the plugin
+        // classloader cannot resolve com.intellij.psi.search.PsiShortNamesCache
+        // (which PsiClassOwner depends on transitively), causing
+        // NoClassDefFoundError at the `psiFile is PsiClassOwner` check. Guard
+        // with reflection so the class is never loaded when unavailable.
+        private val javaPsiAvailable: Boolean = try {
+            Class.forName("com.intellij.psi.PsiClassOwner")
+            Class.forName("com.intellij.psi.search.PsiShortNamesCache")
             true
         } catch (_: Throwable) {
             false
@@ -88,9 +106,12 @@ class ContextGenerator(private val project: Project) {
                     val rel = java.nio.file.Paths.get(b).relativize(java.nio.file.Paths.get(vfilePath))
                     rel.toString().replace(java.io.File.separatorChar, '/')
                 } catch (_: Exception) {
-                    vfilePath
+                    // Relativization failed (e.g., file is outside the project base path).
+                    // Return a placeholder instead of the raw absolute path to avoid
+                    // disclosing absolute filesystem paths in the committed context file (CWE-200).
+                    "<external>"
                 }
-            } ?: vfilePath
+            } ?: "<external>"
 
         // All source file extensions we can parse PSI for.
         // If a language plugin isn't installed, PsiManager.findFile returns null
@@ -112,10 +133,13 @@ class ContextGenerator(private val project: Project) {
         )
 
         for (ext in extensions) {
-            if (project.isDisposed) return entries
+            // Early-exit once we have enough symbols — avoids loading PSI for
+            // every source file in large monorepos (the output is truncated to
+            // 100 anyway, so collecting more is wasted work).
+            if (project.isDisposed || entries.size >= MAX_SYMBOLS) return entries
             val files = FilenameIndex.getAllFilesByExt(project, ext, scope)
             for (vfile in files) {
-                if (project.isDisposed) return entries
+                if (project.isDisposed || entries.size >= MAX_SYMBOLS) return entries
                 val psiFile = PsiManager.getInstance(project).findFile(vfile) ?: continue
                 val rel = relPath(vfile.path)
 
@@ -124,33 +148,45 @@ class ContextGenerator(private val project: Project) {
                     PsiTreeUtil.findChildrenOfType(psiFile, KtClass::class.java)
                         .filter { it.parent is KtFile }
                         .forEach { cls ->
-                            entries.add(SymbolEntry(
-                                cls.name ?: "<anonymous>", rel,
-                                cls.fqName?.asString() ?: cls.name ?: "", "class",
-                            ))
+                            entries.add(
+                                SymbolEntry(
+                                    cls.name ?: "<anonymous>", rel,
+                                    cls.fqName?.asString() ?: cls.name ?: "", "class",
+                                )
+                            )
                         }
                     PsiTreeUtil.findChildrenOfType(psiFile, KtObjectDeclaration::class.java)
                         .filter { it.parent is KtFile }
                         .forEach { obj ->
                             if (obj.isCompanion()) return@forEach
-                            entries.add(SymbolEntry(
-                                obj.name ?: "<anonymous>", rel,
-                                obj.fqName?.asString() ?: obj.name ?: "", "object",
-                            ))
+                            entries.add(
+                                SymbolEntry(
+                                    obj.name ?: "<anonymous>", rel,
+                                    obj.fqName?.asString() ?: obj.name ?: "", "object",
+                                )
+                            )
                         }
                     continue // KtFile handled, skip generic traversal
                 }
 
-                if (psiFile is PsiClassOwner) {
-                    PsiTreeUtil.findChildrenOfType(psiFile, PsiClass::class.java)
-                        .filter { it.parent is PsiFile || it.parent is PsiClassOwner }
-                        .forEach { cls ->
-                            entries.add(SymbolEntry(
-                                cls.name ?: "<anonymous>", rel,
-                                cls.qualifiedName ?: cls.name ?: "", "class",
-                            ))
-                        }
-                    continue // Java file handled, skip generic traversal
+                if (javaPsiAvailable && psiFile is PsiClassOwner) {
+                    try {
+                        PsiTreeUtil.findChildrenOfType(psiFile, PsiClass::class.java)
+                            .filter { it.parent is PsiFile || it.parent is PsiClassOwner }
+                            .forEach { cls ->
+                                entries.add(
+                                    SymbolEntry(
+                                        cls.name ?: "<anonymous>", rel,
+                                        cls.qualifiedName ?: cls.name ?: "", "class",
+                                    )
+                                )
+                            }
+                    } catch (e: NoClassDefFoundError) {
+                        // Java PSI classes vanished at runtime (classloader issue) —
+                        // skip this file's Java-specific extraction but continue
+                        // with the generic traversal below for other languages.
+                    }
+                    continue // Java file handled (or skipped), avoid generic traversal
                 }
 
                 // --- All other languages: generic PsiNamedElement traversal ---
@@ -160,6 +196,12 @@ class ContextGenerator(private val project: Project) {
                 // We use PsiTreeUtil.findChildrenOfType with a filter for direct children
                 // of the file (parent is PsiFile) to avoid the O(depth) parent chain walk
                 // and the risk of misclassifying nested elements as top-level.
+                // INVARIANT: genericCounter MUST reset to 0 for EACH file (it's declared
+                // inside the for-file loop). The distinctBy key is (qualifiedName to file),
+                // so the per-file counter reset ensures two files can both have "Foo#0"
+                // without colliding (they differ by file). If this counter is ever hoisted
+                // to project-scope, the distinctBy key would need to include the counter
+                // value uniquely per-project, or symbols would be wrongly deduped.
                 var genericCounter = 0
                 val topLevelNamed = PsiTreeUtil.findChildrenOfType(psiFile, PsiNamedElement::class.java)
                     .filter { element ->
@@ -249,8 +291,12 @@ class ContextGenerator(private val project: Project) {
             stack.add("Elixir")
         }
         if (try {
-            java.nio.file.Files.newDirectoryStream(baseDir.toPath(), "*.{csproj,sln}").use { it.iterator().hasNext() }
-        } catch (_: java.io.IOException) { false }) {
+                java.nio.file.Files.newDirectoryStream(baseDir.toPath(), "*.{csproj,sln}")
+                    .use { it.iterator().hasNext() }
+            } catch (_: java.io.IOException) {
+                false
+            }
+        ) {
             stack.add(".NET/C#")
         }
         if (java.io.File(baseDir, "CMakeLists.txt").exists()) {
@@ -360,7 +406,13 @@ internal fun formatRepoStructureMarkdown(data: RepoData): String {
         sb.appendLine("| (no symbols found) | | | |")
     } else {
         data.keySymbols.forEach { s ->
-            sb.appendLine("| `${s.name}` | `${s.file}` | `${s.qualifiedName}` | ${s.kind} |")
+            val safeName = s.name.replace("|", "\\|").replace("`", "\\`").replace("\n", " ")
+            val safeFile = s.file.replace("|", "\\|").replace("`", "\\`").replace("\n", " ")
+            val safeQName = s.qualifiedName.replace("|", "\\|").replace("`", "\\`").replace("\n", " ")
+            // Escape the kind column too — it's currently hardcoded to "class"/"object"/"symbol",
+            // but defense-in-depth: if it ever becomes PSI-derived, this prevents markdown injection.
+            val safeKind = s.kind.replace("|", "\\|").replace("`", "\\`").replace("\n", " ")
+            sb.appendLine("| `${safeName}` | `${safeFile}` | `${safeQName}` | ${safeKind} |")
         }
     }
     sb.appendLine()

@@ -107,6 +107,13 @@
             id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.psi"
             displayName="PSI Tools"/>
 
+        <!-- CHILD: Agents -->
+        <applicationConfigurable
+            parentId="com.opencode.acp.settings.OpenCodeSettingsConfigurable"
+            instance="com.opencode.acp.config.settings.OpenCodeAgentConfigurable"
+            id="com.opencode.acp.settings.OpenCodeSettingsConfigurable.agent"
+            displayName="Agents"/>
+
         <toolWindow
             id="Sigil - Coding Assistant"
             secondary="true"
