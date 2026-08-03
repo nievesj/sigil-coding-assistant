@@ -1228,8 +1228,9 @@ The bridge runs at three points: (1) initial server launch in `ProcessManager.in
 **Stale-path eviction (Q4):** Plugin-managed paths are fully determined at runtime by `JetBrainsSkillBridge.detectSkillPaths()`. On each write, plugin-managed paths from previous writes (e.g., from an old IDE version) are evicted via `isPluginManagedPath()` (path-shape-based matching), while user-added paths are always preserved. This handles IDE version upgrades (2026.1 ? 2026.2) and plugin uninstalls cleanly.
 
 **Detected paths:**
-1. IDE-level skill storage: `{PathManager.getSystemPath()}/aia/agents/.agents/skills` � gated on AI Assistant plugin presence (`com.intellij.ai.assistant`) + directory existence.
-2. Codex Global scope: `~/.codex/skills` � gated on directory existence only (no plugin to detect).
+1. IDE-level skill storage: `{PathManager.getSystemPath()}/aia/agents/.agents/skills` -- gated on **directory existence** only.
+
+**Gate strategy (directory existence, not plugin presence):** The IDE path was originally gated on `PluginManager.isPluginInstalled(PluginId.getId("com.intellij.ai.assistant"))` + directory existence. The AI Assistant plugin ID changed across IDE versions (`com.intellij.ai.assistant` in older IDEs, `com.intellij.ml.llm` in IntelliJ 2026.2), so the plugin-presence gate failed silently and bridged zero skills. The gate is now directory existence only: if `aia/agents/.agents/skills` exists, the AI Assistant created skills there and they should be bridged regardless of plugin load state. This is robust against future plugin-ID renames. The Codex Global path (`~/.codex/skills`) was removed entirely (Codex scoping is not used). `isPluginManagedPath` now matches only `/aia/agents/.agents/skills`.
 
 **Feature 2 � `$` Skill Invocation:** A skill palette in the input area (mirroring the existing `/` slash command palette) that lets the user manually invoke a skill by typing `$` followed by the skill name. Skills are fetched from OpenCode's `GET /skill` endpoint. When selected, the skill content is injected into the user's message text (wrapped in `<skill_content name="...">...</skill_content>` tags) for review before sending. This guarantees the agent receives the skill instructions directly � no dependency on the agent deciding to call the `skill` tool.
 

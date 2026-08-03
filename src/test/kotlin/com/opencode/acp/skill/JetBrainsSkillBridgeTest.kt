@@ -11,9 +11,14 @@ import java.nio.file.Path
  * Unit tests for [JetBrainsSkillBridge] (TDD §8.2 scenarios 7-9 + 6d).
  *
  * Tests the pure function [JetBrainsSkillBridge.detectSkillPathsPure] and
- * [JetBrainsSkillBridge.isPluginManagedPath]. No mocking of PluginManager
- * or PathManager is required — all Platform dependencies are passed as
- * parameters to the pure function.
+ * [JetBrainsSkillBridge.isPluginManagedPath]. No mocking of PathManager is
+ * required — all Platform dependencies are passed as parameters to the pure
+ * function.
+ *
+ * Plugin ID history: the AI Assistant plugin ID changed across IDE versions
+ * (`com.intellij.ai.assistant` → `com.intellij.ml.llm` in 2026.2), so the
+ * gate was switched from plugin-presence to directory-existence. These tests
+ * verify the directory-existence behavior directly.
  */
 class JetBrainsSkillBridgeTest {
 
@@ -21,15 +26,13 @@ class JetBrainsSkillBridgeTest {
     lateinit var tempDir: Path
 
     @Test
-    fun `detectSkillPathsPure returns IDE path when skill directory exists and AI Assistant is installed`() {
+    fun `detectSkillPathsPure returns IDE path when skill directory exists`() {
         // Create the IDE skill directory structure under tempDir
         val ideSkills = tempDir.resolve("aia/agents/.agents/skills")
         Files.createDirectories(ideSkills)
 
         val result = JetBrainsSkillBridge.detectSkillPathsPure(
             basePath = tempDir.toString(),
-            isAiAssistantInstalled = true,
-            userHome = tempDir.resolve("nonexistent-home").toString(), // avoid codex path collision
         )
 
         result shouldNotBe emptyList<String>()
@@ -42,78 +45,35 @@ class JetBrainsSkillBridgeTest {
         // Do not create the IDE skill directory
         val result = JetBrainsSkillBridge.detectSkillPathsPure(
             basePath = tempDir.toString(),
-            isAiAssistantInstalled = true,
-            userHome = tempDir.resolve("nonexistent-home").toString(),
         )
 
         result shouldBe emptyList()
     }
 
     @Test
-    fun `detectSkillPathsPure returns empty when AI Assistant is not installed even if directory exists`() {
-        // Create the IDE skill directory structure
+    fun `detectSkillPathsPure returns empty when basePath does not exist`() {
+        val result = JetBrainsSkillBridge.detectSkillPathsPure(
+            basePath = tempDir.resolve("nonexistent-base").toString(),
+        )
+
+        result shouldBe emptyList()
+    }
+
+    @Test
+    fun `detectSkillPathsPure does not require plugin presence - directory existence is the gate`() {
+        // This is the core regression test for the bug where the AI Assistant
+        // plugin ID changed (`com.intellij.ai.assistant` → `com.intellij.ml.llm`)
+        // and the plugin-presence gate failed silently, bridging zero skills.
+        // Now the gate is directory-existence: if the dir is there, bridge it.
         val ideSkills = tempDir.resolve("aia/agents/.agents/skills")
         Files.createDirectories(ideSkills)
 
         val result = JetBrainsSkillBridge.detectSkillPathsPure(
             basePath = tempDir.toString(),
-            isAiAssistantInstalled = false,
-            userHome = tempDir.resolve("nonexistent-home").toString(),
-        )
-
-        result shouldBe emptyList()
-    }
-
-    @Test
-    fun `detectSkillPathsPure includes codex path when dot-codex skills exists`() {
-        // Create the codex skills directory under tempDir (used as userHome)
-        val codexSkills = tempDir.resolve(".codex/skills")
-        Files.createDirectories(codexSkills)
-
-        // Use a separate basePath that does NOT have the IDE skill dir
-        val result = JetBrainsSkillBridge.detectSkillPathsPure(
-            basePath = tempDir.resolve("nonexistent-base").toString(),
-            isAiAssistantInstalled = true,
-            userHome = tempDir.toString(),
         )
 
         result.size shouldBe 1
-        result[0] shouldBe codexSkills.toString()
-    }
-
-    @Test
-    fun `detectSkillPathsPure returns empty when neither directory exists`() {
-        val result = JetBrainsSkillBridge.detectSkillPathsPure(
-            basePath = tempDir.resolve("nonexistent-base").toString(),
-            isAiAssistantInstalled = true,
-            userHome = tempDir.resolve("nonexistent-home").toString(),
-        )
-
-        result shouldBe emptyList()
-    }
-
-    @Test
-    fun `detectSkillPathsPure returns both paths when both directories exist`() {
-        // Create both directories under tempDir. Use tempDir as basePath for the
-        // IDE path and a sub-directory as userHome for the codex path so they
-        // don't collide.
-        val ideSkills = tempDir.resolve("aia/agents/.agents/skills")
-        Files.createDirectories(ideSkills)
-
-        val homeDir = tempDir.resolve("home")
-        Files.createDirectories(homeDir)
-        val codexSkills = homeDir.resolve(".codex/skills")
-        Files.createDirectories(codexSkills)
-
-        val result = JetBrainsSkillBridge.detectSkillPathsPure(
-            basePath = tempDir.toString(),
-            isAiAssistantInstalled = true,
-            userHome = homeDir.toString(),
-        )
-
-        result.size shouldBe 2
         result[0] shouldBe ideSkills.toString()
-        result[1] shouldBe codexSkills.toString()
     }
 
     @Test
@@ -129,12 +89,6 @@ class JetBrainsSkillBridgeTest {
     }
 
     @Test
-    fun `isPluginManagedPath returns true for codex path`() {
-        val path = "/home/user/.codex/skills"
-        JetBrainsSkillBridge.isPluginManagedPath(path) shouldBe true
-    }
-
-    @Test
     fun `isPluginManagedPath returns false for user-added custom path`() {
         val path = "/home/user/my-custom-skills"
         JetBrainsSkillBridge.isPluginManagedPath(path) shouldBe false
@@ -146,25 +100,6 @@ class JetBrainsSkillBridgeTest {
         // end with it should NOT be classified as plugin-managed.
         val path = "/home/user/my-aia/agents/.agents/skills-backup"
         JetBrainsSkillBridge.isPluginManagedPath(path) shouldBe false
-    }
-
-    @Test
-    fun `isPluginManagedPath returns false for codex path containing but not ending with pattern`() {
-        val path = "/home/user/projects/.codex/skills-backup"
-        JetBrainsSkillBridge.isPluginManagedPath(path) shouldBe false
-    }
-
-    @Test
-    fun `detectSkillPathsPure handles null userHome gracefully without throwing`() {
-        // userHome can be null if -Duser.home= is set or in security-restricted envs.
-        // Should not throw NPE — just skip the codex path.
-        val result = JetBrainsSkillBridge.detectSkillPathsPure(
-            basePath = tempDir.resolve("nonexistent-base").toString(),
-            isAiAssistantInstalled = false,
-            userHome = null as String?,
-        )
-
-        result shouldBe emptyList()
     }
 
     @Test

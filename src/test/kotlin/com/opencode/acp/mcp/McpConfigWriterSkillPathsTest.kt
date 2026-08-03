@@ -234,7 +234,7 @@ class McpConfigWriterSkillPathsTest {
               "skills": {
                 "paths": [
                   "/ide/aia/agents/.agents/skills",
-                  "/home/user/.codex/skills",
+                  "/home/user/extra-ide/aia/agents/.agents/skills",
                   "/user/custom/skills"
                 ]
               }
@@ -246,7 +246,7 @@ class McpConfigWriterSkillPathsTest {
         result shouldBe true
 
         val paths = skillsPaths()
-        // Both plugin-managed paths evicted, user path preserved
+        // Both plugin-managed IDE paths evicted; user custom path preserved
         paths shouldBe listOf("/user/custom/skills")
     }
 
@@ -277,7 +277,8 @@ class McpConfigWriterSkillPathsTest {
     @Test
     fun `scenario 6d - writeSkillPaths handles Windows backslash paths in pattern matching`() {
         // Pre-populate with a Windows backslash path that matches the plugin-managed pattern
-        val windowsPath = "C:\\Users\\josen\\AppData\\Local\\JetBrains\\IntelliJIdea2026.1\\aia\\agents\\.agents\\skills"
+        val windowsPath =
+            "C:\\Users\\josen\\AppData\\Local\\JetBrains\\IntelliJIdea2026.1\\aia\\agents\\.agents\\skills"
         writeInitialConfig(
             """{
               "${'$'}schema": "https://opencode.ai/config.json",
@@ -368,7 +369,8 @@ class McpConfigWriterSkillPathsTest {
         )
 
         val writer = newWriter()
-        val result = writer.writeAgentOverrides(enableExplore = true, enableGeneral = true, disabledAgentNames = emptyList())
+        val result =
+            writer.writeAgentOverrides(enableExplore = true, enableGeneral = true, disabledAgentNames = emptyList())
         result shouldBe true
 
         val agent = readConfig()["agent"]?.jsonObject
@@ -393,7 +395,11 @@ class McpConfigWriterSkillPathsTest {
         )
 
         val writer = newWriter()
-        val result = writer.writeAgentOverrides(enableExplore = true, enableGeneral = true, disabledAgentNames = listOf("adversarial-glm-5.1"))
+        val result = writer.writeAgentOverrides(
+            enableExplore = true,
+            enableGeneral = true,
+            disabledAgentNames = listOf("adversarial-glm-5.1")
+        )
         result shouldBe true
 
         val agent = readConfig()["agent"]?.jsonObject
