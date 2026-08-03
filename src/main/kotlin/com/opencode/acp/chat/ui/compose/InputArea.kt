@@ -102,7 +102,8 @@ private fun isAttachedPathAllowed(
     projectBase: String?,
     userHome: String?,
 ): Boolean {
-    val canonicalAttached = com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(attachedPath) ?: return false
+    val canonicalAttached =
+        com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(attachedPath) ?: return false
     return com.opencode.acp.chat.util.AttachmentPathValidator.isAllowed(canonicalAttached, projectBase, userHome)
 }
 
@@ -215,7 +216,7 @@ fun InputArea(
     isBraveModeEnabled: Boolean = false,               // NEW: brave mode state
     onToggleBraveMode: () -> Unit = {},               // NEW: brave mode toggle
     placeholderText: String = "Type a message...",
-    ) {
+) {
     val textState = remember { TextFieldState() }
     val focusRequester = remember { FocusRequester() }
     var showAttachMenu by remember { mutableStateOf(false) }
@@ -240,14 +241,13 @@ fun InputArea(
     // Skill palette state: shown when text starts with "$" (but not "$$")
     var showSkillPalette by remember { mutableStateOf(false) }
     var skillSelectedIndex by remember { mutableStateOf(0) }
-    // Only treat a single leading "$" as a skill query; "$$" is the escape
-    // mechanism to send literal text starting with "$".
-    // Gate: $ at position 0, not $$, no newline, and second char is a valid
-    // skill-name-start character (letter/digit/hyphen/underscore).
-    val skillQuery = if (currentText.startsWith("$") && !currentText.startsWith("$$") &&
-        currentText.length > 1 &&
-        (currentText[1].isLetterOrDigit() || currentText[1] == '-' || currentText[1] == '_'))
-        currentText.substring(1) else ""
+    // Skill trigger detection — mirrors the slash palette gate. The palette
+    // opens on bare "$" (showing all skills, unfiltered), exactly as the slash
+    // palette opens on bare "/". "$$" is the escape to send literal text
+    // starting with "$". The pure logic lives in detectSkillTrigger() so it
+    // can be unit-tested without Compose (mirrors detectMentionTrigger).
+    val skillTrigger = detectSkillTrigger(currentText)
+    val skillQuery = skillTrigger.query
 
     val filteredSkills = remember(skillQuery, availableSkills) {
         if (skillQuery.isBlank()) availableSkills
@@ -277,7 +277,7 @@ fun InputArea(
         } else {
             mentionFiles.filter {
                 it.name.contains(mentionQuery, ignoreCase = true) ||
-                it.path.contains(mentionQuery, ignoreCase = true)
+                        it.path.contains(mentionQuery, ignoreCase = true)
             }.take(20)
         }
     }
@@ -331,7 +331,9 @@ fun InputArea(
                                 // Reject non-file URI schemes (e.g. http://, ftp://) to
                                 // prevent attaching arbitrary remote resources. Only
                                 // local file:// URIs are allowed for drag-and-drop.
-                                val parsed = try { java.net.URI(uri) } catch (e: java.net.URISyntaxException) {
+                                val parsed = try {
+                                    java.net.URI(uri)
+                                } catch (e: java.net.URISyntaxException) {
                                     logger.warn { "[ACP] Drag-and-drop: malformed URI: ${uri.take(50)}" }
                                     null
                                 }
@@ -347,10 +349,15 @@ fun InputArea(
                                     // allowed dirs after the copy. This guards against a copy failure
                                     // silently returning the raw external path, which would bypass the
                                     // attachment security boundary.
-                                    val projectBase = project?.basePath?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
-                                    val userHome = System.getProperty("user.home")?.let { com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it) }
+                                    val projectBase = project?.basePath?.let {
+                                        com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it)
+                                    }
+                                    val userHome = System.getProperty("user.home")?.let {
+                                        com.opencode.acp.chat.util.AttachmentPathValidator.canonicalizeOrReject(it)
+                                    }
                                     val attached = file.toAttachedFile(project)
-                                    val isAllowed = attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
+                                    val isAllowed =
+                                        attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
                                     if (isAllowed) attached else {
                                         logger.warn { "[ACP] Drag-and-drop: attached file path outside allowed dirs after copy: ${attached?.path}" }
                                         null
@@ -367,6 +374,7 @@ fun InputArea(
                             return attached.isNotEmpty()
                         }
                     }
+
                     is DragData.Image -> {
                         // DragData.Image.readImage() returns Painter (CMP 1.10), which we can't
                         // convert to an AttachedFile. Fall through to the AWT transferable
@@ -436,7 +444,8 @@ fun InputArea(
                                 // allowed dirs after toAttachedFile (which copies external files in).
                                 // This guards against a copy failure silently returning the raw external
                                 // path, which would bypass the attachment security boundary.
-                                val isAllowed = attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
+                                val isAllowed =
+                                    attached != null && isAttachedPathAllowed(attached.path, projectBase, userHome)
                                 if (isAllowed) {
                                     onAttachFile(attached)
                                     anyAttached = true
@@ -490,12 +499,10 @@ fun InputArea(
                 // Show skill palette only for a single leading "$" — "$$" is the escape
                 // mechanism to send literal text starting with "$".
                 // Mutual exclusion: only one palette visible at a time (first char wins).
-                showSkillPalette = !showSlashPalette &&
-                    text.startsWith("$") &&
-                    !text.startsWith("$$") &&
-                    !text.contains("\n") &&
-                    text.length > 1 &&
-                    (text[1].isLetterOrDigit() || text[1] == '-' || text[1] == '_')
+                // Reuses detectSkillTrigger() (the same pure gate as skillQuery
+                // derivation above) so the visible-palettes state and the query
+                // extraction can never diverge. The palette opens on bare "$".
+                showSkillPalette = !showSlashPalette && detectSkillTrigger(text).active
             }
     }
 
@@ -765,7 +772,7 @@ fun InputArea(
                         }
                 )
             }
-            
+
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -783,447 +790,489 @@ fun InputArea(
                         )
                     ),
             ) {
-            Column {
-                // Attached images — thumbnails inside the box
-                if (attachedFiles.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        attachedFiles.forEachIndexed { index, file ->
-                            val isImage = file.mime.startsWith("image/")
-                            if (isImage) {
-                                // Image thumbnail with click-to-preview
-                                var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-                                LaunchedEffect(file.path) {
-                                    bitmap = withContext(Dispatchers.IO) { try { decodeFileToBitmap(file.path) } catch (_: Exception) { null } }
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .size(ChatTheme.dims.attachmentThumbnailSize)
-                                        .clip(ChatTheme.shapes.attachmentCornerRadius)
-                                        .background(ChatTheme.colors.component.attachmentBg)
-                                        .clickable { onImagePreview(file.path) },
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    if (bitmap != null) {
-                                        ComposeImage(
-                                            bitmap = bitmap!!,
-                                            contentDescription = file.name,
-                                            modifier = Modifier
-                                                .size(ChatTheme.dims.attachmentThumbnailSize)
-                                                .clip(ChatTheme.shapes.attachmentCornerRadius),
-                                            contentScale = ContentScale.Crop,
+                Column {
+                    // Attached images — thumbnails inside the box
+                    if (attachedFiles.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            attachedFiles.forEachIndexed { index, file ->
+                                val isImage = file.mime.startsWith("image/")
+                                if (isImage) {
+                                    // Image thumbnail with click-to-preview
+                                    var bitmap by remember {
+                                        mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(
+                                            null
                                         )
-                                    } else {
+                                    }
+                                    LaunchedEffect(file.path) {
+                                        bitmap = withContext(Dispatchers.IO) {
+                                            try {
+                                                decodeFileToBitmap(file.path)
+                                            } catch (_: Exception) {
+                                                null
+                                            }
+                                        }
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .size(ChatTheme.dims.attachmentThumbnailSize)
+                                            .clip(ChatTheme.shapes.attachmentCornerRadius)
+                                            .background(ChatTheme.colors.component.attachmentBg)
+                                            .clickable { onImagePreview(file.path) },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        if (bitmap != null) {
+                                            ComposeImage(
+                                                bitmap = bitmap!!,
+                                                contentDescription = file.name,
+                                                modifier = Modifier
+                                                    .size(ChatTheme.dims.attachmentThumbnailSize)
+                                                    .clip(ChatTheme.shapes.attachmentCornerRadius),
+                                                contentScale = ContentScale.Crop,
+                                            )
+                                        } else {
+                                            Icon(
+                                                key = AllIconsKeys.FileTypes.Image,
+                                                contentDescription = file.name,
+                                                modifier = Modifier.size(20.dp),
+                                                tint = ChatTheme.colors.component.attachmentRemoveIcon,
+                                            )
+                                        }
+                                        // Remove button overlay
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .size(ChatTheme.dims.attachmentImageRemoveSize)
+                                                .clip(ChatTheme.shapes.imageRemoveBadgeShape)
+                                                .background(ChatTheme.colors.component.attachmentImageOverlay)
+                                                .clickable { onRemoveFile(index) },
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(
+                                                key = AllIconsKeys.Actions.Close,
+                                                contentDescription = "Remove",
+                                                modifier = Modifier.size(ChatTheme.dims.attachmentImageRemoveBadge),
+                                                tint = ChatTheme.colors.component.attachmentImageRemove,
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    // Non-image file pill
+                                    Row(
+                                        modifier = Modifier
+                                            .clip(ChatTheme.shapes.attachmentCornerRadius)
+                                            .background(ChatTheme.colors.component.attachmentBg)
+                                            .padding(
+                                                horizontal = ChatTheme.dims.attachmentChipPaddingH,
+                                                vertical = ChatTheme.dims.attachmentChipPaddingV
+                                            ),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
                                         Icon(
-                                            key = AllIconsKeys.FileTypes.Image,
-                                            contentDescription = file.name,
-                                            modifier = Modifier.size(20.dp),
+                                            key = AllIconsKeys.FileTypes.Text,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(ChatTheme.dims.attachmentFileIconSize),
                                             tint = ChatTheme.colors.component.attachmentRemoveIcon,
                                         )
-                                    }
-                                    // Remove button overlay
-                                    Box(
-                                        modifier = Modifier
-                                            .align(Alignment.TopEnd)
-                                            .size(ChatTheme.dims.attachmentImageRemoveSize)
-                                            .clip(ChatTheme.shapes.imageRemoveBadgeShape)
-                                            .background(ChatTheme.colors.component.attachmentImageOverlay)
-                                            .clickable { onRemoveFile(index) },
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Icon(
-                                            key = AllIconsKeys.Actions.Close,
-                                            contentDescription = "Remove",
-                                            modifier = Modifier.size(ChatTheme.dims.attachmentImageRemoveBadge),
-                                            tint = ChatTheme.colors.component.attachmentImageRemove,
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = file.name,
+                                            fontSize = ChatTheme.fonts.attachmentFileName,
+                                            color = ChatTheme.colors.component.attachmentRemoveIcon,
+                                            maxLines = 1,
+                                            modifier = Modifier.widthIn(max = 120.dp),
                                         )
-                                    }
-                                }
-                            } else {
-                                // Non-image file pill
-                                Row(
-                                    modifier = Modifier
-                                        .clip(ChatTheme.shapes.attachmentCornerRadius)
-                                        .background(ChatTheme.colors.component.attachmentBg)
-                                        .padding(horizontal = ChatTheme.dims.attachmentChipPaddingH, vertical = ChatTheme.dims.attachmentChipPaddingV),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Icon(
-                                        key = AllIconsKeys.FileTypes.Text,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(ChatTheme.dims.attachmentFileIconSize),
-                                        tint = ChatTheme.colors.component.attachmentRemoveIcon,
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = file.name,
-                                        fontSize = ChatTheme.fonts.attachmentFileName,
-                                        color = ChatTheme.colors.component.attachmentRemoveIcon,
-                                        maxLines = 1,
-                                        modifier = Modifier.widthIn(max = 120.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Box(
-                                        modifier = Modifier
-                                            .size(14.dp)
-                                            .clip(ChatTheme.shapes.fileRemoveBadgeShape)
-                                            .clickable { onRemoveFile(index) },
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Icon(
-                                            key = AllIconsKeys.Actions.Close,
-                                            contentDescription = "Remove",
-                                            modifier = Modifier.size(ChatTheme.dims.attachmentFileRemoveBadge),
-                                            tint = ChatTheme.colors.component.attachmentFileSize,
-                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Box(
+                                            modifier = Modifier
+                                                .size(14.dp)
+                                                .clip(ChatTheme.shapes.fileRemoveBadgeShape)
+                                                .clickable { onRemoveFile(index) },
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(
+                                                key = AllIconsKeys.Actions.Close,
+                                                contentDescription = "Remove",
+                                                modifier = Modifier.size(ChatTheme.dims.attachmentFileRemoveBadge),
+                                                tint = ChatTheme.colors.component.attachmentFileSize,
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                // Input area: Text field on top, buttons below
-                Column(
-                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-                ) {
-                    // Text area — grows with content, 2 rows min, max ~7 lines
-                    val scrollState = rememberScrollState()
-                    val lineCount = textState.text.lines().size.coerceAtLeast(1)
-                    val maxLines = 7
-                    val lineHeight = ChatTheme.dims.inputLineHeight
-                    val targetHeight = (lineCount.coerceAtMost(maxLines) * lineHeight.value).dp + 16.dp // 16dp for vertical padding
-                    val textFieldHeight = targetHeight.coerceIn(ChatTheme.dims.inputMinHeight, ChatTheme.dims.inputMaxHeight)
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(textFieldHeight)
-                            .padding(horizontal = ChatTheme.dims.inputContentPaddingH, vertical = ChatTheme.dims.inputContentPaddingV),
+                    // Input area: Text field on top, buttons below
+                    Column(
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
                     ) {
-                        BasicTextField(
-                            state = textState,
+                        // Text area — grows with content, 2 rows min, max ~7 lines
+                        val scrollState = rememberScrollState()
+                        val lineCount = textState.text.lines().size.coerceAtLeast(1)
+                        val maxLines = 7
+                        val lineHeight = ChatTheme.dims.inputLineHeight
+                        val targetHeight =
+                            (lineCount.coerceAtMost(maxLines) * lineHeight.value).dp + 16.dp // 16dp for vertical padding
+                        val textFieldHeight =
+                            targetHeight.coerceIn(ChatTheme.dims.inputMinHeight, ChatTheme.dims.inputMaxHeight)
+
+                        Box(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .focusRequester(focusRequester)
-                                .onPreviewKeyEvent { event ->
-                                    // Build the immutable state snapshot for the pure reducer.
-                                    // The reducer decides the action; the executor below applies
-                                    // it to the real TextFieldState and Compose state.
-                                    val currentTextStr = textState.text.toString()
-                                    val trimmedText = currentTextStr.trim()
-                                    val hasMatchingSlashCommand = trimmedText.startsWith("/") &&
-                                        !trimmedText.startsWith("//") &&
-                                        run {
-                                            val firstWord = trimmedText.substring(1).substringBefore(" ")
-                                            commands.any { it.name.equals(firstWord, ignoreCase = true) }
-                                        }
-                                    val state = InputKeyboardState(
-                                        text = currentTextStr,
-                                        cursorPos = textState.selection.start.coerceIn(0, currentTextStr.length),
-                                        showSlashPalette = showSlashPalette,
-                                        showMentionPalette = showMentionPalette,
-                                        showAttachMenu = showAttachMenu,
-                                        filteredSlashSize = filtered.size,
-                                        filteredMentionSize = filteredMentionFiles.size,
-                                        slashSelectedIndex = selectedIndex,
-                                        mentionSelectedIndex = mentionSelectedIndex,
-                                        historyIndex = historyIndex,
-                                        inHistoryMode = inHistoryMode,
-                                        commandHistorySize = commandHistory.size,
-                                        hasMatchingSlashCommand = hasMatchingSlashCommand,
-                                        showSkillPalette = showSkillPalette,
-                                        filteredSkillSize = filteredSkills.size,
-                                        skillSelectedIndex = skillSelectedIndex,
-                                    )
-                                    val action = InputKeyboardHandler.handleKeyEvent(event, state)
-                                    // Executor: apply the action to the real Compose state.
-                                    // Preserves the exact behavior of the original inline handler.
-                                    when (action) {
-                                        is InputKeyboardAction.SelectSlashIndex -> {
-                                            selectedIndex = action.index
-                                            true
-                                        }
-                                        is InputKeyboardAction.SelectSkillIndex -> {
-                                            skillSelectedIndex = action.index
-                                            true
-                                        }
-                                        is InputKeyboardAction.SelectMentionIndex -> {
-                                            mentionSelectedIndex = action.index
-                                            true
-                                        }
-                                        InputKeyboardAction.SelectMentionFile -> {
-                                            val file = filteredMentionFiles.getOrNull(mentionSelectedIndex)
-                                                ?: filteredMentionFiles.firstOrNull()
-                                            if (file != null) {
-                                                val text = textState.text.toString()
-                                                val endIdx = textState.selection.start.coerceIn(0, text.length)
-                                                if (mentionStartIndex >= 0 && endIdx > mentionStartIndex) {
-                                                    textState.edit {
-                                                        replace(mentionStartIndex, endIdx, "@${file.name}")
+                                .fillMaxWidth()
+                                .height(textFieldHeight)
+                                .padding(
+                                    horizontal = ChatTheme.dims.inputContentPaddingH,
+                                    vertical = ChatTheme.dims.inputContentPaddingV
+                                ),
+                        ) {
+                            BasicTextField(
+                                state = textState,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .focusRequester(focusRequester)
+                                    .onPreviewKeyEvent { event ->
+                                        // Build the immutable state snapshot for the pure reducer.
+                                        // The reducer decides the action; the executor below applies
+                                        // it to the real TextFieldState and Compose state.
+                                        val currentTextStr = textState.text.toString()
+                                        val trimmedText = currentTextStr.trim()
+                                        val hasMatchingSlashCommand = trimmedText.startsWith("/") &&
+                                                !trimmedText.startsWith("//") &&
+                                                run {
+                                                    val firstWord = trimmedText.substring(1).substringBefore(" ")
+                                                    commands.any { it.name.equals(firstWord, ignoreCase = true) }
+                                                }
+                                        val state = InputKeyboardState(
+                                            text = currentTextStr,
+                                            cursorPos = textState.selection.start.coerceIn(0, currentTextStr.length),
+                                            showSlashPalette = showSlashPalette,
+                                            showMentionPalette = showMentionPalette,
+                                            showAttachMenu = showAttachMenu,
+                                            filteredSlashSize = filtered.size,
+                                            filteredMentionSize = filteredMentionFiles.size,
+                                            slashSelectedIndex = selectedIndex,
+                                            mentionSelectedIndex = mentionSelectedIndex,
+                                            historyIndex = historyIndex,
+                                            inHistoryMode = inHistoryMode,
+                                            commandHistorySize = commandHistory.size,
+                                            hasMatchingSlashCommand = hasMatchingSlashCommand,
+                                            showSkillPalette = showSkillPalette,
+                                            filteredSkillSize = filteredSkills.size,
+                                            skillSelectedIndex = skillSelectedIndex,
+                                        )
+                                        val action = InputKeyboardHandler.handleKeyEvent(event, state)
+                                        // Executor: apply the action to the real Compose state.
+                                        // Preserves the exact behavior of the original inline handler.
+                                        when (action) {
+                                            is InputKeyboardAction.SelectSlashIndex -> {
+                                                selectedIndex = action.index
+                                                true
+                                            }
+
+                                            is InputKeyboardAction.SelectSkillIndex -> {
+                                                skillSelectedIndex = action.index
+                                                true
+                                            }
+
+                                            is InputKeyboardAction.SelectMentionIndex -> {
+                                                mentionSelectedIndex = action.index
+                                                true
+                                            }
+
+                                            InputKeyboardAction.SelectMentionFile -> {
+                                                val file = filteredMentionFiles.getOrNull(mentionSelectedIndex)
+                                                    ?: filteredMentionFiles.firstOrNull()
+                                                if (file != null) {
+                                                    val text = textState.text.toString()
+                                                    val endIdx = textState.selection.start.coerceIn(0, text.length)
+                                                    if (mentionStartIndex >= 0 && endIdx > mentionStartIndex) {
+                                                        textState.edit {
+                                                            replace(mentionStartIndex, endIdx, "@${file.name}")
+                                                        }
+                                                    }
+                                                    showMentionPalette = false
+                                                    onMentionFileSelected(file)
+                                                }
+                                                true
+                                            }
+
+                                            InputKeyboardAction.DismissMention -> {
+                                                showMentionPalette = false
+                                                true
+                                            }
+
+                                            is InputKeyboardAction.NavigateHistory -> {
+                                                saveDraftIfNeeded(attachedFiles)
+                                                val newIndex = if (historyIndex < 0) 0
+                                                else (historyIndex + action.delta).coerceAtMost(commandHistory.size - 1)
+                                                if (newIndex != historyIndex || historyIndex < 0) {
+                                                    loadHistoryEntry(newIndex)
+                                                }
+                                                true
+                                            }
+
+                                            InputKeyboardAction.RestoreDraft -> {
+                                                textState.edit { replace(0, length, draftText) }
+                                                historyIndex = -1
+                                                inHistoryMode = false
+                                                onLoadHistoryEntry(CommandHistoryEntry(draftText, draftFiles))
+                                                true
+                                            }
+
+                                            InputKeyboardAction.ExecuteSlashCommand -> {
+                                                if (showSlashPalette) {
+                                                    // Palette-visible path: execute the selected command.
+                                                    val cmd =
+                                                        filtered.getOrNull(selectedIndex) ?: filtered.firstOrNull()
+                                                    if (cmd != null) {
+                                                        val args = extractArgs(cmd)
+                                                        showSlashPalette = false
+                                                        textState.edit { replace(0, length, "") }
+                                                        onSlashCommand(cmd.copy(args = args))
+                                                    }
+                                                } else {
+                                                    // Slash interception path: text starts with "/" and the
+                                                    // first word matches a known command. Execute it with
+                                                    // trailing args instead of sending to the server.
+                                                    val text = textState.text.toString().trim()
+                                                    val firstWord = text.substring(1).substringBefore(" ")
+                                                    val matchedCmd =
+                                                        commands.filter { it.name.equals(firstWord, ignoreCase = true) }
+                                                            .firstOrNull()
+                                                    if (matchedCmd != null) {
+                                                        val args = if (text.length > firstWord.length + 1) {
+                                                            text.substring(firstWord.length + 1).trim()
+                                                        } else ""
+                                                        logger.debug { "[ACP] Slash command intercepted: /${matchedCmd.name} args='$args'" }
+                                                        showSlashPalette = false
+                                                        inHistoryMode = false
+                                                        historyIndex = -1
+                                                        textState.edit { replace(0, length, "") }
+                                                        onSlashCommand(matchedCmd.copy(args = args))
                                                     }
                                                 }
-                                                showMentionPalette = false
-                                                onMentionFileSelected(file)
+                                                true
                                             }
-                                            true
-                                        }
-                                        InputKeyboardAction.DismissMention -> {
-                                            showMentionPalette = false
-                                            true
-                                        }
-                                        is InputKeyboardAction.NavigateHistory -> {
-                                            saveDraftIfNeeded(attachedFiles)
-                                            val newIndex = if (historyIndex < 0) 0
-                                                else (historyIndex + action.delta).coerceAtMost(commandHistory.size - 1)
-                                            if (newIndex != historyIndex || historyIndex < 0) {
-                                                loadHistoryEntry(newIndex)
-                                            }
-                                            true
-                                        }
-                                        InputKeyboardAction.RestoreDraft -> {
-                                            textState.edit { replace(0, length, draftText) }
-                                            historyIndex = -1
-                                            inHistoryMode = false
-                                            onLoadHistoryEntry(CommandHistoryEntry(draftText, draftFiles))
-                                            true
-                                        }
-                                        InputKeyboardAction.ExecuteSlashCommand -> {
-                                            if (showSlashPalette) {
-                                                // Palette-visible path: execute the selected command.
-                                                val cmd = filtered.getOrNull(selectedIndex) ?: filtered.firstOrNull()
-                                                if (cmd != null) {
-                                                    val args = extractArgs(cmd)
-                                                    showSlashPalette = false
-                                                    textState.edit { replace(0, length, "") }
-                                                    onSlashCommand(cmd.copy(args = args))
+
+                                            InputKeyboardAction.ExecuteSkillCommand -> {
+                                                val skill = filteredSkills.getOrNull(skillSelectedIndex)
+                                                    ?: filteredSkills.firstOrNull()
+                                                if (skill != null) {
+                                                    showSkillPalette = false
+                                                    val freshText = textState.text.toString()
+                                                    if (skill.content.length > 8192) {
+                                                        logger.warn {
+                                                            "[ACP] Skill '${skill.name}' is large (${skill.content.length} chars) — consider trimming"
+                                                        }
+                                                    }
+                                                    val injectedContent = buildSkillInjection(skill, freshText)
+                                                    textState.edit {
+                                                        replace(
+                                                            0,
+                                                            textState.text.length,
+                                                            injectedContent
+                                                        )
+                                                    }
                                                 }
-                                            } else {
-                                                // Slash interception path: text starts with "/" and the
-                                                // first word matches a known command. Execute it with
-                                                // trailing args instead of sending to the server.
+                                                true
+                                            }
+
+                                            InputKeyboardAction.Send -> {
                                                 val text = textState.text.toString().trim()
-                                                val firstWord = text.substring(1).substringBefore(" ")
-                                                val matchedCmd = commands.filter { it.name.equals(firstWord, ignoreCase = true) }
-                                                    .firstOrNull()
-                                                if (matchedCmd != null) {
-                                                    val args = if (text.length > firstWord.length + 1) {
-                                                        text.substring(firstWord.length + 1).trim()
-                                                    } else ""
-                                                    logger.debug { "[ACP] Slash command intercepted: /${matchedCmd.name} args='$args'" }
+                                                // $$ escape: strip one $ and send (lets user type literal $)
+                                                // // escape: strip one / and send (lets user type literal /)
+                                                val sendText = when {
+                                                    text.startsWith("$$") -> text.substring(1)
+                                                    text.startsWith("//") -> text.substring(1)
+                                                    else -> text
+                                                }
+                                                if (sendText.isNotEmpty()) {
+                                                    onSend(sendText, attachedFiles)
+                                                    textState.edit { replace(0, length, "") }
                                                     showSlashPalette = false
+                                                    showSkillPalette = false
                                                     inHistoryMode = false
                                                     historyIndex = -1
-                                                    textState.edit { replace(0, length, "") }
-                                                    onSlashCommand(matchedCmd.copy(args = args))
                                                 }
+                                                true
                                             }
-                                            true
-                                        }
-                                        InputKeyboardAction.ExecuteSkillCommand -> {
-                                            val skill = filteredSkills.getOrNull(skillSelectedIndex) ?: filteredSkills.firstOrNull()
-                                            if (skill != null) {
-                                                showSkillPalette = false
-                                                val freshText = textState.text.toString()
-                                                if (skill.content.length > 8192) {
-                                                    logger.warn {
-                                                        "[ACP] Skill '${skill.name}' is large (${skill.content.length} chars) — consider trimming"
-                                                    }
-                                                }
-                                                val injectedContent = buildSkillInjection(skill, freshText)
-                                                textState.edit { replace(0, textState.text.length, injectedContent) }
-                                            }
-                                            true
-                                        }
-                                        InputKeyboardAction.Send -> {
-                                            val text = textState.text.toString().trim()
-                                            // $$ escape: strip one $ and send (lets user type literal $)
-                                            // // escape: strip one / and send (lets user type literal /)
-                                            val sendText = when {
-                                                text.startsWith("$$") -> text.substring(1)
-                                                text.startsWith("//") -> text.substring(1)
-                                                else -> text
-                                            }
-                                            if (sendText.isNotEmpty()) {
-                                                onSend(sendText, attachedFiles)
-                                                textState.edit { replace(0, length, "") }
+
+                                            InputKeyboardAction.InsertNewline -> {
+                                                // Explicitly insert newline — CMP BasicTextField
+                                                // doesn't always handle this via pass-through
+                                                val pos = textState.selection.start
+                                                textState.edit { replace(pos, pos, "\n") }
                                                 showSlashPalette = false
+                                                showMentionPalette = false
                                                 showSkillPalette = false
+                                                true
+                                            }
+
+                                            InputKeyboardAction.Cancel -> {
+                                                onCancel()
+                                                true
+                                            }
+
+                                            InputKeyboardAction.DismissSlashPalette -> {
+                                                showSlashPalette = false
+                                                true
+                                            }
+
+                                            InputKeyboardAction.DismissSkillPalette -> {
+                                                showSkillPalette = false
+                                                true
+                                            }
+
+                                            InputKeyboardAction.DismissAttachMenu -> {
+                                                showAttachMenu = false
+                                                true
+                                            }
+
+                                            InputKeyboardAction.None -> false
+                                        }
+                                    },
+                                enabled = enabled,
+                                cursorBrush = SolidColor(ChatTheme.colors.component.inputCursor),
+                                textStyle = TextStyle(
+                                    color = ChatTheme.colors.component.inputText,
+                                    fontSize = ChatTheme.fonts.inputText,
+                                ),
+                                decorator = { innerTextField ->
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .verticalScroll(scrollState),
+                                        contentAlignment = Alignment.CenterStart,
+                                    ) {
+                                        if (textState.text.isEmpty()) {
+                                            Text(
+                                                text = placeholderText,
+                                                color = ChatTheme.colors.component.inputPlaceholder,
+                                                fontSize = ChatTheme.fonts.inputPlaceholder,
+                                            )
+                                        }
+                                        innerTextField()
+                                    }
+                                },
+                            )
+                        }
+
+                        // Buttons row: + button | spacer | Send/Stop button
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            // Attach button — opens the attach menu popup
+                            Box(
+                                modifier = Modifier
+                                    .size(ChatTheme.dims.modelPickerButtonSize)
+                                    .clip(ChatTheme.shapes.modelPickerButtonShape)
+                                    .clickable(enabled = enabled) {
+                                        showAttachMenu = !showAttachMenu
+
+                                    }
+                                    .padding(8.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    key = AllIconsKeys.General.Add,
+                                    contentDescription = "Attach",
+                                    modifier = Modifier.size(ChatTheme.dims.actionIconSize),
+                                    tint = ChatTheme.colors.component.inputPlaceholder,
+                                )
+
+                                // Attach menu popup anchored to the + button
+                                if (showAttachMenu) {
+
+                                    Popup(
+                                        alignment = Alignment.BottomStart,
+                                        offset = IntOffset(0, 4),
+                                        properties = PopupProperties(
+                                            focusable = true,
+                                            dismissOnBackPress = true,
+                                            dismissOnClickOutside = true,
+                                        ),
+                                        onDismissRequest = { showAttachMenu = false },
+                                    ) {
+                                        AttachMenu(
+                                            recentFiles = recentFiles,
+                                            searchResults = searchResults,
+                                            onFilesAndFolders = {
+                                                onFilesAndFolders()
+                                            },
+                                            onImage = {
+                                                onImage()
+                                            },
+                                            onRecentFileClick = { file ->
+                                                onRecentFileClick(file)
+                                            },
+                                            onDismiss = { showAttachMenu = false },
+                                            onSearch = onSearch,
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.weight(1f))
+
+                            // Contextual Send / Stop button:
+                            // - Has text → green Send (even during streaming, triggers queue or steer)
+                            // - No text + streaming → red Stop
+                            // - No text + idle → no button
+                            val hasText = textState.text.toString().trim().isNotEmpty()
+
+                            if (hasText) {
+                                // Green Send button — always available when there's text to send.
+                                // During streaming: queues message (if queue mode) or steers (abort + send).
+                                // During idle: triggers normal send.
+                                Box(
+                                    modifier = Modifier
+                                        .size(ChatTheme.dims.actionButtonSize)
+                                        .clip(ChatTheme.shapes.actionButtonCornerRadius)
+                                        .clickable(enabled = enabled) {
+                                            val text = textState.text.toString().trim()
+                                            if (text.isNotEmpty()) {
+                                                onSend(text, attachedFiles)
+                                                textState.edit { replace(0, length, "") }
                                                 inHistoryMode = false
                                                 historyIndex = -1
                                             }
-                                            true
-                                        }
-                                        InputKeyboardAction.InsertNewline -> {
-                                            // Explicitly insert newline — CMP BasicTextField
-                                            // doesn't always handle this via pass-through
-                                            val pos = textState.selection.start
-                                            textState.edit { replace(pos, pos, "\n") }
-                                            showSlashPalette = false
-                                            showMentionPalette = false
-                                            showSkillPalette = false
-                                            true
-                                        }
-                                        InputKeyboardAction.Cancel -> {
-                                            onCancel()
-                                            true
-                                        }
-                                        InputKeyboardAction.DismissSlashPalette -> {
-                                            showSlashPalette = false
-                                            true
-                                        }
-                                        InputKeyboardAction.DismissSkillPalette -> {
-                                            showSkillPalette = false
-                                            true
-                                        }
-                                        InputKeyboardAction.DismissAttachMenu -> {
-                                            showAttachMenu = false
-                                            true
-                                        }
-                                        InputKeyboardAction.None -> false
-                                    }
-                                },
-                            enabled = enabled,
-                            cursorBrush = SolidColor(ChatTheme.colors.component.inputCursor),
-                            textStyle = TextStyle(
-                                color = ChatTheme.colors.component.inputText,
-                                fontSize = ChatTheme.fonts.inputText,
-                            ),
-                            decorator = { innerTextField ->
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .verticalScroll(scrollState),
-                                    contentAlignment = Alignment.CenterStart,
+                                        },
+                                    contentAlignment = Alignment.Center,
                                 ) {
-                                    if (textState.text.isEmpty()) {
-                                        Text(
-                                            text = placeholderText,
-                                            color = ChatTheme.colors.component.inputPlaceholder,
-                                            fontSize = ChatTheme.fonts.inputPlaceholder,
-                                        )
-                                    }
-                                    innerTextField()
-                                }
-                            },
-                        )
-                    }
-
-                    // Buttons row: + button | spacer | Send/Stop button
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        // Attach button — opens the attach menu popup
-                        Box(
-                            modifier = Modifier
-                                .size(ChatTheme.dims.modelPickerButtonSize)
-                                .clip(ChatTheme.shapes.modelPickerButtonShape)
-                                .clickable(enabled = enabled) {
-                                    showAttachMenu = !showAttachMenu
-
-                                }
-                                .padding(8.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                key = AllIconsKeys.General.Add,
-                                contentDescription = "Attach",
-                                modifier = Modifier.size(ChatTheme.dims.actionIconSize),
-                                tint = ChatTheme.colors.component.inputPlaceholder,
-                            )
-
-                            // Attach menu popup anchored to the + button
-                            if (showAttachMenu) {
-
-                                Popup(
-                                    alignment = Alignment.BottomStart,
-                                    offset = IntOffset(0, 4),
-                                    properties = PopupProperties(
-                                        focusable = true,
-                                        dismissOnBackPress = true,
-                                        dismissOnClickOutside = true,
-                                    ),
-                                    onDismissRequest = { showAttachMenu = false },
-                                ) {
-                                    AttachMenu(
-                                        recentFiles = recentFiles,
-                                        searchResults = searchResults,
-                                        onFilesAndFolders = {
-                                            onFilesAndFolders()
-                                        },
-                                        onImage = {
-                                            onImage()
-                                        },
-                                        onRecentFileClick = { file ->
-                                            onRecentFileClick(file)
-                                        },
-                                        onDismiss = { showAttachMenu = false },
-                                        onSearch = onSearch,
+                                    Icon(
+                                        key = AllIconsKeys.Actions.Execute,
+                                        contentDescription = "Send",
+                                        modifier = Modifier.size(ChatTheme.dims.actionIconSize),
+                                        tint = ChatTheme.colors.accent.greenLight,
                                     )
                                 }
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.weight(1f))
-
-                        // Contextual Send / Stop button:
-                        // - Has text → green Send (even during streaming, triggers queue or steer)
-                        // - No text + streaming → red Stop
-                        // - No text + idle → no button
-                        val hasText = textState.text.toString().trim().isNotEmpty()
-
-                        if (hasText) {
-                            // Green Send button — always available when there's text to send.
-                            // During streaming: queues message (if queue mode) or steers (abort + send).
-                            // During idle: triggers normal send.
-                            Box(
-                                modifier = Modifier
-                                    .size(ChatTheme.dims.actionButtonSize)
-                                    .clip(ChatTheme.shapes.actionButtonCornerRadius)
-                                    .clickable(enabled = enabled) {
-                                        val text = textState.text.toString().trim()
-                                        if (text.isNotEmpty()) {
-                                            onSend(text, attachedFiles)
-                                            textState.edit { replace(0, length, "") }
-                                            inHistoryMode = false
-                                            historyIndex = -1
-                                        }
-                                    },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Icon(
-                                    key = AllIconsKeys.Actions.Execute,
-                                    contentDescription = "Send",
-                                    modifier = Modifier.size(ChatTheme.dims.actionIconSize),
-                                    tint = ChatTheme.colors.accent.greenLight,
-                                )
-                            }
-                        } else if (isStreaming) {
-                            // Red Stop button — only when empty input + streaming
-                            Box(
-                                modifier = Modifier
-                                    .size(ChatTheme.dims.actionButtonSize)
-                                    .clip(ChatTheme.shapes.actionButtonCornerRadius)
-                                    .clickable(enabled = enabled) { onCancel() },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Icon(
-                                    key = AllIconsKeys.Actions.Suspend,
-                                    contentDescription = "Stop",
-                                    modifier = Modifier.size(ChatTheme.dims.stopIconSize),
-                                    tint = ChatTheme.colors.accent.red,
-                                )
+                            } else if (isStreaming) {
+                                // Red Stop button — only when empty input + streaming
+                                Box(
+                                    modifier = Modifier
+                                        .size(ChatTheme.dims.actionButtonSize)
+                                        .clip(ChatTheme.shapes.actionButtonCornerRadius)
+                                        .clickable(enabled = enabled) { onCancel() },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        key = AllIconsKeys.Actions.Suspend,
+                                        contentDescription = "Stop",
+                                        modifier = Modifier.size(ChatTheme.dims.stopIconSize),
+                                        tint = ChatTheme.colors.accent.red,
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
-        }
         }
 
         Spacer(modifier = Modifier.height(6.dp))
@@ -1244,7 +1293,13 @@ fun InputArea(
                     text = modelDisplayText,
                     onClick = { showModelPicker = !showModelPicker },
                     leadingIcon = if (selectedProviderIconId != null) {
-                        { ProviderIcon(providerId = selectedProviderIconId, modifier = Modifier.size(14.dp), tint = ChatTheme.colors.component.inputText) }
+                        {
+                            ProviderIcon(
+                                providerId = selectedProviderIconId,
+                                modifier = Modifier.size(14.dp),
+                                tint = ChatTheme.colors.component.inputText
+                            )
+                        }
                     } else null,
                 )
 
@@ -1371,5 +1426,3 @@ private fun DisconnectButton(isReconnecting: Boolean, onClick: () -> Unit) {
         }
     }
 }
-
-
