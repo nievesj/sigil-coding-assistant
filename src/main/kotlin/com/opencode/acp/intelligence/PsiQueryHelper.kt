@@ -92,7 +92,7 @@ class PsiQueryHelper(private val project: Project) {
      * via [SymbolFormatter.formatSymbols].
      */
     suspend fun runSymbolSearch(pattern: String, scope: String, limit: Int, kind: String?): String {
-        val guard = preGuard(scope)
+        val guard = preGuard(scope, requireJavaPsi = true)
         if (guard != null) return guard
         val scopeResult = parseScope(scope)
         val kindFilter = kind?.let { parseSymbolKind(it) }
@@ -101,7 +101,10 @@ class PsiQueryHelper(private val project: Project) {
         return try {
             withTimeout(TOOL_TIMEOUT_DEFAULT_MS) {
                 readAction {
-                    if (project.isDisposed) return@readAction SymbolFormatter.formatError("Project closed", retry = false)
+                    if (project.isDisposed) return@readAction SymbolFormatter.formatError(
+                        "Project closed",
+                        retry = false
+                    )
                     val cache = PsiShortNamesCache.getInstance(project)
                     val results = mutableListOf<SymbolInfo>()
 
@@ -112,6 +115,7 @@ class PsiQueryHelper(private val project: Project) {
                             results.add(buildSymbolInfo(cls))
                         }
                     }
+
                     fun addMethods() {
                         val methods = cache.getMethodsByName(pattern, scopeResult.scope)
                         for (m in methods) {
@@ -119,6 +123,7 @@ class PsiQueryHelper(private val project: Project) {
                             results.add(buildSymbolInfo(m))
                         }
                     }
+
                     fun addFields() {
                         val fields = cache.getFieldsByName(pattern, scopeResult.scope)
                         for (f in fields) {
@@ -128,11 +133,15 @@ class PsiQueryHelper(private val project: Project) {
                     }
 
                     when (kindFilter) {
-                        null -> { addClasses(); addMethods(); addFields() }
+                        null -> {
+                            addClasses(); addMethods(); addFields()
+                        }
+
                         SymbolKind.CLASS, SymbolKind.INTERFACE, SymbolKind.ENUM, SymbolKind.OBJECT, SymbolKind.ANNOTATION, SymbolKind.COMPANION_OBJECT -> addClasses()
                         SymbolKind.METHOD, SymbolKind.FUNCTION, SymbolKind.CONSTRUCTOR -> addMethods()
                         SymbolKind.FIELD, SymbolKind.PROPERTY -> addFields()
-                        else -> { /* PACKAGE, TYPE_ALIAS, PARAMETER — not indexed by short-names cache */ }
+                        else -> { /* PACKAGE, TYPE_ALIAS, PARAMETER — not indexed by short-names cache */
+                        }
                     }
 
                     val (kept, _, _) = truncateResults(results, effectiveLimit)
@@ -157,7 +166,7 @@ class PsiQueryHelper(private val project: Project) {
      * `ensureActive()` for cancellation cooperation.
      */
     suspend fun runFindReferences(symbol: String, file: String?, scope: String, limit: Int): String {
-        val guard = preGuard(scope, file)
+        val guard = preGuard(scope, file, requireJavaPsi = true)
         if (guard != null) return guard
         val scopeResult = parseScope(scope)
         val effectiveLimit = limit.coerceIn(1, MAX_REFERENCE_RESULTS)
@@ -166,7 +175,10 @@ class PsiQueryHelper(private val project: Project) {
             withTimeout(TOOL_TIMEOUT_FIND_REFERENCES_MS) {
                 val ctx = currentCoroutineContext()
                 readAction {
-                    if (project.isDisposed) return@readAction SymbolFormatter.formatError("Project closed", retry = false)
+                    if (project.isDisposed) return@readAction SymbolFormatter.formatError(
+                        "Project closed",
+                        retry = false
+                    )
                     val resolved = resolveSymbol(symbol, file, scopeResult.scope)
                     if (resolved.isEmpty()) {
                         return@readAction SymbolFormatter.formatError(
@@ -224,12 +236,15 @@ class PsiQueryHelper(private val project: Project) {
         return try {
             withTimeout(TOOL_TIMEOUT_DEFAULT_MS) {
                 readAction {
-                    if (project.isDisposed) return@readAction SymbolFormatter.formatError("Project closed", retry = false)
+                    if (project.isDisposed) return@readAction SymbolFormatter.formatError(
+                        "Project closed",
+                        retry = false
+                    )
                     // preGuard already validated the path against the project root.
                     // Resolve relative paths against the project base directory and
                     // canonicalize for VirtualFile lookup.
                     val resolvedFile = if (java.io.File(file).isAbsolute) file
-                        else project.basePath?.let { java.io.File(it, file).path } ?: file
+                    else project.basePath?.let { java.io.File(it, file).path } ?: file
                     val canonical = AttachmentPathValidator.canonicalizeOrReject(resolvedFile)
                         ?: return@readAction SymbolFormatter.formatError("Invalid path: $file", retry = false)
                     val vfile = LocalFileSystem.getInstance().findFileByIoFile(File(canonical))
@@ -239,17 +254,19 @@ class PsiQueryHelper(private val project: Project) {
 
                     val language = when {
                         kotlinPluginAvailable && psiFile is KtFile -> "Kotlin"
-                        psiFile is PsiClassOwner -> "Java"
+                        javaPsiAvailable && psiFile is PsiClassOwner -> "Java"
                         else -> psiFile.language.displayName
                     }
                     val relPath = relativePath(vfile)
 
                     val classes = mutableListOf<ClassStructure>()
                     // Top-level classes only (parent is the file).
-                    val topClasses = PsiTreeUtil.findChildrenOfType(psiFile, PsiClass::class.java)
-                        .filter { it.parent is PsiFile || it.parent is PsiClassOwner }
-                    for (cls in topClasses) {
-                        classes.add(buildClassStructure(cls))
+                    if (javaPsiAvailable) {
+                        val topClasses = PsiTreeUtil.findChildrenOfType(psiFile, PsiClass::class.java)
+                            .filter { it.parent is PsiFile || it.parent is PsiClassOwner }
+                        for (cls in topClasses) {
+                            classes.add(buildClassStructure(cls))
+                        }
                     }
                     // Kotlin top-level classes/objects.
                     if (kotlinPluginAvailable && psiFile is KtFile) {
@@ -297,7 +314,7 @@ class PsiQueryHelper(private val project: Project) {
         limit: Int,
         scope: String,
     ): String {
-        val guard = preGuard(scope, file)
+        val guard = preGuard(scope, file, requireJavaPsi = true)
         if (guard != null) return guard
         val scopeResult = parseScope(scope)
         val effectiveDepth = depth.coerceIn(1, MAX_CALL_HIERARCHY_DEPTH)
@@ -307,7 +324,10 @@ class PsiQueryHelper(private val project: Project) {
             withTimeout(TOOL_TIMEOUT_DEFAULT_MS) {
                 val ctx = currentCoroutineContext()
                 readAction {
-                    if (project.isDisposed) return@readAction SymbolFormatter.formatError("Project closed", retry = false)
+                    if (project.isDisposed) return@readAction SymbolFormatter.formatError(
+                        "Project closed",
+                        retry = false
+                    )
                     val resolved = resolveSymbol(symbol, file, scopeResult.scope)
                     if (resolved.isEmpty()) {
                         return@readAction SymbolFormatter.formatError(
@@ -331,8 +351,23 @@ class PsiQueryHelper(private val project: Project) {
 
                     val visited = mutableSetOf<String>()
                     val root = when (direction.lowercase()) {
-                        "callees" -> buildCalleeTree(targetElement, scopeResult.scope, effectiveDepth, effectiveLimit, visited, ctx)
-                        else -> buildCallerTree(targetElement, scopeResult.scope, effectiveDepth, effectiveLimit, visited, ctx)
+                        "callees" -> buildCalleeTree(
+                            targetElement,
+                            scopeResult.scope,
+                            effectiveDepth,
+                            effectiveLimit,
+                            visited,
+                            ctx
+                        )
+
+                        else -> buildCallerTree(
+                            targetElement,
+                            scopeResult.scope,
+                            effectiveDepth,
+                            effectiveLimit,
+                            visited,
+                            ctx
+                        )
                     }
                     SymbolFormatter.formatCallHierarchy(root)
                 }
@@ -356,7 +391,7 @@ class PsiQueryHelper(private val project: Project) {
      * with [RiskLevel.UNKNOWN].
      */
     suspend fun runImpactAnalysis(symbol: String, file: String?, depth: Int, limit: Int, scope: String): String {
-        val guard = preGuard(scope, file)
+        val guard = preGuard(scope, file, requireJavaPsi = true)
         if (guard != null) return guard
         val scopeResult = parseScope(scope)
         val effectiveDepth = depth.coerceIn(1, MAX_IMPACT_DEPTH)
@@ -366,7 +401,10 @@ class PsiQueryHelper(private val project: Project) {
             withTimeout(TOOL_TIMEOUT_IMPACT_ANALYSIS_MS) {
                 val ctx = currentCoroutineContext()
                 readAction {
-                    if (project.isDisposed) return@readAction SymbolFormatter.formatError("Project closed", retry = false)
+                    if (project.isDisposed) return@readAction SymbolFormatter.formatError(
+                        "Project closed",
+                        retry = false
+                    )
                     val resolved = resolveSymbol(symbol, file, scopeResult.scope)
                     if (resolved.isEmpty()) {
                         return@readAction SymbolFormatter.formatError(
@@ -432,7 +470,7 @@ class PsiQueryHelper(private val project: Project) {
                         }
 
                         // Class inheritors.
-                        if (elem is PsiClass) {
+                        if (javaPsiAvailable && elem is PsiClass) {
                             ClassInheritorsSearch.search(elem, scopeResult.scope, true).forEach(Processor { inheritor ->
                                 ctx.ensureActive()
                                 val key = elementKey(inheritor)
@@ -486,7 +524,7 @@ class PsiQueryHelper(private val project: Project) {
      * retryable "cache warming" message and triggers a background rebuild.
      */
     suspend fun runRepoMap(limit: Int, scope: String): String {
-        val guard = preGuard(scope)
+        val guard = preGuard(scope, requireJavaPsi = true)
         if (guard != null) return guard
         val scopeResult = parseScope(scope)
         val effectiveLimit = limit.coerceIn(1, MAX_REPO_MAP_RESULTS)
@@ -589,6 +627,7 @@ class PsiQueryHelper(private val project: Project) {
                 //    signature varies across platform versions, so we wrap it
                 //    defensively and fall back to direct counting.
                 data class Counted(val entry: RepoMapEntry, val count: Int, val needsNormalization: Boolean)
+
                 val counted = mutableListOf<Counted>()
                 for (name in sampled) {
                     ctx.ensureActive()
@@ -612,11 +651,13 @@ class PsiQueryHelper(private val project: Project) {
                             refCount = 0
                             needsNormalization = false
                         }
+
                         PsiSearchHelper.SearchCostResult.TOO_MANY_OCCURRENCES -> {
                             importance = 0.1
                             refCount = 100
                             needsNormalization = false
                         }
+
                         else -> {
                             // COUNT: ReferencesSearch with early termination at 100.
                             var c = 0
@@ -641,7 +682,8 @@ class PsiQueryHelper(private val project: Project) {
                 val maxCount = counted.maxOfOrNull { it.count } ?: 0
                 val normalized = counted.map { c ->
                     if (c.needsNormalization) {
-                        val imp = if (maxCount > 0) ln((c.count + 1).toDouble()) / ln((maxCount + 1).toDouble()) else 0.0
+                        val imp =
+                            if (maxCount > 0) ln((c.count + 1).toDouble()) / ln((maxCount + 1).toDouble()) else 0.0
                         c.entry.copy(importance = imp)
                     } else {
                         c.entry
@@ -667,11 +709,25 @@ class PsiQueryHelper(private val project: Project) {
      * @param file the file path (null if no file param). When non-null, the
      *   path is canonicalized and validated against the project root.
      */
-    private fun preGuard(scope: String?, file: String? = null): String? {
+    private fun preGuard(scope: String?, file: String? = null, requireJavaPsi: Boolean = false): String? {
         // 1. Disabled check.
         if (!OpenCodePsiToolsSettingsState.getInstance().psiToolsEnabled) {
             return SymbolFormatter.formatError(
                 "PSI code intelligence tools are disabled. Enable in Settings → Tools → Sigil → PSI Tools.",
+                retry = false,
+            )
+        }
+        // 1b. Java PSI availability check (Rider/PyCharm/WebStorm don't bundle the
+        // Java plugin, so PsiShortNamesCache/PsiClassOwner are not on the classloader).
+        // Methods that need symbol resolution via PsiShortNamesCache must bail out
+        // early with a clear error instead of throwing NoClassDefFoundError.
+        if (requireJavaPsi && !javaPsiAvailable) {
+            return SymbolFormatter.formatError(
+                "Java PSI is not available in this IDE (no Java plugin). " +
+                        "Symbol search, find-references, call hierarchy, impact analysis, " +
+                        "and repo-map require the Java plugin to be installed (IntelliJ IDEA, " +
+                        "not Rider/PyCharm/WebStorm). File structure and context generation " +
+                        "still work for Kotlin/C#/other languages.",
                 retry = false,
             )
         }
@@ -693,7 +749,7 @@ class PsiQueryHelper(private val project: Project) {
         if (file != null) {
             // Resolve relative paths against the project base directory.
             val resolvedFile = if (java.io.File(file).isAbsolute) file
-                else project.basePath?.let { java.io.File(it, file).path } ?: file
+            else project.basePath?.let { java.io.File(it, file).path } ?: file
             val canonical = AttachmentPathValidator.canonicalizeOrReject(resolvedFile)
                 ?: return SymbolFormatter.formatError("Invalid path: $file", retry = false)
             val projectBase = project.basePath?.let { AttachmentPathValidator.canonicalizeOrReject(it) }
@@ -882,12 +938,24 @@ class PsiQueryHelper(private val project: Project) {
         val children = mutableListOf<CallHierarchyNode>()
         if (depth <= 0) return CallHierarchyNode(name, kind, file, line, children)
 
-        // Find call expressions in the method body.
-        val callExprs = PsiTreeUtil.findChildrenOfType(target, com.intellij.psi.PsiCallExpression::class.java)
-        for (call in callExprs) {
+        // Find call expressions in the method body. Guard Java PSI types —
+        // PsiCallExpression/PsiMethodCallExpression are only available when the
+        // Java plugin is installed (e.g., not in Rider). On Kotlin files we can
+        // still find KtCallExpression without the Java PSI types.
+        val callExprs = if (javaPsiAvailable) {
+            PsiTreeUtil.findChildrenOfType(target, com.intellij.psi.PsiCallExpression::class.java)
+        } else {
+            emptyList()
+        }
+        val ktCallExprs = if (kotlinPluginAvailable) {
+            PsiTreeUtil.findChildrenOfType(target, KtCallExpression::class.java)
+        } else {
+            emptyList()
+        }
+        for (call in (callExprs + ktCallExprs)) {
             ctx.ensureActive()
             val resolved = when {
-                call is com.intellij.psi.PsiMethodCallExpression -> call.resolveMethod()
+                javaPsiAvailable && call is com.intellij.psi.PsiMethodCallExpression -> call.resolveMethod()
                 kotlinPluginAvailable && call is KtCallExpression -> resolveKtCall(call)
                 else -> null
             } ?: continue
@@ -923,9 +991,9 @@ class PsiQueryHelper(private val project: Project) {
 
     private fun extractSignature(element: PsiElement): String? {
         return when {
-            element is PsiMethod -> extractSignature(element)
-            element is PsiClass -> extractSignature(element)
-            element is PsiField -> extractSignature(element)
+            javaPsiAvailable && element is PsiMethod -> extractSignature(element)
+            javaPsiAvailable && element is PsiClass -> extractSignature(element)
+            javaPsiAvailable && element is PsiField -> extractSignature(element)
             kotlinPluginAvailable && element is KtNamedFunction -> extractKtSignature(element)
             kotlinPluginAvailable && element is KtClass -> extractKtSignature(element)
             kotlinPluginAvailable && element is KtProperty -> extractKtSignature(element)
@@ -1084,11 +1152,13 @@ class PsiQueryHelper(private val project: Project) {
                     else -> true // no visibility modifier = public in Kotlin
                 }
             }
+
             element is PsiModifierListOwner -> {
                 val ml = element.modifierList
                 ml?.hasModifierProperty(PsiModifier.PUBLIC) == true ||
-                    ml?.hasModifierProperty(PsiModifier.PROTECTED) == true
+                        ml?.hasModifierProperty(PsiModifier.PROTECTED) == true
             }
+
             else -> false
         }
     }
@@ -1111,17 +1181,19 @@ class PsiQueryHelper(private val project: Project) {
             element.isAnnotation() -> SymbolKind.ANNOTATION
             else -> SymbolKind.CLASS
         }
+
         kotlinPluginAvailable && element is KtObjectDeclaration -> if (element.isCompanion()) SymbolKind.COMPANION_OBJECT else SymbolKind.OBJECT
         kotlinPluginAvailable && element is KtNamedFunction -> SymbolKind.FUNCTION
         kotlinPluginAvailable && element is KtProperty -> SymbolKind.PROPERTY
-        element is PsiClass -> when {
+        javaPsiAvailable && element is PsiClass -> when {
             element.isInterface -> SymbolKind.INTERFACE
             element.isEnum -> SymbolKind.ENUM
             element.isAnnotationType -> SymbolKind.ANNOTATION
             else -> SymbolKind.CLASS
         }
-        element is PsiMethod -> if (element.isConstructor) SymbolKind.CONSTRUCTOR else SymbolKind.METHOD
-        element is PsiField -> SymbolKind.FIELD
+
+        javaPsiAvailable && element is PsiMethod -> if (element.isConstructor) SymbolKind.CONSTRUCTOR else SymbolKind.METHOD
+        javaPsiAvailable && element is PsiField -> SymbolKind.FIELD
         else -> SymbolKind.CLASS
     }
 
@@ -1143,9 +1215,9 @@ class PsiQueryHelper(private val project: Project) {
     }
 
     private fun elementName(element: PsiElement): String? = when {
-        element is PsiClass -> element.name
-        element is PsiMethod -> element.name
-        element is PsiField -> element.name
+        javaPsiAvailable && element is PsiClass -> element.name
+        javaPsiAvailable && element is PsiMethod -> element.name
+        javaPsiAvailable && element is PsiField -> element.name
         kotlinPluginAvailable && element is KtClass -> element.name
         kotlinPluginAvailable && element is KtObjectDeclaration -> element.name
         kotlinPluginAvailable && element is KtNamedFunction -> element.name
@@ -1155,19 +1227,28 @@ class PsiQueryHelper(private val project: Project) {
 
     private fun extractQualifiedName(element: PsiElement): String? = when {
         element is PsiClass -> element.qualifiedName
-        kotlinPluginAvailable && element is KtClass -> try { element.fqName?.asString() } catch (_: Exception) { null }
+        kotlinPluginAvailable && element is KtClass -> try {
+            element.fqName?.asString()
+        } catch (_: Exception) {
+            null
+        }
+
         else -> null
     }
 
     private fun findEnclosingSymbol(element: PsiElement): String? {
-        val method = PsiTreeUtil.getParentOfType(element, PsiMethod::class.java, false)
-        if (method != null) return "${method.name}()"
+        if (javaPsiAvailable) {
+            val method = PsiTreeUtil.getParentOfType(element, PsiMethod::class.java, false)
+            if (method != null) return "${method.name}()"
+        }
         if (kotlinPluginAvailable) {
             val ktFn = PsiTreeUtil.getParentOfType(element, KtNamedFunction::class.java, false)
             if (ktFn != null) return "${ktFn.name}()"
         }
-        val cls = PsiTreeUtil.getParentOfType(element, PsiClass::class.java, false)
-        if (cls != null) return cls.name
+        if (javaPsiAvailable) {
+            val cls = PsiTreeUtil.getParentOfType(element, PsiClass::class.java, false)
+            if (cls != null) return cls.name
+        }
         if (kotlinPluginAvailable) {
             val ktCls = PsiTreeUtil.getParentOfType(element, KtClass::class.java, false)
             if (ktCls != null) return ktCls.name
@@ -1245,6 +1326,7 @@ class PsiQueryHelper(private val project: Project) {
         return when {
             scope.equals("all", ignoreCase = true) ->
                 ScopeResult(GlobalSearchScope.allScope(project), isAllScope = true)
+
             scope.startsWith("module:", ignoreCase = true) -> {
                 val moduleName = scope.substringAfter(':').trim()
                 val module = ModuleManager.getInstance(project).findModuleByName(moduleName)
@@ -1252,6 +1334,7 @@ class PsiQueryHelper(private val project: Project) {
                     ?: GlobalSearchScope.projectScope(project)
                 ScopeResult(moduleScope, isAllScope = false)
             }
+
             else -> ScopeResult(GlobalSearchScope.projectScope(project), isAllScope = false)
         }
     }
@@ -1274,6 +1357,22 @@ class PsiQueryHelper(private val project: Project) {
          *  with this flag via short-circuit && to prevent class loading. */
         private val kotlinPluginAvailable: Boolean = try {
             Class.forName("org.jetbrains.kotlin.psi.KtFile")
+            true
+        } catch (_: Throwable) {
+            false
+        }
+
+        /** True if Java PSI classes (PsiClassOwner, PsiShortNamesCache) are available.
+         *  Checked via reflection to avoid NoClassDefFoundError on IDEs without the
+         *  Java plugin (e.g., Rider, PyCharm, WebStorm). On some IDE configurations
+         *  the plugin classloader cannot resolve com.intellij.psi.PsiClassOwner
+         *  (which depends on PsiShortNamesCache transitively), causing
+         *  NoClassDefFoundError at the `psiFile is PsiClassOwner` check. All
+         *  Java-specific PSI code is guarded with this flag via short-circuit &&
+         *  to prevent class loading. Mirrors the pattern in ContextGenerator.kt. */
+        private val javaPsiAvailable: Boolean = try {
+            Class.forName("com.intellij.psi.PsiClassOwner")
+            Class.forName("com.intellij.psi.search.PsiShortNamesCache")
             true
         } catch (_: Throwable) {
             false

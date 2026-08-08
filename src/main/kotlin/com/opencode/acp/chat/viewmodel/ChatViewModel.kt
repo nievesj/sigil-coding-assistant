@@ -192,7 +192,10 @@ class ChatViewModel(
         computeSessionContext = { computeSessionContext() },
         fetchTodos = { fetchTodos() },
         computeSessionContextLocal = { computeSessionContextLocal() },
-        setStreamPhaseIdle = { _streamPhase.value = StreamPhase.IDLE },
+        setStreamPhaseIdle = {
+            logger.info { "[ACP] setStreamPhaseIdle: _streamPhase = IDLE (current=${_streamPhase.value})" }
+            _streamPhase.value = StreamPhase.IDLE
+        },
         // Gate on sessionId: only reset the ACTIVE session's stream phase if the SessionError
         // was for the active session. Without this gate, a SessionError on an inactive/background
         // session would incorrectly reset the active session's stream phase, potentially hiding

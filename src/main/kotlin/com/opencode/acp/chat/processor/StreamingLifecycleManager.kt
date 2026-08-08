@@ -156,9 +156,13 @@ internal class StreamingLifecycleManager(
                         logger.info { "[ACP] finalizeStreaming (debounced): SKIP — activeMessageId changed from $capturedMsgId to ${turnLifecycleState.activeMessageId} during debounce" }
                         return@withLock
                     }
-                    if (!turnLifecycleState.isStreaming) return@withLock
+                    if (!turnLifecycleState.isStreaming) {
+                        logger.info { "[ACP] finalizeStreaming (debounced): SKIP — isStreaming already false (msgId=$capturedMsgId) — StreamingCompleted NOT emitted by debounce" }
+                        return@withLock
+                    }
                     turnLifecycleState.isStreaming = false
                     messageMap.update(capturedMsgId) { it.copy(isStreaming = false, state = MessageState.Completed) }
+                    logger.info { "[ACP] finalizeStreaming (debounced): finalizing msg=$capturedMsgId, calling emitStreamingCompleted" }
                     emitStreamingCompleted(capturedMsgId)
                 }
             }
@@ -189,7 +193,10 @@ internal class StreamingLifecycleManager(
     /** Emit StreamingCompleted signal once per turn (idempotent via turnLifecycleState.streamingCompletedEmitted).
      *  @param naturalCompletion true for natural end (Stop/idle/debounce), false for abort/error/timeout. */
     fun emitStreamingCompleted(msgId: String, naturalCompletion: Boolean = true) {
-        if (turnLifecycleState.streamingCompletedEmitted) return
+        if (turnLifecycleState.streamingCompletedEmitted) {
+            logger.info { "[ACP] emitStreamingCompleted: SKIP — streamingCompletedEmitted already true (msgId=$msgId, naturalCompletion=$naturalCompletion)" }
+            return
+        }
         // Try to emit FIRST. Only set the flag if emission succeeded. If the buffer
         // is full, tryEmit returns false and we leave the flag false so a retry
         // path (SessionIdle backstop, Error backstop) can re-attempt. Setting the
@@ -201,6 +208,7 @@ internal class StreamingLifecycleManager(
         )
         if (emitted) {
             turnLifecycleState.streamingCompletedEmitted = true
+            logger.info { "[ACP] emitStreamingCompleted: EMITTED (msgId=$msgId, naturalCompletion=$naturalCompletion)" }
         } else {
             // Buffer full — signal DROPPED. Do NOT set the flag so a retry path
             // (SessionIdle backstop, Error backstop) can re-attempt. Without this,
