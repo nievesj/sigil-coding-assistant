@@ -157,14 +157,19 @@ class SignalRouter(
 
     /** Route an active-session [UiSignal] to one or more [SignalEffect]s. */
     private suspend fun routeSignal(signal: UiSignal) {
-        if (stopped) return
+        if (stopped) {
+            logger.warn { "[ACP] routeSignal: DROPPED — router stopped (signal=${signal::class.simpleName})" }
+            return
+        }
         when (signal) {
             is UiSignal.StreamingStarted -> {
                 // _streamPhase.value = StreamPhase.STREAMING — handled directly by
                 // ChatViewModel (simple StateFlow update, no side effect needed).
                 // The router only emits effects for side-effectful operations.
             }
+
             is UiSignal.StreamingCompleted -> {
+                logger.info { "[ACP] routeSignal: StreamingCompleted received (msgId=${signal.messageId}, naturalCompletion=${signal.naturalCompletion}) — emitting SetStreamPhaseIdle + effects" }
                 // CRITICAL: ordered side effects — preserve exact order.
                 // Each is emitted separately so the executor can independently
                 // try/catch each. naturalCompletion is checked HERE (router) —
@@ -186,15 +191,18 @@ class SignalRouter(
                 _effects.emit(SignalEffect.DrainQueue)
                 _effects.emit(SignalEffect.RefreshReviewFiles)
             }
+
             is UiSignal.PermissionRequested -> {
                 _effects.emit(SignalEffect.SetPermissionPrompt(signal.prompt))
                 _effects.emit(SignalEffect.NotifyPermissionNeeded)
                 _effects.emit(SignalEffect.StartPermissionTimeout(signal.prompt))
             }
+
             is UiSignal.SelectionRequested -> {
                 _effects.emit(SignalEffect.SetSelectionPrompt(signal.prompt))
                 _effects.emit(SignalEffect.NotifyQuestionAsked)
             }
+
             is UiSignal.Error -> {
                 // Error signal (abort/timeout): emit SetStreamPhaseIdleGated as a
                 // backstop. abortStreamingWithFallback emits StreamingCompleted
@@ -213,11 +221,13 @@ class SignalRouter(
                 // from killing a legitimately streaming active session's UI).
                 _effects.emit(SignalEffect.SetStreamPhaseIdleGated(signal.messageId))
             }
+
             is UiSignal.TodoUpdated -> Unit
             is UiSignal.FileChanged -> {
                 _effects.emit(SignalEffect.EmitFileChangeSignal)
                 _effects.emit(SignalEffect.RefreshReviewFiles)
             }
+
             is UiSignal.MessageUpdated -> {
                 _effects.emit(SignalEffect.ComputeSessionContextLocal(signal.messageId))
             }
@@ -257,9 +267,11 @@ class SignalRouter(
             is UiSignal.SessionCreated -> {
                 _effects.emit(SignalEffect.LoadSessions(false))
             }
+
             is UiSignal.SessionIdle -> {
                 _effects.emit(SignalEffect.ComputeSessionContext(null))
             }
+
             is UiSignal.SessionError -> {
                 // Log the error message (preserves errorMessage that was previously
                 // discarded). The executor logs it at WARN level for idea.log visibility.
@@ -267,27 +279,38 @@ class SignalRouter(
                 _effects.emit(SignalEffect.SetStreamPhaseIdleForSession(signal.sessionId))
                 _effects.emit(SignalEffect.RemoveStreamingSession(signal.sessionId))
             }
+
             is UiSignal.SessionCompacted -> {
                 _effects.emit(SignalEffect.RefreshActiveSessionMessages(signal.sessionId))
                 _effects.emit(SignalEffect.ComputeSessionContext(null))
             }
+
             is UiSignal.SessionDeleted -> {
                 _effects.emit(SignalEffect.HandleSessionDeleted(signal.sessionId))
             }
+
             is UiSignal.ChildPermissionRequested -> {
                 _effects.emit(SignalEffect.AddChildPermissionPrompt(signal.prompt))
                 _effects.emit(SignalEffect.NotifyPermissionNeeded)
             }
+
             is UiSignal.PermissionReplied -> {
                 _effects.emit(SignalEffect.HandlePermissionReplied(signal.permissionId, signal.reply, signal.sessionId))
             }
+
             is UiSignal.PermissionTimedOut -> {
                 // Dedup: if the same PermissionTimedOut was already handled (e.g.,
                 // it arrived on activeSignals first and was delegated here, then
                 // also arrived on globalSignals), skip the second emission. This
                 // prevents double-reject and double-clear-prompt.
                 if (!isDuplicatePermissionTimeout(signal.permissionId, signal.sessionId, signal.toolName)) {
-                    _effects.emit(SignalEffect.HandlePermissionTimedOut(signal.permissionId, signal.sessionId, signal.toolName))
+                    _effects.emit(
+                        SignalEffect.HandlePermissionTimedOut(
+                            signal.permissionId,
+                            signal.sessionId,
+                            signal.toolName
+                        )
+                    )
                 } else {
                     logger.warn { "[ACP] PermissionTimedOut dedup: skipping duplicate (permissionId=${signal.permissionId}, sessionId=${signal.sessionId})" }
                 }
