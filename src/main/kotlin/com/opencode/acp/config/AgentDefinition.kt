@@ -34,15 +34,26 @@ import com.opencode.acp.config.settings.OpenCodeAgentSettingsState
  *   via [AgentPromptContext]).
  * @property frontmatterBuilder builds the YAML frontmatter (parameterized by
  *   settings + per-agent model via [AgentFrontmatterContext]).
+ * @property enableFlagGetter reads this agent's enable flag from settings.
+ *   Centralized here so there is a SINGLE source of truth for the
+ *   name→enable-flag mapping (previously duplicated across FOUR parallel
+ *   `when` expressions in [AgentConfigWriter] and
+ *   [com.opencode.acp.config.settings.OpenCodeAgentConfigurable] — a missing
+ *   arm in any one caused a silent failure). Now adding a new agent = add
+ *   one [AgentRegistry.ALL_AGENTS] entry with its getter/setter; no parallel
+ *   `when` to keep in sync.
+ * @property enableFlagSetter writes this agent's enable flag into settings.
+ *   The inverse of [enableFlagGetter], used by the Settings UI's Apply path.
  *
- * LAMBDA EQUALITY CAVEAT: this is a `data class` with two lambda
- * properties ([promptBuilder], [frontmatterBuilder]). Data-class
- * `equals`/`hashCode`/`copy` use REFERENCE equality for lambdas, so two
- * `AgentDefinition` instances built with structurally-identical-but-distinct
- * lambdas are NOT equal, and `copy()` shares lambda references with the
- * original. Do NOT use `AgentDefinition` in `Set` contexts, as a `Map` key,
- * or rely on `==` for registry membership -- use [AgentRegistry.byName]
- * (which matches by `name`, the natural key) instead.
+ * LAMBDA EQUALITY CAVEAT: this is a `data class` with lambda
+ * properties ([promptBuilder], [frontmatterBuilder], [enableFlagGetter],
+ * [enableFlagSetter]). Data-class `equals`/`hashCode`/`copy` use REFERENCE
+ * equality for lambdas, so two `AgentDefinition` instances built with
+ * structurally-identical-but-distinct lambdas are NOT equal, and `copy()`
+ * shares lambda references with the original. Do NOT use `AgentDefinition`
+ * in `Set` contexts, as a `Map` key, or rely on `==` for registry
+ * membership -- use [AgentRegistry.byName] (which matches by `name`, the
+ * natural key) instead.
  *
  * HIDDEN FIELD: the [hidden] property is currently `false` for every
  * registry entry (no agent uses `hidden: true`). It is retained for
@@ -61,6 +72,21 @@ data class AgentDefinition(
     val description: String,
     val promptBuilder: (AgentPromptContext) -> String,
     val frontmatterBuilder: (AgentFrontmatterContext) -> String,
+    /**
+     * Read this agent's enable flag from [settings]. Centralized mapping so
+     * the name→flag relationship lives in ONE place (the registry entry),
+     * not in four parallel `when` expressions across two files. A missing
+     * agent in a `when` was a SILENT failure (no compile error); this lambda
+     * is wired once at registry construction and cannot be forgotten.
+     */
+    val enableFlagGetter: (OpenCodeAgentSettingsState) -> Boolean,
+    /**
+     * Write this agent's enable flag into [settings]. The inverse of
+     * [enableFlagGetter], used by the Settings UI Apply path. Centralized
+     * for the same reason: a missing `when` arm silently discarded the
+     * user's Apply choice (the checkbox read correctly but never persisted).
+     */
+    val enableFlagSetter: (OpenCodeAgentSettingsState, Boolean) -> Unit,
 )
 
 /**

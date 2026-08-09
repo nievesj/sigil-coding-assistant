@@ -23,13 +23,15 @@ class OpenCodeAgentSettingsStateTest {
         val state = OpenCodeAgentSettingsState()
         state.enableCodingAssistant shouldBe true
         state.enableCouncil shouldBe false
-        state.taskAllowedAgents shouldContainExactly listOf("explore", "general")
+        state.taskAllowedAgents shouldContainExactly listOf("explore", "general", "reviewer")
         state.councilMembers shouldHaveSize 0
         // v2 defaults
         state.enableCoder shouldBe false
         state.enableResearcher shouldBe false
         state.enablePlanner shouldBe false
         state.enableTester shouldBe false
+        // reviewer is the documented exception: the first v2 subagent to default ON
+        state.enableReviewer shouldBe true
         state.agentModels shouldHaveSize 0
     }
 
@@ -259,6 +261,7 @@ class OpenCodeAgentSettingsStateTest {
             enableResearcher = true
             enablePlanner = false
             enableTester = true
+            enableReviewer = true
         }
 
         target.loadState(source)
@@ -267,6 +270,7 @@ class OpenCodeAgentSettingsStateTest {
         target.enableResearcher shouldBe true
         target.enablePlanner shouldBe false
         target.enableTester shouldBe true
+        target.enableReviewer shouldBe true
     }
 
     // ── v2 new: agentModels loadState ─────────────────────────────────────
@@ -603,7 +607,7 @@ class OpenCodeAgentSettingsStateTest {
             AgentModelBinding("coder", CouncilMember("anthropic", "claude-sonnet-4", "high")),
             AgentModelBinding("researcher", CouncilMember("openai", "gpt-4o")),
         )
-        val uiAgentNames = setOf("coder", "researcher", "planner", "tester")
+        val uiAgentNames = setOf("coder", "researcher", "planner", "tester", "reviewer")
 
         val merged = OpenCodeAgentConfigurable.mergeAgentModelBindings(existing, uiBindings, uiAgentNames)
 

@@ -1,5 +1,7 @@
 ﻿package com.opencode.acp.config
 
+import com.opencode.acp.config.settings.OpenCodeAgentSettingsState
+
 /**
  * The ordered list of all plugin-defined agents.
  *
@@ -19,8 +21,9 @@ object AgentRegistry {
      * The ordered list of all plugin-defined agents (v1 + v2).
      *
      * v1: `coding-assistant` (primary), `council` (subagent).
-     * v2: `coder`, `researcher`, `planner`, `tester` (all subagents, all
-     * opt-in / default OFF).
+     * v2: `coder`, `researcher`, `planner`, `tester` (all opt-in / default OFF)
+     * and `reviewer` (adversarial review subagent, default ON — advisory /
+     * read-only: writes only .review/ findings).
      */
     val ALL_AGENTS: List<AgentDefinition> = listOf(
         AgentDefinition(
@@ -32,6 +35,8 @@ object AgentRegistry {
             description = "Coding assistant optimized for IntelliJ-based development with hands-on codebase access and IDE intelligence tools.",
             promptBuilder = { ctx -> AgentConfigWriter.buildCodingAssistantPrompt(ctx) },
             frontmatterBuilder = { ctx -> AgentConfigWriter.buildCodingAssistantFrontmatter(ctx) },
+            enableFlagGetter = { s -> s.enableCodingAssistant },
+            enableFlagSetter = { s, v -> s.enableCodingAssistant = v },
         ),
         AgentDefinition(
             name = AgentConstants.COUNCIL_AGENT_NAME,
@@ -43,6 +48,8 @@ object AgentRegistry {
             description = "Multi-model council coordinator that fans out review subtasks to configured models and synthesizes a consensus report.",
             promptBuilder = { ctx -> AgentConfigWriter.buildCouncilPrompt(ctx) },
             frontmatterBuilder = { ctx -> AgentConfigWriter.buildCouncilFrontmatter(ctx) },
+            enableFlagGetter = { s -> s.enableCouncil },
+            enableFlagSetter = { s, v -> s.enableCouncil = v },
         ),
         AgentDefinition(
             name = AgentConstants.CODER_AGENT_NAME,
@@ -53,6 +60,8 @@ object AgentRegistry {
             description = "Scoped implementation subagent. Takes one file-scoped chunk, researches target files, edits, self-verifies, and returns a structured result. The parallelism unit for fan-out implementation.",
             promptBuilder = { ctx -> AgentConfigWriter.buildCoderPrompt(ctx) },
             frontmatterBuilder = { ctx -> AgentConfigWriter.buildCoderFrontmatter(ctx) },
+            enableFlagGetter = { s -> s.enableCoder },
+            enableFlagSetter = { s, v -> s.enableCoder = v },
         ),
         AgentDefinition(
             name = AgentConstants.RESEARCHER_AGENT_NAME,
@@ -63,6 +72,8 @@ object AgentRegistry {
             description = "Semantic codebase investigator. Uses IntelliJ PSI tools to produce structured context briefs (symbols, call graphs, affected files, gotchas). Read-only — does not edit.",
             promptBuilder = { ctx -> AgentConfigWriter.buildResearcherPrompt(ctx) },
             frontmatterBuilder = { ctx -> AgentConfigWriter.buildResearcherFrontmatter(ctx) },
+            enableFlagGetter = { s -> s.enableResearcher },
+            enableFlagSetter = { s, v -> s.enableResearcher = v },
         ),
         AgentDefinition(
             name = AgentConstants.PLANNER_AGENT_NAME,
@@ -73,6 +84,8 @@ object AgentRegistry {
             description = "Task decomposer. Takes a feature/task and produces a chunk plan with file assignments and cross-chunk contracts. The safety layer for parallel coder fan-out.",
             promptBuilder = { ctx -> AgentConfigWriter.buildPlannerPrompt(ctx) },
             frontmatterBuilder = { ctx -> AgentConfigWriter.buildPlannerFrontmatter(ctx) },
+            enableFlagGetter = { s -> s.enablePlanner },
+            enableFlagSetter = { s, v -> s.enablePlanner = v },
         ),
         AgentDefinition(
             name = AgentConstants.TESTER_AGENT_NAME,
@@ -83,6 +96,20 @@ object AgentRegistry {
             description = "Scoped test implementer. Takes one test-file-scoped chunk, reads existing tests for patterns, writes tests, self-verifies, and returns a structured result.",
             promptBuilder = { ctx -> AgentConfigWriter.buildTesterPrompt(ctx) },
             frontmatterBuilder = { ctx -> AgentConfigWriter.buildTesterFrontmatter(ctx) },
+            enableFlagGetter = { s -> s.enableTester },
+            enableFlagSetter = { s, v -> s.enableTester = v },
+        ),
+        AgentDefinition(
+            name = AgentConstants.REVIEWER_AGENT_NAME,
+            mode = "subagent",
+            defaultEnabled = true, // FIRST v2 subagent to default ON — reviewer is advisory/read-only (writes only .review/ findings)
+            hidden = false,
+            hasPerAgentModel = true,
+            description = "Adversarial code reviewer. Reviews changed files for flaws (coding standards, patterns, SOLID/DRY, bugs, security, test gaps) and writes .review/<path>.json findings. Identifies issues — never fixes them.",
+            promptBuilder = { ctx -> AgentConfigWriter.buildReviewerPrompt(ctx) },
+            frontmatterBuilder = { ctx -> AgentConfigWriter.buildReviewerFrontmatter(ctx) },
+            enableFlagGetter = { s -> s.enableReviewer },
+            enableFlagSetter = { s, v -> s.enableReviewer = v },
         ),
     )
 
@@ -114,4 +141,16 @@ object AgentRegistry {
      */
     fun byNameOrNull(name: String): AgentDefinition? =
         ALL_AGENTS.firstOrNull { it.name == name }
+
+    /**
+     * Read the enable flag for [name] from [settings] via the centralized
+     * [AgentDefinition.enableFlagGetter]. Returns `false` for unknown names
+     * (defense-in-depth — only registry agents can be enabled). This replaces
+     * the four parallel `when` expressions that previously mapped name→flag
+     * across [AgentConfigWriter] and
+     * [com.opencode.acp.config.settings.OpenCodeAgentConfigurable]; the
+     * mapping now lives once on each [AgentDefinition] entry.
+     */
+    fun enableFlagFor(name: String, settings: OpenCodeAgentSettingsState): Boolean =
+        byNameOrNull(name)?.enableFlagGetter?.invoke(settings) ?: false
 }
