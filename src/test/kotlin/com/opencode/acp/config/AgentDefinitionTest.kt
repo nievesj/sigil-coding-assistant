@@ -26,6 +26,8 @@ class AgentDefinitionTest {
     // Shared builder instances so data-class equality can be tested.
     private val sharedPromptBuilder: (AgentPromptContext) -> String = { ctx -> "prompt-${ctx.agentDef.name}" }
     private val sharedFrontmatterBuilder: (AgentFrontmatterContext) -> String = { ctx -> "fm-${ctx.agentDef.name}" }
+    private val sharedEnableGetter: (OpenCodeAgentSettingsState) -> Boolean = { false }
+    private val sharedEnableSetter: (OpenCodeAgentSettingsState, Boolean) -> Unit = { _, _ -> }
 
     private fun newDef(
         name: String = "coder",
@@ -36,6 +38,8 @@ class AgentDefinitionTest {
         alwaysOverwrite: Boolean = false,
         promptBuilder: (AgentPromptContext) -> String = sharedPromptBuilder,
         frontmatterBuilder: (AgentFrontmatterContext) -> String = sharedFrontmatterBuilder,
+        enableFlagGetter: (OpenCodeAgentSettingsState) -> Boolean = sharedEnableGetter,
+        enableFlagSetter: (OpenCodeAgentSettingsState, Boolean) -> Unit = sharedEnableSetter,
     ): AgentDefinition = AgentDefinition(
         name = name,
         mode = mode,
@@ -46,6 +50,8 @@ class AgentDefinitionTest {
         description = "test agent",
         promptBuilder = promptBuilder,
         frontmatterBuilder = frontmatterBuilder,
+        enableFlagGetter = enableFlagGetter,
+        enableFlagSetter = enableFlagSetter,
     )
 
     @Test
@@ -105,6 +111,8 @@ class AgentDefinitionTest {
             description = "x",
             promptBuilder = { "p" },
             frontmatterBuilder = { "f" },
+            enableFlagGetter = { false },
+            enableFlagSetter = { _, _ -> },
         )
         val ctx = AgentFrontmatterContext(OpenCodeAgentSettingsState(), false, def)
         ctx.modelBinding shouldBe null

@@ -4,7 +4,6 @@ import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import org.junit.jupiter.api.Test
-import com.opencode.acp.config.AgentFrontmatterContext
 import com.opencode.acp.config.settings.OpenCodeAgentSettingsState
 import com.opencode.acp.config.settings.CouncilMember
 import io.kotest.matchers.string.shouldContain
@@ -21,7 +20,7 @@ import io.kotest.matchers.string.shouldContain
 class AgentRegistryTest {
 
     @Test
-    fun `ALL_AGENTS contains all 6 agents in registry order`() {
+    fun `ALL_AGENTS contains all 7 agents in registry order`() {
         AgentRegistry.ALL_AGENTS.map { it.name } shouldContainExactly listOf(
             AgentConstants.CODING_ASSISTANT_AGENT_NAME,
             AgentConstants.COUNCIL_AGENT_NAME,
@@ -29,6 +28,7 @@ class AgentRegistryTest {
             AgentConstants.RESEARCHER_AGENT_NAME,
             AgentConstants.PLANNER_AGENT_NAME,
             AgentConstants.TESTER_AGENT_NAME,
+            AgentConstants.REVIEWER_AGENT_NAME,
         )
     }
 
@@ -102,6 +102,18 @@ class AgentRegistryTest {
     }
 
     @Test
+    fun `reviewer is subagent, default-enabled, has per-agent model`() {
+        // INVERTED vs coder/researcher/planner/tester: reviewer is the FIRST
+        // v2 subagent to default ON (advisory/read-only — writes only .review/
+        // findings, never edits source files). See AgentRegistry.ALL_AGENTS.
+        val def = AgentRegistry.byName(AgentConstants.REVIEWER_AGENT_NAME)
+        def.mode shouldBe "subagent"
+        def.defaultEnabled shouldBe true
+        def.hidden shouldBe false
+        def.hasPerAgentModel shouldBe true
+    }
+
+    @Test
     fun `all v2 subagent names are kebab-case and YAML-safe`() {
         for (name in AgentConstants.V2_SUBAGENT_NAMES) {
             AgentConstants.YAML_SAFE_IDENTIFIER.matches(name) shouldBe true
@@ -141,6 +153,74 @@ class AgentRegistryTest {
         // injection guard -- every registry name must pass it.
         for (def in AgentRegistry.ALL_AGENTS) {
             AgentConstants.YAML_SAFE_IDENTIFIER.matches(def.name) shouldBe true
+        }
+    }
+
+    @Test
+    fun `enableFlagFor reflects the correct settings flag for every registry agent (exhaustive coverage)`() {
+        // Exhaustive-coverage test (review cmt_b2c3d4e5f6a8 / cmt_e5f6a7b8c9d1 /
+        // cmt_f6a7b8c9d0e2): the name→enable-flag mapping is now centralized on
+        // each AgentDefinition (enableFlagGetter), exposed via
+        // AgentRegistry.enableFlagFor. This test asserts that EVERY registry
+        // agent's getter reads the correct settings field — enabling all flags
+        // and verifying enableFlagFor returns true for every name. A missing
+        // getter wiring (e.g., a new agent added to ALL_AGENTS without an
+        // enableFlagGetter) would fail here. Previously the mapping was
+        // duplicated across four parallel `when` expressions with no exhaustive
+        // test — a missing arm was a silent failure.
+        val settings = OpenCodeAgentSettingsState().apply {
+            enableCodingAssistant = true
+            enableCouncil = true
+            enableCoder = true
+            enableResearcher = true
+            enablePlanner = true
+            enableTester = true
+            enableReviewer = true
+        }
+        for (def in AgentRegistry.ALL_AGENTS) {
+            AgentRegistry.enableFlagFor(def.name, settings) shouldBe true
+        }
+        // Disable all flags → enableFlagFor returns false for every name.
+        val allOff = OpenCodeAgentSettingsState().apply {
+            enableCodingAssistant = false
+            enableCouncil = false
+            enableCoder = false
+            enableResearcher = false
+            enablePlanner = false
+            enableTester = false
+            enableReviewer = false
+        }
+        for (def in AgentRegistry.ALL_AGENTS) {
+            AgentRegistry.enableFlagFor(def.name, allOff) shouldBe false
+        }
+    }
+
+    @Test
+    fun `enableFlagFor returns false for unknown agent name (defense-in-depth)`() {
+        // Unknown names must fail-closed (false) — only registry agents can be
+        // enabled. This is the safety net that replaced the `else -> false` arm
+        // of the old `when` expressions.
+        val settings = OpenCodeAgentSettingsState()
+        AgentRegistry.enableFlagFor("nonexistent-agent", settings) shouldBe false
+        AgentRegistry.enableFlagFor("", settings) shouldBe false
+    }
+
+    @Test
+    fun `enableFlagSetter writes the correct settings flag for every registry agent (exhaustive coverage)`() {
+        // Exhaustive-coverage test for the setter side (review
+        // cmt_f6a7b8c9d0e2): the name→enable-flag setter is centralized on each
+        // AgentDefinition. This test asserts that setting each registry agent's
+        // flag via the centralized setter actually mutates the correct settings
+        // field. A missing setter wiring would leave the field unchanged — the
+        // user's Apply choice would silently revert on reload.
+        for (def in AgentRegistry.ALL_AGENTS) {
+            val settings = OpenCodeAgentSettingsState()
+            // Start from false (the safe default), set true via the centralized
+            // setter, then verify the raw settings field reflects the change.
+            def.enableFlagSetter.invoke(settings, true)
+            // enableFlagFor reads it back via the getter — if the setter wrote
+            // the WRONG field, the getter would still read false.
+            AgentRegistry.enableFlagFor(def.name, settings) shouldBe true
         }
     }
 
@@ -200,6 +280,7 @@ class AgentRegistryTest {
                 AgentConstants.RESEARCHER_AGENT_NAME -> prompt shouldContain "investigator"
                 AgentConstants.PLANNER_AGENT_NAME -> prompt shouldContain "decomposer"
                 AgentConstants.TESTER_AGENT_NAME -> prompt shouldContain "test implementer"
+                AgentConstants.REVIEWER_AGENT_NAME -> prompt shouldContain "adversarial"
             }
         }
     }

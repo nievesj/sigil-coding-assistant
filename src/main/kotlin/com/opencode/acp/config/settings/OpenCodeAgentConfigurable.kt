@@ -60,13 +60,13 @@ private val logger = KotlinLogging.logger {}
  *
  * Exposes:
  *  - One enable checkbox per [AgentRegistry] agent (coding-assistant,
- *    council, coder, researcher, planner, tester).
+ *    council, coder, researcher, planner, tester, reviewer).
  *  - Delegation allowlist (which agents can be invoked via the `task` tool):
  *    built-ins (explore, general) + all registry subagents.
  *  - Council member models (v1, unchanged): a dynamic list of model pickers.
  *  - Per-agent model pickers for v2 subagents with
  *    [AgentDefinition.hasPerAgentModel] == true (coder, researcher, planner,
- *    tester). null/empty = inherit parent's model (v1 default).
+ *    tester, reviewer). null/empty = inherit parent's model (v1 default).
  *
  * Council member models use a searchable, provider-grouped dropdown that
  * mirrors the model picker in the main chat screen (using the same
@@ -206,7 +206,8 @@ class OpenCodeAgentConfigurable : Configurable {
 
         // ── Per-agent model pickers (v2 — hasPerAgentModel agents only) ─
         // One row per agent with hasPerAgentModel=true. Built dynamically
-        // from the registry; coder/researcher/planner/tester each get a row.
+        // from the registry; coder/researcher/planner/tester/reviewer each
+        // get a row.
         // coding-assistant and council do NOT (primary uses chat's active
         // model; council has its own per-MEMBER list).
         for (def in AgentRegistry.ALL_AGENTS.filter { it.hasPerAgentModel }) {
@@ -315,38 +316,33 @@ class OpenCodeAgentConfigurable : Configurable {
         AgentConstants.RESEARCHER_AGENT_NAME -> "Semantic codebase investigator (read-only, PSI tools)."
         AgentConstants.PLANNER_AGENT_NAME -> "Task decomposer that produces a chunk plan for parallel coder fan-out."
         AgentConstants.TESTER_AGENT_NAME -> "Scoped test implementer that mirrors existing test patterns."
+        AgentConstants.REVIEWER_AGENT_NAME -> "Adversarial code reviewer that writes .review/<path>.json findings. Identifies issues, never fixes."
         else -> "Agent: $name"
     }
 
     /**
      * Read the enable flag for [name] from [settings].
      *
-     * Uses a `when` expression (acceptable for 6 agents; revisit at ~8+).
-     * See [AgentConfigWriter.isEnabled] for the parallel write-side logic.
+     * Delegates to the centralized [AgentDefinition.enableFlagGetter] via
+     * [AgentRegistry.enableFlagFor]. This replaces a hand-maintained `when`
+     * that was duplicated across four call sites; a missing arm was a SILENT
+     * failure (permanently-off checkbox). The mapping now lives once on each
+     * [AgentDefinition] entry and cannot be forgotten.
      */
-    private fun isEnabledInSettings(name: String, s: OpenCodeAgentSettingsState): Boolean = when (name) {
-        AgentConstants.CODING_ASSISTANT_AGENT_NAME -> s.enableCodingAssistant
-        AgentConstants.COUNCIL_AGENT_NAME -> s.enableCouncil
-        AgentConstants.CODER_AGENT_NAME -> s.enableCoder
-        AgentConstants.RESEARCHER_AGENT_NAME -> s.enableResearcher
-        AgentConstants.PLANNER_AGENT_NAME -> s.enablePlanner
-        AgentConstants.TESTER_AGENT_NAME -> s.enableTester
-        else -> false
-    }
+    private fun isEnabledInSettings(name: String, s: OpenCodeAgentSettingsState): Boolean =
+        AgentRegistry.enableFlagFor(name, s)
 
     /**
      * Write the enable flag for [name] into [settings].
+     *
+     * Delegates to the centralized [AgentDefinition.enableFlagSetter]. This
+     * replaces a hand-maintained `when` whose `else -> {}` arm SILENTLY
+     * DISCARDED the user's Apply choice for any agent missing from the
+     * expression — the checkbox read correctly but the value never
+     * persisted. The setter is now wired once at registry construction.
      */
     private fun setEnabledInSettings(name: String, s: OpenCodeAgentSettingsState, value: Boolean) {
-        when (name) {
-            AgentConstants.CODING_ASSISTANT_AGENT_NAME -> s.enableCodingAssistant = value
-            AgentConstants.COUNCIL_AGENT_NAME -> s.enableCouncil = value
-            AgentConstants.CODER_AGENT_NAME -> s.enableCoder = value
-            AgentConstants.RESEARCHER_AGENT_NAME -> s.enableResearcher = value
-            AgentConstants.PLANNER_AGENT_NAME -> s.enablePlanner = value
-            AgentConstants.TESTER_AGENT_NAME -> s.enableTester = value
-            else -> {}
-        }
+        AgentRegistry.byNameOrNull(name)?.enableFlagSetter?.invoke(s, value)
     }
 
     /**
@@ -364,6 +360,20 @@ class OpenCodeAgentConfigurable : Configurable {
         }
 
         fetchModelsJob = service.scope.launch {
+            // Compute the modality ONCE before the try-catch so BOTH the
+            // success path and the error path can bind their invokeLater
+            // callbacks to it. Previously the error-path invokeLater (the
+            // restart-hint update) was unbound — if the panel was disposed
+            // between the isDisplayable check and the Swing mutation, it could
+            // update a disposed component. Binding to modality ensures the
+            // callback only runs when the settings dialog is in a suitable
+            // modality state (review cmt_a7b8c9d0e1f3).
+            //
+            // stateForComponent returns NON_BLOCKING when the component is
+            // not displayable / null — safe to compute even if the panel is
+            // gone (the callbacks themselves re-check panel?.isDisplayable).
+            val modality =
+                ModalityState.stateForComponent(panel ?: this@OpenCodeAgentConfigurable.panel ?: return@launch)
             try {
                 val providers = service.listProviders()
                 if (providers == null) {
@@ -388,10 +398,6 @@ class OpenCodeAgentConfigurable : Configurable {
                         }
                     }.sortedBy { it.displayName }
 
-                val modality = ModalityState.stateForComponent(panel ?: run {
-                    logger.debug { "[ACP] AgentConfigurable: panel was null before model fetch completed — models not loaded (user likely closed settings)" }
-                    return@launch
-                })
                 ApplicationManager.getApplication().invokeLater({
                     if (panel?.isDisplayable != true) return@invokeLater
                     availableModels = models
@@ -404,12 +410,15 @@ class OpenCodeAgentConfigurable : Configurable {
                 logger.warn(e) { "[ACP] AgentConfigurable: failed to fetch available models" }
                 val hint = restartHintLabel
                 if (hint != null) {
-                    ApplicationManager.getApplication().invokeLater {
+                    // Bind the error-path callback to the same modality as the
+                    // success path — consistent EDT discipline, prevents
+                    // updating a disposed component (review cmt_a7b8c9d0e1f3).
+                    ApplicationManager.getApplication().invokeLater({
                         if (panel?.isDisplayable == true) {
                             hint.text = "[!] Failed to load models - retry by reopening settings"
                             hint.foreground = JBColor.RED
                         }
-                    }
+                    }, modality)
                 }
             }
         }
@@ -846,10 +855,8 @@ class OpenCodeAgentConfigurable : Configurable {
     private fun getActiveProject(): com.intellij.openapi.project.Project? {
         val focused = focusedProject
         if (focused != null && !focused.isDisposed) return focused
-        val fallback = ProjectManager.getInstance().openProjects.firstOrNull()
-        if (fallback != null && focused != null && !focused.isDisposed) {
-            // No log needed - focused was returned above.
-        } else if (fallback != null) {
+        val fallback = ProjectManager.getInstance().openProjects.firstOrNull { !it.isDisposed }
+        if (fallback != null) {
             logger.debug { "[ACP] AgentConfigurable: no focused project - using fallback open project '${fallback.name}' for model list (app-scoped settings may show models from a different project than the one the user opened Settings from)" }
         }
         return fallback
@@ -862,10 +869,21 @@ class OpenCodeAgentConfigurable : Configurable {
          * bindings. Extracted from apply() so the merge logic is unit-testable
          * without the IntelliJ application context (review cmt_d8e9f0a1b2c3).
          *
+         * **Dedup of preserved bindings:** the `existing` list may carry
+         * duplicate agentNames (hand-edited XML or a prior plugin version
+         * that bypassed loadState's dedup). Without dedup here, duplicates
+         * for non-UI agents (coding-assistant, council) survive every Apply
+         * (they are preserved again on the next merge) and accumulate in
+         * persisted state. modelFor() uses `.find { ... }` (first wins) so
+         * behavior is not broken today, but the bloat is real. Dedup
+         * `preserved` by agentName (first wins) before concatenating,
+         * mirroring the loadState dedup strategy. See review cmt_e5f6a7b8c9d0.
+         *
          * @param existing the current settings.agentModels (may contain non-UI
-         *   bindings from a prior plugin version or hand-edited XML)
+         *   bindings from a prior plugin version or hand-edited XML; may
+         *   contain duplicate agentNames among non-UI bindings)
          * @param uiBindings the bindings built from the UI rows
-         *   (buildAgentModelBindings() result)
+         *   (buildAgentModelBindings() result; one per agent by construction)
          * @param uiAgentNames the set of agent names that HAVE a UI row
          *   (agentModelRows.keys, i.e. hasPerAgentModel==true agents)
          * @return the merged list to assign to settings.agentModels
@@ -875,7 +893,12 @@ class OpenCodeAgentConfigurable : Configurable {
             uiBindings: List<AgentModelBinding>,
             uiAgentNames: Set<String>,
         ): List<AgentModelBinding> {
+            // Preserve non-UI bindings, deduped by agentName (first wins).
+            // AgentModelBinding has identity equals (no custom equals/hashCode),
+            // so we dedup on the String agentName key, not via distinctBy { it }.
+            val seen = mutableSetOf<String>()
             val preserved = existing.filter { it.agentName !in uiAgentNames }
+                .filter { seen.add(it.agentName) }
             return preserved + uiBindings
         }
 

@@ -11,7 +11,7 @@ import com.intellij.openapi.components.Storage
 
 /**
  * Persistent settings for Custom Agents (v1: coding-assistant + council;
- * v2: coder + researcher + planner + tester + per-agent models) — follows the
+ * v2: coder + researcher + planner + tester + reviewer + per-agent models) — follows the
  * same XStream-safe pattern as [OpenCodeContextSettingsState] and
  * [OpenCodeFollowSettingsState].
  *
@@ -43,8 +43,12 @@ class OpenCodeAgentSettingsState : PersistentStateComponent<OpenCodeAgentSetting
      * Shared dynamic allowlist of agent names that can be delegated to via the
      * `task` tool. Applies to BOTH coding-assistant and council. Driven by the
      * settings UI. Stored as [java.util.ArrayList] for XStream compatibility.
+     *
+     * Defaults include `reviewer` because it is the first default-enabled v2
+     * subagent — the allowlist default mirrors the enable defaults so the
+     * post-completion review gate works on fresh installs without user action.
      */
-    var taskAllowedAgents: java.util.ArrayList<String> = java.util.ArrayList(listOf("explore", "general"))
+    var taskAllowedAgents: java.util.ArrayList<String> = java.util.ArrayList(listOf("explore", "general", "reviewer"))
 
     /** XStream-compatible ArrayList of [CouncilMember] (mirrors commandHistory pattern). */
     var councilMembers: java.util.ArrayList<CouncilMember> = java.util.ArrayList()
@@ -59,6 +63,9 @@ class OpenCodeAgentSettingsState : PersistentStateComponent<OpenCodeAgentSetting
     var enableResearcher: Boolean = false
     var enablePlanner: Boolean = false
     var enableTester: Boolean = false
+
+    /** Enable the `reviewer` adversarial code-review subagent. Default ON (first v2 subagent to default enabled). */
+    var enableReviewer: Boolean = true
 
     /**
      * Per-agent model bindings. One entry per agent that has a configured
@@ -97,6 +104,7 @@ class OpenCodeAgentSettingsState : PersistentStateComponent<OpenCodeAgentSetting
         enableResearcher = state.enableResearcher
         enablePlanner = state.enablePlanner
         enableTester = state.enableTester
+        enableReviewer = state.enableReviewer
         // Filter invalid bindings (blank/unsafe agentName). Normalize a
         // non-null-but-invalid inner CouncilMember (e.g. XStream deserialized
         // `<model/>` as a blank-fields CouncilMember instead of null) to a

@@ -12,6 +12,7 @@ object AgentConstants {
     const val RESEARCHER_AGENT_NAME = "researcher"
     const val PLANNER_AGENT_NAME = "planner"
     const val TESTER_AGENT_NAME = "tester"
+    const val REVIEWER_AGENT_NAME = "reviewer"
 
     /**
      * All plugin-defined v2 subagent names (excludes `coding-assistant`
@@ -24,6 +25,7 @@ object AgentConstants {
         RESEARCHER_AGENT_NAME,
         PLANNER_AGENT_NAME,
         TESTER_AGENT_NAME,
+        REVIEWER_AGENT_NAME,
     )
 
     /**
@@ -42,6 +44,9 @@ object AgentConstants {
      *   analysis; no steps cap (research is open-ended).
      * - `planner`: moderate temperature (0.4) for balanced decomposition; no
      *   steps cap (planning is iterative).
+     * - `reviewer`: low temperature (0.2) for rigorous deterministic analysis;
+     *   steps: 50 guardrail (reviews are file-read-heavy — higher than
+     *   coder/tester's 25).
      *
      * When `coder`/`tester` hits the steps limit, OpenCode stops the agentic
      * loop and returns whatever the agent has produced so far (partial result).
@@ -54,6 +59,8 @@ object AgentConstants {
     const val PLANNER_DEFAULT_TEMPERATURE = 0.4
     const val TESTER_DEFAULT_TEMPERATURE = 0.2
     const val TESTER_DEFAULT_STEPS: Int = 25
+    const val REVIEWER_DEFAULT_TEMPERATURE = 0.2
+    const val REVIEWER_DEFAULT_STEPS: Int = 50
 
     const val AGENTS_DIR = ".opencode/agents"
     const val OWNERSHIP_MARKER = "<!-- sigil-managed -->"

@@ -20,15 +20,15 @@ import org.junit.jupiter.api.io.TempDir
  *
  * Verifies:
  * - [AgentRegistry] iteration writes enabled agents and removes disabled ones.
- * - New subagent files (coder/researcher/planner/tester) have valid frontmatter
- *   + prompt body.
+ * - New subagent files (coder/researcher/planner/tester/reviewer) have valid
+ *   frontmatter + prompt body.
  * - Per-agent model frontmatter (Path B): `model: "providerID/modelID"` +
  *   `variant: <value>` (sibling, not inline) when configured; omitted when
  *   not (inherit).
  * - Per-agent `temperature`/`steps` frontmatter (hardcoded constants).
  * - Generalized [AgentConfigWriter.buildTaskPermissionYaml] gating for v2
  *   subagents.
- * - `clearAll()` removes all 6 managed agent files (deliberate v2 behavior
+ * - `clearAll()` removes all 7 managed agent files (deliberate v2 behavior
  *   change, §7.7).
  * - v1 back-compat wrappers (`writeCodingAssistant`/`writeCouncil`) still work.
  *
@@ -46,6 +46,11 @@ class AgentConfigWriterV2Test {
         enableResearcher: Boolean = false,
         enablePlanner: Boolean = false,
         enableTester: Boolean = false,
+        // Reviewer defaults to false in the TEST helper (production
+        // OpenCodeAgentSettingsState defaults it to true — see
+        // `fresh install writes reviewer md by default` which constructs the
+        // raw state directly to lock in the default-ON behavior).
+        enableReviewer: Boolean = false,
         taskAllowedAgents: List<String> = listOf("explore", "general"),
         councilMembers: List<CouncilMember> = emptyList(),
         agentModels: List<AgentModelBinding> = emptyList(),
@@ -56,6 +61,7 @@ class AgentConfigWriterV2Test {
         this.enableResearcher = enableResearcher
         this.enablePlanner = enablePlanner
         this.enableTester = enableTester
+        this.enableReviewer = enableReviewer
         this.taskAllowedAgents = java.util.ArrayList(taskAllowedAgents)
         this.councilMembers = java.util.ArrayList(councilMembers)
         this.agentModels = java.util.ArrayList(agentModels)
@@ -75,6 +81,8 @@ class AgentConfigWriterV2Test {
 
     private fun coderBinding(model: CouncilMember) = AgentModelBinding(AgentConstants.CODER_AGENT_NAME, model)
 
+    private fun reviewerBinding(model: CouncilMember) = AgentModelBinding(AgentConstants.REVIEWER_AGENT_NAME, model)
+
     // ── Registry-driven writeAll ─────────────────────────────────────────
 
     @Test
@@ -90,6 +98,7 @@ class AgentConfigWriterV2Test {
         Files.exists(agentFile(AgentConstants.RESEARCHER_AGENT_NAME)) shouldBe false
         Files.exists(agentFile(AgentConstants.PLANNER_AGENT_NAME)) shouldBe false
         Files.exists(agentFile(AgentConstants.TESTER_AGENT_NAME)) shouldBe false
+        Files.exists(agentFile(AgentConstants.REVIEWER_AGENT_NAME)) shouldBe false
     }
 
     @Test
@@ -124,6 +133,38 @@ class AgentConfigWriterV2Test {
         content shouldContain "You are a scoped implementation subagent."
         content shouldContain "## Return Format (REQUIRED)"
         content shouldContain "Do NOT call `intellij_build_project`"
+    }
+
+    @Test
+    fun `writeAgent for reviewer writes valid markdown with frontmatter and prompt`() {
+        val writer = newWriter(newSettings(enableReviewer = true))
+        val def = AgentRegistry.byName(AgentConstants.REVIEWER_AGENT_NAME)
+        writer.writeAgent(def, isIntellijMcpEnabled = true)
+
+        val content = readAgent(AgentConstants.REVIEWER_AGENT_NAME)
+        content shouldContain AgentConstants.OWNERSHIP_MARKER
+        content shouldContain "mode: subagent"
+        content shouldContain "hidden: false"
+        content shouldContain "temperature: 0.2"
+        content shouldContain "steps: 50"
+        // Subagents cannot delegate (subagent_depth: 1): deny-only
+        // task permission, NOT the full allowlist (see cmt_b2e3c4d5e6f7).
+        content shouldContain "    \"*\": \"deny\""
+        content shouldNotContain "\"explore\": \"allow\""
+        // No model configured → no model: frontmatter (inherit)
+        content shouldNotContain "model:"
+        content shouldNotContain "variant:"
+        // Prompt body present — adversarial review, writes .review/ findings,
+        // identifies issues but never fixes them
+        content shouldContain "adversarial"
+        content shouldContain ".review/"
+        content shouldContain "IDENTIFY"
+        // Safety-critical constraints (mirror the coder/tester tests) — the
+        // build-ownership prohibition, the no-terminal rule, and the merge
+        // semantics are the highest-value lines in the reviewer prompt.
+        content shouldContain "Do NOT call `intellij_build_project`"
+        content shouldContain "No terminal commands"
+        content shouldContain "append your new comments"
     }
 
     @Test
@@ -198,6 +239,24 @@ class AgentConfigWriterV2Test {
     }
 
     @Test
+    fun `writeAgent for reviewer emits model and variant frontmatter when per-agent model configured`() {
+        val model = CouncilMember("anthropic", "claude-sonnet-4", "high")
+        val writer = newWriter(
+            newSettings(enableReviewer = true, agentModels = listOf(reviewerBinding(model)))
+        )
+        val def = AgentRegistry.byName(AgentConstants.REVIEWER_AGENT_NAME)
+        writer.writeAgent(def, isIntellijMcpEnabled = true)
+
+        val content = readAgent(AgentConstants.REVIEWER_AGENT_NAME)
+        // Path B: model is a STRING "providerID/modelID" (NOT a nested object);
+        // variant is a SIBLING field.
+        content shouldContain """model: "anthropic/claude-sonnet-4""""
+        content shouldContain "variant: \"high\""
+        // Must NOT be inline (providerID/modelID:variant)
+        content shouldNotContain """model: "anthropic/claude-sonnet-4:high""""
+    }
+
+    @Test
     fun `writeAgent omits variant frontmatter when thinking variant is blank`() {
         val model = CouncilMember("anthropic", "claude-sonnet-4") // no variant
         val writer = newWriter(
@@ -259,14 +318,23 @@ class AgentConfigWriterV2Test {
         // active model); council has its own per-MEMBER list embedded in the
         // prompt body. Neither should emit model:/variant: frontmatter even
         // if an agentModels binding happens to exist for them (defense).
+        //
+        // Uses a REALISTIC model (anthropic/claude-sonnet-4) rather than a
+        // placeholder ("x"/"y") so the test is robust against a future change
+        // that special-cases placeholder-looking values (review
+        // cmt_d0e1f2a3b4c6). The hasPerAgentModel=false gate in
+        // AgentFrontmatterContext.modelBinding is the real guard being tested.
         val members = listOf(CouncilMember("anthropic", "claude-sonnet-4"))
         val writer = newWriter(
             newSettings(
                 enableCouncil = true,
                 councilMembers = members,
                 agentModels = listOf(
-                    AgentModelBinding(AgentConstants.CODING_ASSISTANT_AGENT_NAME, CouncilMember("x", "y")),
-                    AgentModelBinding(AgentConstants.COUNCIL_AGENT_NAME, CouncilMember("x", "y")),
+                    AgentModelBinding(
+                        AgentConstants.CODING_ASSISTANT_AGENT_NAME,
+                        CouncilMember("anthropic", "claude-sonnet-4")
+                    ),
+                    AgentModelBinding(AgentConstants.COUNCIL_AGENT_NAME, CouncilMember("anthropic", "claude-opus-4")),
                 ),
             )
         )
@@ -304,11 +372,25 @@ class AgentConfigWriterV2Test {
     }
 
     @Test
+    fun `reviewer file removed when enableReviewer is false`() {
+        // First write the file
+        val writer = newWriter(newSettings(enableReviewer = true))
+        writer.writeAgent(AgentRegistry.byName(AgentConstants.REVIEWER_AGENT_NAME), isIntellijMcpEnabled = true)
+        Files.exists(agentFile(AgentConstants.REVIEWER_AGENT_NAME)) shouldBe true
+
+        // Now disable and re-write
+        val writer2 = newWriter(newSettings(enableReviewer = false))
+        writer2.writeAgent(AgentRegistry.byName(AgentConstants.REVIEWER_AGENT_NAME), isIntellijMcpEnabled = true)
+        Files.exists(agentFile(AgentConstants.REVIEWER_AGENT_NAME)) shouldBe false
+    }
+
+    @Test
     fun `all v2 subagent files removed via writeAll when disabled`() {
         // Write all enabled first
         val writer = newWriter(
             newSettings(
                 enableCoder = true, enableResearcher = true, enablePlanner = true, enableTester = true,
+                enableReviewer = true,
             )
         )
         writer.writeAll(isIntellijMcpEnabled = true)
@@ -322,6 +404,30 @@ class AgentConfigWriterV2Test {
         for (name in AgentConstants.V2_SUBAGENT_NAMES) {
             Files.exists(agentFile(name)) shouldBe false
         }
+    }
+
+    @Test
+    fun `fresh install writes reviewer md by default`() {
+        // Production OpenCodeAgentSettingsState defaults enableReviewer to true
+        // (the first v2 subagent to default enabled). Construct the RAW state —
+        // NOT the newSettings() helper (which defaults reviewer to false) — to
+        // lock in the default-ON behavior.
+        val raw = OpenCodeAgentSettingsState()
+        raw.enableReviewer shouldBe true // sanity: production default is ON
+        val writer = newWriter(raw)
+        writer.writeAll(isIntellijMcpEnabled = true)
+
+        Files.exists(agentFile(AgentConstants.REVIEWER_AGENT_NAME)) shouldBe true
+        // The fresh-install allowlist must contain reviewer: the task permission
+        // in coding-assistant.md would otherwise deny the post-completion gate
+        // delegation (regression guard for the default-allowlist gap).
+        val ca = readAgent(AgentConstants.CODING_ASSISTANT_AGENT_NAME)
+        ca shouldContain "\"reviewer\": \"allow\""
+        // Other v2 subagents default OFF → not written
+        Files.exists(agentFile(AgentConstants.CODER_AGENT_NAME)) shouldBe false
+        Files.exists(agentFile(AgentConstants.RESEARCHER_AGENT_NAME)) shouldBe false
+        Files.exists(agentFile(AgentConstants.PLANNER_AGENT_NAME)) shouldBe false
+        Files.exists(agentFile(AgentConstants.TESTER_AGENT_NAME)) shouldBe false
     }
 
     // ── Ownership marker overwrite semantics ─────────────────────────────
@@ -405,6 +511,18 @@ class AgentConfigWriterV2Test {
     }
 
     @Test
+    fun `buildTaskPermissionYaml includes reviewer when enableReviewer is true and reviewer in taskAllowedAgents`() {
+        val writer = newWriter(
+            newSettings(
+                enableReviewer = true,
+                taskAllowedAgents = listOf("explore", "general", "reviewer"),
+            )
+        )
+        val yaml = writer.buildTaskPermissionYaml()
+        yaml shouldContain "\"reviewer\": \"allow\""
+    }
+
+    @Test
     fun `buildTaskPermissionYaml gates all v2 subagents on their enable flags`() {
         // All v2 subagents in allowlist, but only coder + planner enabled
         val writer = newWriter(
@@ -413,7 +531,15 @@ class AgentConfigWriterV2Test {
                 enableResearcher = false,
                 enablePlanner = true,
                 enableTester = false,
-                taskAllowedAgents = listOf("explore", "general", "coder", "researcher", "planner", "tester"),
+                taskAllowedAgents = listOf(
+                    "explore",
+                    "general",
+                    "coder",
+                    "researcher",
+                    "planner",
+                    "tester",
+                    "reviewer"
+                ),
             )
         )
         val yaml = writer.buildTaskPermissionYaml()
@@ -421,6 +547,7 @@ class AgentConfigWriterV2Test {
         yaml shouldContain "\"planner\": \"allow\""
         yaml shouldNotContain "\"researcher\": \"allow\""
         yaml shouldNotContain "\"tester\": \"allow\""
+        yaml shouldNotContain "\"reviewer\": \"allow\""
     }
 
     @Test
@@ -460,7 +587,7 @@ class AgentConfigWriterV2Test {
                     "my agent",     // space
                     "x\"y",         // quote
                     "general",
-                    "a".repeat(129), // too long
+                    "a".repeat(129), // too long — exceeds the 128-char max
                 )
             )
         )
@@ -471,20 +598,27 @@ class AgentConfigWriterV2Test {
         yaml shouldNotContain "my/agent"
         yaml shouldNotContain "my agent"
         yaml shouldNotContain "x\"y"
+        // Length-boundary guard: a 129-char name exceeds YAML_SAFE_IDENTIFIER's
+        // 128-char max and MUST be dropped. This is the ONLY length-boundary
+        // assertion in the suite — a regression that removes the max-length
+        // check would otherwise pass silently (review cmt_f6a7b8c9d0e1).
+        val tooLong = "a".repeat(129)
+        yaml shouldNotContain tooLong
     }
 
-    // ── clearAll removes all 6 managed files (deliberate v2 behavior change) ─
+    // ── clearAll removes all 7 managed files (deliberate v2 behavior change) ─
 
     @Test
-    fun `clearAll removes all 6 managed agent files`() {
+    fun `clearAll removes all 7 managed agent files`() {
         val members = listOf(CouncilMember("anthropic", "claude-sonnet-4"))
         val writer = newWriter(
             newSettings(
                 enableCouncil = true, councilMembers = members,
                 enableCoder = true, enableResearcher = true, enablePlanner = true, enableTester = true,
+                enableReviewer = true,
             )
         )
-        // Write all 6
+        // Write all 7
         writer.writeAll(isIntellijMcpEnabled = true)
         for (name in AgentRegistry.ALL_NAMES) {
             Files.exists(agentFile(name)) shouldBe true
@@ -502,9 +636,29 @@ class AgentConfigWriterV2Test {
 
     @Test
     fun `writeCodingAssistant back-compat wrapper delegates to writeAgent via registry`() {
-        val writer = newWriter(newSettings(enableCodingAssistant = true))
-        val ok = writer.writeCodingAssistant(isIntellijMcpEnabled = true)
+        // Strengthened (review cmt_a7b8c9d0e1f2): the wrapper must delegate to
+        // writeAgent with the SAME isIntellijMcpEnabled value, not hardcode a
+        // different one (writeCouncil hardcodes false; a regression that
+        // hardcodes false here would pass a bare exists() check). Verify by
+        // comparing the wrapper output to a direct writeAgent call with the
+        // same flag — they must be byte-identical. The prompt is static (Path
+        // B), so there is no MCP-enabled-only marker to assert; output
+        // equality is the correct delegation proof.
+        val writer1 = newWriter(newSettings(enableCodingAssistant = true))
+        val ok = writer1.writeCodingAssistant(isIntellijMcpEnabled = true)
         ok shouldBe true
+        val wrapperContent = readAgent(AgentConstants.CODING_ASSISTANT_AGENT_NAME)
+
+        // Direct writeAgent call with the same flag in a fresh temp dir writer.
+        val writer2 = newWriter(newSettings(enableCodingAssistant = true))
+        writer2.writeAgent(
+            AgentRegistry.byName(AgentConstants.CODING_ASSISTANT_AGENT_NAME),
+            isIntellijMcpEnabled = true
+        )
+        val directContent = readAgent(AgentConstants.CODING_ASSISTANT_AGENT_NAME)
+
+        // Wrapper output must equal direct writeAgent output (delegation proof).
+        wrapperContent shouldBe directContent
         Files.exists(agentFile(AgentConstants.CODING_ASSISTANT_AGENT_NAME)) shouldBe true
     }
 
@@ -530,6 +684,7 @@ class AgentConfigWriterV2Test {
         content shouldContain "`coder`"
         content shouldContain "`researcher`"
         content shouldContain "`tester`"
+        content shouldContain "`reviewer`"
         content shouldContain "`council`"
         content shouldContain "`explore`"
         content shouldContain "`general`"
@@ -542,9 +697,15 @@ class AgentConfigWriterV2Test {
         // Per-agent models applied server-side (§10.Q1)
         content shouldContain "Per-agent models (applied server-side)"
         content shouldContain "do NOT pass a `model` parameter"
-        // Fan-out heuristic
-        content shouldContain "Fan-out heuristic"
-        content shouldContain "3+ independent files"
+        // Fan-out heuristic — assert the FULL bullet. A bare "2+ independent
+        // files" substring also matches the Parallel-implementation workflow
+        // header, so it would false-pass a regression of this bullet.
+        content shouldContain "**2+ independent files** → fan out"
+        // Delegation-by-default rewrite sections (2026-08-09) — lock the
+        // new sections in so a regression is caught.
+        content shouldContain "Accountability rule"
+        content shouldContain "delegate by phase"
+        content shouldContain "Post-completion review gate"
     }
 
     @Test
