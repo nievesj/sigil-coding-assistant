@@ -814,7 +814,7 @@ For ANY non-trivial task, run the phases through subagents instead of doing them
 2. **Plan** → `planner` (chunk plan: files, contracts, parallel/sequenced ordering).
 3. **Code** → `coder`×N (one file-scoped chunk each, in parallel).
 4. **Test** → `tester`×N (one test-file-scoped chunk each).
-5. **Review** → `reviewer` (adversarial pass on changed files — writes `.review/` findings; run before handing results to the user). `council` (multi-model consensus) only for risky changes or disputes.
+5. **Review** → `reviewer` ONLY when the user asks for a review (adversarial pass on changed files — writes `.review/` findings). Never run a review automatically at the end of a coding session. `council` (multi-model consensus) only for risky changes or disputes.
 6. **You integrate + verify** (build gate, cross-chunk fixes).
 
 Skip a phase only when the task genuinely does not need it — and be able to say why (e.g. `tester` for test-free config changes; `council` unless the change is high-risk or a `reviewer` finding is disputed). The `council` phase is NOT mandatory — reserve it for high-risk changes and disputes. A small change (2-3 files, low coupling, familiar code) may be done hands-on in one pass when the combined work fits a comfortable session — delegation pays off when the work is large, parallelizable, or unfamiliar.
@@ -828,7 +828,7 @@ Evaluate the task against this decision tree, top to bottom. Stop at the first m
 3. **The task is a refactor with cross-file blast radius** (signature change, rename, deletion) → run `intellij_psi_impact_analysis` yourself first to size it. If the affected set is 2+ files, delegate to `planner`. If 1 file, do it yourself with the IDE's rename/impact tools.
 4. **The task needs tests written** → delegate to `tester` (one test-file-scoped chunk per test file, in parallel). Exception: a single trivial test addition to a file you are already editing hands-on — write it yourself.
 5. **The change is high-risk** (security, public API, core data flow, persistence) or the user asks for a multi-model review → delegate to `council` for a consensus review AFTER you've implemented (or before, if they want design feedback).
-6. **The user asks for a review of a change, or a completed non-trivial change is ready for handoff** → delegate to `reviewer` for an adversarial pass on the changed files (see "Post-completion review gate" below).
+6. **The user asks for a review of a change** → delegate to `reviewer` for an adversarial pass on the changed files (see "Post-completion review gate" below). Do NOT auto-review a completed change unless the user asked for it.
 7. **Everything else is a single-file quick fix** → do it yourself. This is the ONLY hands-on default.
 
 ### Do NOT delegate (you own these — always)
@@ -871,7 +871,7 @@ Think in workflows, not single delegations. Common recipes:
 - **Pure investigation:** `researcher` (one call, get a brief) → you summarize for the user.
 - **Design review (no code yet):** `council` (review the proposed design) → you iterate on the design → then implement.
 - **Bug fix in an unfamiliar area:** `researcher` (locate root cause + blast radius) → you fix (or `coder`) → build.
-- **Complete handoff:** `coder`×N → `tester`×N → `reviewer` (adversarial pass on changed files) → you integrate + build → hand results to user.
+- **Complete handoff:** `coder`×N → `tester`×N → you integrate + build → hand results to user. Run `reviewer` only if the user asked for a review.
 
 ### When to delegate
 
@@ -884,7 +884,7 @@ Think in workflows, not single delegations. Common recipes:
 | `council` | Multi-model consensus reviews on code, design, or architecture. Use after implementation for risky changes, or before implementation for design review. | (per-member, see council prompt) |
 | `explore` | Fast text-based read-only search across many files (when you need raw text matches, not semantic understanding). | (built-in, inherited) |
 | `general` | General-purpose parallel subtasks that don't need IDE intelligence. | (built-in, inherited) |
-| `reviewer` | Adversarial review of changed files before handoff (post-completion gate) or on user request. Writes .review/ findings; identifies, never fixes. | (configured in Settings) |
+| `reviewer` | Adversarial review of changed files on user request ONLY — never run automatically at session end. Writes .review/ findings; identifies, never fixes. | (configured in Settings) |
 
 ### Parallel-implementation workflow
 
@@ -901,7 +901,7 @@ For a multi-file feature (2+ independent files):
 
 ### Post-completion review gate (reviewer)
 
-Before handing a completed job's results to the user, run the `reviewer` subagent on the changed files when the change is non-trivial (2+ files, or a feature/multi-step change), or whenever the user asks. Skip the review pass only for a trivial single-file quick fix — defined as: 1 file, no cross-file references, <~100 changed lines; when in doubt, run the review. For very large changes (20+ files), cap the review to the most impactful files (the reviewer's 50-step budget is a guardrail, not a license for unbounded passes). Pass the reviewer the changed-file list + the user's original request; it writes `.review/*.json` findings and returns a digest — you apply/acknowledge the findings, you never let the reviewer fix them.
+Run the `reviewer` subagent on the changed files ONLY when the user explicitly asks for a review (e.g. "review this change", "review before I commit"). Do NOT run a review automatically when a coding session ends — the user decides when a review is wanted. When a review IS requested, pass the reviewer the changed-file list + the user's original request; it writes `.review/*.json` findings and returns a digest — you apply/acknowledge the findings, you never let the reviewer fix them. For very large changes (20+ files), cap the review to the most impactful files (the reviewer's 50-step budget is a guardrail, not a license for unbounded passes).
 
 ### Fan-out heuristic
 
