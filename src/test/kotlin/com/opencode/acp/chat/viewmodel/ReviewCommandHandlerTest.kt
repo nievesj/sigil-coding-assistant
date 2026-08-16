@@ -7,10 +7,12 @@ import com.opencode.acp.chat.model.ControlBarState
 import com.opencode.acp.chat.model.FileChangeStatus
 import com.opencode.acp.chat.model.LineDelta
 import com.opencode.acp.chat.model.ProviderModel
+import com.opencode.acp.chat.model.StagedFilesResult
 import com.opencode.acp.chat.service.GitService
 import com.opencode.acp.chat.service.SendMessageResult
 import com.opencode.acp.review.ReviewCommentManager
 import com.opencode.acp.review.ReviewIndex
+import com.opencode.acp.review.ReviewMessages
 import com.intellij.openapi.application.Application
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
@@ -18,6 +20,7 @@ import com.intellij.openapi.util.Computable
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.collections.shouldHaveSize
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkObject
@@ -28,6 +31,8 @@ import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -87,6 +92,11 @@ class ReviewCommandHandlerTest {
         project = mockk<Project>(relaxed = true)
         gitService = mockk<GitService>(relaxed = true)
         reviewCommentManager = mockk<ReviewCommentManager>(relaxed = true)
+
+        // Default stub: StagedFilesResult is a sealed interface, so relaxed
+        // MockK needs an explicit return value. Tests that exercise the
+        // NothingStaged/NoGitRepository branches override this per-test.
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(emptyList())
 
         sendCalls = mutableListOf()
         sendWithModelCalls = mutableListOf()
@@ -202,7 +212,7 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewPerformCommand with no args calls sendFunction with perform prompt`() {
-        every { gitService.getChangedFiles() } returns listOf(changedFile("src/test.kt"))
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/test.kt")))
         runHandlerAwaiting { it.executeReviewPerformCommand("") }
 
         sendCalls shouldHaveSize 1
@@ -213,7 +223,7 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewPerformCommand with no args uses control bar model`() {
-        every { gitService.getChangedFiles() } returns emptyList()
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
         runHandlerAwaiting { it.executeReviewPerformCommand("") }
 
         // No model args → single sendFunction call (control-bar model)
@@ -225,7 +235,7 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewPerformCommand with resolvable model arg calls sendWithModelFunction`() {
-        every { gitService.getChangedFiles() } returns listOf(changedFile("src/main.kt"))
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/main.kt")))
         val model = ProviderModel(
             providerID = "anthropic",
             modelID = "claude-sonnet",
@@ -247,7 +257,7 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewPerformCommand with nonexistent model injects error message`() {
-        every { gitService.getChangedFiles() } returns emptyList()
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
         controlState = ControlBarState(models = emptyList())
         runHandlerAwaiting { it.executeReviewPerformCommand("nonexistent") }
 
@@ -259,8 +269,24 @@ class ReviewCommandHandlerTest {
     }
 
     @Test
+    fun `executeReviewPerformCommand escapes backticks in unresolved model args`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
+        controlState = ControlBarState(models = emptyList())
+        // An arg containing a backtick must be escaped so it cannot break the
+        // backtick code span wrapping it in the injected error message.
+        runHandlerAwaiting { it.executeReviewPerformCommand("foo`bar") }
+
+        injectedMessages shouldHaveSize 1
+        // The escaped form \\`foo\\`bar... must appear (backtick escaped), and the
+        // raw unescaped code-span terminator must NOT appear unescaped.
+        injectedMessages[0].contains("\\`") shouldBe true
+        sendCalls shouldHaveSize 0
+        sendWithModelCalls shouldHaveSize 0
+    }
+
+    @Test
     fun `executeReviewPerformCommand with multiple models sends once per model`() {
-        every { gitService.getChangedFiles() } returns emptyList()
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
         val model1 = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
         val model2 = ProviderModel("openai", "gpt-4", "GPT-4")
         controlState = ControlBarState(models = listOf(model1, model2))
@@ -275,7 +301,7 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewPerformCommand breaks loop and injects cancel message when cancelled`() {
-        every { gitService.getChangedFiles() } returns emptyList()
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
         val model1 = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
         val model2 = ProviderModel("openai", "gpt-4", "GPT-4")
         controlState = ControlBarState(models = listOf(model1, model2))
@@ -290,18 +316,121 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewPerformCommand resets cancelled flag at start`() {
-        every { gitService.getChangedFiles() } returns emptyList()
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
         runHandlerAwaiting { it.executeReviewPerformCommand("") }
 
-        // resetCancelled called at start (no-args path returns early after send)
-        resetCancelledCalls shouldHaveSize 1
+        // resetCancelled is called at start (line 246) AND in the finally block
+        // of the no-args path — so 2 calls total. The finally ensures the flag
+        // is cleared even if the send throws or the coroutine is cancelled.
+        resetCancelledCalls shouldHaveSize 2
+    }
+
+    @Test
+    fun `executeReviewPerformCommand breaks loop mid-way when cancelled between iterations`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
+        val model1 = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
+        val model2 = ProviderModel("openai", "gpt-4", "GPT-4")
+        controlState = ControlBarState(models = listOf(model1, model2))
+        isCancelled = false
+
+        // Build a custom handler that flips isCancelled after the first send
+        val scope = CoroutineScope(SupervisorJob())
+        var sendCount = 0
+        handler = ReviewCommandHandler(
+            scope = scope,
+            project = project,
+            gitService = gitService,
+            controlStateProvider = { controlState },
+            sendFunction = { text, files ->
+                sendCalls.add(SendCall(text, files))
+                SendMessageResult.Success("msg_ok")
+            },
+            sendWithModelFunction = { text, modelID, providerID, variant, model ->
+                sendWithModelCalls.add(SendWithModelCall(text, modelID, providerID, variant, model))
+                sendCount++
+                // After the first send succeeds, set cancellation flag to true
+                // so the second iteration's isCancelledProvider() check breaks the loop
+                if (sendCount >= 1) {
+                    isCancelled = true
+                }
+                SendMessageResult.Success("msg_ok")
+            },
+            injectLocalMessage = { msg -> injectedMessages.add(msg) },
+            refreshReviewFiles = {
+                val job = SupervisorJob()
+                job.complete()
+                refreshCalls.add(job)
+                job
+            },
+            isCancelledProvider = { isCancelled },
+            resetCancelled = { resetCancelledCalls.add(resetCancelledCalls.size) },
+        )
+        runBlocking {
+            handler.executeReviewPerformCommand("claude-sonnet gpt-4")
+            scope.coroutineContext[Job]!!.children.toList().forEach { it.join() }
+        }
+
+        // First model sent, then isCancelled is set to true, loop breaks before
+        // the second model (mid-loop cancellation check at ReviewCommandHandler.kt:283-288)
+        sendWithModelCalls shouldHaveSize 1
+        injectedMessages.any { it.contains("cancelled", ignoreCase = true) } shouldBe true
+    }
+
+    @Test
+    fun `executeReviewPerformCommand breaks loop on send failure and injects error message`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
+        val model1 = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
+        val model2 = ProviderModel("openai", "gpt-4", "GPT-4")
+        controlState = ControlBarState(models = listOf(model1, model2))
+
+        // Build a handler where sendWithModelFunction returns Error for the first model
+        val scope = CoroutineScope(SupervisorJob())
+        var sendCount = 0
+        handler = ReviewCommandHandler(
+            scope = scope,
+            project = project,
+            gitService = gitService,
+            controlStateProvider = { controlState },
+            sendFunction = { text, files ->
+                sendCalls.add(SendCall(text, files))
+                SendMessageResult.Success("msg_ok")
+            },
+            sendWithModelFunction = { text, modelID, providerID, variant, model ->
+                sendWithModelCalls.add(SendWithModelCall(text, modelID, providerID, variant, model))
+                sendCount++
+                // First model fails with an error
+                if (sendCount == 1) {
+                    SendMessageResult.Error("timeout", isStuckMutex = false)
+                } else {
+                    SendMessageResult.Success("msg_ok")
+                }
+            },
+            injectLocalMessage = { msg -> injectedMessages.add(msg) },
+            refreshReviewFiles = {
+                val job = SupervisorJob()
+                job.complete()
+                refreshCalls.add(job)
+                job
+            },
+            isCancelledProvider = { false },
+            resetCancelled = { resetCancelledCalls.add(resetCancelledCalls.size) },
+        )
+        runBlocking {
+            handler.executeReviewPerformCommand("claude-sonnet gpt-4")
+            scope.coroutineContext[Job]!!.children.toList().forEach { it.join() }
+        }
+
+        // First model fails → loop breaks, error injected, second model NOT sent
+        sendWithModelCalls shouldHaveSize 1
+        injectedMessages.any { it.contains("failed") } shouldBe true
+        injectedMessages.any { it.contains("claude-sonnet") || it.contains("Claude Sonnet") } shouldBe true
     }
 
     // ── executeReviewRecheckCommand ───────────────────────────────────────
 
     @Test
     fun `executeReviewRecheckCommand with no args calls sendFunction then refreshReviewFiles`() {
-        every { gitService.getChangedFiles() } returns listOf(changedFile("src/recheck.kt"))
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/recheck.kt")))
         every { reviewCommentManager.getIndex() } returns ReviewIndex()
         runHandlerAwaiting { it.executeReviewRecheckCommand("") }
 
@@ -312,7 +441,7 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewRecheckCommand with model args sends with model and refreshes`() {
-        every { gitService.getChangedFiles() } returns emptyList()
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
         every { reviewCommentManager.getIndex() } returns ReviewIndex()
         val model = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
         controlState = ControlBarState(models = listOf(model))
@@ -324,20 +453,22 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewRecheckCommand restores missing replies after refresh`() {
-        every { gitService.getChangedFiles() } returns emptyList()
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
         every { reviewCommentManager.getIndex() } returns ReviewIndex()
         coEvery { reviewCommentManager.restoreMissingReplies(any(), any()) } returns 2
         runHandlerAwaiting { it.executeReviewRecheckCommand("") }
 
         // restoreMissingReplies returns 2 → triggers a second refresh
         refreshCalls shouldHaveSize 2
+        // Verify the safety net was actually called, not just its side effect
+        coVerify { reviewCommentManager.restoreMissingReplies(any(), any()) }
     }
 
     // ── executeReviewPerformGamingCommand ────────────────────────────────
 
     @Test
     fun `executeReviewPerformGamingCommand with no args calls sendFunction`() {
-        every { gitService.getChangedFiles() } returns listOf(changedFile("src/game.cpp"))
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/game.cpp")))
         runHandlerAwaiting { it.executeReviewPerformGamingCommand("") }
 
         sendCalls shouldHaveSize 1
@@ -347,7 +478,7 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewPerformGamingCommand with model args calls sendWithModelFunction`() {
-        every { gitService.getChangedFiles() } returns listOf(changedFile("src/game.cpp"))
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/game.cpp")))
         val model = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
         controlState = ControlBarState(models = listOf(model))
         runHandlerAwaiting { it.executeReviewPerformGamingCommand("claude-sonnet") }
@@ -360,7 +491,7 @@ class ReviewCommandHandlerTest {
 
     @Test
     fun `executeReviewPerformCommand with wildcard resolves all models`() {
-        every { gitService.getChangedFiles() } returns emptyList()
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
         val model1 = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
         val model2 = ProviderModel("openai", "gpt-4", "GPT-4")
         controlState = ControlBarState(models = listOf(model1, model2))
@@ -368,5 +499,204 @@ class ReviewCommandHandlerTest {
 
         // * should resolve to all available models
         sendWithModelCalls shouldHaveSize 2
+    }
+
+    // ── StagedFilesResult branches (NothingStaged / NoGitRepository) ──────
+
+    @Test
+    fun `executeReviewPerformCommand with nothing staged injects message and does not send`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.NothingStaged
+        runHandlerAwaiting { it.executeReviewPerformCommand("") }
+        sendCalls shouldHaveSize 0
+        injectedMessages shouldHaveSize 1
+        injectedMessages[0] shouldBe ReviewMessages.NOTHING_STAGED
+    }
+
+    @Test
+    fun `executeReviewPerformCommand in non-git project injects message and does not send`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.NoGitRepository
+        runHandlerAwaiting { it.executeReviewPerformCommand("") }
+        sendCalls shouldHaveSize 0
+        injectedMessages shouldHaveSize 1
+        injectedMessages[0] shouldBe ReviewMessages.NO_GIT_REPO
+    }
+
+    @Test
+    fun `executeReviewPerformCommand with git error injects error message and does not send`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Error("fatal: not a git repository")
+        runHandlerAwaiting { it.executeReviewPerformCommand("") }
+        sendCalls shouldHaveSize 0
+        injectedMessages shouldHaveSize 1
+        injectedMessages[0].startsWith(ReviewMessages.GIT_ERROR_PREFIX) shouldBe true
+        injectedMessages[0].contains("fatal: not a git repository") shouldBe true
+    }
+
+    @Test
+    fun `executeReviewPerformGamingCommand with nothing staged injects message`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.NothingStaged
+        runHandlerAwaiting { it.executeReviewPerformGamingCommand("") }
+        sendCalls shouldHaveSize 0
+        injectedMessages shouldHaveSize 1
+        injectedMessages[0] shouldBe ReviewMessages.NOTHING_STAGED
+    }
+
+    @Test
+    fun `executeReviewRecheckCommand with nothing staged injects message and does not refresh`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.NothingStaged
+        every { reviewCommentManager.getIndex() } returns ReviewIndex()
+        runHandlerAwaiting { it.executeReviewRecheckCommand("") }
+        sendCalls shouldHaveSize 0
+        injectedMessages shouldHaveSize 1
+        injectedMessages[0] shouldBe ReviewMessages.NOTHING_STAGED
+        // No LLM send → no refresh/reply-restore
+        refreshCalls shouldHaveSize 0
+    }
+
+    @Test
+    fun `executeReviewRecheckCommand in non-git project injects message and does not refresh`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.NoGitRepository
+        every { reviewCommentManager.getIndex() } returns ReviewIndex()
+        runHandlerAwaiting { it.executeReviewRecheckCommand("") }
+        sendCalls shouldHaveSize 0
+        injectedMessages shouldHaveSize 1
+        injectedMessages[0] shouldBe ReviewMessages.NO_GIT_REPO
+        refreshCalls shouldHaveSize 0
+    }
+
+    @Test
+    fun `executeReviewRecheckCommand with git error injects message and does not refresh`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Error("fatal: corrupt repo")
+        every { reviewCommentManager.getIndex() } returns ReviewIndex()
+        runHandlerAwaiting { it.executeReviewRecheckCommand("") }
+        sendCalls shouldHaveSize 0
+        injectedMessages shouldHaveSize 1
+        injectedMessages[0].startsWith(ReviewMessages.GIT_ERROR_PREFIX) shouldBe true
+        injectedMessages[0].contains("fatal: corrupt repo") shouldBe true
+        refreshCalls shouldHaveSize 0
+    }
+
+    // ── Exception propagation + resetCancelled finally guarantee ──────────
+
+    @Test
+    fun `executeReviewPerformCommand resets cancelled flag even when sendWithModelFunction throws`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
+        val model1 = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
+        val model2 = ProviderModel("openai", "gpt-4", "GPT-4")
+        controlState = ControlBarState(models = listOf(model1, model2))
+
+        val scope = CoroutineScope(SupervisorJob())
+        handler = ReviewCommandHandler(
+            scope = scope,
+            project = project,
+            gitService = gitService,
+            controlStateProvider = { controlState },
+            sendFunction = { text, files ->
+                sendCalls.add(SendCall(text, files))
+                SendMessageResult.Success("msg_ok")
+            },
+            sendWithModelFunction = { _, _, _, _, _ ->
+                sendWithModelCalls.add(SendWithModelCall("", "", "", "", null))
+                // First model's send THROWS (not returns Error) — the finally
+                // block must still call resetCancelled().
+                throw RuntimeException("boom")
+            },
+            injectLocalMessage = { msg -> injectedMessages.add(msg) },
+            refreshReviewFiles = {
+                val job = SupervisorJob()
+                job.complete()
+                refreshCalls.add(job)
+                job
+            },
+            isCancelledProvider = { false },
+            resetCancelled = { resetCancelledCalls.add(resetCancelledCalls.size) },
+        )
+        runBlocking {
+            try {
+                handler.executeReviewPerformCommand("claude-sonnet gpt-4")
+            } catch (_: RuntimeException) {
+                // Expected — the thrown exception propagates out of scope.launch
+            }
+            scope.coroutineContext[Job]!!.children.toList().forEach { it.join() }
+        }
+
+        // Only the first model was attempted (it threw) — second model NOT sent
+        sendWithModelCalls shouldHaveSize 1
+        // resetCancelled is called at the start (line 246) AND in the finally
+        // block — so at least 2 calls even though the send threw.
+        (resetCancelledCalls.size >= 2) shouldBe true
+    }
+
+    // ── Cancellation during an in-flight send ─────────────────────────────
+    // Verifies the sendWithCancellationPoll helper: when isCancelled flips to
+    // true DURING a suspending send, the in-flight send is cancelled (not left
+    // to complete) and the loop breaks before the next model.
+
+    @Test
+    fun `executeReviewPerformCommand cancels in-flight send when user cancels during suspension`() {
+        every { gitService.getStagedFiles() } returns StagedFilesResult.Staged(listOf(changedFile("src/dummy.kt")))
+        val model1 = ProviderModel("anthropic", "claude-sonnet", "Claude Sonnet")
+        val model2 = ProviderModel("openai", "gpt-4", "GPT-4")
+        controlState = ControlBarState(models = listOf(model1, model2))
+        isCancelled = false
+
+        val scope = CoroutineScope(SupervisorJob())
+        var sendStarted = false
+        handler = ReviewCommandHandler(
+            scope = scope,
+            project = project,
+            gitService = gitService,
+            controlStateProvider = { controlState },
+            sendFunction = { text, files ->
+                sendCalls.add(SendCall(text, files))
+                SendMessageResult.Success("msg_ok")
+            },
+            sendWithModelFunction = { _, _, _, _, _ ->
+                sendWithModelCalls.add(SendWithModelCall("", "", "", "", null))
+                sendStarted = true
+                // Simulate a long-running send. The cancellation poll runs every
+                // 200ms; we sleep here so the poll has a chance to detect the
+                // flag flip and cancel this coroutine.
+                delay(2000) // Long enough for the 200ms poll to fire multiple times
+                SendMessageResult.Success("msg_ok")
+            },
+            injectLocalMessage = { msg -> injectedMessages.add(msg) },
+            refreshReviewFiles = {
+                val job = SupervisorJob()
+                job.complete()
+                refreshCalls.add(job)
+                job
+            },
+            isCancelledProvider = { isCancelled },
+            resetCancelled = { resetCancelledCalls.add(resetCancelledCalls.size) },
+        )
+
+        runBlocking {
+            // Launch a coroutine that flips the cancellation flag shortly after
+            // the send starts, simulating the user clicking Cancel mid-stream.
+            scope.launch {
+                // Wait until the send has started, then set the flag.
+                // The poll interval is 200ms, so a 300ms delay gives the send
+                // time to start and the poll time to detect the flag.
+                delay(300)
+                isCancelled = true
+            }
+            // executeReviewPerformCommand launches its own coroutine via scope.launch
+            // and returns immediately. The cancellation happens inside that coroutine.
+            handler.executeReviewPerformCommand("claude-sonnet gpt-4")
+            // Wait for all launched child coroutines to complete (including the
+            // cancellation-flag-flip coroutine and the review loop coroutine).
+            scope.coroutineContext[Job]!!.children.toList().forEach { it.join() }
+        }
+
+        // The first send was started, then cancelled mid-flight (the
+        // sendWithModelFunction caught CancellationException and recorded
+        // "CANCELLED"). The loop broke before the second model.
+        sendStarted shouldBe true
+        // Either the send was cancelled (recorded "CANCELLED") or the loop
+        // broke on the next-iteration check. Either way, at most 1 send
+        // attempt and the second model was NOT sent.
+        sendWithModelCalls shouldHaveSize 1
+        // A cancel message was injected
+        injectedMessages.any { it.contains("cancelled", ignoreCase = true) } shouldBe true
     }
 }

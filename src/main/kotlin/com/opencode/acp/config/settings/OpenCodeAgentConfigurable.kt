@@ -360,20 +360,6 @@ class OpenCodeAgentConfigurable : Configurable {
         }
 
         fetchModelsJob = service.scope.launch {
-            // Compute the modality ONCE before the try-catch so BOTH the
-            // success path and the error path can bind their invokeLater
-            // callbacks to it. Previously the error-path invokeLater (the
-            // restart-hint update) was unbound — if the panel was disposed
-            // between the isDisplayable check and the Swing mutation, it could
-            // update a disposed component. Binding to modality ensures the
-            // callback only runs when the settings dialog is in a suitable
-            // modality state (review cmt_a7b8c9d0e1f3).
-            //
-            // stateForComponent returns NON_BLOCKING when the component is
-            // not displayable / null — safe to compute even if the panel is
-            // gone (the callbacks themselves re-check panel?.isDisplayable).
-            val modality =
-                ModalityState.stateForComponent(panel ?: this@OpenCodeAgentConfigurable.panel ?: return@launch)
             try {
                 val providers = service.listProviders()
                 if (providers == null) {
@@ -398,6 +384,23 @@ class OpenCodeAgentConfigurable : Configurable {
                         }
                     }.sortedBy { it.displayName }
 
+                // Compute the modality AFTER the async listProviders() call,
+                // NOT before it. At createComponent() time the panel is not
+                // yet added to the modal Settings dialog, so stateForComponent
+                // returns NON_BLOCKING — and invokeLater(callback,
+                // NON_BLOCKING) defers until the app is non-blocking, which
+                // NEVER happens while the modal Settings dialog is open. The
+                // callback (availableModels = models) would never fire and the
+                // pickers would stay empty. By computing the modality here
+                // (after the ~1s fetch, when the panel is displayable and
+                // inside the dialog), stateForComponent returns the dialog's
+                // actual modality so invokeLater fires immediately.
+                val modality = (panel ?: this@OpenCodeAgentConfigurable.panel)?.let {
+                    ModalityState.stateForComponent(it)
+                } ?: run {
+                    logger.debug { "[ACP] AgentConfigurable: panel was null after fetch — models not loaded" }
+                    return@launch
+                }
                 ApplicationManager.getApplication().invokeLater({
                     if (panel?.isDisplayable != true) return@invokeLater
                     availableModels = models
@@ -410,15 +413,22 @@ class OpenCodeAgentConfigurable : Configurable {
                 logger.warn(e) { "[ACP] AgentConfigurable: failed to fetch available models" }
                 val hint = restartHintLabel
                 if (hint != null) {
-                    // Bind the error-path callback to the same modality as the
-                    // success path — consistent EDT discipline, prevents
-                    // updating a disposed component (review cmt_a7b8c9d0e1f3).
+                    // Compute the modality from the panel here too (after the
+                    // failed fetch) so the error hint shows inside the modal
+                    // Settings dialog. stateForComponent on a non-displayable
+                    // panel returns NON_BLOCKING, which would defer the
+                    // callback forever inside a modal dialog — so fall back to
+                    // defaultModalityState() if the panel is gone.
+                    val errModality =
+                        (panel ?: this@OpenCodeAgentConfigurable.panel)?.let {
+                            ModalityState.stateForComponent(it)
+                        } ?: ModalityState.defaultModalityState()
                     ApplicationManager.getApplication().invokeLater({
                         if (panel?.isDisplayable == true) {
                             hint.text = "[!] Failed to load models - retry by reopening settings"
                             hint.foreground = JBColor.RED
                         }
-                    }, modality)
+                    }, errModality)
                 }
             }
         }

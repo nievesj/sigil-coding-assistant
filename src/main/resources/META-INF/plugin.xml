@@ -76,6 +76,13 @@
          When absent, the plugin works normally — tools are simply not registered. -->
     <depends config-file="plugin-mcp.xml" optional="true">com.intellij.mcpServer</depends>
 
+    <!-- Optional: git4idea (vcs-git) for staged-changes review.
+         When present, staged-changes review (git diff cached) is enabled.
+         When absent, getStagedFiles() returns NoGitRepository gracefully.
+         Plugin id is "Git4Idea" (CamelCase) per the git4idea plugin.xml.
+         See TDD docs/tdd/review-staged-changes-only.md. -->
+    <depends config-file="plugin-git.xml" optional="true">Git4Idea</depends>
+
     <extensions defaultExtensionNs="com.intellij">
         <applicationConfigurable
             parentId="tools"

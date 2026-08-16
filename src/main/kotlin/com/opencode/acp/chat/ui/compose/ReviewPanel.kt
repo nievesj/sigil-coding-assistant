@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import com.opencode.acp.chat.ui.theme.ChatTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -62,6 +63,7 @@ import com.opencode.acp.chat.model.CommentCounts
 import com.opencode.acp.chat.model.FileChangeStatus
 import com.opencode.acp.chat.model.LineDelta
 import com.opencode.acp.chat.model.ReviewState
+import com.opencode.acp.chat.model.StagedFilesResult
 import com.opencode.acp.chat.service.GitService
 import com.opencode.acp.chat.service.getRelativePath
 import com.opencode.acp.follow.EditorFollowManager
@@ -69,6 +71,7 @@ import com.opencode.acp.review.ReviewComment
 import com.opencode.acp.review.ReviewCommentDiffExtension
 import com.opencode.acp.review.ReviewCommentManager
 import com.opencode.acp.review.ReviewIndex
+import com.opencode.acp.review.ReviewMessages
 import com.opencode.acp.review.ReviewSeverity
 import com.opencode.acp.review.ReviewStatus
 import kotlinx.coroutines.Dispatchers
@@ -89,12 +92,13 @@ import org.jetbrains.jewel.ui.icon.IconKey
 // ── Review Panel (sidebar tab content) ───────────────────────────────────────
 
 /**
- * One-time notification flag for [openDiffForPath] — set the first time a
+ * Per-project notification flags for [openDiffForPath] — set the first time a
  * `NoClassDefFoundError` prevents the diff viewer from opening, so the user
- * gets a single warning dialog instead of silent failure (or per-click spam).
+ * gets a single warning dialog per project instead of silent failure (or
+ * per-click spam). Keyed by project so a failure in one project doesn't
+ * suppress the warning in another (multi-project IDE window).
  */
-@Volatile
-private var diffOpenFailedNotified: Boolean = false
+private val diffOpenFailedNotifiedByProject = java.util.concurrent.ConcurrentHashMap<Project, Boolean>()
 
 /**
  * Main composable for the Review tab.
@@ -136,16 +140,26 @@ fun ReviewPanel(
         val vfsListener = object : AsyncFileListener {
             override fun prepareChange(events: List<VFileEvent>): AsyncFileListener.ChangeApplier? {
                 // Emit on any non-transactional file event (skip .git internal, build dirs, etc.)
-                // NOTE: `.review/` writes are intentionally NOT filtered out — the review panel
-                // should refresh when the LLM agent writes review JSON. There IS a benign feedback
-                // path: VFS write → refreshSignal → produceState → gitService.getChangedFiles()
-                // (read-only VCS query). It does not write to `.review/`, so there is no infinite
-                // loop. If getChangedFiles() ever writes a cache file, this could become a problem.
+                // NOTE: `.review/` writes ARE filtered out here to avoid triggering an expensive
+                // `git diff --cached` on every LLM-written review JSON file. Comment changes
+                // are picked up by `commentChangeSignal` (a StateFlow<ReviewIndex>) which
+                // already triggers produceState via `key2 = commentIndex` — that path only
+                // re-derives comment maps without re-running getStagedFiles(). The staged
+                // files list refreshes on the next non-`.review/` VFS event or ChangeListManager
+                // event, which is sufficient since `.review/` writes don't change the staged
+                // file set.
                 val relevant = events.any { ev ->
                     val path = ev.file?.path?.replace('\\', '/') ?: return@any false
+                    // Skip VCS-internal, IDE-internal, build, and plugin-internal
+                    // .review/ directories. Use a robust check that handles:
+                    // - absolute paths with a leading slash (common): `/.review/`
+                    // - .review/ as the first path segment (relative): `.review/`
+                    // - any nested occurrence
                     !path.contains("/.git/") &&
-                    !path.contains("/.idea/") &&
-                    !path.contains("/build/")
+                            !path.contains("/.idea/") &&
+                            !path.contains("/build/") &&
+                            !path.contains("/.review/") &&
+                            !path.startsWith(".review/")
                 }
                 if (relevant) {
                     refreshSignal.update { it + 1 }
@@ -180,48 +194,90 @@ fun ReviewPanel(
         .debounce(300)
         .collectAsState(initial = 0L)
 
-    // Fetch data on background thread inside read action, update state on EDT.
-    // Uses Mutex to prevent concurrent refreshes — only one refresh runs at a time.
-    // Catch Exception to avoid swallowing OutOfMemoryError and other serious JVM errors.
+    // ── Split state: VCS file list (expensive) vs comment maps (in-memory) ──
     //
-    // Key on `commentIndex` directly (not a stringified refreshKey) so the produceState
-    // block restarts whenever the comment index changes. The maps are derived INSIDE
-    // the block from `commentIndex`, eliminating the fragile outer-scope capture that
-    // could go stale if the remember keys for the maps were ever changed.
-    val state by produceState<ReviewState>(
-        initialValue = ReviewState.Loading,
-        key1 = debouncedRefresh,
-        key2 = commentIndex
-    ) {
-        // Derive CommentCounts and open-comments-per-file from the current
-        // commentIndex inside the produceState block — self-contained capture.
-        val counts = CommentCounts(
+    // Previously a single produceState keyed on (debouncedRefresh, commentIndex)
+    // re-ran gitService.getStagedFiles() (an expensive `git diff --cached` VCS
+    // operation) every time a review comment was added/resolved/replied — even
+    // though comment changes do NOT change the staged file set. On a large repo
+    // this added hundreds of ms of latency to every comment edit.
+    //
+    // Now the VCS query is keyed ONLY on debouncedRefresh (VCS/refresh events),
+    // and the comment maps are derived purely in-memory from commentIndex (no
+    // VCS call). The two are merged into the final ReviewState via derivedStateOf.
+    //
+    // AGENTS.md "Review Panel VFS Listener" hard constraint: the produceState
+    // block must NEVER write to `.review/`. This split respects that — the VCS
+    // block only reads getStagedFiles(); the comment maps are derived from the
+    // StateFlow without any .review/ I/O.
+
+    // Comment maps — derived purely in-memory from commentIndex (no VCS call).
+    // Recomputed only when commentIndex changes (a new ReviewIndex is emitted).
+    val commentCounts = remember(commentIndex) {
+        CommentCounts(
             commentIndex.commentsByFile
                 .mapValues { (_, comments) -> comments.count { it.status == ReviewStatus.OPEN } }
                 .filterValues { it > 0 }
         )
-        val openComments = commentIndex.commentsByFile
+    }
+    val openCommentsByFile = remember(commentIndex) {
+        commentIndex.commentsByFile
             .mapValues { (_, comments) ->
                 comments.filter { it.status == ReviewStatus.OPEN }
                     .sortedBy { it.startLine }
             }
             .filterValues { it.isNotEmpty() }
+    }
+
+    // VCS file list — keyed ONLY on debouncedRefresh. Runs getStagedFiles()
+    // inside readAction on Dispatchers.IO, guarded by the refresh Mutex.
+    val filesResult by produceState<StagedFilesResult>(
+        initialValue = StagedFilesResult.NoGitRepository,
+        key1 = debouncedRefresh,
+    ) {
         try {
             refreshMutex.withLock {
                 value = withContext(Dispatchers.IO) {
                     readAction {
-                    val files = gitService.getChangedFiles()
-                    if (files.isEmpty()) ReviewState.Empty
-                    else ReviewState.Loaded(files, counts, openComments)
+                        gitService.getStagedFiles()
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: NoClassDefFoundError) {
+            // git4idea classes missing despite the isPluginInstalled guard in
+            // GitService (plugin present-but-disabled, classloading edge case).
+            // NoClassDefFoundError is an Error, not an Exception, so the generic
+            // catch(Exception) below would NOT catch it — it would escape and crash
+            // the produceState coroutine, leaving the Review tab stuck on Loading.
+            // Degrade to NoGitRepository so the UI shows the no-git message.
+            value = StagedFilesResult.NoGitRepository
         } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            value = ReviewState.Error(
-                message = e.message ?: "Failed to load changes",
-                retryable = true
-            )
+            value = StagedFilesResult.Error(e.message ?: "Failed to load changes")
+        }
+    }
+
+    // Merge the VCS file list with the comment maps into the final ReviewState.
+    // derivedStateOf recomputes only when filesResult OR the comment maps change,
+    // and the comment maps are stable references (remember(commentIndex)) so they
+    // don't trigger spurious recompositions.
+    val state by remember(commentCounts, openCommentsByFile) {
+        derivedStateOf {
+            when (filesResult) {
+                is StagedFilesResult.Staged -> ReviewState.Loaded(
+                    (filesResult as StagedFilesResult.Staged).files,
+                    commentCounts,
+                    openCommentsByFile,
+                )
+
+                StagedFilesResult.NothingStaged -> ReviewState.NothingStaged
+                StagedFilesResult.NoGitRepository -> ReviewState.NotAGitRepository
+                is StagedFilesResult.Error -> ReviewState.Error(
+                    message = (filesResult as StagedFilesResult.Error).message,
+                    retryable = true,
+                )
+            }
         }
     }
 
@@ -239,13 +295,15 @@ fun ReviewPanel(
         )
         when (val s = state) {
             is ReviewState.Loading -> ReviewLoadingContent(Modifier.fillMaxSize())
-            is ReviewState.Empty -> ReviewEmptyContent(Modifier.fillMaxSize())
+            is ReviewState.NothingStaged -> ReviewNothingStagedContent()
+            is ReviewState.NotAGitRepository -> ReviewNoGitRepoContent()
             is ReviewState.Error -> ReviewErrorContent(
                 message = s.message,
                 retryable = s.retryable,
                 onRetry = { refreshSignal.update { it + 1 } },
                 modifier = Modifier.fillMaxSize()
             )
+
             is ReviewState.Loaded -> ReviewFileListContent(
                 files = s.files,
                 commentCounts = s.commentCounts,
@@ -263,6 +321,7 @@ fun ReviewPanel(
                                 openFileInEditor(project, virtualFile)
                             }
                         }
+
                         else -> openDiffForPath(project, filePath, virtualFile, scope)
                     }
                 },
@@ -410,6 +469,7 @@ private fun ChangedFileRow(
                         )
                     }
                 }
+
                 is LineDelta.Unknown -> {
                     Text(
                         text = "—",
@@ -433,12 +493,12 @@ private fun ChangedFileRow(
                         .clickable(onClick = onOpenFile),
                     contentAlignment = Alignment.Center
                 ) {
-                Icon(
-                    key = PlatformIconKeys.Actions.Diff,
-                    contentDescription = "Diff",
-                    modifier = Modifier.size(ChatTheme.dims.reviewOpenFileIconSize),
-                    tint = if (isLocateHovered) ChatTheme.colors.text.link else pathColor
-                )
+                    Icon(
+                        key = PlatformIconKeys.Actions.Diff,
+                        contentDescription = "Diff",
+                        modifier = Modifier.size(ChatTheme.dims.reviewOpenFileIconSize),
+                        tint = if (isLocateHovered) ChatTheme.colors.text.link else pathColor
+                    )
                 }
             }
         }
@@ -462,7 +522,7 @@ private fun ChangedFileRow(
             ) {
                 Icon(
                     key = if (expanded) PlatformIconKeys.General.ChevronDown
-                          else PlatformIconKeys.General.ChevronRight,
+                    else PlatformIconKeys.General.ChevronRight,
                     contentDescription = if (expanded) "Collapse" else "Expand",
                     modifier = Modifier.size(12.dp),
                     tint = commentColor
@@ -581,9 +641,9 @@ private fun ReviewCommentChildRow(
 
 /** Map a review severity to a Jewel icon key matching [ReviewIcons]. */
 private fun severityIconKey(severity: ReviewSeverity): IconKey = when (severity) {
-    ReviewSeverity.ERROR   -> PlatformIconKeys.General.BalloonError
+    ReviewSeverity.ERROR -> PlatformIconKeys.General.BalloonError
     ReviewSeverity.WARNING -> PlatformIconKeys.General.Warning
-    ReviewSeverity.INFO    -> PlatformIconKeys.General.BalloonInformation
+    ReviewSeverity.INFO -> PlatformIconKeys.General.BalloonInformation
 }
 
 // ── File type icons ────────────────────────────────────────────────────────────
@@ -662,15 +722,31 @@ private fun ReviewLoadingContent(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun ReviewEmptyContent(modifier: Modifier = Modifier) {
-    Box(
-        modifier = modifier.fillMaxSize().padding(horizontal = 16.dp),
-        contentAlignment = Alignment.Center
+private fun ReviewNothingStagedContent() {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
         Text(
-            text = "No changes",
+            text = ReviewMessages.NOTHING_STAGED_UI,
             fontSize = ChatTheme.fonts.reviewEmpty,
-            color = ChatTheme.colors.text.disabled
+            color = ChatTheme.colors.text.disabled,
+        )
+    }
+}
+
+@Composable
+private fun ReviewNoGitRepoContent() {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = ReviewMessages.NO_GIT_REPO_UI,
+            fontSize = ChatTheme.fonts.reviewEmpty,
+            color = ChatTheme.colors.text.disabled,
         )
     }
 }
@@ -709,6 +785,14 @@ private fun ReviewErrorContent(
 
 // ── Diff/Editor helpers ───────────────────────────────────────────────────────
 
+// TODO: openDiffForPath currently uses defaultChangeList.changes (working-tree diff).
+//   Per TDD §4.7.3, it should pass staged changes from GitService.getStagedFiles()
+//   alongside the List<ChangedFile> so the diff viewer shows staged (not working-tree)
+//   diffs. This requires changing the function signature and threading staged changes
+//   through the UI — deferred as a secondary concern. The staged file LIST in the
+//   Review tab works correctly; the diff viewer showing working-tree is a known
+//   limitation.
+
 /**
  * Opens the IDE's native diff viewer for a tracked change.
  * All VCS reads happen on Dispatchers.IO inside readAction;
@@ -721,7 +805,12 @@ private fun ReviewErrorContent(
  *   the caller's lifecycle (e.g., the composable's rememberCoroutineScope)
  *   to prevent coroutine leaks after project disposal.
  */
-fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intellij.openapi.vfs.VirtualFile?, scope: kotlinx.coroutines.CoroutineScope) {
+fun openDiffForPath(
+    project: Project,
+    filePath: String,
+    virtualFile: com.intellij.openapi.vfs.VirtualFile?,
+    scope: kotlinx.coroutines.CoroutineScope
+) {
     scope.launch(kotlinx.coroutines.Dispatchers.IO) {
         try {
             val changeListManager = ChangeListManager.getInstance(project)
@@ -762,6 +851,9 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
                 ApplicationManager.getApplication().invokeLater {
                     try {
                         DiffManager.getInstance().showDiff(project, request, DiffDialogHints.DEFAULT)
+                        // Reset the one-shot failure flag on success so a future
+                        // failure (after a transient issue is resolved) can notify again.
+                        diffOpenFailedNotifiedByProject.remove(project)
                     } catch (e: NoClassDefFoundError) {
                         // Missing optional dependency — indicates a broken plugin installation.
                         // Log at ERROR level so the user is aware of the configuration issue.
@@ -782,8 +874,8 @@ fun openDiffForPath(project: Project, filePath: String, virtualFile: com.intelli
                             .error("[ACP] Failed to open diff viewer for $filePath — missing dependency", e)
                         // One-time user-visible warning so the failure isn't completely silent.
                         // `invokeLater` already puts us on EDT, so `Messages.showWarningDialog` is safe here.
-                        if (!diffOpenFailedNotified) {
-                            diffOpenFailedNotified = true
+                        // Per-project: a failure in project A doesn't suppress the warning in project B.
+                        if (diffOpenFailedNotifiedByProject.putIfAbsent(project, true) == null) {
                             com.intellij.openapi.ui.Messages.showWarningDialog(
                                 project,
                                 "The diff viewer could not be opened (missing dependency: ${e.message}). See idea.log for details.",
