@@ -18,6 +18,7 @@ data class ChangedFile(
 sealed interface LineDelta {
     /** Known line counts computed via LCS diff. */
     data class Known(val additions: Int, val deletions: Int) : LineDelta
+
     /** Binary file, untracked file, or diff unavailable — display "—" in UI. */
     data object Unknown : LineDelta
 }
@@ -52,6 +53,30 @@ sealed interface ReviewState {
         val commentCounts: CommentCounts = CommentCounts(),
         val openCommentsByFile: Map<String, List<ReviewComment>> = emptyMap(),
     ) : ReviewState
-    data object Empty : ReviewState           // No changes in any VCS
+
+    /** Nothing staged in a git repo — prompt user to `git add`. */
+    data object NothingStaged : ReviewState
+
+    /** Project is not a git repository, or git4idea is not loaded — feature requires git. */
+    data object NotAGitRepository : ReviewState
     data class Error(val message: String, val retryable: Boolean = true) : ReviewState
+}
+
+/** Result of enumerating git-staged files. Sealed so callers distinguish
+ *  the "empty", "non-git", and "error" cases from "files present" without sentinels. */
+sealed interface StagedFilesResult {
+    /** Staged files exist. [files] is non-empty. */
+    data class Staged(val files: List<ChangedFile>) : StagedFilesResult
+
+    /** Git repo(s) found, but nothing is staged (no `git add` yet). */
+    data object NothingStaged : StagedFilesResult
+
+    /** No git repository in the project, or git4idea plugin not loaded. */
+    data object NoGitRepository : StagedFilesResult
+
+    /** Git command failed for all repositories (e.g., corrupt repo, missing git binary,
+     *  permission error). [message] contains the joined error output for diagnostics.
+     *  Distinct from [NothingStaged] so callers can show an error, not a misleading
+     *  "stage your files" prompt. */
+    data class Error(val message: String) : StagedFilesResult
 }

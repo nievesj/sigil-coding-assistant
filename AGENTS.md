@@ -36,8 +36,11 @@ edits and return; the main task gates completion on the build + test result.
   the IntelliJ application context), mark it `@Disabled` with a clear reason
   referencing the relevant AGENTS.md section.
 - **Skipped tests are allowed only with justification.** The current baseline has
-  21 skipped tests: 18 `@Disabled` Compose UI tests (see "Compose UI Tests �
-  ComposePanel Cannot Render in Plain Unit Tests" below) and 3 pre-existing skips.
+  27 skipped tests: 18 `@Disabled` Compose UI tests (see "Compose UI Tests —
+  ComposePanel Cannot Render in Plain Unit Tests" below), 5 `@Disabled` `@Tag("psi")`
+  GitLineHandler tests (see "GitLineHandler Requires IntelliJ Application Context"
+  below), 1 `@Disabled` AgentConfigurableProviderModelsTest (see "Disabled Test —
+  AgentConfigurableProviderModelsTest" below), and 3 pre-existing skips.
   Do not add new `@Disabled` tests without documenting the reason in AGENTS.md.
 
 ### Compose UI Tests � ComposePanel Cannot Render in Plain Unit Tests
@@ -80,6 +83,81 @@ context.
 **Files:** `ComposePanelTestBase.kt` (base class + full docs),
 `CheckboxChipTest.kt`, `ConnectionBannerStatesTest.kt`,
 `MessageListStaleDataTest.kt` (all `@Disabled`).
+
+### GitLineHandler Requires IntelliJ Application Context
+
+`GitService.getStagedFiles()` constructs a `GitLineHandler(project, repo.root,
+GitCommand.DIFF)` for each git repository. `GitLineHandler`'s constructor
+calls `GitExecutableManager.getInstance()` and `ProjectLevelVcsManager.getInstance()`
+internally, which require a bootstrapped IntelliJ application context
+(`ApplicationManager.getApplication()` initialized). Plain unit tests do not
+bootstrap the application context, so constructing `GitLineHandler` fails.
+
+This is a DISTINCT limitation from the Compose UI Tests `ComposePanel`/`ModalityState`
+NPE — it is about git4idea service initialization, not Compose rendering.
+
+**Symptom:** `NullPointerException` / `IllegalStateException` during
+`GitLineHandler` construction (before `Git.runCommand` is ever called).
+
+**What works (current approach):**
+- The 3 early-return branches of `getStagedFiles()` (git4idea not installed, no
+  git repos, NoClassDefFoundError/IllegalStateException from
+  GitRepositoryManager) ARE unit-tested via MockK in `GitServiceTest` — they
+  don't construct `GitLineHandler`.
+- The 5 full-chain branches (empty diff → NothingStaged, staged files → Staged,
+  `.review/` filtering, failed command) are `@Disabled` + `@Tag("psi")` so the
+  `testPsi` Gradle task picks them up when the IntelliJ test framework
+  (`LightPlatformTestCase`/`TestApplication`) is used to bootstrap the
+  application context — that makes `GitLineHandler` constructible.
+- The diff-parsing logic itself is fully covered by `UnifiedDiffParserTest`
+  (pure-logic parser, no platform dependencies).
+
+**To enable the 5 full-chain tests in the future:**
+1. Use `LightPlatformTestCase` or `TestApplication` to bootstrap the
+   application context (same path as enabling the Compose UI tests).
+2. Remove the `@Disabled` annotations (keep `@Tag("psi")`).
+
+**Files:** `GitServiceTest.kt` (5 `@Disabled` `@Tag("psi")` tests).
+
+### Disabled Test — AgentConfigurableProviderModelsTest
+
+`AgentConfigurableProviderModelsTest` is `@Disabled` because
+`OpenCodeAgentConfigurable.buildProviderModels` was refactored into a local
+function inside `ControlBarViewModel.loadProviders()` and is no longer
+accessible as a top-level/companion method. The test bodies are commented out
+because they reference the old location and would not compile.
+
+This is pre-existing breakage unrelated to the staged-changes review feature.
+The `@Disabled` + commented-bodies state was committed to prevent a compile
+error while preserving the test structure for future re-enablement.
+
+**To re-enable:** extract `buildProviderModels` back to a testable top-level
+or companion function (on `OpenCodeAgentConfigurable` or
+`ControlBarViewModel`), then uncomment the test bodies and update the
+`OpenCodeAgentConfigurable.buildProviderModels` references.
+
+**Files:** `AgentConfigurableProviderModelsTest.kt` (1 `@Disabled` class).
+
+### Review Panel VFS Listener — `.review/` Write Constraint (HARD)
+
+`ReviewPanel.kt` registers an `AsyncFileListener` that refreshes the Review
+tab on any file change. It intentionally does NOT filter out `.review/`
+writes so the panel refreshes when the LLM agent writes review JSON.
+
+**HARD CONSTRAINT:** The `produceState` block in `ReviewPanel` (which runs on
+refresh) must NEVER write to `.review/`. If it did, the VFS listener →
+`refreshSignal` → `produceState` → write loop would become infinite. The
+current `produceState` block only calls `GitService.getStagedFiles()` (a
+read-only VCS query) and derives comment maps from the `commentIndex`
+StateFlow — neither writes to `.review/`. The `ReviewRefreshBar.onRefresh`
+calls `ReviewCommentManager.loadAll()` (reads `.review/` via `Files.walk`)
+and bumps `refreshSignal` — also read-only.
+
+Do NOT add any `.review/` write path inside the `produceState` block or any
+code triggered by `refreshSignal` without first filtering `.review/` events
+out of the VFS listener.
+
+**Files:** `ReviewPanel.kt` (VFS listener ~line 138, `produceState` ~line 193).
 
 ### MockK SharedFlow/StateFlow � Must Stub with Real Flows
 

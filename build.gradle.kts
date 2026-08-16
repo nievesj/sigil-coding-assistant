@@ -78,6 +78,16 @@ dependencies {
         // inferred Kotlin types in file_structure and find_symbol signatures.
         bundledPlugin("org.jetbrains.kotlin")
 
+        // git4idea (plugin id "Git4Idea", directory "vcs-git" in IU 2026.1) — provides
+        // GitLineHandler/GitRepositoryManager for staged-changes review
+        // (git diff --cached via managed git execution).
+        // Optional at runtime (plugin.xml uses <depends optional="true">Git4Idea);
+        // bundled here for compile-time API access.
+        // The Gradle bundledPlugin() takes the PLATFORM PLUGIN ID ("Git4Idea"),
+        // same as the existing bundledPlugin("com.intellij.mcpServer") pattern.
+        // See TDD docs/tdd/review-staged-changes-only.md.
+        bundledPlugin("Git4Idea")
+
         // Test framework for PSI integration tests (LightPlatformTestCase).
         // Per AGENTS.md: enables IntelliJ application context bootstrap for tests.
         // NOTE: The IntelliJ test framework registers a JUnit5TestSessionListener

@@ -1,0 +1,17 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<!-- Plugin descriptor for git4idea (vcs-git) integration — loaded only when the
+     Git4Idea plugin is present (optional dependency in plugin.xml).
+     Declares the git4idea dependency so the platform loads this module's git
+     integration code only on IDEs that bundle git4idea.
+
+     No extension-point registrations here — the staged-changes review logic
+     (GitService.getStagedFiles) is called directly by ReviewCommandHandler and
+     ReviewPanel, not via an EP. The git4idea presence guard is in GitService
+     itself (returns NoGitRepository when git4idea classes are unavailable).
+
+     See TDD docs/tdd/review-staged-changes-only.md. -->
+<idea-plugin>
+    <dependencies>
+        <plugin id="Git4Idea"/>
+    </dependencies>
+</idea-plugin>
